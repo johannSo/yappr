@@ -4,6 +4,7 @@ pub mod config;
 pub mod guardrail;
 pub mod inject;
 pub mod lang;
+pub mod llama;
 pub mod models;
 pub mod normalize;
 pub mod paths;

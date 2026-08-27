@@ -347,6 +347,12 @@ impl Config {
         if self.normalize.context_size < 512 {
             bail!("normalize.context_size must be at least 512");
         }
+        if self.normalize.port == 0 {
+            bail!("normalize.port must be greater than 0");
+        }
+        if self.normalize.threads == 0 {
+            bail!("normalize.threads must be at least 1");
+        }
         for (name, v) in [
             ("guardrail.min_overlap_english", self.guardrail.min_overlap_english),
             ("guardrail.min_overlap_other", self.guardrail.min_overlap_other),
@@ -494,6 +500,8 @@ mod tests {
             "[guardrail]\nmin_overlap_english = 1.5\n",
             "[guardrail]\nmin_word_ratio = 2.0\nmax_word_ratio = 1.0\n",
             "[asr]\nnum_threads = 0\n",
+            "[normalize]\nport = 0\n",
+            "[normalize]\nthreads = 0\n",
         ] {
             assert!(Config::from_str(bad).is_err(), "should have rejected: {bad}");
         }
