@@ -1,0 +1,16 @@
+[package]
+name = "owf-cli"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+owf-core = { path = "../owf-core" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[[bin]]
+name = "owf-ctl"
+path = "src/bin/owf-ctl.rs"
