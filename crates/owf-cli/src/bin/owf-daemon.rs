@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -16,7 +17,7 @@ use std::time::Duration;
 
 use owf_core::asr::SherpaTranscriber;
 use owf_core::capture::Recorder;
-use owf_core::config::Config;
+use owf_core::config::{AudioConfig, Config};
 use owf_core::inject;
 use owf_core::lang::WhatlangDetector;
 use owf_core::llama::LlamaServer;
@@ -57,7 +58,13 @@ fn lock_ignoring_poison<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 struct Daemon {
     state: AtomicU8,
-    recorder: Recorder,
+    /// `None` until a `Recorder` has been successfully constructed -- either
+    /// eagerly at startup, or lazily on the first `ptt-start` after a
+    /// startup where it wasn't (I7). See `ensure_recorder`.
+    recorder: Mutex<Option<Recorder>>,
+    /// Kept so `ensure_recorder` can retry `Recorder::new` later with the
+    /// same settings, independent of how many times it has already failed.
+    audio_cfg: AudioConfig,
     pipeline: Mutex<Option<Pipeline>>,
     /// Owns the supervised `llama-server` child (R3): storing it here, rather
     /// than leaking it with `mem::forget`, keeps `LlamaServer::drop` reachable
@@ -75,17 +82,27 @@ struct Daemon {
     recording_epoch: AtomicU64,
 }
 
-/// Never invoked: `Pipeline::process` only calls the normalizer when
-/// `cfg.normalize.enabled` is true, and `warm_up` skips spawning
-/// `llama-server` (and builds this stub instead of `S1MiniClient`) exactly
-/// when it's false (R9). If this is ever reached, that is itself the bug --
-/// report it loudly rather than silently hang trying to reach a
-/// `llama-server` that was never started.
-struct DisabledNormalizer;
+/// Stands in for `S1MiniClient` whenever no working `llama-server` backs
+/// normalization for this run.
+///
+/// Two distinct situations reach this, both correctly modelled the same way:
+/// `[normalize].enabled = false` (no child was ever spawned at all), or
+/// `enabled = true` but `warm_up` couldn't get `llama-server` spawned and
+/// healthy (C1) -- a missing ggml compute backend, a missing binary, a port
+/// conflict outside the retry range, or any other startup failure.
+/// `Pipeline::process` already treats a normalizer *error* exactly like a
+/// `llama-server` that goes down or times out mid-utterance: log it and fall
+/// back to the raw transcript plus the rule-based pass (spec 15). Routing
+/// both "never had one" and "tried and failed" through that same, already-
+/// correct degraded path is what lets the daemon come up `Idle` and useful
+/// in either case, rather than the previous behaviour of `warm_up` returning
+/// `Err` on the second case and leaving the daemon stuck in `Warming`
+/// forever.
+struct UnavailableNormalizer(String);
 
-impl Normalizer for DisabledNormalizer {
+impl Normalizer for UnavailableNormalizer {
     fn normalize(&self, _control_line: &str, _raw: &str) -> Result<String> {
-        anyhow::bail!("normalization is disabled (normalize.enabled = false)")
+        anyhow::bail!("normalization unavailable: {}", self.0)
     }
 }
 
@@ -122,10 +139,36 @@ fn main() -> Result<()> {
     let _ = std::fs::remove_file(&sock_path); // stale socket; we hold the lock
     let listener = UnixListener::bind(&sock_path)
         .with_context(|| format!("binding {}", sock_path.display()))?;
+    // I6: the socket would otherwise sit at whatever the umask leaves it --
+    // world-writable-ish under the /tmp fallback `paths::runtime_socket`
+    // uses when `$XDG_RUNTIME_DIR` is unset (mode 1777), which would let any
+    // local user connect and send `ptt-start`, turning on this machine's
+    // microphone and typing into whatever window has focus. Owner-only
+    // access is all a client ever legitimately needs.
+    secure_socket(&sock_path)?;
+
+    // I7: a capture device that isn't there yet at startup (a USB mic not
+    // enumerated in time under Hyprland's `exec-once`) must not take the
+    // whole daemon down with it -- it used to, via this same `?` propagating
+    // out of `main`, which meant the daemon never even bound its socket.
+    // Attempted eagerly here so a startup failure is visible in the logs
+    // immediately, but `ensure_recorder` retries construction on the next
+    // `ptt-start` regardless of whether this attempt succeeded.
+    let recorder = match Recorder::new(&cfg.audio) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            tracing::error!(
+                error = ?e,
+                "no capture device at startup; will retry on the next ptt-start"
+            );
+            None
+        }
+    };
 
     let daemon = Arc::new(Daemon {
         state: AtomicU8::new(WARMING),
-        recorder: Recorder::new(&cfg.audio)?,
+        recorder: Mutex::new(recorder),
+        audio_cfg: cfg.audio.clone(),
         pipeline: Mutex::new(None),
         llama: Mutex::new(None),
         window_class: Mutex::new(None),
@@ -177,6 +220,22 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Restricts a just-bound Unix socket to owner-only access (I6).
+///
+/// `UnixListener::bind` creates the socket file at whatever the process
+/// umask leaves it, which on most desktop umasks (022) is merely
+/// world-readable -- harmless on its own -- but `paths::runtime_socket`
+/// falls back to `std::env::temp_dir()` (mode 1777, world-writable-with-
+/// sticky-bit) when `$XDG_RUNTIME_DIR` is unset, and *that* combination
+/// would let any other local user connect and issue `ptt-start`. Locking the
+/// socket down to `0600` unconditionally costs nothing on a correctly
+/// configured `$XDG_RUNTIME_DIR` (already mode 0700 by the systemd/logind
+/// contract) and closes the gap on the fallback path.
+fn secure_socket(path: &std::path::Path) -> Result<()> {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("setting permissions on {}", path.display()))
+}
+
 /// `std::fs::File::try_lock` is a stable `flock`(2) wrapper (stabilized in
 /// Rust 1.89) that needs neither an extra dependency nor an `unsafe` block on
 /// this toolchain -- preferred here over `libc::flock` for exactly that
@@ -201,14 +260,36 @@ fn try_lock_exclusive(f: &std::fs::File) -> bool {
 /// load any model; running with `[normalize] enabled = false` is how the
 /// rest of the daemon (capture -> VAD -> ASR -> guardrail-fallback -> wtype)
 /// is verified without it.
+///
+/// C1: a `llama-server` that fails to spawn, or spawns but never becomes
+/// healthy, no longer fails this function. Before this fix, either failure
+/// propagated out via `?`, the caller (`main`'s warm-up thread) logged it and
+/// left `daemon.state` at `WARMING` forever, and every subsequent
+/// `ptt-start` answered `{"ok":false,"err":"warming"}` -- permanently, with
+/// no retry -- even though ASR, VAD, and the guardrail's raw-text fallback
+/// were completely unaffected and spec 15 explicitly calls for exactly that
+/// degraded path ("`llama-server` down / unhealthy -> skip normalization,
+/// inject raw + rule pass"). Only spawning the ASR/VAD models can still fail
+/// this function: there is no raw-fallback path for a missing ASR the way
+/// there is for a missing normalizer, so failing loudly there is correct.
 fn warm_up(cfg: Config) -> Result<(Pipeline, Option<LlamaServer>)> {
     let models = paths::models_dir();
 
     let (server, base_url) = if cfg.normalize.enabled {
-        let server = LlamaServer::spawn(&cfg.normalize)?;
-        server.wait_healthy(Duration::from_secs(120))?;
-        let base_url = server.base_url();
-        (Some(server), base_url)
+        match spawn_and_wait_healthy(&cfg.normalize) {
+            Ok(server) => {
+                let base_url = server.base_url();
+                (Some(server), base_url)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = ?e,
+                    "llama-server did not come up; continuing with normalization disabled \
+                     for this run (ASR + guardrail raw-text fallback only)"
+                );
+                (None, String::new())
+            }
+        }
     } else {
         tracing::info!("normalize.enabled = false; not spawning llama-server");
         (None, String::new())
@@ -216,10 +297,12 @@ fn warm_up(cfg: Config) -> Result<(Pipeline, Option<LlamaServer>)> {
 
     let asr = SherpaTranscriber::new(&models, cfg.asr.num_threads)?;
     let trimmer = SileroTrimmer::new(&models)?;
-    let normalizer: Box<dyn Normalizer> = if cfg.normalize.enabled {
-        Box::new(S1MiniClient::new(base_url, cfg.normalize.timeout_ms))
-    } else {
-        Box::new(DisabledNormalizer)
+    let normalizer: Box<dyn Normalizer> = match &server {
+        Some(_) => Box::new(S1MiniClient::new(base_url, cfg.normalize.timeout_ms)),
+        None if cfg.normalize.enabled => {
+            Box::new(UnavailableNormalizer("llama-server failed to start".to_string()))
+        }
+        None => Box::new(UnavailableNormalizer("normalize.enabled = false".to_string())),
     };
     let injector = inject::build(&cfg.inject);
 
@@ -232,6 +315,15 @@ fn warm_up(cfg: Config) -> Result<(Pipeline, Option<LlamaServer>)> {
         injector,
     );
     Ok((pipeline, server))
+}
+
+/// Spawns `llama-server` and waits for it to report healthy, as one
+/// `Result` -- the seam `warm_up` above matches on to fall back to
+/// [`UnavailableNormalizer`] instead of failing outright (C1).
+fn spawn_and_wait_healthy(cfg: &owf_core::config::NormalizeConfig) -> Result<LlamaServer> {
+    let mut server = LlamaServer::spawn(cfg)?;
+    server.wait_healthy(Duration::from_secs(120))?;
+    Ok(server)
 }
 
 /// Guards `shutdown` against running its cleanup twice.
@@ -269,7 +361,9 @@ fn shutdown(daemon: &Daemon) {
     }
     tracing::info!("shutting down");
     kill_llama(&daemon.llama);
-    let _ = daemon.recorder.stop();
+    if let Some(r) = lock_ignoring_poison(&daemon.recorder).as_ref() {
+        let _ = r.stop();
+    }
     remove_runtime_files();
 }
 
@@ -376,7 +470,9 @@ fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
                 .compare_exchange(RECORDING, IDLE, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
             {
-                let _ = daemon.recorder.stop();
+                if let Some(r) = lock_ignoring_poison(&daemon.recorder).as_ref() {
+                    let _ = r.stop();
+                }
                 return Response::ok(State::Idle);
             }
             match daemon.state.load(Ordering::SeqCst) {
@@ -391,24 +487,81 @@ fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
             if current != IDLE {
                 return Response::err("reload requires idle");
             }
-            // Validates the config on disk without disturbing the running
-            // pipeline -- swapping the pipeline live (new ASR/VAD models,
-            // possibly a different llama-server) is out of scope here.
+            // I5: this used to parse the config on disk, discard the result,
+            // and report bare success -- a user who edited a guardrail
+            // threshold (or a style rule, or the inject backend) and
+            // reloaded got `{"ok":true}` and no actual change. `[guardrail]`,
+            // `[inject]`, and `[style_default]`/`[style_rules]` are pure
+            // per-utterance data the pipeline reads straight off its config
+            // and its injector on every call (see
+            // `Pipeline::update_reloadable`), so those now really do take
+            // effect. `[asr]`/`[normalize]`'s model- and llama-server-facing
+            // settings still require a restart -- swapping ASR/VAD models or
+            // reconnecting to a different `llama-server` live remains out of
+            // scope, exactly as before.
             match Config::load() {
-                Ok(_) => Response::ok(State::Idle),
+                Ok(new_cfg) => {
+                    let injector = inject::build(&new_cfg.inject);
+                    let mut guard = lock_ignoring_poison(&daemon.pipeline);
+                    match guard.as_mut() {
+                        Some(p) => {
+                            p.update_reloadable(new_cfg, injector);
+                            Response::ok(State::Idle)
+                        }
+                        // Unreachable in normal operation: IDLE is only ever
+                        // reached once warm-up has populated `pipeline` (see
+                        // `process_utterance`'s identical note).
+                        None => Response::err("reload requires the pipeline to be warmed up"),
+                    }
+                }
                 Err(e) => Response::err(format!("config error: {e}")),
             }
         }
     }
 }
 
-fn start_recording(daemon: &Arc<Daemon>) -> Response {
-    // Captured before recording so the overlay (M2) can never confuse it.
-    *lock_ignoring_poison(&daemon.window_class) = owf_core::hypr::active_window_class();
+/// Ensures `slot` holds a constructed value, building one via `ctor` first if
+/// it doesn't yet -- and leaving an existing value alone rather than
+/// rebuilding it.
+///
+/// `ctor` stands in for `Recorder::new` at the one real call site so this is
+/// testable without live audio hardware, which `Recorder::new` needs even
+/// just to enumerate a device (see `capture::Recorder::new`). This is the
+/// retry half of I7: a capture device that wasn't there at startup gets
+/// tried again on every `ptt-start` until one succeeds, using this exact
+/// same path either way -- there is no separate "first time" logic to fall
+/// out of sync with normal operation.
+fn ensure_recorder<T>(slot: &Mutex<Option<T>>, ctor: impl FnOnce() -> Result<T, String>) -> Result<(), String> {
+    let mut guard = lock_ignoring_poison(slot);
+    if guard.is_none() {
+        *guard = Some(ctor()?);
+    }
+    Ok(())
+}
 
-    if let Err(e) = daemon.recorder.start(|_level| {}) {
+fn start_recording(daemon: &Arc<Daemon>) -> Response {
+    // I7: construct the recorder (or retry a previous failure) before doing
+    // anything else -- and I4: query the window class *after* capture has
+    // actually started, not before. `hyprctl` is a subprocess spawn (bounded
+    // by a timeout, see I3 in `hypr.rs`), and running it first clipped the
+    // beginning of every utterance behind that spawn, which also contradicts
+    // `hypr.rs`'s own claim that this call is off the critical path.
+    if let Err(e) = ensure_recorder(&daemon.recorder, || {
+        Recorder::new(&daemon.audio_cfg).map_err(|e| e.to_string())
+    }) {
+        return Response::err(format!("no microphone: {e}"));
+    }
+    let start_result =
+        lock_ignoring_poison(&daemon.recorder).as_ref().expect("just ensured Some").start(|_level| {});
+    if let Err(e) = start_result {
         return Response::err(format!("cannot start capture: {e}"));
     }
+
+    // Capturing the window class here, now that the mic is already open,
+    // is still deliberate (spec 11): it is the window that was focused when
+    // the user *started* talking, not whatever has focus once they finish.
+    *lock_ignoring_poison(&daemon.window_class) = owf_core::hypr::active_window_class();
+
     // Bump the epoch *before* flipping the state, not after: they are two
     // independent atomics, and the safety-valve timer below reads the epoch
     // to decide whether it still owns this recording. If the state store ran
@@ -469,7 +622,16 @@ impl Drop for IdleOnExit<'_> {
 fn run_utterance(daemon: Arc<Daemon>) {
     let _idle_on_exit = IdleOnExit(&daemon.state);
 
-    let samples = match daemon.recorder.stop() {
+    let stop_result = match lock_ignoring_poison(&daemon.recorder).as_ref() {
+        Some(r) => r.stop(),
+        // Unreachable in normal operation: reaching RECORDING requires
+        // `start_recording` to have already ensured a recorder exists.
+        None => {
+            tracing::warn!("utterance finished but no recorder was ever constructed");
+            return;
+        }
+    };
+    let samples = match stop_result {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(error = ?e, "capture stop failed");
@@ -621,5 +783,78 @@ mod tests {
             !std::path::Path::new(&format!("/proc/{pid}")).exists(),
             "child process {pid} survived kill_llama: no llama-server may outlive shutdown"
         );
+    }
+
+    /// I7: `ensure_recorder` is the retry mechanism behind "a missing
+    /// microphone at startup must not kill the daemon" -- this exercises it
+    /// with a fake `u32` "recorder" and a call counter instead of a real
+    /// `capture::Recorder`, which needs live audio hardware just to
+    /// construct. Proves both halves: it builds lazily when empty, and it
+    /// never rebuilds once something is there.
+    #[test]
+    fn ensure_recorder_constructs_lazily_and_only_once() {
+        let slot: Mutex<Option<u32>> = Mutex::new(None);
+        let calls = std::sync::atomic::AtomicU32::new(0);
+
+        ensure_recorder(&slot, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(7)
+        })
+        .unwrap();
+        assert_eq!(*slot.lock().unwrap(), Some(7));
+
+        // The slot is already populated: this must not reconstruct.
+        ensure_recorder(&slot, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(99)
+        })
+        .unwrap();
+        assert_eq!(*slot.lock().unwrap(), Some(7), "must not reconstruct once populated");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the constructor should only run once");
+    }
+
+    /// I7: a failed construction must propagate the error and leave the slot
+    /// exactly as it was (empty), so the very next call retries rather than
+    /// getting stuck on a poisoned placeholder -- this is what lets a
+    /// missing-at-startup microphone recover once it's actually plugged in,
+    /// without the daemon needing a restart.
+    #[test]
+    fn ensure_recorder_propagates_the_constructor_error_and_leaves_the_slot_empty() {
+        let slot: Mutex<Option<u32>> = Mutex::new(None);
+
+        let err = ensure_recorder(&slot, || Err("no microphone".to_string())).unwrap_err();
+
+        assert_eq!(err, "no microphone");
+        assert!(
+            slot.lock().unwrap().is_none(),
+            "a failed construction must not poison the slot with a placeholder"
+        );
+
+        // And the retry that matters: a later call with a working
+        // constructor must still succeed.
+        ensure_recorder(&slot, || Ok(1)).unwrap();
+        assert_eq!(*slot.lock().unwrap(), Some(1));
+    }
+
+    /// I6: proves the socket this daemon binds ends up owner-only, not at
+    /// whatever the ambient umask would otherwise leave it -- exercised
+    /// against a scratch socket path rather than the real
+    /// `$XDG_RUNTIME_DIR` one, since `main` itself isn't unit-testable.
+    #[test]
+    fn secure_socket_locks_the_socket_down_to_owner_only() {
+        let dir =
+            std::env::temp_dir().join(format!("owf-test-socket-perms-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock_path = dir.join("test.sock");
+        let _ = std::fs::remove_file(&sock_path);
+        let _bound = UnixListener::bind(&sock_path).unwrap();
+
+        secure_socket(&sock_path).unwrap();
+
+        let mode = std::fs::metadata(&sock_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the socket must be owner-only, got {mode:o}");
+
+        drop(_bound);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

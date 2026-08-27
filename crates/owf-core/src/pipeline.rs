@@ -91,6 +91,24 @@ impl Pipeline {
         &self.cfg
     }
 
+    /// Applies a freshly-loaded [`Config`] and a rebuilt injector to an
+    /// already-warmed-up pipeline, for `owf-ctl reload` (spec 6).
+    ///
+    /// I5: deliberately narrow. `[guardrail]`, `[inject]`, `[style_default]`,
+    /// and `[style_rules]` are pure per-utterance data this struct reads
+    /// straight off `self.cfg`/`self.injector` on every call, so swapping
+    /// both here is enough to make an edited guardrail threshold or style
+    /// rule take effect immediately -- which is the whole point of `reload`
+    /// existing. `asr`, the VAD/ASR models, and the `llama-server` connection
+    /// underneath `self.normalizer` are untouched: those require a restart
+    /// (see `owf-daemon.rs`'s `Reload` handler), exactly as the comment this
+    /// replaces already said -- the bug was applying that restriction to
+    /// *everything* in `Config`, including the fields that need no restart.
+    pub fn update_reloadable(&mut self, cfg: Config, injector: Box<dyn TextInjector>) {
+        self.cfg = cfg;
+        self.injector = injector;
+    }
+
     /// Runs a complete utterance. `Ok(None)` means there was nothing to say
     /// and nothing was injected.
     pub fn process(&self, samples: &[f32], window_class: Option<&str>) -> Result<Option<Outcome>> {
@@ -192,12 +210,25 @@ fn log_rejection_to(
     lang: Lang,
     control: &str,
 ) {
+    // Spec 9.3 pins `ts` (RFC 3339) and a numeric `overlap` field in every
+    // record. Neither was present before ("Also fix" item): `ts` was missing
+    // outright, and the overlap score was only reachable -- for the one
+    // reject reason that is actually an overlap rejection -- by parsing it
+    // back out of the `detail` Debug string below. Recomputing it directly
+    // via `guardrail::overlap` instead means *every* rejection carries a
+    // real, parseable overlap number, not just the ones rejected for low
+    // overlap specifically -- which is what M3 tuning, the sole consumer of
+    // this file, actually needs to correlate overlap against every reason.
+    let overlap = guardrail::overlap(&guardrail::tokenize(raw), &guardrail::tokenize(cleaned));
+
     let record = serde_json::json!({
+        "ts": rfc3339_now(),
         "reason": reason.code(),
         "detail": format!("{reason:?}"),
         "lang": match lang { Lang::English => "English", Lang::Other => "Other" },
         "raw": raw,
         "cleaned": cleaned,
+        "overlap": overlap,
         "control": control,
     });
     if let Some(parent) = path.parent() {
@@ -213,9 +244,66 @@ fn log_rejection_to(
     }
 }
 
+fn rfc3339_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    rfc3339_utc(secs)
+}
+
+/// Formats whole seconds since the Unix epoch as an RFC 3339 UTC timestamp
+/// with second precision, e.g. `0` -> `"1970-01-01T00:00:00Z"`.
+///
+/// Hand-rolled (Howard Hinnant's well-known `civil_from_days` algorithm)
+/// rather than pulling in `chrono` or `time` as a direct dependency for this
+/// one call site -- this is the entire extent of the calendar math
+/// `rejections.jsonl` needs. Takes a plain integer specifically so it's
+/// testable without touching the wall clock.
+fn rfc3339_utc(secs_since_epoch: u64) -> String {
+    let days = (secs_since_epoch / 86_400) as i64;
+    let rem = secs_since_epoch % 86_400;
+    let (hour, minute, second) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+
+    // civil_from_days: days since 1970-01-01 -> (year, month, day). All
+    // intermediate values are non-negative for any date on or after the
+    // epoch, so plain (truncating) integer division agrees with floor
+    // division throughout -- no negative-operand pitfalls to worry about
+    // here.
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+
+    format!("{y:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rfc3339_utc_formats_the_unix_epoch() {
+        assert_eq!(rfc3339_utc(0), "1970-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn rfc3339_utc_formats_a_leap_day() {
+        // 2024-02-29T12:34:56Z
+        assert_eq!(rfc3339_utc(1_709_210_096), "2024-02-29T12:34:56Z");
+    }
+
+    #[test]
+    fn rfc3339_utc_formats_a_recent_timestamp() {
+        // 2026-08-27T18:04:11Z -- spec 9.3's own example record.
+        assert_eq!(rfc3339_utc(1_787_853_851), "2026-08-27T18:04:11Z");
+    }
 
     /// A fresh, collision-free scratch file path for a single test. Mirrors
     /// the `scratch_dir` helper in `inject.rs`'s own tests -- `tempfile`
@@ -256,6 +344,41 @@ mod tests {
         assert_eq!(
             parsed["control"],
             "[Styling: casual] [Structure: prose] [Context: general]"
+        );
+        // Spec 9.3: "the meeting is at 4:30" (3 raw tokens) vs "Cleaned."
+        // (1 cleaned token, disjoint) -> 0 of 3 raw tokens survive.
+        assert_eq!(parsed["overlap"], 0.0, "overlap must be a plain numeric field, got: {parsed}");
+        let ts = parsed["ts"].as_str().expect("ts must be a string");
+        assert_eq!(ts.len(), "2026-08-27T18:04:11Z".len(), "ts should be RFC 3339, got: {ts}");
+        assert!(ts.ends_with('Z'), "ts should be RFC 3339 UTC (trailing 'Z'), got: {ts}");
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn log_rejection_to_computes_overlap_regardless_of_the_reject_reason() {
+        let path = scratch_path("rejection-log-overlap");
+        // A Loop rejection, not an Overlap rejection -- before this fix, only
+        // an actual Overlap-reason rejection carried the score at all (and
+        // only inside an unparseable `{reason:?}` Debug string). "please" and
+        // "send" both survive from 4 raw tokens into the (looping) cleaned
+        // text -> overlap = 2/4 = 0.5.
+        log_rejection_to(
+            &path,
+            "please send that now",
+            "please send please send please send",
+            &RejectReason::Loop { ngram: "please send".into() },
+            Lang::English,
+            "control",
+        );
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(contents.lines().next().unwrap()).unwrap();
+        assert_eq!(parsed["reason"], "loop");
+        assert_eq!(
+            parsed["overlap"], 0.5,
+            "overlap must be computed for every rejection, not just Overlap-reason ones"
         );
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

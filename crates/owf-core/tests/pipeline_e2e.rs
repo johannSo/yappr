@@ -48,6 +48,38 @@ impl Normalizer for BrokenNormalizer {
     }
 }
 
+/// Used only by `disabling_normalization_skips_it_entirely`, in place of
+/// `BrokenNormalizer`. `Pipeline::process` swallows a normalizer *error*
+/// into exactly the same `normalized == false` / `reject_reason == None`
+/// outcome a correctly *skipped* normalizer produces (see
+/// `a_dead_normalizer_still_produces_text`) -- so `BrokenNormalizer` here
+/// asserted the same thing whether or not `[normalize].enabled = false` was
+/// actually honoured. A panic can't be silently swallowed the same way: if a
+/// regression ever lets the pipeline call the normalizer despite
+/// `enabled = false`, this fails loudly instead of passing for the wrong
+/// reason.
+struct PanickingNormalizer;
+impl Normalizer for PanickingNormalizer {
+    fn normalize(&self, _: &str, _: &str) -> anyhow::Result<String> {
+        panic!("normalizer must never be called when normalize.enabled = false");
+    }
+}
+
+/// Forwards to a shared `Arc<MockInjector>` so a test can inspect what was
+/// injected after `Pipeline::new` (or `Pipeline::update_reloadable`) has
+/// taken ownership of the `Box<dyn TextInjector>`. Mirrors the `Fwd`/
+/// `SpyNormalizer` pattern `the_window_class_selects_the_control_line`
+/// already uses on the normalizer side.
+struct FwdInjector(std::sync::Arc<MockInjector>);
+impl owf_core::inject::TextInjector for FwdInjector {
+    fn inject(&self, text: &str) -> Result<(), owf_core::inject::InjectError> {
+        self.0.inject(text)
+    }
+    fn name(&self) -> &'static str {
+        self.0.name()
+    }
+}
+
 /// Captures the control line the normalizer was handed.
 struct SpyNormalizer(std::sync::Mutex<Option<String>>);
 impl Normalizer for SpyNormalizer {
@@ -154,7 +186,7 @@ fn disabling_normalization_skips_it_entirely() {
         Box::new(FixedAsr("send the invoice on friday".into())),
         Box::new(WholeBuffer),
         Box::new(AlwaysEnglish),
-        Box::new(BrokenNormalizer), // would error if it were called
+        Box::new(PanickingNormalizer), // must never be called
         Box::new(MockInjector::default()),
     );
 
@@ -165,28 +197,63 @@ fn disabling_normalization_skips_it_entirely() {
 
 #[test]
 fn no_speech_injects_nothing() {
+    let injector = std::sync::Arc::new(MockInjector::default());
     let p = Pipeline::new(
         Config::from_str("").unwrap(),
         Box::new(FixedAsr("should never be reached".into())),
         Box::new(NoSpeechTrimmer),
         Box::new(AlwaysEnglish),
         Box::new(FixedNormalizer("nope".into())),
-        Box::new(MockInjector::default()),
+        Box::new(FwdInjector(injector.clone())),
     );
     assert!(p.process(&samples(), None).unwrap().is_none());
+    assert!(
+        injector.injected().is_empty(),
+        "no speech means nothing should ever reach the injector"
+    );
 }
 
 #[test]
 fn an_empty_transcript_injects_nothing() {
+    let injector = std::sync::Arc::new(MockInjector::default());
     let p = Pipeline::new(
         Config::from_str("").unwrap(),
         Box::new(FixedAsr("   ".into())),
         Box::new(WholeBuffer),
         Box::new(AlwaysEnglish),
         Box::new(FixedNormalizer("nope".into())),
-        Box::new(MockInjector::default()),
+        Box::new(FwdInjector(injector.clone())),
     );
     assert!(p.process(&samples(), None).unwrap().is_none());
+    assert!(
+        injector.injected().is_empty(),
+        "an empty transcript means nothing should ever reach the injector"
+    );
+}
+
+#[test]
+fn the_injector_receives_exactly_what_the_outcome_reports() {
+    // Spec 16 calls for a `MockInjector` capturing injected text for
+    // full-pipeline assertions; nothing exercised that before this fix, even
+    // though `Outcome.text`'s doc comment claims it is "exactly what was
+    // handed to the injector".
+    let injector = std::sync::Arc::new(MockInjector::default());
+    let p = Pipeline::new(
+        Config::from_str("").unwrap(),
+        Box::new(FixedAsr("send the invoice on friday".into())),
+        Box::new(WholeBuffer),
+        Box::new(AlwaysEnglish),
+        Box::new(FixedNormalizer("Send the invoice on Friday.".into())),
+        Box::new(FwdInjector(injector.clone())),
+    );
+
+    let out = p.process(&samples(), None).unwrap().expect("some outcome");
+
+    assert_eq!(
+        injector.injected(),
+        vec![out.text.clone()],
+        "the injector must receive exactly what Outcome.text reports, once, and nothing else"
+    );
 }
 
 #[test]
@@ -236,4 +303,46 @@ fn trailing_space_can_be_disabled() {
     );
     let out = p.process(&samples(), None).unwrap().expect("some outcome");
     assert_eq!(out.text, "Send the invoice on Friday.");
+}
+
+#[test]
+fn update_reloadable_applies_a_new_guardrail_and_a_new_injector() {
+    // I5: `owf-ctl reload` used to parse the config on disk, discard it, and
+    // report bare success -- a user editing a guardrail threshold and
+    // reloading got `{"ok":true}` and no actual change. This proves
+    // `Pipeline::update_reloadable` (what `owf-daemon.rs`'s `Reload` handler
+    // now calls) really does change guardrail behaviour without rebuilding
+    // the pipeline.
+    let strict = Config::from_str("").unwrap(); // default thresholds
+    let old_injector = std::sync::Arc::new(MockInjector::default());
+    let mut p = Pipeline::new(
+        strict,
+        Box::new(FixedAsr("the quarterly numbers came in higher than we forecast".into())),
+        Box::new(WholeBuffer),
+        Box::new(AlwaysEnglish),
+        Box::new(FixedNormalizer("Numbers.".into())), // far too short under the default ratio
+        Box::new(FwdInjector(old_injector.clone())),
+    )
+    .with_rejections_path(scratch_rejections_path("reload-strict"));
+
+    let before = p.process(&samples(), None).unwrap().expect("some outcome");
+    assert!(!before.normalized, "the default guardrail should reject this cleanup");
+    assert_eq!(old_injector.injected().len(), 1);
+
+    // Reload with a guardrail permissive enough to accept the same cleanup,
+    // and a brand-new injector -- both must take effect on the very next
+    // utterance, with no restart.
+    let permissive =
+        Config::from_str("[guardrail]\nmin_word_ratio = 0.0\nmin_overlap_english = 0.0\n").unwrap();
+    let new_injector = std::sync::Arc::new(MockInjector::default());
+    p.update_reloadable(permissive, Box::new(FwdInjector(new_injector.clone())));
+
+    let after = p.process(&samples(), None).unwrap().expect("some outcome");
+    assert!(after.normalized, "the reloaded, permissive guardrail should accept this cleanup");
+    assert!(old_injector.injected().len() == 1, "the old injector must not be used again after reload");
+    assert_eq!(
+        new_injector.injected(),
+        vec![after.text],
+        "the reloaded injector must receive the post-reload utterance"
+    );
 }

@@ -29,7 +29,31 @@ fn pick_port(preferred: u16) -> Result<u16> {
             return Ok(port);
         }
     }
-    bail!("no free port in {}..{}", preferred, preferred + 10)
+    // `.saturating_add(10)`, matching the loop above: `preferred + 10` here
+    // would overflow (and panic in a debug/test build) for a `preferred`
+    // within 10 of `u16::MAX`, even though the loop itself was already
+    // overflow-safe -- the bail message just needs to describe the same
+    // range the loop actually checked.
+    bail!("no free port in {}..{}", preferred, preferred.saturating_add(10))
+}
+
+/// A single `/health` request, bounded to a couple of seconds.
+///
+/// Without a request-level timeout here, a `llama-server` that accepts the
+/// TCP connection but never writes a response would hang this call forever
+/// -- which would in turn defeat `wait_healthy`'s own deadline loop (the
+/// `Instant::now() >= deadline` check is never reached if this call never
+/// returns). This is the same class of bug I2 fixes in `normalize.rs`,
+/// applied here so C1's "fail fast on a dead llama-server" guarantee holds
+/// even when the child is alive but wedged rather than exited.
+fn health_probe(url: &str) -> bool {
+    ureq::get(url)
+        .config()
+        .timeout_global(Some(Duration::from_secs(2)))
+        .build()
+        .call()
+        .map(|r| r.status() == 200)
+        .unwrap_or(false)
 }
 
 impl LlamaServer {
@@ -78,12 +102,26 @@ impl LlamaServer {
 
     /// Polls `/health` until the model is loaded and serving, or the timeout
     /// elapses.
-    pub fn wait_healthy(&self, timeout: Duration) -> Result<()> {
+    ///
+    /// Takes `&mut self` (not `&self`, as before C1) so it can call
+    /// `Child::try_wait` between polls: a `llama-server` that fails to spawn
+    /// at all with a working model (missing ggml compute backend, a bad
+    /// model path, etc.) typically exits within milliseconds, and without
+    /// this check the caller would otherwise learn that only after the full
+    /// `timeout` elapsed -- up to 120 s of polling a corpse before reporting
+    /// what was knowable almost immediately. See C1.
+    pub fn wait_healthy(&mut self, timeout: Duration) -> Result<()> {
         let url = format!("{}/health", self.base_url());
         let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            if ureq::get(&url).call().map(|r| r.status() == 200).unwrap_or(false) {
+        loop {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                bail!("llama-server exited during startup ({status})");
+            }
+            if health_probe(&url) {
                 return Ok(());
+            }
+            if Instant::now() >= deadline {
+                break;
             }
             std::thread::sleep(Duration::from_millis(250));
         }
@@ -93,10 +131,7 @@ impl LlamaServer {
     /// A single, non-blocking-retry health probe (used by the daemon's
     /// ongoing supervision loop, unlike `wait_healthy`'s startup poll).
     pub fn is_healthy(&self) -> bool {
-        ureq::get(&format!("{}/health", self.base_url()))
-            .call()
-            .map(|r| r.status() == 200)
-            .unwrap_or(false)
+        health_probe(&format!("{}/health", self.base_url()))
     }
 }
 
@@ -158,6 +193,58 @@ mod tests {
         }
 
         assert!(pick_port(base_port).is_err());
+    }
+
+    #[test]
+    fn pick_port_error_message_does_not_overflow_near_the_top_of_the_range() {
+        // `preferred + 10` (unsaturated) would overflow `u16` arithmetic --
+        // and panic in this debug/test build -- for a `preferred` this close
+        // to `u16::MAX`. Hold every port the loop actually checks so
+        // `pick_port` is forced down the `bail!` path that builds the
+        // message.
+        let preferred = u16::MAX - 3;
+        let mut held = Vec::new();
+        for p in preferred..preferred.saturating_add(10) {
+            if let Ok(l) = TcpListener::bind(("127.0.0.1", p)) {
+                held.push(l);
+            }
+        }
+
+        let err = pick_port(preferred).unwrap_err();
+        assert!(
+            err.to_string().contains(&preferred.saturating_add(10).to_string()),
+            "message should describe the saturated range, got: {err}"
+        );
+    }
+
+    /// C1: proves `wait_healthy` reports a dead child almost immediately
+    /// instead of polling it for the rest of the (potentially 120 s) budget.
+    /// A real `llama-server` can't run here (no ggml compute backend on this
+    /// machine), so this stubs the supervised child with a process that
+    /// exits on its own right away -- `LlamaServer::from_child` is the same
+    /// test seam `kill_llama_terminates_a_stub_child_and_is_idempotent`
+    /// (owf-daemon.rs) uses for the same reason.
+    #[test]
+    fn wait_healthy_fails_fast_when_the_child_has_already_exited() {
+        let child = std::process::Command::new("false")
+            .spawn()
+            .expect("spawning a stub child (`false`) for this test");
+        // Give the child a moment to actually exit before asking; `false`
+        // exits essentially instantly, but this keeps the test robust
+        // against scheduling jitter without inflating the timing assertion
+        // below.
+        std::thread::sleep(Duration::from_millis(100));
+        let mut server = LlamaServer::from_child(child, 0);
+
+        let t0 = Instant::now();
+        let err = server.wait_healthy(Duration::from_secs(120)).unwrap_err();
+        let elapsed = t0.elapsed();
+
+        assert!(err.to_string().contains("exited"), "got: {err}");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "should fail fast rather than polling the full 120 s budget, took {elapsed:?}"
+        );
     }
 
     #[test]
