@@ -19,3 +19,7 @@ path = "src/bin/owf-ctl.rs"
 [[bin]]
 name = "owf-bench"
 path = "src/bin/owf-bench.rs"
+
+[[bin]]
+name = "owf-daemon"
+path = "src/bin/owf-daemon.rs"

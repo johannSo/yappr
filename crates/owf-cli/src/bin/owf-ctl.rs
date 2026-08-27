@@ -1,16 +1,42 @@
 use anyhow::Result;
+use owf_core::proto::{self, Request};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     match refs.as_slice() {
+        ["ptt-start"] => send(Request::PttStart),
+        ["ptt-stop"] => send(Request::PttStop),
+        ["cancel"] => send(Request::Cancel),
+        ["status"] => send(Request::Status),
+        ["reload"] => send(Request::Reload),
         ["setup"] => setup(false),
         ["setup", "--update-lock"] => setup(true),
+        ["setup", "--print-hypr"] => {
+            print!("{}", owf_core::hypr::HYPR_CONFIG);
+            Ok(())
+        }
         _ => {
-            eprintln!("usage: owf-ctl setup [--update-lock]");
+            eprintln!(
+                "usage: owf-ctl <ptt-start|ptt-stop|cancel|status|reload>\n\
+                 \x20      owf-ctl setup [--update-lock|--print-hypr]"
+            );
             std::process::exit(2);
         }
     }
+}
+
+/// Sends one request to the daemon and prints its response line verbatim.
+/// Exits non-zero when the daemon reports `ok: false` (a rejected command,
+/// e.g. "busy"), matching the exit-status contract a Hyprland `bind = ...,
+/// exec, owf-ctl ...` invocation can rely on.
+fn send(req: Request) -> Result<()> {
+    let resp = proto::send(&req)?;
+    println!("{}", serde_json::to_string(&resp)?);
+    if !resp.ok {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 /// Carries the progress-reporting state from one `progress_line` call to the
