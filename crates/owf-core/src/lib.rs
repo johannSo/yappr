@@ -8,5 +8,6 @@ pub mod llama;
 pub mod models;
 pub mod normalize;
 pub mod paths;
+pub mod pipeline;
 pub mod style;
 pub mod vad;
