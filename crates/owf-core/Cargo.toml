@@ -1,0 +1,34 @@
+[package]
+name = "owf-core"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tracing.workspace = true
+dirs.workspace = true
+regex.workspace = true
+ureq.workspace = true
+sha2 = "0.11"
+tar = "0.4"
+bzip2 = "0.5"
+sherpa-onnx = "1.13.6"
+hound = "3.5"
+whatlang = "0.18"
+cpal = "0.18"
+rubato = "5.0"
+
+[dev-dependencies]
+hound = "3.5"
+httpmock = "0.8"
+
+[features]
+# Exposes test-only construction helpers (e.g. `LlamaServer::from_child`) to
+# other crates in the workspace so *their* tests can stub out a process that
+# can't run in CI or this sandbox (a real `llama-server` needs a model file
+# and a working ggml compute backend). Never enabled outside test builds.
+test-util = []

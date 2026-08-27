@@ -1,0 +1,32 @@
+[package]
+name = "owf-cli"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+owf-core = { path = "../owf-core" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+hound = "3.5"
+# Synchronous, self-pipe-based signal handling for the daemon's SIGTERM/
+# SIGINT/SIGHUP shutdown path (fix 2) -- no async runtime, matching the rest
+# of this binary.
+signal-hook = "0.3"
+
+[[bin]]
+name = "owf-ctl"
+path = "src/bin/owf-ctl.rs"
+
+[[bin]]
+name = "owf-bench"
+path = "src/bin/owf-bench.rs"
+
+[[bin]]
+name = "owf-daemon"
+path = "src/bin/owf-daemon.rs"
+
+[dev-dependencies]
+owf-core = { path = "../owf-core", features = ["test-util"] }
