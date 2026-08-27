@@ -1,8 +1,20 @@
+use std::io;
 use std::process::Command;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use crate::config::{InjectBackend, InjectConfig};
 use crate::paths;
+use crate::procutil;
+
+/// I3: none of these subprocess calls may block the daemon forever. `wtype`
+/// gets the most generous budget because `-d <ms>` (see `wtype_argv`) makes
+/// its own runtime proportional to the text length -- even a full 120 s
+/// utterance typed at a brisk pace is a few thousand characters, comfortably
+/// inside this bound at the default 2 ms/keystroke delay.
+const WTYPE_TIMEOUT: Duration = Duration::from_secs(15);
+const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(5);
+const NOTIFY_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, thiserror::Error)]
 pub enum InjectError {
@@ -10,8 +22,22 @@ pub enum InjectError {
     Failed { backend: &'static str, status: String, stderr: String },
     #[error("could not run {backend}: {source}")]
     Spawn { backend: &'static str, source: std::io::Error },
+    #[error("{backend} did not respond within {timeout:?}")]
+    Timeout { backend: &'static str, timeout: Duration },
     #[error("mock injector configured to fail")]
     Mock,
+}
+
+/// Maps a [`procutil::run_with_timeout`] failure onto the right
+/// [`InjectError`] variant: a timeout is a distinct, recognizable failure
+/// mode from "the OS couldn't even start the process" (I3), even though both
+/// currently degrade the same way (fall through to the clipboard fallback).
+fn map_proc_error(backend: &'static str, timeout: Duration, e: io::Error) -> InjectError {
+    if e.kind() == io::ErrorKind::TimedOut {
+        InjectError::Timeout { backend, timeout }
+    } else {
+        InjectError::Spawn { backend, source: e }
+    }
 }
 
 pub trait TextInjector: Send + Sync {
@@ -46,10 +72,10 @@ impl TextInjector for WtypeInjector {
     }
 
     fn inject(&self, text: &str) -> Result<(), InjectError> {
-        let out = Command::new("wtype")
-            .args(wtype_argv(text, self.delay_ms))
-            .output()
-            .map_err(|source| InjectError::Spawn { backend: "wtype", source })?;
+        let mut cmd = Command::new("wtype");
+        cmd.args(wtype_argv(text, self.delay_ms));
+        let out = procutil::run_with_timeout(cmd, WTYPE_TIMEOUT, None)
+            .map_err(|e| map_proc_error("wtype", WTYPE_TIMEOUT, e))?;
         if !out.status.success() {
             return Err(InjectError::Failed {
                 backend: "wtype",
@@ -69,25 +95,14 @@ impl TextInjector for ClipboardInjector {
     }
 
     fn inject(&self, text: &str) -> Result<(), InjectError> {
-        use std::io::Write;
-        let mut child = Command::new("wl-copy")
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|source| InjectError::Spawn { backend: "wl-copy", source })?;
-        child
-            .stdin
-            .as_mut()
-            .expect("piped stdin")
-            .write_all(text.as_bytes())
-            .map_err(|source| InjectError::Spawn { backend: "wl-copy", source })?;
-        let status = child
-            .wait()
-            .map_err(|source| InjectError::Spawn { backend: "wl-copy", source })?;
-        if !status.success() {
+        let cmd = Command::new("wl-copy");
+        let out = procutil::run_with_timeout(cmd, CLIPBOARD_TIMEOUT, Some(text.as_bytes()))
+            .map_err(|e| map_proc_error("wl-copy", CLIPBOARD_TIMEOUT, e))?;
+        if !out.status.success() {
             return Err(InjectError::Failed {
                 backend: "clipboard",
-                status: status.to_string(),
-                stderr: String::new(),
+                status: out.status.to_string(),
+                stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
             });
         }
         Ok(())
@@ -98,11 +113,27 @@ impl TextInjector for ClipboardInjector {
 pub struct MockInjector {
     calls: Mutex<Vec<String>>,
     fail: bool,
+    /// `None` reports the default `"mock"` name. See [`MockInjector::named`].
+    name: Option<&'static str>,
 }
 
 impl MockInjector {
     pub fn failing() -> Self {
-        Self { calls: Mutex::new(Vec::new()), fail: true }
+        Self { calls: Mutex::new(Vec::new()), fail: true, name: None }
+    }
+
+    /// A non-failing mock identified by `name` instead of the default
+    /// `"mock"`.
+    ///
+    /// Lets a test tell two `MockInjector`s apart by the backend name
+    /// `inject_with_fallback`/`inject_with_recovery` return -- e.g. a
+    /// primary and a fallback injector in the same test. Without this,
+    /// `a_working_fallback_never_touches_the_recovery_file` constructed both
+    /// as plain `MockInjector`s (both named `"mock"`), so its
+    /// `assert_eq!(backend, "mock")` passed identically whether the primary
+    /// or the fallback had actually run.
+    pub fn named(name: &'static str) -> Self {
+        Self { calls: Mutex::new(Vec::new()), fail: false, name: Some(name) }
     }
 
     pub fn injected(&self) -> Vec<String> {
@@ -112,7 +143,7 @@ impl MockInjector {
 
 impl TextInjector for MockInjector {
     fn name(&self) -> &'static str {
-        "mock"
+        self.name.unwrap_or("mock")
     }
 
     fn inject(&self, text: &str) -> Result<(), InjectError> {
@@ -138,7 +169,9 @@ pub fn build(cfg: &InjectConfig) -> Box<dyn TextInjector> {
 /// surface as an error, so any failure — spawn or exit status — is silently
 /// discarded.
 fn notify_send(summary: &str, body: &str) {
-    let _ = Command::new("notify-send").arg(summary).arg(body).output();
+    let mut cmd = Command::new("notify-send");
+    cmd.arg(summary).arg(body);
+    let _ = procutil::run_with_timeout(cmd, NOTIFY_TIMEOUT, None);
 }
 
 /// Appends one timestamped line to `<state_dir>/unsent.txt`.
@@ -303,10 +336,15 @@ mod tests {
     fn a_working_fallback_never_touches_the_recovery_file() {
         let dir = scratch_dir("no-recovery");
         let primary = MockInjector::failing();
-        let fallback = MockInjector::default();
+        // Named distinctly from the primary (fix: both used to be plain
+        // `MockInjector::default()`, both reporting the same "mock" name, so
+        // asserting on the returned backend could not actually tell which
+        // one ran).
+        let fallback = MockInjector::named("fallback-mock");
 
         let backend = inject_with_recovery(&primary, &fallback, "hello", &dir).unwrap();
-        assert_eq!(backend, "mock");
+        assert_eq!(backend, "fallback-mock", "must report that the fallback, not the primary, ran");
+        assert_eq!(fallback.injected(), vec!["hello".to_string()]);
         assert!(!dir.join("unsent.txt").exists());
 
         let _ = std::fs::remove_dir_all(&dir);

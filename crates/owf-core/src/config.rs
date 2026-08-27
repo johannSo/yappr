@@ -361,6 +361,24 @@ impl Config {
                 bail!("{name} must be between 0.0 and 1.0, got {v}");
             }
         }
+        // Only the ordering (min < max) used to be checked here, so
+        // `min_word_ratio = -0.5` validated cleanly and silently disabled the
+        // floor entirely (every ratio is >= any negative number). Bounding
+        // each to a sane range independently catches that, and a nonsense
+        // `max_word_ratio` (e.g. from a typo like `18.0` for `1.80`), before
+        // the ordering check ever runs.
+        if !(0.0..=1.0).contains(&self.guardrail.min_word_ratio) {
+            bail!(
+                "guardrail.min_word_ratio must be between 0.0 and 1.0, got {}",
+                self.guardrail.min_word_ratio
+            );
+        }
+        if !(0.0..=10.0).contains(&self.guardrail.max_word_ratio) {
+            bail!(
+                "guardrail.max_word_ratio must be between 0.0 and 10.0, got {}",
+                self.guardrail.max_word_ratio
+            );
+        }
         if self.guardrail.min_word_ratio >= self.guardrail.max_word_ratio {
             bail!(
                 "guardrail.min_word_ratio ({}) must be less than max_word_ratio ({})",
@@ -499,6 +517,10 @@ mod tests {
             "[normalize]\ntimeout_ms = 0\n",
             "[guardrail]\nmin_overlap_english = 1.5\n",
             "[guardrail]\nmin_word_ratio = 2.0\nmax_word_ratio = 1.0\n",
+            // A negative floor used to validate cleanly (only the ordering
+            // was checked) and silently disable the ratio floor entirely.
+            "[guardrail]\nmin_word_ratio = -0.5\n",
+            "[guardrail]\nmax_word_ratio = 50.0\n",
             "[asr]\nnum_threads = 0\n",
             "[normalize]\nport = 0\n",
             "[normalize]\nthreads = 0\n",

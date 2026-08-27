@@ -98,16 +98,27 @@ impl Normalizer for S1MiniClient {
 
         let url = format!("{}/v1/chat/completions", self.base_url);
 
-        // The timeout is enforced here, by racing the worker against
-        // `recv_timeout`, rather than by ureq's own timeout configuration --
-        // so a hung connection is bounded by exactly the configured budget
-        // regardless of what ureq would otherwise default to. A timed-out
-        // worker is left to finish (or hang) on its own thread; its result is
-        // discarded when the receiver has already gone away.
+        // The *authoritative* timeout is `self.timeout`, enforced below by
+        // racing the worker against `recv_timeout` -- that stays exactly as
+        // it was, per spec 8.2. But `ureq` 3.4's own `Timeouts::default()` is
+        // all `None` (verified), so without a timeout configured on the
+        // request itself, a `llama-server` that accepts the connection and
+        // then never replies parks the worker thread -- and its socket --
+        // forever: `recv_timeout` gives up on *waiting* for that thread, but
+        // nothing ever stops the thread itself, so one such utterance leaks
+        // a thread and an fd, unbounded (I2). Configuring `timeout_global`
+        // at roughly double the caller's budget means the worker can always
+        // eventually finish (with an error) and exit cleanly on its own,
+        // even on a request `recv_timeout` has already stopped waiting for.
+        let ureq_timeout = self.timeout * 2;
+
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let result = (|| -> Result<String> {
                 let mut resp = ureq::post(&url)
+                    .config()
+                    .timeout_global(Some(ureq_timeout))
+                    .build()
                     .send_json(&body)
                     .map_err(|e| anyhow!("request to llama-server failed: {e}"))?;
                 if resp.status() != 200 {

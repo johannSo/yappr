@@ -1,4 +1,13 @@
 use std::process::Command;
+use std::time::Duration;
+
+use crate::procutil;
+
+/// I3: `hyprctl` runs on the single-threaded accept loop's behalf at every
+/// `ptt-start`; a hung `hyprctl` (compositor wedged, IPC socket stuck) must
+/// not be able to block that loop -- and every command it serves, including
+/// `status` -- forever.
+const HYPRCTL_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Hyprland configuration for OpenWhisprFlow.
 ///
@@ -34,7 +43,9 @@ fn parse_class(json: &str) -> Option<String> {
 ///
 /// Called at ptt-start, off the latency-critical path.
 pub fn active_window_class() -> Option<String> {
-    let out = Command::new("hyprctl").args(["-j", "activewindow"]).output().ok()?;
+    let mut cmd = Command::new("hyprctl");
+    cmd.args(["-j", "activewindow"]);
+    let out = procutil::run_with_timeout(cmd, HYPRCTL_TIMEOUT, None).ok()?;
     if !out.status.success() {
         tracing::debug!("hyprctl activewindow failed; using default style");
         return None;

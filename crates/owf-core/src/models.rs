@@ -49,6 +49,20 @@ pub static ARTIFACTS: [Artifact; 3] = [
     },
 ];
 
+/// The lock file committed to the repository at `crates/owf-core/models.lock.toml`,
+/// generated once during M0 via `owf-ctl setup --update-lock` (spec 14.2).
+///
+/// C2: nothing in the tree ever read this file -- `LockFile::load()` only
+/// ever looked at the *runtime* lock under `paths::models_dir()`, which does
+/// not exist on a fresh install. The result was that a brand-new machine
+/// downloaded the full ~1.1 GB of models, hashed them, found nothing pinned,
+/// and aborted with "re-run with --update-lock" -- discarding the very
+/// integrity check spec 14.2 promises ("every subsequent install verifies
+/// against pinned values"). Compiling the committed file in with
+/// `include_str!` is what makes that promise true starting from the very
+/// first run, without requiring a network fetch of the lock file itself.
+const COMPILED_IN_LOCK: &str = include_str!("../models.lock.toml");
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct LockFile {
     #[serde(default)]
@@ -60,13 +74,40 @@ impl LockFile {
         paths::models_dir().join("models.lock.toml")
     }
 
+    /// Parses the lock file compiled into this binary. The only way this can
+    /// fail is if `crates/owf-core/models.lock.toml` itself were malformed,
+    /// which would fail every build, not just this call.
+    fn compiled_in() -> Result<Self> {
+        Ok(toml::from_str(COMPILED_IN_LOCK)?)
+    }
+
+    /// Loads the effective lock file: the runtime copy under
+    /// `paths::models_dir()`, if any, with the compiled-in pin (see
+    /// `COMPILED_IN_LOCK`) filling in any artifact it doesn't cover -- absent
+    /// entirely (the common case on a fresh install) or just missing that
+    /// one entry. A runtime entry always wins over the compiled-in one, which
+    /// is what keeps `--update-lock` able to actually change a pin rather
+    /// than being permanently shadowed by the committed file.
     pub fn load() -> Result<Self> {
-        let p = Self::path();
-        if !p.exists() {
-            return Ok(Self::default());
+        Self::load_from(&Self::path())
+    }
+
+    /// The testable core of `load`: `path` is a parameter so a test can
+    /// point it at a location that deliberately doesn't exist, proving the
+    /// compiled-in fallback is used, without touching the real
+    /// `models_dir()` -- which, on this machine, already has 1.1 GB of
+    /// downloaded models and a runtime lock file that must not be disturbed.
+    fn load_from(path: &Path) -> Result<Self> {
+        let compiled = Self::compiled_in()?;
+        if !path.exists() {
+            return Ok(compiled);
         }
-        let s = std::fs::read_to_string(&p)?;
-        Ok(toml::from_str(&s)?)
+        let s = std::fs::read_to_string(path)?;
+        let mut runtime: Self = toml::from_str(&s)?;
+        for (name, hash) in compiled.hashes {
+            runtime.hashes.entry(name).or_insert(hash);
+        }
+        Ok(runtime)
     }
 
     pub fn save(&self) -> Result<()> {
@@ -385,6 +426,70 @@ mod tests {
             assert!(a.url.starts_with("https://"), "{} is not https", a.name);
         }
         assert_eq!(ARTIFACTS.len(), 3);
+    }
+
+    #[test]
+    fn compiled_in_lock_covers_every_artifact() {
+        let compiled = LockFile::compiled_in().unwrap();
+        for a in ARTIFACTS.iter() {
+            assert!(
+                compiled.hashes.contains_key(a.name),
+                "crates/owf-core/models.lock.toml has no pinned hash for {}",
+                a.name
+            );
+        }
+    }
+
+    /// C2: proves a fresh machine -- no runtime `models.lock.toml` at all --
+    /// still gets a real pin for every artifact, sourced from the file
+    /// compiled into the binary. Before this fix, `LockFile::load()` in this
+    /// exact situation returned an empty map, which is what let a fresh
+    /// install burn the entire ~1.1 GB download only to be told to re-run
+    /// with `--update-lock`.
+    #[test]
+    fn load_falls_back_to_the_compiled_in_pin_when_no_runtime_lock_exists() {
+        let dir = std::env::temp_dir()
+            .join(format!("owf-test-no-runtime-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let never_created = dir.join("models.lock.toml");
+
+        let lock = LockFile::load_from(&never_created).unwrap();
+
+        for a in ARTIFACTS.iter() {
+            assert!(
+                lock.hashes.contains_key(a.name),
+                "compiled-in pin should cover {} when no runtime lock exists",
+                a.name
+            );
+        }
+        // Matches the hash actually committed in crates/owf-core/models.lock.toml.
+        assert_eq!(
+            lock.hashes.get("silero").map(String::as_str),
+            Some("9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6")
+        );
+    }
+
+    #[test]
+    fn load_prefers_a_runtime_entry_but_fills_gaps_from_the_compiled_in_pin() {
+        let dir =
+            std::env::temp_dir().join(format!("owf-test-partial-runtime-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("models.lock.toml");
+        std::fs::write(&path, "[hashes]\nsilero = \"deadbeef\"\n").unwrap();
+
+        let lock = LockFile::load_from(&path).unwrap();
+
+        assert_eq!(
+            lock.hashes.get("silero").map(String::as_str),
+            Some("deadbeef"),
+            "an explicit runtime entry must win over the compiled-in pin"
+        );
+        assert!(
+            lock.hashes.contains_key("s1-mini") && lock.hashes.contains_key("parakeet"),
+            "artifacts absent from the runtime file must still fall back to the compiled-in pin"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -108,6 +108,59 @@ fn a_slow_server_times_out_within_the_configured_budget() {
     assert!(elapsed < std::time::Duration::from_millis(1_200), "took {elapsed:?}");
 }
 
+/// I2: a `llama-server` that accepts the connection and then never replies
+/// must not leak the worker thread `normalize()` races against
+/// `recv_timeout`. Before this fix, `ureq` was given no timeout of its own
+/// (`ureq::Timeouts::default()` is all `None`), so the thread -- and its
+/// socket -- would still be blocked in I/O well after this function's
+/// `recv_timeout` gave up on waiting for it.
+///
+/// Live thread count is Linux-specific (`/proc/self/status`), which matches
+/// the rest of this project's scope (Hyprland on Linux only).
+#[test]
+fn a_permanently_silent_server_does_not_leak_the_worker_thread() {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(POST).path("/v1/chat/completions");
+        then.status(200)
+            .delay(std::time::Duration::from_secs(5))
+            .json_body(ok_body("too late"));
+    });
+
+    // ureq's own timeout is roughly double the caller's budget, so it fires
+    // at ~300ms here -- well before the mock's 5 s delay, but comfortably
+    // after this call's own 150ms `recv_timeout` has already returned.
+    let c = S1MiniClient::new(server.base_url(), 150);
+
+    let threads_before = live_thread_count();
+    let err = c
+        .normalize("[Styling: casual] [Structure: prose] [Context: general]", "hi there")
+        .unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("timeout"), "got: {err}");
+
+    // Give the worker thread comfortable headroom past ureq's own timeout to
+    // actually unblock and exit.
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    let threads_after = live_thread_count();
+
+    assert!(
+        threads_after <= threads_before,
+        "a worker thread is still alive well past ureq's own timeout: before={threads_before}, after={threads_after}"
+    );
+}
+
+fn live_thread_count() -> usize {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("Threads:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|n| n.parse().ok())
+        })
+        .unwrap_or(0)
+}
+
 #[test]
 fn output_is_trimmed() {
     let server = MockServer::start();
