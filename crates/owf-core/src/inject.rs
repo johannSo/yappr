@@ -2,6 +2,7 @@ use std::process::Command;
 use std::sync::Mutex;
 
 use crate::config::{InjectBackend, InjectConfig};
+use crate::paths;
 
 #[derive(Debug, thiserror::Error)]
 pub enum InjectError {
@@ -130,24 +131,90 @@ pub fn build(cfg: &InjectConfig) -> Box<dyn TextInjector> {
     }
 }
 
+/// Fires a desktop notification via the `notify-send` subprocess.
+///
+/// A courtesy, not part of the contract: a missing or failing `notify-send`
+/// (no notification daemon running, binary not installed, etc.) must never
+/// surface as an error, so any failure — spawn or exit status — is silently
+/// discarded.
+fn notify_send(summary: &str, body: &str) {
+    let _ = Command::new("notify-send").arg(summary).arg(body).output();
+}
+
+/// Appends one timestamped line to `<state_dir>/unsent.txt`.
+///
+/// This is the last resort when both the primary injector and the clipboard
+/// fallback have failed: the transcript has already cost the user real
+/// speech and ASR time, so it must not simply vanish — see spec 10.4.
+/// Failing to write this file must never mask the original injection error,
+/// so failures here are logged and swallowed, not propagated.
+fn write_recovery_file(state_dir: &std::path::Path, text: &str) {
+    if let Err(e) = write_recovery_file_inner(state_dir, text) {
+        tracing::error!(error = %e, "failed to write recovery file; transcript may be lost");
+    }
+}
+
+fn write_recovery_file_inner(state_dir: &std::path::Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    std::fs::create_dir_all(state_dir)?;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(state_dir.join("unsent.txt"))?;
+    writeln!(f, "[{ts}] {text}")
+}
+
 /// Injects via `primary`; on failure copies to the clipboard and notifies.
 ///
-/// A transcript is never silently lost — see spec 10.4.
+/// A transcript is never silently lost — see spec 10.4. If the clipboard
+/// fallback also fails, the transcript is appended to a recovery file under
+/// `paths::state_dir()` before the error is returned.
 pub fn inject_with_fallback(
     primary: &dyn TextInjector,
     text: &str,
 ) -> anyhow::Result<&'static str> {
+    inject_with_recovery(primary, &ClipboardInjector, text, &paths::state_dir())
+}
+
+/// The testable core of [`inject_with_fallback`]: the clipboard fallback and
+/// the recovery-file directory are both parameters, so tests can substitute
+/// a failing fallback and a scratch directory without touching real system
+/// state or the public signature `inject_with_fallback` is required to keep.
+fn inject_with_recovery(
+    primary: &dyn TextInjector,
+    fallback: &dyn TextInjector,
+    text: &str,
+    state_dir: &std::path::Path,
+) -> anyhow::Result<&'static str> {
     match primary.inject(text) {
         Ok(()) => Ok(primary.name()),
-        Err(e) => {
-            tracing::warn!(error = %e, "primary injector failed; falling back to clipboard");
-            ClipboardInjector.inject(text)?;
-            let _ = notify_rust::Notification::new()
-                .summary("OpenWhisprFlow")
-                .body("Typing failed — transcript copied to clipboard")
-                .timeout(notify_rust::Timeout::Milliseconds(4_000))
-                .show();
-            Ok("clipboard")
+        Err(primary_err) => {
+            tracing::warn!(error = %primary_err, "primary injector failed; falling back to clipboard");
+            match fallback.inject(text) {
+                Ok(()) => {
+                    notify_send(
+                        "OpenWhisprFlow",
+                        "Typing failed — transcript copied to clipboard",
+                    );
+                    Ok(fallback.name())
+                }
+                Err(fallback_err) => {
+                    // Spec 10.4: once transcribed, the user gets the text --
+                    // if it can't be typed or copied, it must at least be
+                    // saved to disk rather than discarded.
+                    write_recovery_file(state_dir, text);
+                    Err(anyhow::anyhow!(
+                        "primary injector '{}' failed ({primary_err}); {} fallback also failed ({fallback_err}); transcript saved to {}",
+                        primary.name(),
+                        fallback.name(),
+                        state_dir.join("unsent.txt").display(),
+                    ))
+                }
+            }
         }
     }
 }
@@ -201,5 +268,47 @@ mod tests {
         let m = MockInjector::default();
         assert_eq!(inject_with_fallback(&m, "hello").unwrap(), "mock");
         assert_eq!(m.injected(), vec!["hello".to_string()]);
+    }
+
+    /// A fresh, collision-free scratch directory for a single test. Not a
+    /// dependency: `tempfile` isn't in `[dev-dependencies]`, and this is the
+    /// whole of what's needed here.
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("owf-core-test-{tag}-{}-{n}", std::process::id()))
+    }
+
+    #[test]
+    fn when_both_injectors_fail_the_transcript_is_saved_to_the_recovery_file() {
+        let dir = scratch_dir("recovery");
+        let primary = MockInjector::failing();
+        let fallback = MockInjector::failing();
+
+        let err = inject_with_recovery(&primary, &fallback, "please do not lose this", &dir)
+            .unwrap_err();
+        assert!(err.to_string().contains("unsent.txt"), "got: {err}");
+
+        let saved = std::fs::read_to_string(dir.join("unsent.txt")).unwrap();
+        assert!(
+            saved.contains("please do not lose this"),
+            "recovery file should contain the transcript, got: {saved:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_working_fallback_never_touches_the_recovery_file() {
+        let dir = scratch_dir("no-recovery");
+        let primary = MockInjector::failing();
+        let fallback = MockInjector::default();
+
+        let backend = inject_with_recovery(&primary, &fallback, "hello", &dir).unwrap();
+        assert_eq!(backend, "mock");
+        assert!(!dir.join("unsent.txt").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
