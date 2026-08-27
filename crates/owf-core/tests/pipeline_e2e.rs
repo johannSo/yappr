@@ -14,6 +14,16 @@ impl Transcriber for FixedAsr {
     }
 }
 
+/// Always errors, never producing a transcript -- used to prove the debug
+/// record is still written when `self.asr.transcribe(...)?` is the return
+/// path (`debug_record_is_written_when_asr_errors`).
+struct FailingAsr;
+impl Transcriber for FailingAsr {
+    fn transcribe(&self, _: &[f32]) -> anyhow::Result<String> {
+        anyhow::bail!("asr exploded")
+    }
+}
+
 struct WholeBuffer;
 impl Trimmer for WholeBuffer {
     fn trim(&self, s: &[f32], _: u32) -> Option<(usize, usize)> {
@@ -260,6 +270,80 @@ fn debug_capture_is_a_no_op_when_disabled() {
     p.process(&samples(), None).unwrap();
 
     assert!(!dir.exists(), "no debug directory should be created when [debug].enabled = false");
+}
+
+/// Structural fix: `self.asr.transcribe(...)?` used to skip the debug write
+/// entirely on error, even with `[debug].enabled = true`. VAD had already
+/// run by then, so the record must still capture that much.
+#[test]
+fn debug_record_is_written_when_asr_errors() {
+    let dir = scratch_debug_dir("asr-error");
+    let p = Pipeline::new(
+        debug_config(&dir, false),
+        Box::new(FailingAsr),
+        Box::new(WholeBuffer),
+        Box::new(AlwaysEnglish),
+        Box::new(FixedNormalizer("unused".into())),
+        Box::new(MockInjector::default()),
+    );
+
+    let err = p.process(&samples(), None).unwrap_err();
+    assert!(err.to_string().contains("asr exploded"), "got {err}");
+
+    let logs_dir = dir.join("logs");
+    let json_path = owf_core::debug::latest_record_path(&logs_dir)
+        .expect("a debug record must be written even when ASR errors");
+    let record: owf_core::debug::DebugRecord =
+        serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
+    assert!(record.vad.found, "VAD had already run before ASR errored");
+    assert!(record.asr_raw.is_none(), "ASR never produced a transcript");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Structural fix, second instance: `inject_with_fallback(...)?` used to skip
+/// the debug write when *both* the primary and clipboard-fallback injectors
+/// failed -- found by review, not disclosed by the implementer. By then the
+/// raw transcript, the normalization result, and the guardrail verdict are
+/// all already computed; this is exactly the utterance you'd most want a
+/// record for.
+///
+/// Uses `with_fallback_injector`/`with_recovery_dir` (added alongside this
+/// fix) so the test can force the fallback path deterministically instead of
+/// depending on whether the real `wl-copy` happens to be installed, and
+/// without writing to the real `paths::state_dir()`.
+#[test]
+fn debug_record_is_written_when_both_injectors_fail() {
+    let dir = scratch_debug_dir("both-injectors-fail");
+    let recovery_dir = scratch_debug_dir("both-injectors-fail-recovery");
+    let p = Pipeline::new(
+        debug_config(&dir, false),
+        Box::new(FixedAsr("send the invoice on friday".into())),
+        Box::new(WholeBuffer),
+        Box::new(AlwaysEnglish),
+        Box::new(FixedNormalizer("Send the invoice on Friday.".into())),
+        Box::new(MockInjector::failing()),
+    )
+    .with_fallback_injector(Box::new(MockInjector::failing()))
+    .with_recovery_dir(recovery_dir.clone());
+
+    let err = p.process(&samples(), None).unwrap_err();
+    assert!(err.to_string().contains("unsent.txt"), "got {err}");
+
+    let logs_dir = dir.join("logs");
+    let json_path = owf_core::debug::latest_record_path(&logs_dir)
+        .expect("a debug record must be written even when both injectors fail");
+    let record: owf_core::debug::DebugRecord =
+        serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
+    assert_eq!(record.asr_raw.as_deref(), Some("send the invoice on friday"));
+    let normalize = record.normalize.expect("normalization should have already run");
+    assert_eq!(normalize.cleaned.as_deref(), Some("Send the invoice on Friday."));
+    let guardrail = record.guardrail.expect("the guardrail should have already reached a verdict");
+    assert_eq!(guardrail.verdict, "accept");
+    assert!(record.inject.is_none(), "injection never completed");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&recovery_dir);
 }
 
 #[test]

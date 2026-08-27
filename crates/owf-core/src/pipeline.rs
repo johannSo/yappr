@@ -16,7 +16,7 @@ use crate::capture::CaptureStats;
 use crate::config::Config;
 use crate::debug;
 use crate::guardrail::{self, RejectReason, Verdict};
-use crate::inject::{inject_with_fallback, TextInjector};
+use crate::inject::{self, ClipboardInjector, TextInjector};
 use crate::lang::{Lang, LanguageDetector};
 use crate::normalize::Normalizer;
 use crate::paths;
@@ -52,11 +52,20 @@ pub struct Pipeline {
     detector: Box<dyn LanguageDetector>,
     normalizer: Box<dyn Normalizer>,
     injector: Box<dyn TextInjector>,
+    /// The fallback `inject_with_recovery` falls through to when `injector`
+    /// fails, if overridden by `with_fallback_injector`. Defaults to the
+    /// real `ClipboardInjector` in `new`, matching `inject_with_fallback`'s
+    /// production behaviour.
+    fallback_injector: Box<dyn TextInjector>,
     /// Where guardrail rejections are appended, if overridden by
     /// `with_rejections_path`. `None` (the default from `new`) means the
     /// real M3 tuning dataset, `paths::rejections_file()` -- see
     /// `rejections_path` and `log_rejection_to`.
     rejections_path: Option<PathBuf>,
+    /// Where the injection-failure recovery file (spec 10.4's `unsent.txt`)
+    /// is written, if overridden by `with_recovery_dir`. `None` (the default
+    /// from `new`) means the real `paths::state_dir()`.
+    recovery_dir: Option<PathBuf>,
 }
 
 impl Pipeline {
@@ -68,7 +77,17 @@ impl Pipeline {
         normalizer: Box<dyn Normalizer>,
         injector: Box<dyn TextInjector>,
     ) -> Self {
-        Self { cfg, asr, trimmer, detector, normalizer, injector, rejections_path: None }
+        Self {
+            cfg,
+            asr,
+            trimmer,
+            detector,
+            normalizer,
+            injector,
+            fallback_injector: Box::new(ClipboardInjector),
+            rejections_path: None,
+            recovery_dir: None,
+        }
     }
 
     /// Points guardrail-rejection logging at `path` instead of the real M3
@@ -88,6 +107,37 @@ impl Pipeline {
     /// unless overridden by `with_rejections_path`.
     fn rejections_path(&self) -> PathBuf {
         self.rejections_path.clone().unwrap_or_else(paths::rejections_file)
+    }
+
+    /// Substitutes the fallback injector that `inject_with_recovery` falls
+    /// through to when the primary injector fails, instead of the real
+    /// `ClipboardInjector` (which shells out to `wl-copy`).
+    ///
+    /// Additive, same rationale as `with_rejections_path`: production always
+    /// takes the `new`-time default. Only tests need this -- specifically,
+    /// to force *both* injectors to fail deterministically and prove the
+    /// debug record still gets written when that happens, without touching
+    /// the real clipboard.
+    pub fn with_fallback_injector(mut self, fallback: Box<dyn TextInjector>) -> Self {
+        self.fallback_injector = fallback;
+        self
+    }
+
+    /// Points the injection-failure recovery file (spec 10.4's `unsent.txt`)
+    /// at `dir` instead of the real `paths::state_dir()`.
+    ///
+    /// Additive, same rationale as `with_rejections_path`: a test that
+    /// deliberately fails both injectors must not write to the real user
+    /// state directory.
+    pub fn with_recovery_dir(mut self, dir: PathBuf) -> Self {
+        self.recovery_dir = Some(dir);
+        self
+    }
+
+    /// Where the injection-failure recovery file is written:
+    /// `paths::state_dir()` unless overridden by `with_recovery_dir`.
+    fn recovery_dir(&self) -> PathBuf {
+        self.recovery_dir.clone().unwrap_or_else(paths::state_dir)
     }
 
     pub fn config(&self) -> &Config {
@@ -140,70 +190,52 @@ impl Pipeline {
         window_class: Option<&str>,
         capture: Option<CaptureStats>,
     ) -> Result<Option<Outcome>> {
-        let mut timings = Timings::default();
-        // `None` when `[debug].enabled` is false -- the common case -- so
-        // that recording an utterance costs this function nothing beyond the
-        // one bool check: no timestamp formatted, no path expanded, no
-        // record built or written.
-        let debug_ctx: Option<(String, std::path::PathBuf)> = self.cfg.debug.enabled.then(|| {
+        // `ctx` is `None` when `[debug].enabled` is false -- the common case
+        // -- so that recording an utterance costs this function nothing
+        // beyond the one bool check: no timestamp formatted, no path
+        // expanded, no record built or written. See `DebugRecordGuard` for
+        // why the write itself is unconditional (structural) rather than
+        // called out at each return point.
+        let ctx = self.cfg.debug.enabled.then(|| {
             (debug::timestamp_for_filename(SystemTime::now()), debug::expand_tilde(&self.cfg.debug.dir))
         });
+        let mut dbg = DebugRecordGuard {
+            ctx,
+            save_audio: self.cfg.debug.save_audio,
+            capture: capture.as_ref(),
+            raw: samples,
+            trim: None,
+            vad: debug::VadDebug::not_found(),
+            asr_raw: None,
+            lang: None,
+            normalize: None,
+            guardrail: None,
+            inject: None,
+            timings: Timings::default(),
+        };
 
         let t = Instant::now();
         let Some((start, end)) = self.trimmer.trim(samples, self.cfg.audio.vad_padding_ms) else {
             tracing::info!("no speech detected");
-            if let Some((ts, dir)) = &debug_ctx {
-                debug::record_utterance(
-                    dir,
-                    ts,
-                    self.cfg.debug.save_audio,
-                    debug::DebugInput {
-                        capture: capture.as_ref(),
-                        raw: samples,
-                        trimmed: None,
-                        vad: debug::VadDebug::not_found(),
-                        asr_raw: None,
-                        lang: None,
-                        normalize: None,
-                        guardrail: None,
-                        inject: None,
-                        timings,
-                    },
-                );
-            }
-            return Ok(None);
+            return Ok(None); // dbg drops here: writes a "no speech" record.
         };
-        timings.vad_ms = t.elapsed().as_millis();
-        let vad_debug = debug::VadDebug::span(start, end);
+        dbg.timings.vad_ms = t.elapsed().as_millis();
+        dbg.trim = Some((start, end));
+        dbg.vad = debug::VadDebug::span(start, end);
 
         let t = Instant::now();
-        let raw = self.asr.transcribe(&samples[start..end])?;
-        timings.asr_ms = t.elapsed().as_millis();
+        let raw = self.asr.transcribe(&samples[start..end])?; // dbg drops here on error: writes a record with the VAD span but no transcript -- the gap this fix closes.
+        dbg.timings.asr_ms = t.elapsed().as_millis();
+        if dbg.ctx.is_some() {
+            dbg.asr_raw = Some(raw.clone());
+        }
         if raw.trim().is_empty() {
             tracing::info!("empty transcript");
-            if let Some((ts, dir)) = &debug_ctx {
-                debug::record_utterance(
-                    dir,
-                    ts,
-                    self.cfg.debug.save_audio,
-                    debug::DebugInput {
-                        capture: capture.as_ref(),
-                        raw: samples,
-                        trimmed: Some(&samples[start..end]),
-                        vad: vad_debug,
-                        asr_raw: Some(&raw),
-                        lang: None,
-                        normalize: None,
-                        guardrail: None,
-                        inject: None,
-                        timings,
-                    },
-                );
-            }
-            return Ok(None);
+            return Ok(None); // dbg drops here: writes a record with the (empty) transcript.
         }
 
         let lang = self.detector.detect(&raw);
+        dbg.lang = Some(lang);
         let axes = style::resolve(&self.cfg, window_class);
         let control = style::control_line(&axes);
 
@@ -225,7 +257,7 @@ impl Pipeline {
             // number.
             let t = Instant::now();
             let normalize_result = self.normalizer.normalize(&control, &raw);
-            timings.normalize_ms = t.elapsed().as_millis();
+            dbg.timings.normalize_ms = t.elapsed().as_millis();
             normalize_debug.ran = true;
 
             match normalize_result {
@@ -256,47 +288,102 @@ impl Pipeline {
                 }
             }
         }
+        // Recorded now (a plain move -- `normalize_debug`/`guardrail_debug`
+        // aren't read again) so that if injection below fails, the record
+        // `dbg` writes on drop still carries the raw transcript, the
+        // normalization result, and the guardrail verdict -- precisely the
+        // three things you'd most want when *both* injectors have failed.
+        dbg.normalize = Some(normalize_debug);
+        dbg.guardrail = guardrail_debug;
 
         if self.cfg.inject.trailing_space {
             text.push(' ');
         }
 
         let t = Instant::now();
-        let backend = inject_with_fallback(self.injector.as_ref(), &text)?;
-        timings.inject_ms = t.elapsed().as_millis();
+        let backend = inject::inject_with_recovery(
+            self.injector.as_ref(),
+            self.fallback_injector.as_ref(),
+            &text,
+            &self.recovery_dir(),
+        )?; // dbg drops here if both injectors fail: writes a record with everything up to (not including) injection -- the gap review flagged.
+        dbg.timings.inject_ms = t.elapsed().as_millis();
+        dbg.inject = Some(debug::InjectDebug { backend: backend.to_string(), final_text: text.clone() });
 
         tracing::info!(
-            ?timings,
+            timings = ?dbg.timings,
             normalized,
             ?reject_reason,
             backend,
             "utterance complete"
         );
 
-        if let Some((ts, dir)) = &debug_ctx {
-            debug::record_utterance(
-                dir,
-                ts,
-                self.cfg.debug.save_audio,
-                debug::DebugInput {
-                    capture: capture.as_ref(),
-                    raw: samples,
-                    trimmed: Some(&samples[start..end]),
-                    vad: vad_debug,
-                    asr_raw: Some(&raw),
-                    lang: Some(lang),
-                    normalize: Some(normalize_debug),
-                    guardrail: guardrail_debug,
-                    inject: Some(debug::InjectDebug {
-                        backend: backend.to_string(),
-                        final_text: text.clone(),
-                    }),
-                    timings,
-                },
-            );
-        }
+        Ok(Some(Outcome { text, raw, normalized, reject_reason, backend, timings: dbg.timings }))
+        // dbg drops here on the happy path too: writes the complete record.
+        // One writer, reached from every exit -- see `DebugRecordGuard`.
+    }
+}
 
-        Ok(Some(Outcome { text, raw, normalized, reject_reason, backend, timings }))
+/// Accumulates the pieces of a per-utterance debug record as
+/// [`Pipeline::process_with_capture`] learns them, and writes exactly one
+/// record -- via `Drop` -- no matter which of that function's returns is
+/// taken.
+///
+/// This replaces writing the record at each individual return point, which
+/// is only as complete as whoever remembers to add a new call site next to
+/// every future fallible call. Two of `process_with_capture`'s early
+/// returns skipped the write entirely before this fix (ASR erroring, and
+/// both injectors failing) -- both found by review, not by a failing test
+/// someone had already written. Tying the write to `Drop` instead closes the
+/// whole *class* of that bug rather than patching the two known instances:
+/// `?` desugars to an early `return`, and a `return` drops every local still
+/// in scope, so any fallible call inserted anywhere in the function body from
+/// now on -- before or after today's two -- still runs through this same,
+/// single writer as the stack unwinds. There is no third call site to add,
+/// and no fourth one to forget later.
+struct DebugRecordGuard<'a> {
+    /// `None` when `[debug].enabled` is false: `Drop::drop` becomes a no-op,
+    /// preserving `process_with_capture`'s "costs nothing beyond one bool
+    /// check" invariant for the common case.
+    ctx: Option<(String, PathBuf)>,
+    save_audio: bool,
+    capture: Option<&'a CaptureStats>,
+    raw: &'a [f32],
+    trim: Option<(usize, usize)>,
+    vad: debug::VadDebug,
+    asr_raw: Option<String>,
+    lang: Option<Lang>,
+    normalize: Option<debug::NormalizeDebug>,
+    guardrail: Option<debug::GuardrailDebug>,
+    inject: Option<debug::InjectDebug>,
+    timings: Timings,
+}
+
+impl Drop for DebugRecordGuard<'_> {
+    fn drop(&mut self) {
+        // `record_utterance` itself logs-and-swallows every I/O failure
+        // (see its own doc comment): a debug write must never be able to
+        // panic out of a `Drop` impl, let alone propagate into the pipeline.
+        let Some((ts, dir)) = self.ctx.take() else { return };
+        let trimmed = self.trim.map(|(s, e)| &self.raw[s..e]);
+        let asr_raw = self.asr_raw.take();
+        debug::record_utterance(
+            &dir,
+            &ts,
+            self.save_audio,
+            debug::DebugInput {
+                capture: self.capture,
+                raw: self.raw,
+                trimmed,
+                vad: self.vad.clone(),
+                asr_raw: asr_raw.as_deref(),
+                lang: self.lang,
+                normalize: self.normalize.take(),
+                guardrail: self.guardrail.take(),
+                inject: self.inject.take(),
+                timings: self.timings,
+            },
+        );
     }
 }
 
