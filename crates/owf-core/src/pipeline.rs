@@ -95,8 +95,15 @@ impl Pipeline {
         let mut text = guardrail::rule_based_fallback(&raw);
 
         if self.cfg.normalize.enabled {
+            // Scoped tightly around just the normalizer call: `evaluate` and
+            // `log_rejection` are cheap and unrelated to normalizer latency,
+            // which is exactly what M3 threshold tuning wants out of this
+            // number.
             let t = Instant::now();
-            match self.normalizer.normalize(&control, &raw) {
+            let normalize_result = self.normalizer.normalize(&control, &raw);
+            timings.normalize_ms = t.elapsed().as_millis();
+
+            match normalize_result {
                 Ok(cleaned) => match guardrail::evaluate(&raw, &cleaned, lang, &self.cfg.guardrail)
                 {
                     Verdict::Accept => {
@@ -105,17 +112,18 @@ impl Pipeline {
                     }
                     Verdict::Reject(reason) => {
                         reject_reason = Some(reason.code().to_string());
-                        self.log_rejection(&raw, &cleaned, &reason, lang, &control);
+                        log_rejection_to(&paths::rejections_file(), &raw, &cleaned, &reason, lang, &control);
                     }
                 },
                 Err(e) => {
                     // A failed cleanup must never cost the transcript, and it
                     // is not a guardrail rejection: `reject_reason` stays
-                    // `None` here.
+                    // `None` here. Pinned by
+                    // `a_dead_normalizer_still_produces_text` in
+                    // tests/pipeline_e2e.rs.
                     tracing::warn!(error = %e, "normalization failed; using raw transcript");
                 }
             }
-            timings.normalize_ms = t.elapsed().as_millis();
         }
 
         if self.cfg.inject.trailing_space {
@@ -136,29 +144,106 @@ impl Pipeline {
 
         Ok(Some(Outcome { text, raw, normalized, reject_reason, backend, timings }))
     }
+}
 
-    /// Appends one JSON line to `rejections.jsonl`, the input to threshold
-    /// tuning (see spec 9.3). Failures here are diagnostics, never fatal.
-    fn log_rejection(&self, raw: &str, cleaned: &str, reason: &RejectReason, lang: Lang, control: &str) {
-        let record = serde_json::json!({
-            "reason": reason.code(),
-            "detail": format!("{reason:?}"),
-            "lang": match lang { Lang::English => "English", Lang::Other => "Other" },
-            "raw": raw,
-            "cleaned": cleaned,
-            "control": control,
-        });
-        let path = paths::rejections_file();
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let write = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .and_then(|mut f| writeln!(f, "{record}"));
-        if let Err(e) = write {
-            tracing::warn!(error = %e, "failed to write rejections.jsonl");
-        }
+/// Appends one JSON line to `path`, the input dataset for M3 guardrail
+/// threshold tuning (see spec 9.3). Failures here are diagnostics, never
+/// fatal.
+///
+/// The destination is a parameter rather than hard-coded to
+/// `paths::rejections_file()` so it can be pointed at a scratch file in
+/// tests: `rejections.jsonl` is live tuning input, and a synthetic fixture
+/// line written to the real file on every test run would quietly poison
+/// that dataset. `Pipeline::process` always calls this with the real path;
+/// only tests use anything else.
+fn log_rejection_to(
+    path: &std::path::Path,
+    raw: &str,
+    cleaned: &str,
+    reason: &RejectReason,
+    lang: Lang,
+    control: &str,
+) {
+    let record = serde_json::json!({
+        "reason": reason.code(),
+        "detail": format!("{reason:?}"),
+        "lang": match lang { Lang::English => "English", Lang::Other => "Other" },
+        "raw": raw,
+        "cleaned": cleaned,
+        "control": control,
+    });
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let write = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut f| writeln!(f, "{record}"));
+    if let Err(e) = write {
+        tracing::warn!(error = %e, "failed to write rejections.jsonl");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fresh, collision-free scratch file path for a single test. Mirrors
+    /// the `scratch_dir` helper in `inject.rs`'s own tests -- `tempfile`
+    /// isn't in `[dev-dependencies]`, and this is the whole of what's
+    /// needed here.
+    fn scratch_path(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir()
+            .join(format!("owf-core-test-{tag}-{}-{n}", std::process::id()))
+            .join("rejections.jsonl")
+    }
+
+    #[test]
+    fn log_rejection_to_writes_one_line_with_the_expected_fields() {
+        let path = scratch_path("rejection-log");
+        let reason = RejectReason::WordRatio { ratio: 0.111 };
+
+        log_rejection_to(
+            &path,
+            "the raw transcript",
+            "Cleaned.",
+            &reason,
+            Lang::English,
+            "[Styling: casual] [Structure: prose] [Context: general]",
+        );
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 1, "should append exactly one line, got: {contents:?}");
+
+        let parsed: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(parsed["reason"], "word_ratio");
+        assert_eq!(parsed["raw"], "the raw transcript");
+        assert_eq!(parsed["cleaned"], "Cleaned.");
+        assert_eq!(parsed["lang"], "English");
+        assert_eq!(
+            parsed["control"],
+            "[Styling: casual] [Structure: prose] [Context: general]"
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn log_rejection_to_appends_rather_than_overwriting() {
+        let path = scratch_path("rejection-log-append");
+        let reason = RejectReason::Empty;
+
+        log_rejection_to(&path, "one", "", &reason, Lang::English, "control");
+        log_rejection_to(&path, "two", "", &reason, Lang::Other, "control");
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents.lines().count(), 2, "second call should append, not overwrite");
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

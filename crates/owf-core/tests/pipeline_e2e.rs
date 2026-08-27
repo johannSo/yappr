@@ -111,6 +111,11 @@ fn a_dead_normalizer_still_produces_text() {
     let out = p.process(&samples(), None).unwrap().expect("some outcome");
     assert!(!out.normalized);
     assert_eq!(out.text, "Send the invoice on friday. ");
+    // A normalizer *error* is not a guardrail *rejection* -- no cleanup was
+    // ever produced for the guardrail to evaluate, so there is nothing to
+    // reject. A regression that set reject_reason here would still pass
+    // every other assertion in this file.
+    assert_eq!(out.reject_reason, None);
 }
 
 #[test]
