@@ -13,6 +13,14 @@ pub enum Request {
     Cancel,
     Status,
     Reload,
+    /// Turns this connection into a long-lived `OverlayEvent` stream (spec
+    /// 12) instead of the usual one-request-one-response exchange: after
+    /// this line, the daemon writes one NDJSON `OverlayEvent` per line,
+    /// starting with a snapshot of whatever state it's in right now, for as
+    /// long as the connection stays open. There is no `Response` for this
+    /// request -- see `owf-daemon.rs`'s `handle`, which special-cases it
+    /// before ever reaching `dispatch`.
+    Subscribe,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,6 +32,36 @@ pub enum State {
     Transcribing,
     Normalizing,
     Injecting,
+}
+
+/// One line of the NDJSON stream a `Request::Subscribe` connection turns
+/// into (spec 12): every state the overlay needs to render, plus the two
+/// terminal outcomes (`Done`, `Error`) and the busy-rejection flash that
+/// aren't `State` transitions at all. `owf-daemon.rs` is the sole producer;
+/// the overlay (and `owf-ctl subscribe`) are the consumers.
+///
+/// `#[serde(tag = "event", ...)]` makes each variant a self-describing JSON
+/// object -- e.g. `{"event":"recording","level":0.02,"elapsed_ms":140}` --
+/// so a bare `serde_json::to_string` plus a trailing newline is already
+/// valid NDJSON with no wrapping needed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum OverlayEvent {
+    Warming,
+    Idle,
+    /// Spec 7.1: emitted at roughly 50 ms cadence while recording, not per
+    /// audio callback. `level` is the RMS of the most recent capture window;
+    /// `elapsed_ms` is time since this recording started.
+    Recording { level: f32, elapsed_ms: u64 },
+    Transcribing,
+    Normalizing,
+    Injecting,
+    /// The first ~60 characters of what was actually injected (spec 12's
+    /// 800 ms preview flash). Truncation to that length is the overlay's
+    /// job, not the wire format's.
+    Done { preview: String },
+    Error { reason: String },
+    BusyRejected,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,11 +119,22 @@ mod tests {
         assert_eq!(serde_json::to_string(&Request::Cancel).unwrap(), r#"{"cmd":"cancel"}"#);
         assert_eq!(serde_json::to_string(&Request::Status).unwrap(), r#"{"cmd":"status"}"#);
         assert_eq!(serde_json::to_string(&Request::Reload).unwrap(), r#"{"cmd":"reload"}"#);
+        assert_eq!(
+            serde_json::to_string(&Request::Subscribe).unwrap(),
+            r#"{"cmd":"subscribe"}"#
+        );
     }
 
     #[test]
     fn requests_round_trip() {
-        for r in [Request::PttStart, Request::PttStop, Request::Cancel, Request::Status, Request::Reload] {
+        for r in [
+            Request::PttStart,
+            Request::PttStop,
+            Request::Cancel,
+            Request::Status,
+            Request::Reload,
+            Request::Subscribe,
+        ] {
             let s = serde_json::to_string(&r).unwrap();
             assert_eq!(serde_json::from_str::<Request>(&s).unwrap(), r);
         }
@@ -120,5 +169,69 @@ mod tests {
         let v: serde_json::Value = serde_json::to_value(&r).unwrap();
         assert_eq!(v["ok"], serde_json::json!(true));
         assert_eq!(v["state"], serde_json::json!("recording"));
+    }
+
+    /// Every `OverlayEvent` variant round-trips through serde -- the overlay
+    /// frontend and `owf-ctl subscribe` are both written against this exact
+    /// wire form, so a variant that fails to round-trip here would silently
+    /// break both.
+    #[test]
+    fn every_overlay_event_round_trips_through_json() {
+        let events = [
+            OverlayEvent::Warming,
+            OverlayEvent::Idle,
+            OverlayEvent::Recording { level: 0.42, elapsed_ms: 1_234 },
+            OverlayEvent::Transcribing,
+            OverlayEvent::Normalizing,
+            OverlayEvent::Injecting,
+            OverlayEvent::Done { preview: "Hello there".to_string() },
+            OverlayEvent::Error { reason: "no speech detected".to_string() },
+            OverlayEvent::BusyRejected,
+        ];
+        for event in events {
+            let s = serde_json::to_string(&event).unwrap();
+            assert_eq!(
+                serde_json::from_str::<OverlayEvent>(&s).unwrap(),
+                event,
+                "round trip failed for {s}"
+            );
+        }
+    }
+
+    /// Pins the exact wire form each variant produces -- the overlay
+    /// frontend (a separate, not-yet-written codebase) will be implemented
+    /// against this shape, so an accidental rename here must fail loudly.
+    #[test]
+    fn overlay_events_serialise_to_the_documented_wire_form() {
+        assert_eq!(serde_json::to_string(&OverlayEvent::Warming).unwrap(), r#"{"event":"warming"}"#);
+        assert_eq!(serde_json::to_string(&OverlayEvent::Idle).unwrap(), r#"{"event":"idle"}"#);
+        assert_eq!(
+            serde_json::to_string(&OverlayEvent::Recording { level: 0.5, elapsed_ms: 100 }).unwrap(),
+            r#"{"event":"recording","level":0.5,"elapsed_ms":100}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&OverlayEvent::Transcribing).unwrap(),
+            r#"{"event":"transcribing"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&OverlayEvent::Normalizing).unwrap(),
+            r#"{"event":"normalizing"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&OverlayEvent::Injecting).unwrap(),
+            r#"{"event":"injecting"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&OverlayEvent::Done { preview: "hi".to_string() }).unwrap(),
+            r#"{"event":"done","preview":"hi"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&OverlayEvent::Error { reason: "boom".to_string() }).unwrap(),
+            r#"{"event":"error","reason":"boom"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&OverlayEvent::BusyRejected).unwrap(),
+            r#"{"event":"busy_rejected"}"#
+        );
     }
 }

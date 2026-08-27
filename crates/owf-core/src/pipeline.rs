@@ -9,6 +9,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
 use crate::asr::Transcriber;
@@ -20,6 +21,7 @@ use crate::inject::{self, ClipboardInjector, TextInjector};
 use crate::lang::{Lang, LanguageDetector};
 use crate::normalize::Normalizer;
 use crate::paths;
+use crate::proto::OverlayEvent;
 use crate::style;
 use crate::vad::Trimmer;
 
@@ -66,6 +68,11 @@ pub struct Pipeline {
     /// is written, if overridden by `with_recovery_dir`. `None` (the default
     /// from `new`) means the real `paths::state_dir()`.
     recovery_dir: Option<PathBuf>,
+    /// Reports `OverlayEvent::Normalizing`/`OverlayEvent::Injecting` as
+    /// `process_with_capture` enters each stage, if set by
+    /// `with_stage_events`. `None` (the default from `new`) costs one `if
+    /// let` check per stage and nothing else.
+    stage_events: Option<Arc<dyn Fn(OverlayEvent) + Send + Sync>>,
 }
 
 impl Pipeline {
@@ -87,6 +94,7 @@ impl Pipeline {
             fallback_injector: Box::new(ClipboardInjector),
             rejections_path: None,
             recovery_dir: None,
+            stage_events: None,
         }
     }
 
@@ -138,6 +146,25 @@ impl Pipeline {
     /// `paths::state_dir()` unless overridden by `with_recovery_dir`.
     fn recovery_dir(&self) -> PathBuf {
         self.recovery_dir.clone().unwrap_or_else(paths::state_dir)
+    }
+
+    /// Reports `OverlayEvent::Normalizing`/`OverlayEvent::Injecting` to
+    /// `sink` as `process_with_capture` enters each stage (spec 12).
+    ///
+    /// Additive, same rationale as `with_rejections_path`: `new`'s six
+    /// positional arguments are `owf-daemon.rs`'s locked-in call site, and
+    /// only the daemon (to drive the overlay's state broadcast) and this
+    /// crate's own tests (to prove event ordering) ever need this.
+    ///
+    /// A callback rather than a channel: `Pipeline` has no business knowing
+    /// whether the far end is a socket fan-out, a test's `Vec`, or nothing
+    /// at all. `Transcribing` is deliberately not reported here -- by the
+    /// time `process_with_capture` is called, the daemon already knows it's
+    /// transcribing (it's the caller), so there is nothing for `Pipeline`
+    /// itself to add.
+    pub fn with_stage_events(mut self, sink: Arc<dyn Fn(OverlayEvent) + Send + Sync>) -> Self {
+        self.stage_events = Some(sink);
+        self
     }
 
     pub fn config(&self) -> &Config {
@@ -251,6 +278,9 @@ impl Pipeline {
         let mut guardrail_debug: Option<debug::GuardrailDebug> = None;
 
         if self.cfg.normalize.enabled {
+            if let Some(sink) = &self.stage_events {
+                sink(OverlayEvent::Normalizing);
+            }
             // Scoped tightly around just the normalizer call: `evaluate` and
             // `log_rejection` are cheap and unrelated to normalizer latency,
             // which is exactly what M3 threshold tuning wants out of this
@@ -300,6 +330,9 @@ impl Pipeline {
             text.push(' ');
         }
 
+        if let Some(sink) = &self.stage_events {
+            sink(OverlayEvent::Injecting);
+        }
         let t = Instant::now();
         let backend = inject::inject_with_recovery(
             self.injector.as_ref(),

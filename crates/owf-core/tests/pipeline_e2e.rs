@@ -5,6 +5,7 @@ use owf_core::inject::MockInjector;
 use owf_core::lang::{Lang, LanguageDetector};
 use owf_core::normalize::Normalizer;
 use owf_core::pipeline::Pipeline;
+use owf_core::proto::OverlayEvent;
 use owf_core::vad::Trimmer;
 
 struct FixedAsr(String);
@@ -586,4 +587,93 @@ fn update_reloadable_applies_a_new_guardrail_and_a_new_injector() {
         vec![after.text],
         "the reloaded injector must receive the post-reload utterance"
     );
+}
+
+/// M2 Task 1: a subscriber (here, a plain `Vec` behind a `Mutex` standing in
+/// for the daemon's socket fan-out -- `owf-daemon.rs`'s own tests cover the
+/// actual `Request::Subscribe` wiring) must see `Normalizing` before
+/// `Injecting`, in that order, for a synthetic utterance driven through the
+/// existing fake `Transcriber`/`Normalizer`/`Trimmer`/`MockInjector`.
+#[test]
+fn stage_events_fire_normalizing_then_injecting_in_order() {
+    let seen: std::sync::Arc<std::sync::Mutex<Vec<OverlayEvent>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_for_sink = seen.clone();
+
+    let p = Pipeline::new(
+        Config::from_str("").unwrap(),
+        Box::new(FixedAsr("send the invoice on friday".into())),
+        Box::new(WholeBuffer),
+        Box::new(AlwaysEnglish),
+        Box::new(FixedNormalizer("Send the invoice on Friday.".into())),
+        Box::new(MockInjector::default()),
+    )
+    .with_stage_events(std::sync::Arc::new(move |ev| {
+        seen_for_sink.lock().unwrap().push(ev);
+    }));
+
+    p.process(&samples(), None).unwrap().expect("some outcome");
+
+    assert_eq!(
+        seen.lock().unwrap().as_slice(),
+        [OverlayEvent::Normalizing, OverlayEvent::Injecting],
+        "Normalizing must be reported before Injecting, in pipeline order"
+    );
+}
+
+/// When normalization is disabled, `Pipeline` never enters that stage at
+/// all -- the subscriber must see only `Injecting`, not a `Normalizing`
+/// event for a stage nothing actually ran.
+#[test]
+fn stage_events_omit_normalizing_when_normalization_is_disabled() {
+    let seen: std::sync::Arc<std::sync::Mutex<Vec<OverlayEvent>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_for_sink = seen.clone();
+
+    let p = Pipeline::new(
+        Config::from_str("[normalize]\nenabled = false\n").unwrap(),
+        Box::new(FixedAsr("send the invoice on friday".into())),
+        Box::new(WholeBuffer),
+        Box::new(AlwaysEnglish),
+        Box::new(PanickingNormalizer),
+        Box::new(MockInjector::default()),
+    )
+    .with_stage_events(std::sync::Arc::new(move |ev| {
+        seen_for_sink.lock().unwrap().push(ev);
+    }));
+
+    p.process(&samples(), None).unwrap().expect("some outcome");
+
+    assert_eq!(seen.lock().unwrap().as_slice(), [OverlayEvent::Injecting]);
+}
+
+/// `with_stage_events`'s sink is a plain, infallible `Fn(OverlayEvent)`:
+/// `Pipeline` never inspects a return value and never depends on the sink
+/// doing anything in particular. That's what lets the daemon's real sink
+/// (`Daemon::broadcast`, via `broadcast_to`) silently drop a disconnected
+/// subscriber -- by design, see `owf-daemon.rs`'s own tests -- without that
+/// choice ever being able to reach back into the utterance itself. This
+/// just pins the call count/outcome so a future change can't quietly make
+/// the pipeline's result depend on the sink.
+#[test]
+fn the_stage_events_sink_cannot_influence_the_pipeline_outcome() {
+    struct CountingSink(std::sync::atomic::AtomicUsize);
+    let calls = std::sync::Arc::new(CountingSink(std::sync::atomic::AtomicUsize::new(0)));
+    let calls_for_sink = calls.clone();
+
+    let p = Pipeline::new(
+        Config::from_str("").unwrap(),
+        Box::new(FixedAsr("send the invoice on friday".into())),
+        Box::new(WholeBuffer),
+        Box::new(AlwaysEnglish),
+        Box::new(FixedNormalizer("Send the invoice on Friday.".into())),
+        Box::new(MockInjector::default()),
+    )
+    .with_stage_events(std::sync::Arc::new(move |_ev| {
+        calls_for_sink.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }));
+
+    let out = p.process(&samples(), None).unwrap().expect("some outcome");
+    assert!(out.normalized);
+    assert_eq!(calls.0.load(std::sync::atomic::Ordering::SeqCst), 2, "Normalizing + Injecting");
 }
