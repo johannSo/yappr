@@ -2,6 +2,7 @@ pub mod asr;
 pub mod capture;
 pub mod config;
 pub mod guardrail;
+pub mod hypr;
 pub mod inject;
 pub mod lang;
 pub mod llama;
