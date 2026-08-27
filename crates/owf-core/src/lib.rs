@@ -6,3 +6,4 @@ pub mod models;
 pub mod normalize;
 pub mod paths;
 pub mod style;
+pub mod vad;
