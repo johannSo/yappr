@@ -15,7 +15,7 @@ fn main() -> Result<()> {
         ["setup"] => setup(false),
         ["setup", "--update-lock"] => setup(true),
         ["setup", "--print-hypr"] => {
-            print!("{}", owf_core::hypr::HYPR_CONFIG);
+            print!("{}", owf_core::hypr::hypr_config());
             Ok(())
         }
         _ => {
