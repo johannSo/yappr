@@ -6,9 +6,11 @@
 //! back. See `owf_core::proto` for the wire format.
 
 use anyhow::{Context, Result};
+use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+use signal_hook::iterator::Signals;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -145,6 +147,26 @@ fn main() -> Result<()> {
         });
     }
 
+    // Explicit shutdown on a terminating signal -- see `shutdown`'s doc
+    // comment for why this can't be left to `Drop` firing through an
+    // unwinding `main`; daemons are stopped by signals, which don't unwind.
+    {
+        let daemon = Arc::clone(&daemon);
+        let mut signals = Signals::new([SIGTERM, SIGINT, SIGHUP])
+            .context("registering SIGTERM/SIGINT/SIGHUP handlers")?;
+        std::thread::spawn(move || {
+            // Blocks until the first signal arrives. `signal-hook`'s
+            // self-pipe iterator is synchronous and needs no async runtime,
+            // matching the rest of this binary. There is nothing to loop
+            // back for: `shutdown` followed by `exit` ends the process, so
+            // only the first signal this thread observes is ever acted on.
+            if signals.forever().next().is_some() {
+                shutdown(&daemon);
+                std::process::exit(0);
+            }
+        });
+    }
+
     tracing::info!(socket = %sock_path.display(), "listening");
     for stream in listener.incoming() {
         match stream {
@@ -210,6 +232,70 @@ fn warm_up(cfg: Config) -> Result<(Pipeline, Option<LlamaServer>)> {
         injector,
     );
     Ok((pipeline, server))
+}
+
+/// Guards `shutdown` against running its cleanup twice.
+///
+/// In the intended path this is redundant -- `shutdown` is followed
+/// immediately by `std::process::exit`, so the signal-handling thread never
+/// loops back to act on a second signal -- but a defensive, explicit guard
+/// costs one atomic and documents the idempotence requirement (fix 2) rather
+/// than leaving it as an accident of control flow that a future edit could
+/// break.
+static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+
+/// Explicit, deterministic teardown run on `SIGTERM`/`SIGINT`/`SIGHUP`.
+///
+/// Rust destructors -- `LlamaServer::drop` in particular -- only run if
+/// `main` returns normally. A daemon is ordinarily stopped by a signal
+/// instead (`pkill`, `systemctl restart`, logging out), none of which unwind
+/// the stack, so relying on `Drop` here would leave the supervised
+/// `llama-server` child (~600 MB resident) orphaned on every restart. That
+/// is exactly the leak storing `LlamaServer` in `Daemon` (rather than
+/// `mem::forget`-ing it) was meant to prevent -- the ownership was fixed but
+/// nothing ever drove the shutdown path that makes it matter, until now.
+///
+/// `SIGKILL` cannot be caught by any process, this one included; that is
+/// acceptable here because it is uncatchable everywhere; the OS reaps
+/// `owf-daemon`'s children when `owf-daemon` itself is killed out from under
+/// them regardless of what this function does.
+///
+/// Idempotent: `SHUTTING_DOWN` makes a second call a no-op, and each
+/// individual step (`Option::take`, `remove_file`) is already a no-op the
+/// second time round even without that guard.
+fn shutdown(daemon: &Daemon) {
+    if SHUTTING_DOWN.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    tracing::info!("shutting down");
+    kill_llama(&daemon.llama);
+    let _ = daemon.recorder.stop();
+    remove_runtime_files();
+}
+
+/// Kills and reaps the supervised `llama-server` child, if any is running.
+///
+/// Split out from `shutdown` so it is testable with a stub child process
+/// (e.g. `sleep 300`) instead of a real `Daemon`, which would otherwise
+/// require live audio hardware just to construct its `Recorder` (see
+/// `capture::Recorder::new`). `Option::take` leaves `None` behind, so a
+/// second call has nothing to do -- that is this function's half of
+/// `shutdown`'s idempotence.
+fn kill_llama(llama: &Mutex<Option<LlamaServer>>) {
+    // Dropping the `LlamaServer` -- not just signalling it -- is what runs
+    // its `Drop` impl: kill, then wait (reap), then remove the port file.
+    drop(lock_ignoring_poison(llama).take());
+}
+
+/// Removes the socket, lock, and port files this daemon owns, so a fresh
+/// `owf-daemon` can start immediately afterward instead of finding a stale
+/// socket or being told the (now-dead) lock is still held. Best-effort: a
+/// file that is already gone (a second call, or it was never created) is not
+/// an error.
+fn remove_runtime_files() {
+    let _ = std::fs::remove_file(paths::runtime_socket());
+    let _ = std::fs::remove_file(paths::runtime_lock());
+    let _ = std::fs::remove_file(paths::runtime_port());
 }
 
 fn handle(daemon: Arc<Daemon>, stream: UnixStream) {
@@ -509,6 +595,31 @@ mod tests {
             state.load(Ordering::SeqCst),
             IDLE,
             "a panic inside the pipeline must not leave the daemon stuck at BUSY"
+        );
+    }
+
+    /// Fix 2: proves the mechanism that guarantees no `llama-server` process
+    /// survives shutdown. A real `llama-server` can't be started on this
+    /// machine (no ggml compute backend), so this stubs the supervised child
+    /// with a plain `sleep 300` via the test-only `LlamaServer::from_child`
+    /// -- the same `Drop` impl (kill, then wait/reap) runs either way.
+    #[test]
+    fn kill_llama_terminates_a_stub_child_and_is_idempotent() {
+        let child = std::process::Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .expect("spawning a stub child (`sleep 300`) for this test");
+        let pid = child.id();
+        let llama = Mutex::new(Some(LlamaServer::from_child(child, 0)));
+
+        kill_llama(&llama);
+        // A second call must be a no-op, not a double-kill or a panic --
+        // `Option::take` on an already-`None` mutex is exactly that.
+        kill_llama(&llama);
+
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "child process {pid} survived kill_llama: no llama-server may outlive shutdown"
         );
     }
 }

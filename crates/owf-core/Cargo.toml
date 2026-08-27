@@ -25,3 +25,10 @@ rubato = "5.0"
 [dev-dependencies]
 hound = "3.5"
 httpmock = "0.8"
+
+[features]
+# Exposes test-only construction helpers (e.g. `LlamaServer::from_child`) to
+# other crates in the workspace so *their* tests can stub out a process that
+# can't run in CI or this sandbox (a real `llama-server` needs a model file
+# and a working ggml compute backend). Never enabled outside test builds.
+test-util = []

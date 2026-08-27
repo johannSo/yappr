@@ -58,6 +58,16 @@ impl LlamaServer {
         Ok(Self { child, port })
     }
 
+    /// Wraps an already-spawned child under the same supervision `spawn`
+    /// gives a real `llama-server`: this is what makes `Drop`'s kill-and-reap
+    /// behaviour testable with a stub process (`sleep 300`, a tiny script)
+    /// instead of a real `llama-server`, which needs a model file on disk and
+    /// a working ggml compute backend to even start.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn from_child(child: Child, port: u16) -> Self {
+        Self { child, port }
+    }
+
     pub fn port(&self) -> u16 {
         self.port
     }
