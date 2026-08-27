@@ -8,8 +8,16 @@ use std::path::{Path, PathBuf};
 use crate::paths;
 
 pub struct Artifact {
+    /// Stable key. This is the lock-file map key already committed in
+    /// `models.lock.toml` — never show it to the user and never change it,
+    /// changing it would invalidate the existing pin.
     pub name: &'static str,
     pub url: &'static str,
+    /// Human-readable name for user-facing text (errors, progress, logs).
+    /// Some artifacts carry license-mandated capitalization (S1-mini by
+    /// Superwhisper requires this exact form), so this must not be derived
+    /// from `name`.
+    pub display: &'static str,
     /// Path relative to models_dir() once provisioned.
     pub rel_path: &'static str,
     /// True when the download is a .tar.bz2 that must be extracted.
@@ -20,18 +28,22 @@ pub static ARTIFACTS: [Artifact; 3] = [
     Artifact {
         name: "parakeet",
         url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2",
+        display: "Parakeet TDT 0.6b v3 (int8)",
         rel_path: "parakeet-tdt-0.6b-v3-int8",
         archive: true,
     },
     Artifact {
         name: "silero",
         url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx",
+        display: "Silero VAD",
         rel_path: "silero_vad.onnx",
         archive: false,
     },
     Artifact {
         name: "s1-mini",
         url: "https://huggingface.co/superwhisper/s1-mini-GGUF/resolve/main/s1-mini-q4_k_m.gguf",
+        // License-mandated capitalization: "S1-mini" by "Superwhisper", exactly.
+        display: "S1-mini by Superwhisper",
         rel_path: "s1-mini-q4_k_m.gguf",
         archive: false,
     },
@@ -91,7 +103,10 @@ pub fn sha256_file(path: &Path) -> Result<String> {
 
 /// For an archive artifact the hash is taken over the extracted encoder file,
 /// which is the piece that actually matters and the only one large enough for
-/// corruption to be plausible.
+/// corruption to be plausible. Always points at the *live*, already-installed
+/// location — used by `verify()` and by the "is it already good" fast path in
+/// `download_all()`. It is never used for the staged (not-yet-verified) copy
+/// of a fresh download; see `fetch_and_stage_file`/`fetch_and_stage_archive`.
 fn hash_target(a: &Artifact) -> PathBuf {
     let base = paths::models_dir().join(a.rel_path);
     if a.archive {
@@ -123,9 +138,29 @@ pub fn verify(lock: &LockFile) -> Result<Vec<String>> {
     Ok(bad)
 }
 
-fn download_to(url: &str, dest: &Path, progress: &mut dyn FnMut(&str, u64, Option<u64>)) -> Result<()> {
-    std::fs::create_dir_all(dest.parent().unwrap())?;
-    let tmp = dest.with_extension("part");
+/// Builds a sibling path by appending `suffix` to `p`'s *whole* file name.
+///
+/// `Path::with_extension` is the wrong tool for this: its "extension" is
+/// whatever comes after the *last* dot in the file name, and artifact
+/// directory names like `parakeet-tdt-0.6b-v3-int8` contain a dot inside the
+/// version number. `.with_extension("staging")` on that path silently
+/// produces `parakeet-tdt-0.staging`, discarding `6b-v3-int8` — the bug was
+/// harmless only by luck (nothing ever read the truncated name back). This
+/// helper preserves the full original name unconditionally.
+fn sibling_with_suffix(p: &Path, suffix: &str) -> PathBuf {
+    let mut name = p.file_name().expect("path has no file name").to_os_string();
+    name.push(suffix);
+    p.with_file_name(name)
+}
+
+/// Streams `url` to `tmp` (which must be the caller's, not the live
+/// install's, path), reporting progress as it goes. Deliberately does not
+/// touch anything else: the caller decides whether and when to promote `tmp`
+/// into a live location, only after verifying its contents. That way a
+/// corrupt or truncated download can never disturb an existing good
+/// installation.
+fn download_to(url: &str, tmp: &Path, progress: &mut dyn FnMut(&str, u64, Option<u64>)) -> Result<()> {
+    std::fs::create_dir_all(tmp.parent().unwrap())?;
     let resp = ureq::get(url).call().with_context(|| format!("GET {url}"))?;
     let total = resp
         .headers()
@@ -133,7 +168,7 @@ fn download_to(url: &str, dest: &Path, progress: &mut dyn FnMut(&str, u64, Optio
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
     let mut reader = resp.into_body().into_reader();
-    let mut out = std::fs::File::create(&tmp)?;
+    let mut out = std::fs::File::create(tmp)?;
     let mut buf = vec![0u8; 1 << 16];
     let mut done: u64 = 0;
     loop {
@@ -145,34 +180,118 @@ fn download_to(url: &str, dest: &Path, progress: &mut dyn FnMut(&str, u64, Optio
         done += n as u64;
         progress(url, done, total);
     }
-    drop(out);
-    std::fs::rename(&tmp, dest)?;
     Ok(())
 }
 
-fn extract_tar_bz2(archive: &Path, into: &Path) -> Result<()> {
+/// Extracts `archive` (a .tar.bz2) into a staging directory next to `dest`
+/// and flattens the single top-level directory the upstream tarball wraps
+/// everything in. Returns the flattened staging directory's path.
+///
+/// Never touches `dest` itself: the caller hashes the staged copy and only
+/// promotes it into `dest` after that hash is verified.
+fn extract_tar_bz2(archive: &Path, dest: &Path) -> Result<PathBuf> {
     let f = std::fs::File::open(archive)?;
     let dec = bzip2::read::BzDecoder::new(f);
     let mut tar = tar::Archive::new(dec);
-    // The upstream tarball contains one top-level directory; flatten it into
-    // `into` so paths are stable regardless of upstream naming.
-    let staging = into.with_extension("staging");
-    if staging.exists() {
-        std::fs::remove_dir_all(&staging)?;
+
+    let unpack_dir = sibling_with_suffix(dest, ".unpack");
+    if unpack_dir.exists() {
+        std::fs::remove_dir_all(&unpack_dir)?;
     }
-    std::fs::create_dir_all(&staging)?;
-    tar.unpack(&staging)?;
-    let top = std::fs::read_dir(&staging)?
+    std::fs::create_dir_all(&unpack_dir)?;
+    tar.unpack(&unpack_dir)?;
+
+    let top = std::fs::read_dir(&unpack_dir)?
         .filter_map(|e| e.ok())
         .find(|e| e.path().is_dir())
         .map(|e| e.path())
         .context("archive had no top-level directory")?;
-    if into.exists() {
-        std::fs::remove_dir_all(into)?;
+
+    let staged = sibling_with_suffix(dest, ".staged");
+    if staged.exists() {
+        std::fs::remove_dir_all(&staged)?;
     }
-    std::fs::rename(&top, into)?;
-    std::fs::remove_dir_all(&staging).ok();
+    std::fs::rename(&top, &staged)?;
+    std::fs::remove_dir_all(&unpack_dir).ok();
+    Ok(staged)
+}
+
+/// Downloads a plain-file artifact to a staging path next to `dest` and
+/// hashes it there. Returns the staged path and its hash; does not touch
+/// `dest`.
+fn fetch_and_stage_file(
+    a: &Artifact,
+    dest: &Path,
+    progress: &mut dyn FnMut(&str, u64, Option<u64>),
+) -> Result<(PathBuf, String)> {
+    let part = sibling_with_suffix(dest, ".part");
+    download_to(a.url, &part, progress)?;
+    let got = sha256_file(&part)?;
+    Ok((part, got))
+}
+
+/// Downloads and extracts an archive artifact into a staging directory next
+/// to `dest`, hashing the staged encoder. Returns the staged directory's
+/// path and the hash; does not touch `dest`.
+fn fetch_and_stage_archive(
+    a: &Artifact,
+    dest: &Path,
+    progress: &mut dyn FnMut(&str, u64, Option<u64>),
+) -> Result<(PathBuf, String)> {
+    let archive_tmp = paths::models_dir().join(format!("{}.tar.bz2", a.name));
+    download_to(a.url, &archive_tmp, progress)?;
+    let staged = extract_tar_bz2(&archive_tmp, dest)?;
+    std::fs::remove_file(&archive_tmp).ok();
+    let got = sha256_file(&staged.join("encoder.int8.onnx"))?;
+    Ok((staged, got))
+}
+
+/// Discards a staged download that failed verification (or that we declined
+/// to accept because it isn't pinned and `--update-lock` wasn't given).
+/// Best-effort: the existing live installation is what matters, not this.
+fn discard_staged(staged: &Path) {
+    if staged.is_dir() {
+        let _ = std::fs::remove_dir_all(staged);
+    } else {
+        let _ = std::fs::remove_file(staged);
+    }
+}
+
+/// Promotes a verified staged file into place, replacing `dest` if present.
+/// A same-filesystem file-to-file rename is atomic on its own.
+fn promote_file(staged: &Path, dest: &Path) -> Result<()> {
+    std::fs::rename(staged, dest).with_context(|| format!("installing {}", dest.display()))
+}
+
+/// Promotes a verified staged directory into place. `rename` cannot replace
+/// a non-empty directory directly, so the previous install (if any) is
+/// backed up first and removed only after the new one is safely in place;
+/// this narrows, though cannot fully eliminate, the window in which `dest`
+/// is briefly absent.
+fn promote_dir(staged: &Path, dest: &Path) -> Result<()> {
+    if dest.exists() {
+        let backup = sibling_with_suffix(dest, ".prev");
+        if backup.exists() {
+            std::fs::remove_dir_all(&backup)?;
+        }
+        std::fs::rename(dest, &backup)
+            .with_context(|| format!("backing up {}", dest.display()))?;
+        std::fs::rename(staged, dest)
+            .with_context(|| format!("installing {}", dest.display()))?;
+        std::fs::remove_dir_all(&backup).ok();
+    } else {
+        std::fs::rename(staged, dest)
+            .with_context(|| format!("installing {}", dest.display()))?;
+    }
     Ok(())
+}
+
+fn promote_staged(staged: &Path, dest: &Path) -> Result<()> {
+    if staged.is_dir() {
+        promote_dir(staged, dest)
+    } else {
+        promote_file(staged, dest)
+    }
 }
 
 pub fn download_all(
@@ -191,34 +310,44 @@ pub fn download_all(
                 bail!(
                     "{} is present but not pinned in models.lock.toml; \
                      re-run with --update-lock to pin it",
-                    a.name
+                    a.display
                 );
             }
         }
 
         let dest = paths::models_dir().join(a.rel_path);
-        if a.archive {
-            let tmp = paths::models_dir().join(format!("{}.tar.bz2", a.name));
-            download_to(a.url, &tmp, progress)?;
-            extract_tar_bz2(&tmp, &dest)?;
-            std::fs::remove_file(&tmp).ok();
+        // Fetch into a staging location and hash it there, *before* it ever
+        // touches `dest`. This is what makes "a mismatch aborts setup and
+        // leaves existing models untouched" true: a bad or interrupted
+        // download never gets a chance to replace a good existing install.
+        let (staged, got) = if a.archive {
+            fetch_and_stage_archive(a, &dest, progress)?
         } else {
-            download_to(a.url, &dest, progress)?;
-        }
+            fetch_and_stage_file(a, &dest, progress)?
+        };
 
-        let got = sha256_file(&hash_target(a))?;
         match lock.hashes.get(a.name) {
             Some(expected) if expected != &got => {
-                bail!("checksum mismatch for {}: expected {expected}, got {got}", a.name)
+                discard_staged(&staged);
+                bail!(
+                    "checksum mismatch for {}: expected {expected}, got {got}",
+                    a.display
+                );
             }
             Some(_) => {}
-            None => {
-                if update_lock {
-                    lock.hashes.insert(a.name.to_string(), got);
-                } else {
-                    bail!("{} has no pinned hash; re-run with --update-lock", a.name);
-                }
+            None if !update_lock => {
+                discard_staged(&staged);
+                bail!(
+                    "{} has no pinned hash; re-run with --update-lock",
+                    a.display
+                );
             }
+            None => {}
+        }
+
+        promote_staged(&staged, &dest)?;
+        if update_lock {
+            lock.hashes.insert(a.name.to_string(), got);
         }
     }
     if update_lock {
@@ -273,5 +402,92 @@ mod tests {
         let missing = verify(&lock).unwrap();
         // With an empty lock, every artifact counts as unverified.
         assert_eq!(missing.len(), ARTIFACTS.len());
+    }
+
+    #[test]
+    fn s1_mini_display_name_matches_the_license_text() {
+        // The S1-mini license requires this exact capitalization in
+        // user-facing text: "S1-mini" by "Superwhisper". `name` (the
+        // committed lock-file key) stays lowercase and is never shown to a
+        // user directly.
+        let s1 = ARTIFACTS.iter().find(|a| a.name == "s1-mini").unwrap();
+        assert_eq!(s1.display, "S1-mini by Superwhisper");
+        assert_eq!(s1.name, "s1-mini", "lock-file key must not change");
+    }
+
+    #[test]
+    fn sibling_with_suffix_preserves_dots_in_the_original_name() {
+        // Path::with_extension would truncate at the dot inside the version
+        // number ("...int8" -> "...0"), silently discarding the rest of the
+        // artifact's directory name (verified empirically during review).
+        let p = Path::new("/models/parakeet-tdt-0.6b-v3-int8");
+        assert_eq!(
+            sibling_with_suffix(p, ".staging"),
+            Path::new("/models/parakeet-tdt-0.6b-v3-int8.staging")
+        );
+        assert_eq!(
+            sibling_with_suffix(p, ".staged"),
+            Path::new("/models/parakeet-tdt-0.6b-v3-int8.staged")
+        );
+    }
+
+    #[test]
+    fn promote_file_replaces_an_existing_destination() {
+        let dir = std::env::temp_dir().join("owf-test-promote-file");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("model.bin");
+        let staged = dir.join("model.bin.part");
+        std::fs::write(&dest, b"old content").unwrap();
+        std::fs::write(&staged, b"new content").unwrap();
+
+        promote_file(&staged, &dest).unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new content");
+        assert!(!staged.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn promote_dir_replaces_an_existing_nonempty_destination() {
+        let dir = std::env::temp_dir().join("owf-test-promote-dir");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("parakeet-tdt-0.6b-v3-int8");
+        let staged = dir.join("parakeet-tdt-0.6b-v3-int8.staged");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("old.onnx"), b"old").unwrap();
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::write(staged.join("encoder.int8.onnx"), b"new").unwrap();
+
+        promote_dir(&staged, &dest).unwrap();
+
+        assert!(dest.join("encoder.int8.onnx").exists());
+        assert!(!dest.join("old.onnx").exists(), "old content must be fully replaced");
+        assert!(!staged.exists());
+        assert!(
+            !sibling_with_suffix(&dest, ".prev").exists(),
+            "backup must be cleaned up after a successful swap"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn discard_staged_removes_files_and_directories() {
+        let dir = std::env::temp_dir().join("owf-test-discard");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let file = dir.join("x.part");
+        std::fs::write(&file, b"x").unwrap();
+        discard_staged(&file);
+        assert!(!file.exists());
+
+        let subdir = dir.join("x.staged");
+        std::fs::create_dir_all(&subdir).unwrap();
+        std::fs::write(subdir.join("y"), b"y").unwrap();
+        discard_staged(&subdir);
+        assert!(!subdir.exists());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
