@@ -287,6 +287,30 @@ impl Default for InjectConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DebugConfig {
+    #[serde(default = "d_debug_enabled")]
+    pub enabled: bool,
+    #[serde(default = "d_debug_dir")]
+    pub dir: String,
+    #[serde(default = "d_true")]
+    pub save_audio: bool,
+}
+
+fn d_debug_enabled() -> bool {
+    false
+}
+fn d_debug_dir() -> String {
+    "~/owf".into()
+}
+
+impl Default for DebugConfig {
+    fn default() -> Self {
+        Self { enabled: d_debug_enabled(), dir: d_debug_dir(), save_audio: d_true() }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -304,6 +328,8 @@ pub struct Config {
     pub style_default: StyleAxes,
     #[serde(default)]
     pub style_rules: Vec<StyleRule>,
+    #[serde(default)]
+    pub debug: DebugConfig,
 }
 
 impl Config {
@@ -397,6 +423,9 @@ impl Config {
                 format!("invalid regex in style_rules match_class: {}", rule.match_class)
             })?;
         }
+        if self.debug.dir.trim().is_empty() {
+            bail!("debug.dir must not be empty");
+        }
         Ok(())
     }
 }
@@ -444,6 +473,15 @@ context = "general"        # general | email
 # match_class = "(?i)thunderbird|^Mail$"
 # styling = "semi-formal"
 # context = "email"
+
+[debug]
+# Diagnostics for tracking down capture/VAD/normalization bugs: per-utterance
+# WAV dumps and a JSON record under `dir`, plus the daemon's tracing output
+# mirrored to `<dir>/logs/daemon.log`. Off by default -- nothing here is on
+# the critical path when disabled.
+enabled = false
+dir = "~/owf"
+save_audio = true    # only meaningful when enabled = true
 "#;
 
 #[cfg(test)]
@@ -471,6 +509,15 @@ mod tests {
         assert_eq!(c.style_default.styling, Styling::SemiCasual);
         assert_eq!(c.style_default.structure, Structure::Prose);
         assert_eq!(c.style_default.context, Context::General);
+        assert!(!c.debug.enabled);
+        assert_eq!(c.debug.dir, "~/owf");
+        assert!(c.debug.save_audio);
+    }
+
+    #[test]
+    fn unknown_debug_key_is_a_load_error() {
+        let err = Config::from_str("[debug]\nfoo = 1\n").unwrap_err();
+        assert!(err.to_string().contains("foo"), "got: {err}");
     }
 
     #[test]
@@ -524,6 +571,8 @@ mod tests {
             "[asr]\nnum_threads = 0\n",
             "[normalize]\nport = 0\n",
             "[normalize]\nthreads = 0\n",
+            "[debug]\ndir = \"\"\n",
+            "[debug]\ndir = \"   \"\n",
         ] {
             assert!(Config::from_str(bad).is_err(), "should have rejected: {bad}");
         }

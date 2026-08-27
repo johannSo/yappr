@@ -163,6 +163,7 @@ commented defaults on first run. The main knobs:
 - **`[guardrail]`** — `min_word_ratio`/`max_word_ratio`, `min_overlap_english`/`min_overlap_other`, `short_input_words` (below this many raw words, the ratio/overlap checks are skipped — see Known limitations), `ngram_size`/`ngram_max_repeats` (loop detection).
 - **`[inject]`** — `backend` (`wtype` or `clipboard`), `trailing_space`, `keystroke_delay_ms`.
 - **`[style_default]`** and **`[[style_rules]]`** — the default `styling`/`structure`/`context` axes S1-mini is prompted with, and per-application overrides matched by focused window class (regex).
+- **`[debug]`** — `enabled` (off by default), `dir` (default `~/owf`), `save_audio`. When enabled, every utterance writes a WAV of the raw capture and the post-VAD-trim buffer under `<dir>/audio/`, plus a JSON diagnostic record (capture stats — device, native rate, samples captured vs. expected, stream error count — audio RMS/peak, VAD span, ASR/normalize/guardrail/inject results, and timings) under `<dir>/logs/`. The daemon's own log is also mirrored to `<dir>/logs/daemon.log` (append) while enabled. Run `owf-ctl debug` to print a summary of the most recent record and the paths to its files.
 
 `owf-ctl reload` re-validates the file on disk against the running daemon;
 it does not yet hot-swap a running pipeline (see Known limitations /

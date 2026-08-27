@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use owf_core::proto::{self, Request};
 
 fn main() -> Result<()> {
@@ -12,6 +12,7 @@ fn main() -> Result<()> {
         ["cancel"] => send(Request::Cancel),
         ["status"] => send(Request::Status),
         ["reload"] => send(Request::Reload),
+        ["debug"] => debug_summary(),
         ["setup"] => setup(false),
         ["setup", "--update-lock"] => setup(true),
         ["setup", "--print-hypr"] => {
@@ -20,12 +21,109 @@ fn main() -> Result<()> {
         }
         _ => {
             eprintln!(
-                "usage: owf-ctl <ptt-start|ptt-stop|cancel|status|reload>\n\
+                "usage: owf-ctl <ptt-start|ptt-stop|cancel|status|reload|debug>\n\
                  \x20      owf-ctl setup [--update-lock|--print-hypr]"
             );
             std::process::exit(2);
         }
     }
+}
+
+/// Prints a short summary of the most recently written debug record --
+/// see `owf_core::debug` and `[debug]` in config.toml. Reads straight off
+/// disk (not through the daemon): the debug facility writes independently
+/// of `owf-ctl`, so there is nothing to ask the daemon for.
+fn debug_summary() -> Result<()> {
+    let cfg = owf_core::config::Config::load().context("loading config")?;
+    if !cfg.debug.enabled {
+        eprintln!("[debug].enabled is false in config.toml -- no records are being written");
+        std::process::exit(1);
+    }
+
+    let dir = owf_core::debug::expand_tilde(&cfg.debug.dir);
+    let logs_dir = dir.join("logs");
+    let json_path = owf_core::debug::latest_record_path(&logs_dir)
+        .with_context(|| format!("no debug records found under {}", logs_dir.display()))?;
+    let contents = std::fs::read_to_string(&json_path)
+        .with_context(|| format!("reading {}", json_path.display()))?;
+    let record: owf_core::debug::DebugRecord = serde_json::from_str(&contents)
+        .with_context(|| format!("parsing {}", json_path.display()))?;
+
+    print_debug_summary(&record, &json_path, &dir);
+    Ok(())
+}
+
+fn print_debug_summary(
+    record: &owf_core::debug::DebugRecord,
+    json_path: &Path,
+    dir: &Path,
+) {
+    println!("most recent utterance: {}", record.ts);
+
+    if let Some(c) = &record.capture {
+        println!(
+            "  capture: {} native samples / {} expected (ratio {:.3}, {} stream error(s))",
+            c.native_samples_captured, c.native_samples_expected, c.capture_ratio, c.stream_errors
+        );
+        println!(
+            "           device={:?} native_rate={} channels={} mono_16k_samples={}",
+            c.device, c.native_sample_rate, c.channels, c.mono_16k_samples
+        );
+    } else {
+        println!("  capture: (no capture stats recorded for this utterance)");
+    }
+
+    println!(
+        "  raw audio:     rms={:.4} peak={:.4}",
+        record.audio.raw.rms, record.audio.raw.peak
+    );
+    match &record.audio.trimmed {
+        Some(t) => println!("  trimmed audio: rms={:.4} peak={:.4}", t.rms, t.peak),
+        None => println!("  trimmed audio: (none -- no speech found)"),
+    }
+
+    match (record.vad.start_secs, record.vad.end_secs) {
+        (Some(s), Some(e)) => println!(
+            "  vad span: {}..{} samples ({:.3}s .. {:.3}s)",
+            record.vad.start_sample.unwrap_or(0),
+            record.vad.end_sample.unwrap_or(0),
+            s,
+            e
+        ),
+        _ => println!("  vad span: no speech found"),
+    }
+
+    match &record.asr_raw {
+        Some(raw) => println!("  raw transcript: {raw:?}"),
+        None => println!("  raw transcript: (none)"),
+    }
+
+    match &record.inject {
+        Some(i) => println!("  final text ({}): {:?}", i.backend, i.final_text),
+        None => println!("  final text: (nothing was injected)"),
+    }
+
+    if let Some(g) = &record.guardrail {
+        println!(
+            "  guardrail: {} reason={:?} overlap={:?} word_ratio={:?}",
+            g.verdict, g.reason, g.overlap, g.word_ratio
+        );
+    }
+
+    println!("  files:");
+    println!("    json:        {}", json_path.display());
+    let raw_wav = dir.join("audio").join(format!("{}-raw.wav", record.ts));
+    let trimmed_wav = dir.join("audio").join(format!("{}-trimmed.wav", record.ts));
+    println!(
+        "    raw wav:     {}{}",
+        raw_wav.display(),
+        if raw_wav.exists() { "" } else { " (missing -- save_audio was off?)" }
+    );
+    println!(
+        "    trimmed wav: {}{}",
+        trimmed_wav.display(),
+        if trimmed_wav.exists() { "" } else { " (missing)" }
+    );
 }
 
 /// Sends one request to the daemon and prints its response line verbatim.

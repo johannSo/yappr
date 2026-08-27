@@ -16,8 +16,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use owf_core::asr::SherpaTranscriber;
-use owf_core::capture::Recorder;
-use owf_core::config::{AudioConfig, Config};
+use owf_core::capture::{CaptureStats, Recorder};
+use owf_core::config::{AudioConfig, Config, DebugConfig};
 use owf_core::inject;
 use owf_core::lang::WhatlangDetector;
 use owf_core::llama::LlamaServer;
@@ -106,14 +106,54 @@ impl Normalizer for UnavailableNormalizer {
     }
 }
 
-fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+/// Sets up `tracing`: always to stdout, and additionally (append mode) to
+/// `<debug.dir>/logs/daemon.log` when `[debug].enabled` -- `paths::log_file()`
+/// lives under the unrelated XDG state dir and was never wired up to
+/// anything, and per-utterance debug records already live under
+/// `debug.dir`, so keeping the daemon's own log alongside them there (rather
+/// than reaching for `paths::log_file()`'s separate location) keeps every
+/// diagnostic artifact from one debug-enabled run in the same place.
+///
+/// Deliberately synchronous: `fmt::Layer::with_writer` just needs something
+/// `io::Write`, and a `Mutex<File>` (`tracing_subscriber::fmt::MakeWriter`
+/// is implemented for any `Mutex<W: Write>`) is exactly that -- no
+/// background flushing thread or async runtime required, unlike
+/// `tracing-appender`'s non-blocking writer.
+fn init_tracing(debug: &DebugConfig) {
+    use tracing_subscriber::prelude::*;
+    use tracing_subscriber::{fmt, EnvFilter};
 
+    let env_filter =
+        || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
+    let file_layer = if debug.enabled {
+        match open_debug_log_file(debug) {
+            Ok(file) => Some(fmt::layer().with_ansi(false).with_writer(Mutex::new(file))),
+            Err(e) => {
+                eprintln!("warning: could not open debug log file: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    tracing_subscriber::registry()
+        .with(env_filter())
+        .with(fmt::layer())
+        .with(file_layer)
+        .init();
+}
+
+/// Opens `<debug.dir>/logs/daemon.log` for append, creating the directory
+/// tree if needed.
+fn open_debug_log_file(debug: &DebugConfig) -> std::io::Result<std::fs::File> {
+    let logs_dir = owf_core::debug::expand_tilde(&debug.dir).join("logs");
+    std::fs::create_dir_all(&logs_dir)?;
+    std::fs::OpenOptions::new().create(true).append(true).open(logs_dir.join("daemon.log"))
+}
+
+fn main() -> Result<()> {
     // Single-instance guard: an exclusive, non-blocking lock on a runtime
     // file, held for the life of the process via `lock` staying in scope.
     let lock_path = paths::runtime_lock();
@@ -131,6 +171,12 @@ fn main() -> Result<()> {
     }
 
     let cfg = Config::load().context("loading config")?;
+
+    // Loaded before tracing is set up so the log destination (stdout, plus
+    // `<debug.dir>/logs/daemon.log` when debug capture is enabled) can
+    // depend on `cfg.debug`. Nothing above this point ever logs via
+    // `tracing`, so nothing is lost by the reordering.
+    init_tracing(&cfg.debug);
 
     let sock_path = paths::runtime_socket();
     if let Some(parent) = sock_path.parent() {
@@ -631,7 +677,7 @@ fn run_utterance(daemon: Arc<Daemon>) {
             return;
         }
     };
-    let samples = match stop_result {
+    let stop = match stop_result {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(error = ?e, "capture stop failed");
@@ -639,7 +685,7 @@ fn run_utterance(daemon: Arc<Daemon>) {
         }
     };
     let class = lock_ignoring_poison(&daemon.window_class).clone();
-    process_utterance(&daemon.pipeline, &samples, class.as_deref());
+    process_utterance(&daemon.pipeline, &stop.samples, class.as_deref(), Some(stop.capture));
 }
 
 /// Runs one utterance's already-captured samples through the pipeline.
@@ -649,7 +695,12 @@ fn run_utterance(daemon: Arc<Daemon>) {
 /// `capture::Recorder::new`): a test can drive this directly with a scratch
 /// `Mutex<Option<Pipeline>>` and a panicking fake stage to prove
 /// `IdleOnExit` recovers `state` even when this function unwinds.
-fn process_utterance(pipeline: &Mutex<Option<Pipeline>>, samples: &[f32], window_class: Option<&str>) {
+fn process_utterance(
+    pipeline: &Mutex<Option<Pipeline>>,
+    samples: &[f32],
+    window_class: Option<&str>,
+    capture: Option<CaptureStats>,
+) {
     // `pipeline` is a `Mutex<Option<Pipeline>>` shared by the whole daemon,
     // and the guard is held for the entire `process` call below. That is
     // deliberate, not incidental: `SherpaTranscriber` wraps sherpa-onnx's
@@ -661,7 +712,7 @@ fn process_utterance(pipeline: &Mutex<Option<Pipeline>>, samples: &[f32], window
     // out from under the guard or call `process` without holding it.
     let guard = lock_ignoring_poison(pipeline);
     if let Some(p) = guard.as_ref() {
-        match p.process(samples, window_class) {
+        match p.process_with_capture(samples, window_class, capture) {
             Ok(Some(out)) => tracing::info!(chars = out.text.len(), "injected"),
             Ok(None) => tracing::info!("nothing to inject"),
             Err(e) => tracing::error!(error = ?e, "pipeline failed"),
@@ -749,7 +800,7 @@ mod tests {
 
         let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
             let _idle_on_exit = IdleOnExit(&state);
-            process_utterance(&pipeline, &samples, None);
+            process_utterance(&pipeline, &samples, None, None);
         }));
 
         assert!(result.is_err(), "the transcriber's panic should have propagated");

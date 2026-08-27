@@ -1,4 +1,5 @@
 use owf_core::asr::Transcriber;
+use owf_core::capture::CaptureStats;
 use owf_core::config::Config;
 use owf_core::inject::MockInjector;
 use owf_core::lang::{Lang, LanguageDetector};
@@ -103,6 +104,162 @@ fn scratch_rejections_path(tag: &str) -> std::path::PathBuf {
     std::env::temp_dir()
         .join(format!("owf-core-test-pipeline-e2e-{tag}-{}-{n}", std::process::id()))
         .join("rejections.jsonl")
+}
+
+/// A fresh, collision-free scratch directory for a single test's
+/// `[debug].dir`. Same pattern as `scratch_rejections_path` above.
+fn scratch_debug_dir(tag: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("owf-core-test-pipeline-e2e-debug-{tag}-{}-{n}", std::process::id()))
+}
+
+fn debug_config(dir: &std::path::Path, save_audio: bool) -> Config {
+    Config::from_str(&format!(
+        "[debug]\nenabled = true\ndir = \"{}\"\nsave_audio = {save_audio}\n",
+        dir.display(),
+    ))
+    .unwrap()
+}
+
+fn capture_stats_fixture() -> CaptureStats {
+    CaptureStats {
+        device: "HDA Intel PCH, ALC3271 Analog".to_string(),
+        native_sample_rate: 48_000,
+        channels: 2,
+        native_samples_captured: 240_000,
+        stream_errors: 3,
+        duration: std::time::Duration::from_secs(5),
+    }
+}
+
+/// The single highest-value diagnostic this whole facility exists for: with
+/// `[debug].enabled = true` and real `CaptureStats` handed in via
+/// `process_with_capture`, the JSON record's `capture` section carries the
+/// captured/expected native sample counts, their ratio, and the stream
+/// error count -- exactly what distinguishes "ALSA dropped audio" from
+/// "VAD over-trimmed" as the cause of a single-word transcript.
+#[test]
+fn debug_capture_records_capture_ratio_and_stream_errors_when_enabled() {
+    let dir = scratch_debug_dir("capture-ratio");
+    let p = Pipeline::new(
+        debug_config(&dir, true),
+        Box::new(FixedAsr("um so the meeting is at uh four thirty on tuesday".into())),
+        Box::new(WholeBuffer),
+        Box::new(AlwaysEnglish),
+        Box::new(FixedNormalizer("So the meeting is at 4:30 on Tuesday.".into())),
+        Box::new(MockInjector::default()),
+    );
+
+    let out = p
+        .process_with_capture(&samples(), None, Some(capture_stats_fixture()))
+        .unwrap()
+        .expect("some outcome");
+    assert!(out.normalized);
+
+    let logs_dir = dir.join("logs");
+    let json_path = owf_core::debug::latest_record_path(&logs_dir).unwrap();
+    let record: owf_core::debug::DebugRecord =
+        serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
+
+    let capture = record.capture.expect("capture section must be present");
+    assert_eq!(capture.native_samples_captured, 240_000);
+    assert_eq!(capture.native_samples_expected, 480_000); // 5s * 48kHz * 2ch
+    assert!((capture.capture_ratio - 0.5).abs() < 1e-9);
+    assert_eq!(capture.stream_errors, 3);
+    assert_eq!(capture.device, "HDA Intel PCH, ALC3271 Analog");
+
+    assert_eq!(record.asr_raw.as_deref(), Some("um so the meeting is at uh four thirty on tuesday"));
+    assert_eq!(record.lang.as_deref(), Some("English"));
+    assert!(record.audio.trimmed.is_some());
+    let guardrail = record.guardrail.expect("guardrail should have run");
+    assert_eq!(guardrail.verdict, "accept");
+    let inject = record.inject.expect("inject should have run");
+    assert_eq!(inject.backend, "mock");
+    assert_eq!(inject.final_text, out.text);
+
+    assert!(dir.join("audio").join(format!("{}-raw.wav", record.ts)).exists());
+    assert!(dir.join("audio").join(format!("{}-trimmed.wav", record.ts)).exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn debug_capture_omits_the_capture_section_when_process_is_called_without_stats() {
+    let dir = scratch_debug_dir("no-capture-stats");
+    let p = Pipeline::new(
+        debug_config(&dir, false),
+        Box::new(FixedAsr("send the invoice on friday".into())),
+        Box::new(WholeBuffer),
+        Box::new(AlwaysEnglish),
+        Box::new(FixedNormalizer("Send the invoice on Friday.".into())),
+        Box::new(MockInjector::default()),
+    );
+
+    // The plain two-arg `process` (what every other test in this file
+    // calls) has no `CaptureStats` to offer -- the record must still be
+    // written, just without a `capture` section.
+    p.process(&samples(), None).unwrap();
+
+    let logs_dir = dir.join("logs");
+    let json_path = owf_core::debug::latest_record_path(&logs_dir).unwrap();
+    let record: owf_core::debug::DebugRecord =
+        serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
+    assert!(record.capture.is_none());
+
+    // save_audio was false: no WAVs, only the JSON record.
+    assert!(!dir.join("audio").join(format!("{}-raw.wav", record.ts)).exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn debug_capture_records_no_speech_utterances_too() {
+    let dir = scratch_debug_dir("no-speech");
+    let p = Pipeline::new(
+        debug_config(&dir, true),
+        Box::new(FixedAsr("should never be reached".into())),
+        Box::new(NoSpeechTrimmer),
+        Box::new(AlwaysEnglish),
+        Box::new(FixedNormalizer("nope".into())),
+        Box::new(MockInjector::default()),
+    );
+
+    assert!(p.process(&samples(), None).unwrap().is_none());
+
+    let logs_dir = dir.join("logs");
+    let json_path = owf_core::debug::latest_record_path(&logs_dir).unwrap();
+    let record: owf_core::debug::DebugRecord =
+        serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
+    assert!(!record.vad.found);
+    assert!(record.asr_raw.is_none());
+    // The raw buffer is still worth having even when VAD found nothing --
+    // that's exactly the buffer to inspect for "did VAD over-trim?".
+    assert!(dir.join("audio").join(format!("{}-raw.wav", record.ts)).exists());
+    assert!(!dir.join("audio").join(format!("{}-trimmed.wav", record.ts)).exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn debug_capture_is_a_no_op_when_disabled() {
+    let dir = scratch_debug_dir("disabled");
+    // enabled = false (the default), pointed at a scratch dir that must
+    // never be created.
+    let cfg = Config::from_str(&format!("[debug]\ndir = \"{}\"\n", dir.display())).unwrap();
+    let p = Pipeline::new(
+        cfg,
+        Box::new(FixedAsr("send the invoice on friday".into())),
+        Box::new(WholeBuffer),
+        Box::new(AlwaysEnglish),
+        Box::new(FixedNormalizer("Send the invoice on Friday.".into())),
+        Box::new(MockInjector::default()),
+    );
+
+    p.process(&samples(), None).unwrap();
+
+    assert!(!dir.exists(), "no debug directory should be created when [debug].enabled = false");
 }
 
 #[test]

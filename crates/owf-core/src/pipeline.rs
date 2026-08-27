@@ -6,12 +6,15 @@
 //! than losing the utterance. See spec 15.
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use crate::asr::Transcriber;
+use crate::capture::CaptureStats;
 use crate::config::Config;
+use crate::debug;
 use crate::guardrail::{self, RejectReason, Verdict};
 use crate::inject::{inject_with_fallback, TextInjector};
 use crate::lang::{Lang, LanguageDetector};
@@ -20,7 +23,7 @@ use crate::paths;
 use crate::style;
 use crate::vad::Trimmer;
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
 pub struct Timings {
     pub vad_ms: u128,
     pub asr_ms: u128,
@@ -111,21 +114,92 @@ impl Pipeline {
 
     /// Runs a complete utterance. `Ok(None)` means there was nothing to say
     /// and nothing was injected.
+    ///
+    /// A thin wrapper around [`Pipeline::process_with_capture`] for the many
+    /// callers (every test in this crate, plus any future caller that has no
+    /// `CaptureStats` to hand) that don't have -- or don't care about --
+    /// capture-side debug info. Real production use goes through
+    /// `process_with_capture` instead, via `owf-daemon.rs`'s
+    /// `process_utterance`.
     pub fn process(&self, samples: &[f32], window_class: Option<&str>) -> Result<Option<Outcome>> {
+        self.process_with_capture(samples, window_class, None)
+    }
+
+    /// Like [`Pipeline::process`], but additionally takes the capture-side
+    /// facts behind `samples` (device, native rate, samples actually
+    /// delivered, stream error count, ...) so that, when `[debug].enabled`,
+    /// the per-utterance debug record's `capture` section can be populated.
+    ///
+    /// `capture` is `None` whenever the caller has no `CaptureStats` for
+    /// this buffer (every test in this crate, and `process`'s own callers);
+    /// the debug record is still written in that case, just without a
+    /// `capture` section -- see `debug::DebugRecord::capture`.
+    pub fn process_with_capture(
+        &self,
+        samples: &[f32],
+        window_class: Option<&str>,
+        capture: Option<CaptureStats>,
+    ) -> Result<Option<Outcome>> {
         let mut timings = Timings::default();
+        // `None` when `[debug].enabled` is false -- the common case -- so
+        // that recording an utterance costs this function nothing beyond the
+        // one bool check: no timestamp formatted, no path expanded, no
+        // record built or written.
+        let debug_ctx: Option<(String, std::path::PathBuf)> = self.cfg.debug.enabled.then(|| {
+            (debug::timestamp_for_filename(SystemTime::now()), debug::expand_tilde(&self.cfg.debug.dir))
+        });
 
         let t = Instant::now();
         let Some((start, end)) = self.trimmer.trim(samples, self.cfg.audio.vad_padding_ms) else {
             tracing::info!("no speech detected");
+            if let Some((ts, dir)) = &debug_ctx {
+                debug::record_utterance(
+                    dir,
+                    ts,
+                    self.cfg.debug.save_audio,
+                    debug::DebugInput {
+                        capture: capture.as_ref(),
+                        raw: samples,
+                        trimmed: None,
+                        vad: debug::VadDebug::not_found(),
+                        asr_raw: None,
+                        lang: None,
+                        normalize: None,
+                        guardrail: None,
+                        inject: None,
+                        timings,
+                    },
+                );
+            }
             return Ok(None);
         };
         timings.vad_ms = t.elapsed().as_millis();
+        let vad_debug = debug::VadDebug::span(start, end);
 
         let t = Instant::now();
         let raw = self.asr.transcribe(&samples[start..end])?;
         timings.asr_ms = t.elapsed().as_millis();
         if raw.trim().is_empty() {
             tracing::info!("empty transcript");
+            if let Some((ts, dir)) = &debug_ctx {
+                debug::record_utterance(
+                    dir,
+                    ts,
+                    self.cfg.debug.save_audio,
+                    debug::DebugInput {
+                        capture: capture.as_ref(),
+                        raw: samples,
+                        trimmed: Some(&samples[start..end]),
+                        vad: vad_debug,
+                        asr_raw: Some(&raw),
+                        lang: None,
+                        normalize: None,
+                        guardrail: None,
+                        inject: None,
+                        timings,
+                    },
+                );
+            }
             return Ok(None);
         }
 
@@ -136,6 +210,13 @@ impl Pipeline {
         let mut normalized = false;
         let mut reject_reason: Option<String> = None;
         let mut text = guardrail::rule_based_fallback(&raw);
+        let mut normalize_debug = debug::NormalizeDebug {
+            control: control.clone(),
+            ran: false,
+            cleaned: None,
+            error: None,
+        };
+        let mut guardrail_debug: Option<debug::GuardrailDebug> = None;
 
         if self.cfg.normalize.enabled {
             // Scoped tightly around just the normalizer call: `evaluate` and
@@ -145,25 +226,32 @@ impl Pipeline {
             let t = Instant::now();
             let normalize_result = self.normalizer.normalize(&control, &raw);
             timings.normalize_ms = t.elapsed().as_millis();
+            normalize_debug.ran = true;
 
             match normalize_result {
-                Ok(cleaned) => match guardrail::evaluate(&raw, &cleaned, lang, &self.cfg.guardrail)
-                {
-                    Verdict::Accept => {
-                        text = cleaned;
-                        normalized = true;
+                Ok(cleaned) => {
+                    normalize_debug.cleaned = Some(cleaned.clone());
+                    match guardrail::evaluate(&raw, &cleaned, lang, &self.cfg.guardrail) {
+                        Verdict::Accept => {
+                            guardrail_debug = Some(debug::GuardrailDebug::accept());
+                            text = cleaned;
+                            normalized = true;
+                        }
+                        Verdict::Reject(reason) => {
+                            guardrail_debug =
+                                Some(debug::GuardrailDebug::reject(&raw, &cleaned, &reason));
+                            reject_reason = Some(reason.code().to_string());
+                            log_rejection_to(&self.rejections_path(), &raw, &cleaned, &reason, lang, &control);
+                        }
                     }
-                    Verdict::Reject(reason) => {
-                        reject_reason = Some(reason.code().to_string());
-                        log_rejection_to(&self.rejections_path(), &raw, &cleaned, &reason, lang, &control);
-                    }
-                },
+                }
                 Err(e) => {
                     // A failed cleanup must never cost the transcript, and it
                     // is not a guardrail rejection: `reject_reason` stays
                     // `None` here. Pinned by
                     // `a_dead_normalizer_still_produces_text` in
                     // tests/pipeline_e2e.rs.
+                    normalize_debug.error = Some(e.to_string());
                     tracing::warn!(error = %e, "normalization failed; using raw transcript");
                 }
             }
@@ -184,6 +272,29 @@ impl Pipeline {
             backend,
             "utterance complete"
         );
+
+        if let Some((ts, dir)) = &debug_ctx {
+            debug::record_utterance(
+                dir,
+                ts,
+                self.cfg.debug.save_audio,
+                debug::DebugInput {
+                    capture: capture.as_ref(),
+                    raw: samples,
+                    trimmed: Some(&samples[start..end]),
+                    vad: vad_debug,
+                    asr_raw: Some(&raw),
+                    lang: Some(lang),
+                    normalize: Some(normalize_debug),
+                    guardrail: guardrail_debug,
+                    inject: Some(debug::InjectDebug {
+                        backend: backend.to_string(),
+                        final_text: text.clone(),
+                    }),
+                    timings,
+                },
+            );
+        }
 
         Ok(Some(Outcome { text, raw, normalized, reject_reason, backend, timings }))
     }
@@ -260,7 +371,11 @@ fn rfc3339_now() -> String {
 /// one call site -- this is the entire extent of the calendar math
 /// `rejections.jsonl` needs. Takes a plain integer specifically so it's
 /// testable without touching the wall clock.
-fn rfc3339_utc(secs_since_epoch: u64) -> String {
+///
+/// `pub(crate)` (not private) so `crate::debug::timestamp_for_filename` can
+/// reuse this same calendar math for its filesystem-safe timestamps instead
+/// of adding a second date/time formatter to the crate.
+pub(crate) fn rfc3339_utc(secs_since_epoch: u64) -> String {
     let days = (secs_since_epoch / 86_400) as i64;
     let rem = secs_since_epoch % 86_400;
     let (hour, minute, second) = (rem / 3600, (rem % 3600) / 60, rem % 60);
