@@ -92,15 +92,60 @@ and re-pin the lock file (e.g. after an upstream model update).
 
 ## Wire up Hyprland
 
+`owf-ctl setup --print-hypr` detects how your Hyprland is configured and emits
+the matching snippet. Hyprland 0.56+ configured in Lua (as Omarchy does)
+rejects the legacy keyword parser entirely, so the two formats are not
+interchangeable.
+
+**Lua config** (`~/.config/hypr/hyprland.lua` exists) — the snippet spans two
+files, so paste rather than redirect:
+
 ```bash
-owf-ctl setup --print-hypr >> ~/.config/hypr/hyprland.conf
-hyprctl reload
+owf-ctl setup --print-hypr
 ```
 
-This appends the keybinds (`SUPER+D` to hold-to-talk, `SUPER+Escape` to
-cancel while held) and the window rules that keep the future overlay window
-from stealing focus during dictation. Log out and back in (so
-`exec-once = owf-daemon` starts the daemon), or start it manually once:
+The bindings go in `~/.config/hypr/bindings.lua`:
+
+```lua
+o.bind("SUPER + D", "Dictate (hold to talk)", "owf-ctl ptt-start")
+o.bind("SUPER + D", nil, "owf-ctl ptt-stop", { release = true })
+o.bind("SUPER + ALT + D", "Dictation: cancel", "owf-ctl cancel")
+```
+
+and the daemon in `~/.config/hypr/autostart.lua`:
+
+```lua
+o.launch_on_start("owf-daemon")
+```
+
+Check first that those keys are free — `omarchy menu keybindings --print` on
+Omarchy — and `hl.unbind(...)` anything you are replacing.
+
+**Classic config:**
+
+```bash
+owf-ctl setup --print-hypr >> ~/.config/hypr/hyprland.conf
+```
+
+Either way, validate:
+
+```bash
+hyprctl reload && hyprctl configerrors
+```
+
+`SUPER+D` is hold-to-talk; `SUPER+ALT+D` cancels a recording in progress.
+The `release` binding is what makes it push-to-talk rather than a toggle —
+both halves must stay on the same key.
+
+**No window rules are emitted.** M1 renders no window, so there is nothing to
+rule on. When the M2 overlay lands it must not take keyboard focus, or `wtype`
+will type the dictation into the overlay instead of your target window; the
+verified Lua form is `o.window("openwhisprflow", { no_focus = true })`.
+Hyprland's window-rule syntax changes between versions, so check any
+additional rules against `/usr/share/hypr/stubs/hl.meta.lua` on the running
+machine rather than against documentation of unknown vintage.
+
+Then log out and back in so the daemon autostarts, or start it once by hand:
 
 ```bash
 owf-daemon &
@@ -142,7 +187,7 @@ watching the result. Treat dictation as unverified until this is done:
 - [ ] `owf-ctl status` reports `warm: true` ~45 s after daemon start
 - [ ] Dictation into Alacritty, Firefox's address bar, an Electron app (VS Code/Slack), and an XWayland window (`xterm` or a Wine app)
 - [ ] Holding `SUPER+D` and releasing without speaking types nothing and logs "no speech detected"
-- [ ] `SUPER+Escape` while still holding `SUPER+D` cancels cleanly
+- [ ] `SUPER+ALT+D` while still holding `SUPER+D` cancels cleanly
 - [ ] Two dictations back-to-back without a pause don't run together
 - [ ] Killing `llama-server` mid-session still types raw ASR text (with a logged warning) instead of failing
 - [ ] A German dictation, and whether the guardrail fires for it (check `rejections.jsonl`)
