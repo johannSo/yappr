@@ -47,7 +47,7 @@ mod tests {
 
     #[test]
     fn confident_english_is_english() {
-        let d = WhatlangDetector::default();
+        let d = WhatlangDetector;
         assert_eq!(
             d.detect("the meeting is at four thirty on tuesday and i will send the notes"),
             Lang::English
@@ -56,7 +56,7 @@ mod tests {
 
     #[test]
     fn confident_german_is_other() {
-        let d = WhatlangDetector::default();
+        let d = WhatlangDetector;
         assert_eq!(
             d.detect("das treffen ist um halb funf am dienstag und ich schicke die notizen"),
             Lang::Other
@@ -67,14 +67,14 @@ mod tests {
     fn very_short_text_defaults_to_english() {
         // Trigram detection is unreliable under ~12 chars, and English is the
         // configured primary language. See spec 7.4.
-        let d = WhatlangDetector::default();
+        let d = WhatlangDetector;
         assert_eq!(d.detect("ok thanks"), Lang::English);
         assert_eq!(d.detect(""), Lang::English);
     }
 
     #[test]
     fn detection_is_deterministic() {
-        let d = WhatlangDetector::default();
+        let d = WhatlangDetector;
         let s = "please forward the invoice to accounting before the end of the week";
         assert_eq!(d.detect(s), d.detect(s));
     }
