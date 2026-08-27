@@ -54,7 +54,7 @@ follows from it.
 | Capture | `cpal` + `rubato` | latest | In-process, no subprocess; gives RMS for the overlay meter without parsing a pipe |
 | VAD | Silero VAD, via the `sherpa-onnx` crate | 1.13.6 | ~2 MB, already linked; trims dead air off the ASR input |
 | ASR | Parakeet TDT 0.6b v3 int8, via `sherpa-onnx` crate | 1.13.6 | Official k2-fsa Rust bindings; **downloads prebuilt native libs, no local cmake build**; model stays warm in-process |
-| Language ID | `whatlang` | 0.16 | See §7.4 — chosen over `lingua` on memory grounds |
+| Language ID | `whatlang` | 0.18 | See §7.4 — chosen over `lingua` on memory grounds |
 | Cleanup | s1-mini Q4_K_M, via `llama-server` | llama.cpp (Arch `extra/llama-cpp`) | The model card's own documented invocation; stays warm; OpenAI-compatible HTTP |
 | Injection | `wtype` | 0.4 | Already installed, no root, no uinput rule |
 | Shell/UI | Tauri 2 + React 19 + Vite | existing scaffold | Already scaffolded in this repo |
