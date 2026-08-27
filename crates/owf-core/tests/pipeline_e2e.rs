@@ -61,6 +61,18 @@ fn samples() -> Vec<f32> {
     vec![0.1; 16_000]
 }
 
+/// A fresh, collision-free scratch path for a single test's rejections log.
+/// Mirrors the identical helper pattern in `owf-core`'s own `pipeline.rs`
+/// and `inject.rs` unit tests -- `tempfile` isn't a dependency here either.
+fn scratch_rejections_path(tag: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir()
+        .join(format!("owf-core-test-pipeline-e2e-{tag}-{}-{n}", std::process::id()))
+        .join("rejections.jsonl")
+}
+
 #[test]
 fn a_good_cleanup_is_injected() {
     let injector = MockInjector::default();
@@ -81,6 +93,12 @@ fn a_good_cleanup_is_injected() {
 
 #[test]
 fn a_rejected_cleanup_falls_back_to_raw() {
+    // Guardrail rejections are the input dataset for M3 threshold tuning
+    // (see `owf_core::pipeline::log_rejection_to`); this test's synthetic
+    // rejection must land in a scratch file, never the real
+    // `rejections.jsonl`, or every CI run would quietly poison that data.
+    let rejections_path = scratch_rejections_path("rejected-cleanup-falls-back-to-raw");
+
     let p = Pipeline::new(
         Config::from_str("").unwrap(),
         Box::new(FixedAsr("the quarterly numbers came in higher than we forecast".into())),
@@ -88,13 +106,24 @@ fn a_rejected_cleanup_falls_back_to_raw() {
         Box::new(AlwaysEnglish),
         Box::new(FixedNormalizer("Numbers.".into())), // far too short
         Box::new(MockInjector::default()),
-    );
+    )
+    .with_rejections_path(rejections_path.clone());
 
     let out = p.process(&samples(), None).unwrap().expect("some outcome");
     assert!(!out.normalized);
     assert_eq!(out.reject_reason.as_deref(), Some("word_ratio"));
     assert!(out.text.starts_with("The quarterly numbers"), "got {:?}", out.text);
     assert!(out.text.trim_end().ends_with('.'));
+
+    let contents = std::fs::read_to_string(&rejections_path)
+        .expect("the rejection should have been logged to the scratch path");
+    let lines: Vec<&str> = contents.lines().collect();
+    assert_eq!(lines.len(), 1, "should log exactly one rejection, got: {contents:?}");
+    let parsed: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(parsed["reason"], "word_ratio");
+    assert_eq!(parsed["raw"], "the quarterly numbers came in higher than we forecast");
+
+    let _ = std::fs::remove_dir_all(rejections_path.parent().unwrap());
 }
 
 #[test]

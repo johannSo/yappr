@@ -7,6 +7,7 @@
 
 use anyhow::Result;
 use std::io::Write;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::asr::Transcriber;
@@ -48,6 +49,11 @@ pub struct Pipeline {
     detector: Box<dyn LanguageDetector>,
     normalizer: Box<dyn Normalizer>,
     injector: Box<dyn TextInjector>,
+    /// Where guardrail rejections are appended, if overridden by
+    /// `with_rejections_path`. `None` (the default from `new`) means the
+    /// real M3 tuning dataset, `paths::rejections_file()` -- see
+    /// `rejections_path` and `log_rejection_to`.
+    rejections_path: Option<PathBuf>,
 }
 
 impl Pipeline {
@@ -59,7 +65,26 @@ impl Pipeline {
         normalizer: Box<dyn Normalizer>,
         injector: Box<dyn TextInjector>,
     ) -> Self {
-        Self { cfg, asr, trimmer, detector, normalizer, injector }
+        Self { cfg, asr, trimmer, detector, normalizer, injector, rejections_path: None }
+    }
+
+    /// Points guardrail-rejection logging at `path` instead of the real M3
+    /// tuning dataset.
+    ///
+    /// Additive on purpose: `new`'s six positional arguments are locked in
+    /// by `owf-daemon.rs`'s call site, so this is a builder rather than a
+    /// seventh parameter every caller would have to update. Only tests are
+    /// expected to call it -- production always takes the `None` default,
+    /// which resolves to `paths::rejections_file()`.
+    pub fn with_rejections_path(mut self, path: PathBuf) -> Self {
+        self.rejections_path = Some(path);
+        self
+    }
+
+    /// The path guardrail rejections are appended to: `paths::rejections_file()`
+    /// unless overridden by `with_rejections_path`.
+    fn rejections_path(&self) -> PathBuf {
+        self.rejections_path.clone().unwrap_or_else(paths::rejections_file)
     }
 
     pub fn config(&self) -> &Config {
@@ -112,7 +137,7 @@ impl Pipeline {
                     }
                     Verdict::Reject(reason) => {
                         reject_reason = Some(reason.code().to_string());
-                        log_rejection_to(&paths::rejections_file(), &raw, &cleaned, &reason, lang, &control);
+                        log_rejection_to(&self.rejections_path(), &raw, &cleaned, &reason, lang, &control);
                     }
                 },
                 Err(e) => {
@@ -147,15 +172,18 @@ impl Pipeline {
 }
 
 /// Appends one JSON line to `path`, the input dataset for M3 guardrail
-/// threshold tuning (see spec 9.3). Failures here are diagnostics, never
-/// fatal.
+/// threshold tuning (see spec 9.3) when `path` is the real
+/// `paths::rejections_file()`. Failures here are diagnostics, never fatal.
 ///
 /// The destination is a parameter rather than hard-coded to
 /// `paths::rejections_file()` so it can be pointed at a scratch file in
 /// tests: `rejections.jsonl` is live tuning input, and a synthetic fixture
 /// line written to the real file on every test run would quietly poison
-/// that dataset. `Pipeline::process` always calls this with the real path;
-/// only tests use anything else.
+/// that dataset. `Pipeline::process` calls this with `self.rejections_path()`,
+/// which defaults to the real path but can be redirected via
+/// `Pipeline::with_rejections_path` -- as `a_rejected_cleanup_falls_back_to_raw`
+/// in `tests/pipeline_e2e.rs` now does, so that test's synthetic rejection no
+/// longer lands in the real dataset.
 fn log_rejection_to(
     path: &std::path::Path,
     raw: &str,
