@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use owf_core::asr::SherpaTranscriber;
@@ -36,6 +36,21 @@ fn state_of(v: u8) -> State {
         BUSY => State::Transcribing,
         _ => State::Idle,
     }
+}
+
+/// Recovers the inner value from a poisoned mutex instead of panicking.
+///
+/// A panic on the utterance thread while `daemon.pipeline`'s lock is held
+/// (see `IdleOnExit`) marks that `Mutex` poisoned even though the data it
+/// guards was never left half-written -- `process_utterance` only ever reads
+/// through the guard (`Pipeline::process` takes `&self`), so there is
+/// nothing here to distrust. Left as `.lock().unwrap()`, that one panic would
+/// turn every subsequent lock on the same mutex into its own panic, cascading
+/// one bad utterance into a permanently broken daemon. Applied uniformly to
+/// every lock in this file, not only `pipeline`'s, so the same cascade can't
+/// happen via `llama` or `window_class` either.
+fn lock_ignoring_poison<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 struct Daemon {
@@ -121,8 +136,8 @@ fn main() -> Result<()> {
         let daemon = Arc::clone(&daemon);
         std::thread::spawn(move || match warm_up(cfg) {
             Ok((pipeline, server)) => {
-                *daemon.pipeline.lock().unwrap() = Some(pipeline);
-                *daemon.llama.lock().unwrap() = server;
+                *lock_ignoring_poison(&daemon.pipeline) = Some(pipeline);
+                *lock_ignoring_poison(&daemon.llama) = server;
                 daemon.state.store(IDLE, Ordering::SeqCst);
                 tracing::info!("ready");
             }
@@ -198,11 +213,25 @@ fn warm_up(cfg: Config) -> Result<(Pipeline, Option<LlamaServer>)> {
 }
 
 fn handle(daemon: Arc<Daemon>, stream: UnixStream) {
+    // The accept loop is single-threaded by design (see the note on
+    // `Daemon::pipeline`'s field and `run_utterance`) and `handle` runs
+    // synchronously within it, so a client that connects and never writes
+    // would otherwise block *every* command -- including `status` -- inside
+    // `read_line` for as long as that connection stayed open. A couple of
+    // seconds is far more than a one-line NDJSON request or response needs.
+    let timeout = Some(Duration::from_secs(2));
+    if stream.set_read_timeout(timeout).is_err() || stream.set_write_timeout(timeout).is_err() {
+        return;
+    }
+
     let mut line = String::new();
     let mut reader = BufReader::new(match stream.try_clone() {
         Ok(s) => s,
         Err(_) => return,
     });
+    // A timed-out read is a plain `io::Error` (`WouldBlock`), not a panic --
+    // this already drops the connection on any read failure, timeouts
+    // included, rather than blocking the accept loop indefinitely.
     if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
         return;
     }
@@ -289,13 +318,23 @@ fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
 
 fn start_recording(daemon: &Arc<Daemon>) -> Response {
     // Captured before recording so the overlay (M2) can never confuse it.
-    *daemon.window_class.lock().unwrap() = owf_core::hypr::active_window_class();
+    *lock_ignoring_poison(&daemon.window_class) = owf_core::hypr::active_window_class();
 
     if let Err(e) = daemon.recorder.start(|_level| {}) {
         return Response::err(format!("cannot start capture: {e}"));
     }
-    daemon.state.store(RECORDING, Ordering::SeqCst);
+    // Bump the epoch *before* flipping the state, not after: they are two
+    // independent atomics, and the safety-valve timer below reads the epoch
+    // to decide whether it still owns this recording. If the state store ran
+    // first, a stale timer waking in the gap between the two stores would
+    // see its own (old) epoch still current *and* `state == RECORDING`
+    // (for what is actually a brand-new session), pass its epoch check, and
+    // wrongly win `claim_busy` against a recording it has nothing to do
+    // with. Bumping first closes that window: any timer that reads the new
+    // epoch after this point also reads `state == RECORDING` from this same
+    // call, never from a still-in-flight earlier one.
     let epoch = daemon.recording_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+    daemon.state.store(RECORDING, Ordering::SeqCst);
 
     // Safety valve: a stuck key must not leave the microphone hot (spec 6.1).
     let d = Arc::clone(daemon);
@@ -314,17 +353,55 @@ fn start_recording(daemon: &Arc<Daemon>) -> Response {
     Response::ok(State::Recording)
 }
 
+/// RAII guard that returns the daemon to `IDLE` when `run_utterance` ends,
+/// on *every* exit path -- including an unwinding panic from anywhere inside
+/// `Pipeline::process` (ASR, VAD, the guardrail, injection, or the
+/// sherpa-onnx FFI underneath ASR/VAD, which this codebase's own comments
+/// flag as resting on an unverified upstream `unsafe impl Send + Sync`).
+///
+/// Without this, a panic on the utterance thread unwinds only that thread
+/// (`panic = "unwind"` is the workspace default) and never reaches a
+/// `state.store(IDLE, ..)` placed at the end of the function -- leaving the
+/// daemon frozen at BUSY forever, with every later
+/// `PttStart`/`PttStop`/`Cancel` hitting the busy branch.
+///
+/// Constructed as the very first thing in `run_utterance`, before anything
+/// fallible, so its `Drop` covers every line after it. The store is
+/// unconditional, not a CAS: at most one `run_utterance` (or safety-valve)
+/// call is ever in flight at a time -- the RECORDING -> BUSY transition it
+/// exits is claimed exactly once per recording, by whichever of `ptt-stop`
+/// or the safety valve won `claim_busy` -- so there is no other legitimate
+/// writer for this guard to race or clobber.
+struct IdleOnExit<'a>(&'a AtomicU8);
+
+impl Drop for IdleOnExit<'_> {
+    fn drop(&mut self) {
+        self.0.store(IDLE, Ordering::SeqCst);
+    }
+}
+
 fn run_utterance(daemon: Arc<Daemon>) {
+    let _idle_on_exit = IdleOnExit(&daemon.state);
+
     let samples = match daemon.recorder.stop() {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(error = ?e, "capture stop failed");
-            daemon.state.store(IDLE, Ordering::SeqCst);
             return;
         }
     };
-    let class = daemon.window_class.lock().unwrap().clone();
+    let class = lock_ignoring_poison(&daemon.window_class).clone();
+    process_utterance(&daemon.pipeline, &samples, class.as_deref());
+}
 
+/// Runs one utterance's already-captured samples through the pipeline.
+///
+/// Split out from `run_utterance` so it is testable without a real
+/// `Recorder` (which needs live audio hardware to construct -- see
+/// `capture::Recorder::new`): a test can drive this directly with a scratch
+/// `Mutex<Option<Pipeline>>` and a panicking fake stage to prove
+/// `IdleOnExit` recovers `state` even when this function unwinds.
+fn process_utterance(pipeline: &Mutex<Option<Pipeline>>, samples: &[f32], window_class: Option<&str>) {
     // `pipeline` is a `Mutex<Option<Pipeline>>` shared by the whole daemon,
     // and the guard is held for the entire `process` call below. That is
     // deliberate, not incidental: `SherpaTranscriber` wraps sherpa-onnx's
@@ -334,9 +411,9 @@ fn run_utterance(daemon: Arc<Daemon>) {
     // FFI. Only one utterance may ever be inside `process` at a time; this
     // lock is what guarantees that, so nothing here may clone the pipeline
     // out from under the guard or call `process` without holding it.
-    let guard = daemon.pipeline.lock().unwrap();
+    let guard = lock_ignoring_poison(pipeline);
     if let Some(p) = guard.as_ref() {
-        match p.process(&samples, class.as_deref()) {
+        match p.process(samples, window_class) {
             Ok(Some(out)) => tracing::info!(chars = out.text.len(), "injected"),
             Ok(None) => tracing::info!("nothing to inject"),
             Err(e) => tracing::error!(error = ?e, "pipeline failed"),
@@ -348,6 +425,90 @@ fn run_utterance(daemon: Arc<Daemon>) {
         // change to that invariant fails loudly instead of panicking.
         tracing::warn!("utterance finished but the pipeline was not ready");
     }
-    drop(guard);
-    daemon.state.store(IDLE, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use owf_core::asr::Transcriber;
+    use owf_core::config::Config;
+    use owf_core::inject::MockInjector;
+    use owf_core::lang::{Lang, LanguageDetector};
+    use owf_core::normalize::Normalizer;
+    use owf_core::vad::Trimmer;
+    use std::panic::AssertUnwindSafe;
+
+    struct WholeBuffer;
+    impl Trimmer for WholeBuffer {
+        fn trim(&self, s: &[f32], _: u32) -> Option<(usize, usize)> {
+            if s.is_empty() {
+                None
+            } else {
+                Some((0, s.len()))
+            }
+        }
+    }
+
+    /// The panic seam: stands in for a real ASR/VAD/guardrail/inject failure,
+    /// or the sherpa-onnx FFI underneath ASR/VAD -- any of which could panic
+    /// on the real utterance thread per fix 1's report.
+    struct PanickingTranscriber;
+    impl Transcriber for PanickingTranscriber {
+        fn transcribe(&self, _: &[f32]) -> anyhow::Result<String> {
+            panic!("boom: transcriber panicked mid-utterance");
+        }
+    }
+
+    struct AlwaysEnglish;
+    impl LanguageDetector for AlwaysEnglish {
+        fn detect(&self, _: &str) -> Lang {
+            Lang::English
+        }
+    }
+
+    /// Never reached: `PanickingTranscriber::transcribe` panics before
+    /// `process_utterance` gets anywhere near normalization.
+    struct NeverNormalizer;
+    impl Normalizer for NeverNormalizer {
+        fn normalize(&self, _: &str, _: &str) -> anyhow::Result<String> {
+            unreachable!("normalization must be unreachable: the panic happens before it")
+        }
+    }
+
+    /// Fix 1: proves the daemon's state returns to `IDLE` even when a
+    /// pipeline stage panics, instead of staying stuck at `BUSY` forever.
+    ///
+    /// Exercises the real `IdleOnExit` guard and the real `process_utterance`
+    /// (the part of `run_utterance` that actually runs the pipeline), wired
+    /// together the same way `run_utterance` wires them -- guard constructed
+    /// first, fallible work run inside its scope -- so this is the same
+    /// unwind path a panic on the real utterance thread would take. It stops
+    /// short of a full `Daemon`/`run_utterance` because `Daemon` embeds a
+    /// real `capture::Recorder`, which needs live audio hardware just to
+    /// construct and so can't run in this sandbox or CI.
+    #[test]
+    fn a_panic_inside_the_pipeline_still_returns_the_daemon_to_idle() {
+        let pipeline = Mutex::new(Some(Pipeline::new(
+            Config::from_str("").unwrap(),
+            Box::new(PanickingTranscriber),
+            Box::new(WholeBuffer),
+            Box::new(AlwaysEnglish),
+            Box::new(NeverNormalizer),
+            Box::new(MockInjector::default()),
+        )));
+        let state = AtomicU8::new(BUSY);
+        let samples = vec![0.1f32; 16_000];
+
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _idle_on_exit = IdleOnExit(&state);
+            process_utterance(&pipeline, &samples, None);
+        }));
+
+        assert!(result.is_err(), "the transcriber's panic should have propagated");
+        assert_eq!(
+            state.load(Ordering::SeqCst),
+            IDLE,
+            "a panic inside the pipeline must not leave the daemon stuck at BUSY"
+        );
+    }
 }
