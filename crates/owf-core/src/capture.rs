@@ -93,6 +93,27 @@ struct DeviceSetup {
     max_samples_native: usize,
 }
 
+/// Whether the device can actually open an f32 input stream at `rate`.
+///
+/// Builds a throwaway stream and drops it. This is the only reliable test:
+/// the rate ranges cpal reports are advisory, and ALSA refuses combinations
+/// that fall inside them.
+fn can_build_at(device: &cpal::Device, channels: usize, rate: u32) -> bool {
+    let config = cpal::StreamConfig {
+        channels: channels as u16,
+        sample_rate: rate,
+        buffer_size: cpal::BufferSize::Default,
+    };
+    device
+        .build_input_stream(
+            config,
+            |_: &[f32], _: &cpal::InputCallbackInfo| {},
+            |_| {},
+            None,
+        )
+        .is_ok()
+}
+
 fn setup_device(cfg: &AudioConfig) -> Result<DeviceSetup> {
     let host = cpal::default_host();
     let device = if cfg.device == "default" {
@@ -103,18 +124,27 @@ fn setup_device(cfg: &AudioConfig) -> Result<DeviceSetup> {
             .with_context(|| format!("input device not found: {}", cfg.device))?
     };
 
-    // Prefer 16 kHz directly; PipeWire resamples transparently.
+    // Prefer 16 kHz so the resampler can be skipped -- but VERIFY it by
+    // building a throwaway stream rather than trusting the advertised range.
+    //
+    // `supported_input_configs()` reports a min..max span, and a rate inside
+    // that span is NOT necessarily buildable with this device's channel count
+    // and sample format. PipeWire accepts 16 kHz transparently because it
+    // resamples for us; real ALSA hardware rejects it at `build_input_stream`
+    // with "The requested stream configuration is not supported by the
+    // device." Trusting the range meant we never fell back, so the resampler
+    // below was unreachable and capture failed outright on such hardware.
     let supported = device.default_input_config().context("default input config")?;
-    let rate = if device
-        .supported_input_configs()
-        .context("supported input configs")?
-        .any(|r| r.min_sample_rate() <= SAMPLE_RATE as u32 && r.max_sample_rate() >= SAMPLE_RATE as u32)
-    {
+    let channels = supported.channels() as usize;
+    let rate = if can_build_at(&device, channels, SAMPLE_RATE as u32) {
         SAMPLE_RATE as u32
     } else {
+        tracing::info!(
+            native_rate = supported.sample_rate(),
+            "device refused 16 kHz; capturing native and resampling"
+        );
         supported.sample_rate()
     };
-    let channels = supported.channels() as usize;
 
     tracing::info!(rate, channels, device = %device, "input device selected");
 
