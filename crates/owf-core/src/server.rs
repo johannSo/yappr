@@ -1301,6 +1301,27 @@ fn claim_busy(daemon: &Daemon) -> bool {
     daemon.state.compare_exchange(RECORDING, TRANSCRIBING, Ordering::SeqCst, Ordering::SeqCst).is_ok()
 }
 
+/// Spec §2's toggle table, expressed as a pure state -> request mapping so
+/// it is testable exhaustively over every state constant without ever
+/// constructing a `Daemon` or touching audio hardware -- see the "Task 7"
+/// test-module comment below for why that matters here specifically.
+/// `--toggle` is resolved against this, the server's *current* state, never
+/// a client-side memory of the last press: the client (`owf-ctl` run by the
+/// Hyprland keybind) is a fresh process on every keypress and has no memory
+/// to consult.
+///
+/// Only `RECORDING` maps to `PttStop`; every other state -- the busy
+/// sub-states, `WARMING`, and `FAILED` included -- maps to `PttStart`, whose
+/// own match arms already refuse all of those (see `dispatch` below). A
+/// later task adds `PAUSED` and will extend this function accordingly; it
+/// is deliberately not anticipated here.
+fn toggle_target(state: u8) -> Request {
+    match state {
+        RECORDING => Request::PttStop,
+        _ => Request::PttStart,
+    }
+}
+
 fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
     let current = daemon.state.load(Ordering::SeqCst);
     match req {
@@ -1505,8 +1526,13 @@ fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
         // comment). Kept only so this match stays exhaustive.
         Request::Subscribe => Response::err("subscribe must be negotiated by the connection handler"),
 
-        // Implemented by Task 7.
-        Request::Toggle => Response::err("not implemented yet"),
+        // Spec §2: resolved against the current state, not a client-side
+        // memory of the last press (see `toggle_target`'s doc comment).
+        // Delegates to the two existing arms rather than reimplementing
+        // them -- PttStart and PttStop already carry the busy-rejection
+        // broadcast, the idempotent restart, and `claim_busy`'s CAS against
+        // the safety valve, and Toggle inherits all of it by construction.
+        Request::Toggle => dispatch(daemon, toggle_target(current)),
         // Implemented by Task 10.
         Request::Quit => Response::err("not implemented yet"),
         // Implemented by Task 10.
@@ -3318,5 +3344,98 @@ mod tests {
             elapsed < Duration::from_secs(1),
             "stop() should return almost immediately, not wait out the backoff; took {elapsed:?}"
         );
+    }
+
+    // -- Task 7: Request::Toggle -------------------------------------------
+
+    /// `toggle_target` carries all of Toggle's state-dependent behaviour as a
+    /// pure function precisely so it can be tested exhaustively, over every
+    /// state constant, without ever constructing a `Daemon`.
+    ///
+    /// The reason that separation exists at all: `start_recording` (reached
+    /// from every non-RECORDING state via `PttStart`) calls
+    /// `ensure_recorder(&daemon.recorder, || Recorder::new(..))`, which
+    /// constructs a *real* recorder the moment the slot is empty -- and every
+    /// fake daemon's slot is empty (`fake_daemon_at` sets
+    /// `recorder: Mutex::new(None)`). A test that dispatched `Toggle` from
+    /// `IDLE` through `dispatch` and asserted `RECORDING` -- the shape this
+    /// task's plan originally called for -- would therefore open the real
+    /// microphone every time `cargo test --workspace` ran. CLAUDE.md
+    /// prohibits that outright ("do not record from the microphone without
+    /// explicit permission"), and no test anywhere in this file drives
+    /// `PttStart` from `IDLE` through `dispatch` for the same reason: the one
+    /// existing `PttStart`-through-`dispatch` test,
+    /// `dispatch_reports_and_rejects_correctly_against_a_failed_daemon`,
+    /// starts from `FAILED`, which is refused before `start_recording` is
+    /// ever called.
+    ///
+    /// Do not "fix" that gap by adding an IDLE-through-`dispatch` test here.
+    /// There is no seam to stub `Recorder` behind -- `daemon.recorder` holds
+    /// a concrete `Recorder`, not a trait object -- so proving the mapping
+    /// this function embodies, exhaustively and with no `Daemon` in sight, is
+    /// the actual assurance available; the one-line delegation in `dispatch`
+    /// (`Request::Toggle => dispatch(daemon, toggle_target(current))`) is
+    /// then correct by inspection, the same trade this project already made
+    /// for `owf-cli`'s `route()`.
+    #[test]
+    fn toggle_target_maps_recording_to_ptt_stop_and_every_other_state_to_ptt_start() {
+        assert_eq!(toggle_target(RECORDING), Request::PttStop);
+        for other in [WARMING, IDLE, TRANSCRIBING, NORMALIZING, INJECTING, FAILED] {
+            assert_eq!(toggle_target(other), Request::PttStart, "state {other} must toggle to PttStart");
+        }
+    }
+
+    /// The one non-refusal case reachable through `dispatch` without
+    /// hardware: `RECORDING` maps to `PttStop`, whose handler never touches
+    /// `daemon.recorder` for *construction* -- it only calls `.stop()` on
+    /// whatever is already there -- and the `run_utterance` it spawns (on
+    /// its own thread, same as `PttStop` always does) takes an early,
+    /// hardware-free return when that slot is `None`, exactly as every fake
+    /// daemon's is: it logs a warning, broadcasts `OverlayEvent::Error`, and
+    /// returns without ever calling `Recorder::new`. This test relies on
+    /// nothing about that spawned thread beyond what `PttStop`'s own
+    /// behaviour already guarantees.
+    #[test]
+    fn toggle_stops_and_begins_transcribing_when_recording() {
+        let d = fake_daemon(RECORDING);
+        let r = dispatch(&d, Request::Toggle);
+        assert!(r.ok);
+        assert_eq!(r.state, Some(State::Transcribing));
+    }
+
+    /// Spec 6.1's busy flash, reached through Toggle: a press while the
+    /// previous utterance is still being processed must not open a second
+    /// recording behind it. Invariant 1 protects the text an utterance has
+    /// already produced; nothing protects it from a second recording
+    /// clobbering the pipeline while that text is still on its way out.
+    /// None of these three states reach `start_recording` -- `is_busy` is
+    /// exactly `TRANSCRIBING | NORMALIZING | INJECTING`, and `PttStart`'s own
+    /// match refuses all three before ever falling through to the `_` arm
+    /// that calls it.
+    #[test]
+    fn toggle_refuses_while_an_utterance_is_still_being_processed() {
+        for busy in [TRANSCRIBING, NORMALIZING, INJECTING] {
+            let d = fake_daemon(busy);
+            let r = dispatch(&d, Request::Toggle);
+            assert!(!r.ok, "toggle must be refused in state {busy}");
+            assert_eq!(d.state.load(Ordering::SeqCst), busy, "and must not change the daemon's state");
+        }
+    }
+
+    /// `WARMING` and `FAILED` are both refused by name in `PttStart`'s match,
+    /// before `start_recording` is ever reached.
+    #[test]
+    fn toggle_refuses_while_warming_or_failed_with_a_stated_reason() {
+        let warming = fake_daemon(WARMING);
+        let r = dispatch(&warming, Request::Toggle);
+        assert!(!r.ok);
+        assert_eq!(r.err.as_deref(), Some("warming"));
+        assert_eq!(warming.state.load(Ordering::SeqCst), WARMING, "and must not change the daemon's state");
+
+        let failed = fake_daemon(FAILED);
+        let r = dispatch(&failed, Request::Toggle);
+        assert!(!r.ok);
+        assert!(r.err.is_some());
+        assert_eq!(failed.state.load(Ordering::SeqCst), FAILED, "and must not change the daemon's state");
     }
 }
