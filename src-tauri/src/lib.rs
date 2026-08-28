@@ -7,11 +7,10 @@
 
 mod connection;
 mod replay;
-mod wire;
 
 use tauri::{Emitter, Manager, PhysicalPosition};
 
-use wire::OverlayEvent;
+use owf_core::proto::OverlayEvent;
 
 /// Must match the window `label` in `tauri.conf.json`.
 const OVERLAY_LABEL: &str = "overlay";
@@ -30,9 +29,9 @@ const OVERLAY_HEIGHT_LOGICAL: f64 = 120.0;
 /// edge. Overridable with `OWF_OVERLAY_MARGIN` (logical px) -- spec 12
 /// calls out "position is configurable"; this env var is the M2 mechanism
 /// for that. Wiring it to `[overlay]` in `config.toml` (as the design's
-/// table suggests) is future work: this crate deliberately does not depend
-/// on `owf-core`'s config loader (see `wire.rs`'s module doc for the same
-/// reasoning applied to the wire format).
+/// table suggests) is future work: this crate now depends on `owf-core`
+/// for its wire types (see the module doc above), but does not yet use
+/// `owf-core`'s config loader.
 ///
 /// This is the gap to the *window*, and the window is now a canvas larger
 /// than the capsule drawn on it -- `.stage` in `Overlay.css` insets the

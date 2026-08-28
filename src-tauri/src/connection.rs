@@ -14,7 +14,7 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::wire::{OverlayEvent, SUBSCRIBE_LINE};
+use owf_core::proto::OverlayEvent;
 
 /// First retry delay after a failed connection attempt.
 const INITIAL_BACKOFF: Duration = Duration::from_millis(250);
@@ -28,9 +28,9 @@ const MAX_BACKOFF: Duration = Duration::from_secs(5);
 /// isn't a failure to back off from -- the daemon may already be back.
 const CLEAN_DISCONNECT_RETRY: Duration = Duration::from_millis(250);
 
-/// Mirrors `owf_core::paths::runtime_socket()` without depending on
-/// `owf-core` -- see `wire.rs`'s module doc for why this crate keeps its
-/// own copy of the small pieces of the wire contract it needs.
+/// Mirrors `owf_core::paths::runtime_socket()`. Kept as a small local copy
+/// for this one path rather than pulling in the `paths` module for a
+/// single line.
 fn runtime_socket() -> PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
@@ -68,7 +68,12 @@ fn connect_and_stream(
 ) -> std::io::Result<()> {
     let stream = UnixStream::connect(sock)?;
     let mut writer = stream.try_clone()?;
-    writeln!(writer, "{SUBSCRIBE_LINE}")?;
+    // Byte-identical to the `SUBSCRIBE_LINE` constant this used to send:
+    // `owf_core::proto`'s `requests_serialise_to_the_documented_wire_form`
+    // test pins `serde_json::to_string(&Request::Subscribe)` to exactly
+    // `{"cmd":"subscribe"}`.
+    let subscribe_line = serde_json::to_string(&owf_core::proto::Request::Subscribe)?;
+    writeln!(writer, "{subscribe_line}")?;
     writer.flush()?;
 
     let mut reader = BufReader::new(stream);

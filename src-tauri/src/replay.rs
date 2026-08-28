@@ -3,14 +3,14 @@
 //! without a microphone (M2 plan, Task 5). Enabled with `--replay <path>`.
 //!
 //! The fixture at `src-tauri/fixtures/replay-full.ndjson` exercises every
-//! variant in `wire::OverlayEvent`, including a realistic `recording` burst
-//! with varying levels.
+//! variant in `owf_core::proto::OverlayEvent`, including a realistic
+//! `recording` burst with varying levels.
 
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::time::Duration;
 
-use crate::wire::OverlayEvent;
+use owf_core::proto::OverlayEvent;
 
 /// How long to hold each event on screen before advancing to the next line,
 /// chosen per event kind: state-transition events get long enough to
@@ -189,5 +189,15 @@ mod tests {
         let min = levels.iter().cloned().fold(f32::INFINITY, f32::min);
         let max = levels.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         assert!(max - min > 0.05, "recording burst levels should actually vary");
+    }
+
+    /// Invariant 3 used to say `OverlayEvent` exists in three hand-maintained
+    /// copies. `wire.rs` is gone, so it exists in two: this crate now shares
+    /// `owf-core`'s type outright, and only the TypeScript union in
+    /// `src/Overlay.tsx` is still maintained by hand.
+    #[test]
+    fn this_crate_shares_owf_cores_overlay_event_rather_than_copying_it() {
+        let e: owf_core::proto::OverlayEvent = owf_core::proto::OverlayEvent::Idle;
+        assert_eq!(serde_json::to_string(&e).unwrap(), r#"{"event":"idle"}"#);
     }
 }
