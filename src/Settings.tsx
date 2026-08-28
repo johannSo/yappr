@@ -89,6 +89,7 @@ export default function Settings() {
   // resolves, deliberately distinct from "ready" — the Setup pane must not
   // flash into existence and back out before the very first answer arrives.
   const [setupStatus, setSetupStatus] = useState<SetupStatus | null>(null);
+  const [setupCheckError, setSetupCheckError] = useState<string | null>(null);
   const [installing, setInstalling] = useState(false);
   const [installError, setInstallError] = useState<string | null>(null);
   const [downloads, setDownloads] = useState<Record<string, DownloadProgress>>({});
@@ -140,19 +141,29 @@ export default function Settings() {
   }, [load]);
 
   /// `setup_status()` hashes whatever models are already on disk (up to
-  /// ~1.1 GB), so it can take noticeably longer than `get_config` — a
-  /// separate call for the same reason `list_input_devices` is one: a slow
-  /// or failing check here must not hold up the rest of the window loading.
-  /// A failure is swallowed into `ready: true` deliberately — this pane is
-  /// the one piece of first-run guidance the app can offer; if it cannot
-  /// even tell what's missing, staying out of the way of the rest of the
-  /// settings window is better than blocking on it forever.
+  /// ~1.1 GB the first time it runs, cached after that — see
+  /// `provision.rs`'s module doc), so it can take noticeably longer than
+  /// `get_config` — a separate call for the same reason `list_input_devices`
+  /// is one: a slow check here must not hold up the rest of the window
+  /// loading.
+  ///
+  /// A failure fails *closed*: `ready: false` with the error carried
+  /// separately, not a silent `ready: true` that hides the Setup pane. The
+  /// scenario that matters is a fresh install where `setup_status` itself
+  /// is broken — that is precisely the moment this pane exists to be seen,
+  /// and reporting "ready" here would make the one piece of first-run
+  /// guidance the app can offer disappear exactly when it's needed most.
+  /// `SetupPane` renders `setupCheckError` as its own state (with a retry)
+  /// rather than the normal prerequisite/model lists, which would otherwise
+  /// show a misleading "nothing missing" built from empty placeholder data.
   const checkSetup = useCallback(async () => {
     try {
       const res = (await invoke("setup_status")) as SetupStatus;
       setSetupStatus(res);
-    } catch {
-      setSetupStatus({ ready: true, missing_prerequisites: [], missing_models: [] });
+      setSetupCheckError(null);
+    } catch (e) {
+      setSetupStatus({ ready: false, missing_prerequisites: [], missing_models: [] });
+      setSetupCheckError(String(e));
     }
   }, []);
 
@@ -182,6 +193,12 @@ export default function Settings() {
       } else if (payload.kind === "failed") {
         setInstalling(false);
         setInstallError(payload.message);
+        // An artifact failing partway through does not undo the ones
+        // already promoted before it (`download_all`), so the list of
+        // what's still missing may be shorter than it was. Cheap to refresh
+        // now that the backend caches the unchanged case (see
+        // `provision.rs`) rather than hashing again on every call.
+        void checkSetup();
       }
     });
     return () => {
@@ -193,11 +210,21 @@ export default function Settings() {
     setInstalling(true);
     setInstallError(null);
     setDownloads({});
-    // Resolution/rejection both also arrive as "setup-progress" events
-    // (Finished/Failed), which is what actually drives `installing` and
-    // `installError` back down — this `catch` exists only so a rejected
-    // invoke doesn't surface as an unhandled promise rejection.
-    invoke("run_setup").catch(() => {});
+    invoke("run_setup").catch((e) => {
+      // A failure that happens *inside* `download_all` also arrives as a
+      // "setup-progress" `failed` event, which is what normally drives
+      // `installing`/`installError` back down — this usually just re-sets
+      // state that event already set. But the backend's reentrancy guard
+      // (a second concurrent `run_setup` call) rejects before
+      // `download_all` ever runs, so no event fires for it at all; without
+      // handling the rejection here too, the button would stay stuck on
+      // "Installation läuft…" forever. The functional update keeps a more
+      // specific error the event already reported rather than overwriting
+      // it with this rejection's (possibly identical, possibly generic)
+      // text.
+      setInstalling(false);
+      setInstallError((prev) => prev ?? String(e));
+    });
   }, []);
 
   useEffect(() => {
@@ -532,6 +559,8 @@ export default function Settings() {
                   {!searching && current.id === "setup" && setupStatus && (
                     <SetupPane
                       status={setupStatus}
+                      checkError={setupCheckError}
+                      onRetryCheck={() => void checkSetup()}
                       downloads={downloads}
                       installing={installing}
                       installError={installError}
@@ -710,17 +739,39 @@ function downloadStatusText(progress: DownloadProgress | undefined, installing: 
 /// it gets its own component instead of a `SectionCard`.
 function SetupPane({
   status,
+  checkError,
+  onRetryCheck,
   downloads,
   installing,
   installError,
   onInstall,
 }: {
   status: SetupStatus;
+  /** Set when `setup_status()` itself failed — see `checkSetup`'s doc
+   *  comment for why this fails closed instead of hiding the pane. */
+  checkError: string | null;
+  onRetryCheck: () => void;
   downloads: Record<string, DownloadProgress>;
   installing: boolean;
   installError: string | null;
   onInstall: () => void;
 }) {
+  // `status` is placeholder data (empty lists) whenever `checkError` is set
+  // — rendering the normal "nothing missing" / "here's what's missing"
+  // content from it would be actively misleading, so this replaces the
+  // whole pane rather than adding a banner on top of it.
+  if (checkError) {
+    return (
+      <div className="banner error">
+        <Icon name="warn" className="icon-sm" />
+        <span>Setup-Status konnte nicht ermittelt werden: {checkError}</span>
+        <button type="button" className="ghost" onClick={onRetryCheck}>
+          Erneut versuchen
+        </button>
+      </div>
+    );
+  }
+
   const { missing_prerequisites: missingPrerequisites, missing_models: missingModels } = status;
 
   return (

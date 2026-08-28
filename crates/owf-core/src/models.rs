@@ -179,6 +179,35 @@ pub fn verify(lock: &LockFile) -> Result<Vec<String>> {
     Ok(bad)
 }
 
+/// The pure core of [`looks_present`]: true when every path in `targets`
+/// exists and is non-empty. Split out so it's testable against scratch
+/// paths instead of `hash_target`'s real, `models_dir()`-rooted ones.
+fn all_targets_look_present(targets: &[PathBuf]) -> bool {
+    targets
+        .iter()
+        .all(|t| std::fs::metadata(t).map(|m| m.len() > 0).unwrap_or(false))
+}
+
+/// Fast, non-authoritative stand-in for `verify`: true only when every
+/// artifact's on-disk target exists and is non-empty. Never reads a byte of
+/// any file's contents, so unlike `verify` it cannot catch a corrupted
+/// install that happens to keep the right size -- callers that need that
+/// guarantee (an explicit re-check from the Setup pane, and the moment a
+/// download finishes and its hash is already known) still call `verify`
+/// directly.
+///
+/// Exists because `verify`'s sha256 pass over up to ~1.1 GB of models is too
+/// expensive to run unconditionally every time something needs to ask "is
+/// anything still missing" -- which, once first-run setup is done, is a
+/// question asked on every single subsequent app launch (see
+/// `src-tauri/src/provision.rs`, the one caller). The common case -- a
+/// machine that finished setup once and never touched the models directory
+/// again -- only ever needs this cheap answer.
+pub fn looks_present() -> bool {
+    let targets: Vec<PathBuf> = ARTIFACTS.iter().map(hash_target).collect();
+    all_targets_look_present(&targets)
+}
+
 /// Builds a sibling path by appending `suffix` to `p`'s *whole* file name.
 ///
 /// `Path::with_extension` is the wrong tool for this: its "extension" is
@@ -416,6 +445,54 @@ mod tests {
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
         std::fs::remove_file(&p).ok();
+    }
+
+    /// A fresh, collision-free scratch directory for a single test -- same
+    /// pattern as `src-tauri/src/setup.rs`'s identical helper, needed here
+    /// too since `all_targets_look_present` must never be exercised against
+    /// the real `models_dir()` (already populated with ~1.1 GB of real
+    /// models on a machine that has run setup).
+    fn scratch_dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("owf-models-test-{tag}-{}-{n}", std::process::id()))
+    }
+
+    #[test]
+    fn all_targets_look_present_is_false_for_a_missing_path() {
+        let dir = scratch_dir("missing");
+        let never_created = dir.join("nope.onnx");
+        assert!(!all_targets_look_present(&[never_created]));
+    }
+
+    #[test]
+    fn all_targets_look_present_is_false_for_an_empty_file() {
+        let dir = scratch_dir("empty-file");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("truncated.onnx");
+        std::fs::write(&p, b"").unwrap();
+        assert!(
+            !all_targets_look_present(&[p]),
+            "a zero-byte file must not look present -- a truncated download \
+             left one behind before, and the cheap check exists to catch \
+             exactly that without a full hash"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn all_targets_look_present_is_true_only_when_every_target_is_present() {
+        let dir = scratch_dir("mixed");
+        std::fs::create_dir_all(&dir).unwrap();
+        let present = dir.join("present.onnx");
+        std::fs::write(&present, b"not empty").unwrap();
+        let missing = dir.join("missing.onnx");
+
+        assert!(all_targets_look_present(std::slice::from_ref(&present)));
+        assert!(!all_targets_look_present(&[present, missing]));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
