@@ -20,10 +20,11 @@ fn main() -> Result<()> {
             print!("{}", owf_core::hypr::hypr_config());
             Ok(())
         }
+        ["setup", "--purge-logs"] => purge_logs(),
         _ => {
             eprintln!(
                 "usage: owf-ctl <ptt-start|ptt-stop|cancel|status|reload|subscribe|debug>\n\
-                 \x20      owf-ctl setup [--update-lock|--print-hypr]"
+                 \x20      owf-ctl setup [--update-lock|--print-hypr|--purge-logs]"
             );
             std::process::exit(2);
         }
@@ -393,6 +394,53 @@ fn setup(update_lock: bool) -> Result<()> {
     Ok(())
 }
 
+/// What [`purge_logs_at`] actually did, so [`purge_logs`] can report it
+/// precisely and tests can assert on the outcome directly instead of
+/// scraping printed text.
+enum PurgeOutcome {
+    Removed,
+    AlreadyAbsent,
+}
+
+/// Deletes exactly `path` and reports which of those two things happened,
+/// treating an already-absent file as success rather than an error --
+/// running `--purge-logs` twice in a row (or on a fresh install that has
+/// never rejected anything) must not fail.
+///
+/// Split out from `purge_logs` so this destructive operation is testable
+/// against a scratch path instead of the real
+/// `~/.local/state/openwhisprflow/rejections.jsonl`.
+fn purge_logs_at(path: &Path) -> Result<PurgeOutcome> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(PurgeOutcome::Removed),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(PurgeOutcome::AlreadyAbsent),
+        Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+    }
+}
+
+/// Spec 5.1/9.3: `owf-ctl setup --purge-logs` is the only documented way to
+/// clear the guardrail-rejection dataset (`rejections.jsonl`) -- a
+/// local-only file of raw/cleaned transcript pairs (spec 9.3) that is never
+/// transmitted anywhere, but is still real user dictation content sitting on
+/// disk, so clearing it needs an explicit, deliberate command rather than
+/// happening as a side effect of `setup` or `reload`.
+///
+/// Deletes exactly that one file -- nothing else under
+/// `~/.local/state/openwhisprflow/` (the daemon's own `openwhisprflow.log`,
+/// in particular, is untouched) -- and, being destructive, always says
+/// exactly what it did: the path it removed, or that there was nothing to
+/// remove.
+fn purge_logs() -> Result<()> {
+    let path = owf_core::paths::rejections_file();
+    match purge_logs_at(&path)? {
+        PurgeOutcome::Removed => println!("removed {} -- rejection dataset cleared", path.display()),
+        PurgeOutcome::AlreadyAbsent => {
+            println!("{} does not exist -- nothing to remove", path.display())
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,5 +559,50 @@ mod tests {
         let line = line.expect("crossing the threshold must report even without a total");
         assert!(line.contains("MB"));
         assert!(!line.contains('%'));
+    }
+
+    #[test]
+    fn purge_logs_at_removes_an_existing_file() {
+        let dir = scratch_dir("purge-existing");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rejections.jsonl");
+        std::fs::write(&path, b"{\"ts\":\"...\"}\n").unwrap();
+
+        let outcome = purge_logs_at(&path).unwrap();
+
+        assert!(matches!(outcome, PurgeOutcome::Removed));
+        assert!(!path.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn purge_logs_at_treats_an_already_absent_file_as_success() {
+        // Running `--purge-logs` twice in a row, or on a fresh install that
+        // has never rejected anything, must not be an error.
+        let dir = scratch_dir("purge-absent");
+        let path = dir.join("rejections.jsonl"); // dir doesn't even exist yet
+
+        let outcome = purge_logs_at(&path).unwrap();
+
+        assert!(matches!(outcome, PurgeOutcome::AlreadyAbsent));
+    }
+
+    #[test]
+    fn purge_logs_at_touches_only_the_path_it_is_given() {
+        // Spec 5.1/9.3 names exactly one file (`rejections.jsonl`) as what
+        // `--purge-logs` clears -- proves it doesn't reach for anything else
+        // that might live alongside it, like the daemon's own log file.
+        let dir = scratch_dir("purge-scoped");
+        std::fs::create_dir_all(&dir).unwrap();
+        let rejections = dir.join("rejections.jsonl");
+        let daemon_log = dir.join("openwhisprflow.log");
+        std::fs::write(&rejections, b"{}\n").unwrap();
+        std::fs::write(&daemon_log, b"log line\n").unwrap();
+
+        purge_logs_at(&rejections).unwrap();
+
+        assert!(!rejections.exists());
+        assert!(daemon_log.exists(), "purge_logs_at must not touch any other file");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

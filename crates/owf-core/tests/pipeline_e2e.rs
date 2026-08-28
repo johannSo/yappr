@@ -577,7 +577,8 @@ fn update_reloadable_applies_a_new_guardrail_and_a_new_injector() {
     let permissive =
         Config::from_str("[guardrail]\nmin_word_ratio = 0.0\nmin_overlap_english = 0.0\n").unwrap();
     let new_injector = std::sync::Arc::new(MockInjector::default());
-    p.update_reloadable(permissive, Box::new(FwdInjector(new_injector.clone())));
+    p.update_reloadable(permissive, Box::new(FwdInjector(new_injector.clone())))
+        .expect("this reload does not touch [normalize].enabled and must be accepted");
 
     let after = p.process(&samples(), None).unwrap().expect("some outcome");
     assert!(after.normalized, "the reloaded, permissive guardrail should accept this cleanup");
@@ -587,6 +588,50 @@ fn update_reloadable_applies_a_new_guardrail_and_a_new_injector() {
         vec![after.text],
         "the reloaded injector must receive the post-reload utterance"
     );
+}
+
+/// R15: `[normalize].enabled` gates which `self.normalizer` is live, but
+/// `update_reloadable` never rebuilds `self.normalizer` -- only
+/// `set_normalizer` (Task 3's supervisor) does. Silently accepting a
+/// changed `enabled` here would flip the flag while leaving the *old*
+/// normalizer in place: disabled -> enabled would start calling a
+/// normalizer that was never built for real use (in production, the
+/// `UnavailableNormalizer` stub `warm_up` installs when normalization
+/// starts disabled), which errors on every utterance and quietly falls back
+/// to raw text forever while `reload` reports success -- the same "reports
+/// success, changes nothing" bug fix I5 already removed from `reload` once.
+/// Proves the reload is refused outright, and that refusing it leaves the
+/// pipeline's config and injector completely untouched, not just the one
+/// field that would have been wrong.
+#[test]
+fn update_reloadable_refuses_to_change_normalize_enabled() {
+    let disabled = Config::from_str("[normalize]\nenabled = false\n").unwrap();
+    let old_injector = std::sync::Arc::new(MockInjector::default());
+    let mut p = Pipeline::new(
+        disabled,
+        Box::new(FixedAsr("send the invoice on friday".into())),
+        Box::new(WholeBuffer),
+        Box::new(AlwaysEnglish),
+        Box::new(PanickingNormalizer),
+        Box::new(FwdInjector(old_injector.clone())),
+    );
+
+    let enabled = Config::from_str("[normalize]\nenabled = true\n").unwrap();
+    let new_injector = std::sync::Arc::new(MockInjector::default());
+    let result = p.update_reloadable(enabled, Box::new(FwdInjector(new_injector.clone())));
+
+    let msg = result.expect_err("flipping [normalize].enabled must be refused");
+    assert!(msg.contains("normalize"), "the error should name the offending setting: {msg}");
+    assert!(msg.to_lowercase().contains("restart"), "the error should say a restart is needed: {msg}");
+
+    // Rejected wholesale, not partially applied: the *old* config and
+    // injector must still be in effect, including the untouched
+    // `enabled = false` that keeps `PanickingNormalizer` correctly
+    // unreachable.
+    let out = p.process(&samples(), None).unwrap().expect("some outcome");
+    assert!(!out.normalized, "normalization must still be disabled after a refused reload");
+    assert_eq!(old_injector.injected(), vec![out.text]);
+    assert!(new_injector.injected().is_empty(), "the rejected reload's injector must never be used");
 }
 
 /// Task 3 (llama-server supervision): after a backoff restart reconnects to

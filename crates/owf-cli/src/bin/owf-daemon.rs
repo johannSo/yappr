@@ -1199,16 +1199,21 @@ fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
             // effect. `[asr]`/`[normalize]`'s model- and llama-server-facing
             // settings still require a restart -- swapping ASR/VAD models or
             // reconnecting to a different `llama-server` live remains out of
-            // scope, exactly as before.
+            // scope, exactly as before. R15: that restart requirement used to
+            // be silently violated for exactly one field, `[normalize].enabled`
+            // -- `update_reloadable` now refuses such a reload outright (see
+            // its doc comment for why rebuilding the normalizer here instead
+            // is the wrong fix) rather than reporting success while leaving
+            // the old normalizer in place.
             match Config::load() {
                 Ok(new_cfg) => {
                     let injector = inject::build(&new_cfg.inject);
                     let mut guard = lock_ignoring_poison(&daemon.pipeline);
                     match guard.as_mut() {
-                        Some(p) => {
-                            p.update_reloadable(new_cfg, injector);
-                            Response::ok(State::Idle)
-                        }
+                        Some(p) => match p.update_reloadable(new_cfg, injector) {
+                            Ok(()) => Response::ok(State::Idle),
+                            Err(msg) => Response::err(msg),
+                        },
                         // Unreachable in normal operation: IDLE is only ever
                         // reached once warm-up has populated `pipeline` (see
                         // `process_utterance`'s identical note).

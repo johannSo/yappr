@@ -182,11 +182,54 @@ impl Pipeline {
     /// existing. `asr`, the VAD/ASR models, and the `llama-server` connection
     /// underneath `self.normalizer` are untouched: those require a restart
     /// (see `owf-daemon.rs`'s `Reload` handler), exactly as the comment this
-    /// replaces already said -- the bug was applying that restriction to
-    /// *everything* in `Config`, including the fields that need no restart.
-    pub fn update_reloadable(&mut self, cfg: Config, injector: Box<dyn TextInjector>) {
+    /// replaces already said.
+    ///
+    /// R15: that restriction used to be applied inconsistently. Every other
+    /// `[normalize]` field (`port`, `llama_server_path`, `context_size`, ...)
+    /// really does need a restart and this function already left them alone
+    /// by never reading them again -- but `cfg` was still swapped in
+    /// *wholesale*, so `[normalize].enabled` silently changed anyway even
+    /// though `self.normalizer` (the object that flag actually gates) is not
+    /// rebuilt here. `false` -> `true` on reload used to leave the
+    /// `UnavailableNormalizer` stub `owf-daemon.rs`'s `warm_up` builds when
+    /// normalization starts disabled in place, now called on every
+    /// utterance; it errors, and the pipeline quietly falls back to raw text
+    /// forever -- the exact "reports success, changes nothing" bug fix I5
+    /// already removed from `reload` once, recreated one field at a time.
+    /// This rejects the reload outright instead of pretending it worked,
+    /// leaving `self` completely untouched (`cfg`/`injector` both, not just
+    /// the one that changed) so a caller can't end up with half a reload
+    /// applied.
+    ///
+    /// Rebuilding the normalizer instead -- spawning a fresh `llama-server`
+    /// and connecting an `S1MiniClient` to it, the way `owf-daemon.rs`'s
+    /// Task 3 supervisor already does in `supervise_llama_once` -- was
+    /// considered and rejected here: that supervisor runs on its own
+    /// background thread precisely so a slow health-wait (15 s for a
+    /// restart, 120 s for a cold start, per `RESTART_HEALTH_TIMEOUT`/
+    /// `STARTUP_HEALTH_TIMEOUT`) never blocks anything else. `Reload`, like
+    /// every other socket command, is dispatched synchronously on the
+    /// daemon's single accept-loop thread (see `owf-daemon.rs`'s `main`) --
+    /// rebuilding here would freeze `status`/`ptt-start`/every other
+    /// in-flight command for the entire model-load, a worse regression than
+    /// asking for a restart. Doing it properly would mean teaching `Reload`
+    /// to hand the slow part off to a background thread and answer
+    /// asynchronously, which is a real redesign, not a small fix.
+    pub fn update_reloadable(
+        &mut self,
+        cfg: Config,
+        injector: Box<dyn TextInjector>,
+    ) -> Result<(), String> {
+        if cfg.normalize.enabled != self.cfg.normalize.enabled {
+            return Err(format!(
+                "reload cannot change [normalize].enabled from {} to {} without rebuilding \
+                 llama-server -- restart owf-daemon instead",
+                self.cfg.normalize.enabled, cfg.normalize.enabled
+            ));
+        }
         self.cfg = cfg;
         self.injector = injector;
+        Ok(())
     }
 
     /// Swaps in a freshly (re)connected normalizer -- e.g. after the
