@@ -24,6 +24,8 @@ use owf_core::server::{shutdown, Daemon, EventSink};
 
 /// Must match the window `label` in `tauri.conf.json`.
 const OVERLAY_LABEL: &str = "overlay";
+/// Must match the settings window's `label` in `tauri.conf.json`.
+const SETTINGS_LABEL: &str = "settings";
 /// The transparent *canvas* the capsule is drawn on -- not the capsule's own
 /// size. Spec 12 fixed both at 280 x 72 because the pill was a fixed-size
 /// pill; it is now a surface that springs its width and height to whatever
@@ -98,7 +100,7 @@ impl EventSink for TauriSink {
     /// returning `None` here would mean that declaration was removed, not a
     /// transient failure worth surfacing to the caller of `Request::ShowSettings`.
     fn show_settings(&self) {
-        if let Some(w) = self.0.get_webview_window("settings") {
+        if let Some(w) = self.0.get_webview_window(SETTINGS_LABEL) {
             let _ = w.show();
             let _ = w.set_focus();
         }
@@ -162,7 +164,7 @@ pub fn run() {
             // window outright, and the settings command handlers would then
             // find no "settings" window left to `show`/`set_focus` on the
             // next `Request::ShowSettings`.
-            if let Some(settings) = app.get_webview_window("settings") {
+            if let Some(settings) = app.get_webview_window(SETTINGS_LABEL) {
                 let w = settings.clone();
                 settings.on_window_event(move |e| {
                     if let tauri::WindowEvent::CloseRequested { api, .. } = e {
