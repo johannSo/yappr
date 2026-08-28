@@ -186,6 +186,13 @@ pub trait EventSink: Send + Sync + 'static {
     /// `TauriSink` (`src-tauri/src/lib.rs`), which actually owns a window to
     /// show, needs to override it.
     fn show_settings(&self) {}
+    /// Unregisters the tray item, spec §8 step 3 -- called once from
+    /// [`shutdown`], between killing `llama-server` (step 2) and removing
+    /// the runtime socket/lock (step 4). A no-op default for the same
+    /// reason `show_settings`'s is: the standalone daemon and every test
+    /// sink in this file own no tray to unregister. Only `TauriSink`
+    /// (Task 12, `src-tauri/src/tray.rs`) overrides it.
+    fn unregister_tray(&self) {}
 }
 
 pub struct Daemon {
@@ -912,6 +919,11 @@ pub fn shutdown(daemon: &Daemon) {
     if let Some(r) = lock_ignoring_poison(&daemon.recorder).as_ref() {
         let _ = r.stop();
     }
+    // Spec §8 step 3, between killing `llama-server` (step 2) and removing
+    // the runtime socket/lock (step 4). A no-op for every sink but
+    // `TauriSink`, and idempotent the same way the rest of this function is
+    // -- ksni's own `Handle::shutdown` is just an atomic flag set.
+    daemon.sink.unregister_tray();
     remove_runtime_files(
         &daemon.runtime_socket_path,
         &daemon.runtime_lock_path,

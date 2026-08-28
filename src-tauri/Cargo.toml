@@ -27,6 +27,15 @@ anyhow = "1"
 # For `bench.rs`'s `read_wav_16k_mono`, moved here from `owf-cli` (matches
 # its pinned version).
 hound = "3.5"
+# The tray (`tray.rs`): a native StatusNotifierItem, not Tauri's `tray-icon`
+# feature -- see that module's doc comment for why. Pinned to the 0.2 line
+# deliberately, not the newer 0.3 (zbus 5, async, needs a tokio/async-io
+# runtime): 0.2's `TrayService::spawn` runs on a plain OS thread with the
+# classic blocking `dbus` crate, matching "ksni runs its own event loop on
+# its own thread" with no async runtime to wire up. It also adds nothing
+# new to the dependency graph -- `tao` (already a transitive dependency of
+# `tauri` on Linux) already resolves `dbus 0.9.12`, exactly what 0.2 needs.
+ksni = "0.2"
 
 # Linux-only, and only for one call: WebKitGTK's WebView widget enforces an
 # internal minimum natural size (~200 logical px tall) that GTK's box

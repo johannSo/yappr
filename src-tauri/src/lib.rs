@@ -17,11 +17,12 @@ mod provision;
 mod replay;
 mod settings_cmds;
 mod setup;
+mod tray;
 
 use tauri::{Emitter, Manager, PhysicalPosition};
 
-use owf_core::proto::OverlayEvent;
-use owf_core::server::{shutdown, Daemon, EventSink};
+use owf_core::proto::{OverlayEvent, Request};
+use owf_core::server::{dispatch, shutdown, Daemon, EventSink};
 
 /// Must match the window `label` in `tauri.conf.json`.
 const OVERLAY_LABEL: &str = "overlay";
@@ -81,29 +82,85 @@ fn position_overlay(window: tauri::WebviewWindow) {
     position_bottom_center(&window);
 }
 
+/// Shows and focuses the settings window, which `setup()` below creates
+/// hidden. Best-effort -- the window is always declared in
+/// `tauri.conf.json`, so `get_webview_window` returning `None` here would
+/// mean that declaration was removed, not a transient failure worth
+/// surfacing to whoever asked for Settings to be shown.
+///
+/// Shared by `TauriSink::show_settings` (`Request::ShowSettings`, the CLI's
+/// `--settings` flag's path) and `tray.rs`'s `OwfTray` (left click and its
+/// Einstellungen menu item, which call this directly rather than going
+/// through a `Daemon` -- see `tray.rs`'s module doc for why) so there is
+/// one definition of "show Settings", not two independently-maintained
+/// copies of the same two lines.
+pub(crate) fn show_settings_window(app: &tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window(SETTINGS_LABEL) {
+        let _ = w.show();
+        let _ = w.set_focus();
+    }
+}
+
 /// Forwards every broadcast from the in-process `owf_core::server::Daemon`
-/// to the frontend as a Tauri event -- the overlay's `src/Overlay.tsx`
-/// already listens for `"overlay-event"`; it used to arrive there via
-/// `connection.rs`'s socket client, and now arrives the same way but
-/// without a socket in between.
-struct TauriSink(tauri::AppHandle);
+/// to the frontend as a Tauri event, and to the tray icon -- the overlay's
+/// `src/Overlay.tsx` already listens for `"overlay-event"`; it used to
+/// arrive there via `connection.rs`'s socket client, and now arrives the
+/// same way but without a socket in between. The tray (Task 12) needs the
+/// same broadcasts the overlay does, so this is the one place both are
+/// fed from, rather than a second subscription.
+struct TauriSink {
+    app: tauri::AppHandle,
+    tray: tray::Handle,
+}
 
 impl EventSink for TauriSink {
     fn emit(&self, event: &OverlayEvent) {
-        if let Err(e) = self.0.emit("overlay-event", event) {
+        if let Err(e) = self.app.emit("overlay-event", event) {
             eprintln!("overlay: failed to emit event to the frontend: {e}");
         }
+        self.refresh_tray_icon();
     }
 
-    /// `Request::ShowSettings` (spec §8): shows and focuses the settings
-    /// window, which `setup()` below creates hidden. Best-effort -- the
-    /// window is always declared in `tauri.conf.json`, so `get_webview_window`
-    /// returning `None` here would mean that declaration was removed, not a
-    /// transient failure worth surfacing to the caller of `Request::ShowSettings`.
+    /// `Request::ShowSettings` (spec §8, the CLI's `--settings` flag).
     fn show_settings(&self) {
-        if let Some(w) = self.0.get_webview_window(SETTINGS_LABEL) {
-            let _ = w.show();
-            let _ = w.set_focus();
+        show_settings_window(&self.app);
+    }
+
+    /// Spec §8 step 3.
+    fn unregister_tray(&self) {
+        self.tray.unregister();
+    }
+}
+
+impl TauriSink {
+    /// Pushes the daemon's real current state to the tray icon, rather than
+    /// inferring one from `event` just received -- see `tray.rs`'s module
+    /// doc for why a per-event guess is not good enough here:
+    /// `OverlayEvent::Error` alone cannot tell a one-time fatal warm-up
+    /// failure apart from an ordinary per-utterance "no speech detected",
+    /// and `proto::State::Error`'s own doc comment says the two must stay
+    /// distinct. `Request::Status` is the same dispatch a `--status`/GUI
+    /// caller gets, so the tray can never disagree with them; it only reads
+    /// already-in-memory atomics/mutexes (no I/O, no device enumeration),
+    /// so it is cheap enough to call on every broadcast, from whatever
+    /// background thread is already calling `emit` -- never the Tauri
+    /// event loop (see this struct's one construction site below).
+    ///
+    /// `try_state` rather than `state`: this can in principle run before
+    /// `setup()` has finished calling `app.manage(Server(..))` (warm-up is
+    /// spawned from inside `owf_core::server::start`, before it returns to
+    /// `setup()`), in which case this is a no-op for that one broadcast --
+    /// harmless, since the tray already shows its correct initial
+    /// `State::Warming` icon until the next one arrives.
+    fn refresh_tray_icon(&self) {
+        let Some(server) = self.app.try_state::<settings_cmds::Server>() else {
+            return;
+        };
+        let Some(daemon) = server.0.clone() else {
+            return;
+        };
+        if let Some(state) = dispatch(&daemon, Request::Status).state {
+            self.tray.set_state(state);
         }
     }
 }
@@ -172,12 +229,20 @@ pub fn run() {
             // per `run`'s `RunEvent::Exit` comment below, does *not* cause
             // the app to exit either, since `settings` (hidden, not
             // destroyed) keeps Tauri's window map non-empty. The app quits
-            // only via Beenden/`--quit` (`Request::Quit`) or a future
-            // tray-driven `AppHandle::exit`, never by closing a window.
+            // only via Beenden or `--quit` -- both `Request::Quit` -- never
+            // by closing a window.
             hide_instead_of_close(&window);
             if let Some(settings) = app.get_webview_window(SETTINGS_LABEL) {
                 hide_instead_of_close(&settings);
             }
+
+            // Task 12: registers with `org.kde.StatusNotifierWatcher` and
+            // serves on `ksni`'s own OS thread -- never this one, and never
+            // the Tauri event loop once it starts (see `tray.rs`'s module
+            // doc). Spawned once, unconditionally, before the branch below:
+            // both arms need a `tray::Handle`, and Beenden must exist as a
+            // menu item under `--replay` too (see `tray::OwfTray::quit`).
+            let tray_handle = tray::spawn(app.handle().clone());
 
             // Never on the Tauri event-loop thread: a not-yet-warm daemon,
             // or a slow/looping replay file, must not delay first paint or
@@ -190,17 +255,26 @@ pub fn run() {
                     // it reports a German error instead.
                     app.manage(settings_cmds::Server(None));
                     let handle = app.handle().clone();
+                    let tray_for_replay = tray_handle.clone();
                     let emit = move |event: OverlayEvent| {
                         if let Err(e) = handle.emit("overlay-event", &event) {
                             eprintln!("overlay: failed to emit event to the frontend: {e}");
+                        }
+                        // No `Daemon` to ask `Request::Status` of, unlike
+                        // `TauriSink::refresh_tray_icon` -- see
+                        // `tray::state_from_replay_event`'s doc comment for
+                        // the (honest, sometimes "leave it as-is") fallback.
+                        if let Some(state) = tray::state_from_replay_event(&event) {
+                            tray_for_replay.set_state(state);
                         }
                     };
                     eprintln!("overlay: replaying {} (not connecting to the daemon)", path.display());
                     std::thread::spawn(move || replay::run(&path, emit));
                 }
                 None => {
-                    let (daemon, listener) =
-                        owf_core::server::start(Arc::new(TauriSink(app.handle().clone())))?;
+                    let sink =
+                        Arc::new(TauriSink { app: app.handle().clone(), tray: tray_handle.clone() });
+                    let (daemon, listener) = owf_core::server::start(sink)?;
                     app.manage(daemon.clone());
                     app.manage(settings_cmds::Server(Some(daemon.clone())));
                     // Never on the Tauri event-loop thread -- the accept
@@ -208,15 +282,14 @@ pub fn run() {
                     // window and an unclickable tray.
                     std::thread::spawn(move || owf_core::server::serve(daemon, listener));
 
-                    // Task 15: until the tray exists (Task 12, blocked), a
-                    // hidden settings window that nothing ever shows is a
-                    // dead end for a first-run user with no models yet --
-                    // there is no other way into the Setup pane. This is the
-                    // one thing standing in for that tray click today: a
-                    // one-time check, off the event-loop thread (it hashes
-                    // whatever models are already on disk), that opens
-                    // Settings for exactly the machines that need it and
-                    // does nothing on every other run.
+                    // Now that the tray (Task 12) exists, Einstellungen is
+                    // always reachable -- this is a redundant safety net,
+                    // not the only way in, for a first-run user who has not
+                    // yet noticed the tray icon: a one-time check, off the
+                    // event-loop thread (it hashes whatever models are
+                    // already on disk), that opens Settings for exactly the
+                    // machines that need it and does nothing on every other
+                    // run.
                     let setup_check_handle = app.handle().clone();
                     std::thread::spawn(move || {
                         if !provision::is_ready_or_assume_not("openwhisprflow") {
@@ -236,13 +309,14 @@ pub fn run() {
 
     // Task 10 / spec §8: every exit route must converge on
     // `owf_core::server::shutdown`, not just the signal handler inside
-    // `owf_core::server::start`. `Request::Quit` (Beenden, `--quit`, and
-    // eventually the tray) already calls `shutdown` directly, on its own
-    // background thread, before its `std::process::exit(0)` -- and `exit`
-    // tears the whole process down immediately, on every thread, without
-    // ever giving Tauri's event loop a chance to run this closure. So
-    // `RunEvent::Exit` never fires on that path, and it doesn't need to:
-    // `shutdown` already ran.
+    // `owf_core::server::start`. `Request::Quit` (Beenden -- Task 12's
+    // `tray::OwfTray::quit` dispatches this and nothing else, deliberately,
+    // see that function's doc comment -- and `--quit`) already calls
+    // `shutdown` directly, on its own background thread, before its
+    // `std::process::exit(0)` -- and `exit` tears the whole process down
+    // immediately, on every thread, without ever giving Tauri's event loop a
+    // chance to run this closure. So `RunEvent::Exit` never fires on that
+    // path, and it doesn't need to: `shutdown` already ran.
     //
     // This hook exists for every *other* way the event loop could end.
     // Tauri's own default reaction, `RunEvent::ExitRequested` -> `Exit`,
@@ -253,10 +327,9 @@ pub fn run() {
     // path cannot currently fire at all; a compositor-issued close of either
     // window is a no-op for the app's lifetime by design (see the comment on
     // those calls). What this hook actually guards is a *programmatic* exit
-    // -- `AppHandle::exit`/`restart`, which a future tray-driven Beenden
-    // (Task 12) may call directly instead of routing through
-    // `Request::Quit` -- which also raises `RunEvent::Exit` and has no
-    // `Request` for `shutdown` to hang off. Kept for that case: `shutdown`
+    // -- `AppHandle::exit`/`restart`, which nothing in this codebase calls
+    // today but which would also raise `RunEvent::Exit` with no `Request`
+    // for `shutdown` to hang off. Kept for that case: `shutdown`
     // is idempotent (`SHUTTING_DOWN`), so a hook that never fires today costs
     // nothing, and one that starts firing tomorrow (e.g. if a window is ever
     // allowed to actually close) is exactly the safety net Task 10 exists
