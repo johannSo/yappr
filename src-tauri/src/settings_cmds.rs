@@ -156,7 +156,10 @@ mod tests {
     #[test]
     fn a_rejected_response_becomes_an_err_carrying_the_daemons_reason() {
         let resp = Response::err("changing settings requires idle");
-        assert_eq!(to_json(resp).unwrap_err(), "changing settings requires idle");
+        assert_eq!(
+            to_json(resp).unwrap_err(),
+            "changing settings requires idle"
+        );
     }
 
     /// `Response::err` always sets a reason in production, but `to_json`'s
