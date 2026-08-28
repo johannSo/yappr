@@ -268,6 +268,18 @@ mod tests {
         assert!(serde_json::from_str::<Request>(r#"{"cmd":"launch-missiles"}"#).is_err());
     }
 
+    /// A malformed or unknown line must not panic the parser -- both
+    /// `src-tauri/src/connection.rs` and `replay.rs`'s `load()` rely on this
+    /// to drop an unrecognised event line and keep listening, rather than
+    /// crashing the overlay. Restored after `src-tauri/src/wire.rs` (whose
+    /// own copy of this assertion, `unknown_event_tag_fails_to_parse_rather_than_panicking`,
+    /// was deleted along with the file) was found to have no equivalent left
+    /// anywhere in the workspace.
+    #[test]
+    fn an_unknown_overlay_event_tag_fails_to_parse() {
+        assert!(serde_json::from_str::<OverlayEvent>(r#"{"event":"levitating"}"#).is_err());
+    }
+
     #[test]
     fn states_serialise_lowercase() {
         assert_eq!(serde_json::to_string(&State::Warming).unwrap(), r#""warming""#);
