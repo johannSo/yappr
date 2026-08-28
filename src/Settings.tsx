@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { AnimatePresence, MotionConfig, motion } from "motion/react";
 import { Icon } from "./settings/icons";
 import { Commit, Device, Field, ResetButton, TableEditor } from "./settings/controls";
@@ -7,6 +8,7 @@ import {
   Json,
   RESTART_SECTIONS,
   SECTION_NOTES,
+  SETUP_CATEGORY,
   Section,
   categorize,
   jsonEqual,
@@ -44,6 +46,31 @@ const GLIDE = { type: "spring", bounce: 0.18, duration: 0.42 } as const;
 
 type SaveState = "clean" | "pending" | "saving" | "saved" | "error";
 
+/// A model `setup_status()`/`run_setup()` reported missing — `provision.rs`'s
+/// `MissingModel`, unchanged across the wire.
+type MissingModel = { name: string; display: string };
+
+/// `provision::setup_status`'s response shape, and also what `run_setup`
+/// resolves to once provisioning finishes.
+type SetupStatus = {
+  ready: boolean;
+  missing_prerequisites: string[];
+  missing_models: MissingModel[];
+};
+
+/// One artifact's live download progress, keyed by `MissingModel.name` — kept
+/// only for artifacts a `"setup-progress"` event has actually mentioned, so a
+/// model nothing has reported on yet renders as "fehlt" rather than a bar
+/// stuck at 0%.
+type DownloadProgress = { display: string; done: number; total: number | null };
+
+/// `provision::SetupProgress`, unchanged across the wire (`#[serde(tag =
+/// "kind")]` is what makes the discriminated union below work).
+type SetupProgressEvent =
+  | { kind: "downloading"; name: string; display: string; done: number; total: number | null }
+  | { kind: "finished" }
+  | { kind: "failed"; message: string };
+
 export default function Settings() {
   const [config, setConfig] = useState<Section | null>(null);
   const [defaults, setDefaults] = useState<Section | null>(null);
@@ -57,6 +84,14 @@ export default function Settings() {
   const [notice, setNotice] = useState<string | null>(null);
   const [saveState, setSaveState] = useState<SaveState>("clean");
   const [loading, setLoading] = useState(true);
+
+  // Task 15: first-run Setup. `setupStatus` is `null` until the first check
+  // resolves, deliberately distinct from "ready" — the Setup pane must not
+  // flash into existence and back out before the very first answer arrives.
+  const [setupStatus, setSetupStatus] = useState<SetupStatus | null>(null);
+  const [installing, setInstalling] = useState(false);
+  const [installError, setInstallError] = useState<string | null>(null);
+  const [downloads, setDownloads] = useState<Record<string, DownloadProgress>>({});
 
   // The save path reads the config through a ref: a debounced write fires long
   // after the render that scheduled it, and must send what the config looks
@@ -103,6 +138,67 @@ export default function Settings() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  /// `setup_status()` hashes whatever models are already on disk (up to
+  /// ~1.1 GB), so it can take noticeably longer than `get_config` — a
+  /// separate call for the same reason `list_input_devices` is one: a slow
+  /// or failing check here must not hold up the rest of the window loading.
+  /// A failure is swallowed into `ready: true` deliberately — this pane is
+  /// the one piece of first-run guidance the app can offer; if it cannot
+  /// even tell what's missing, staying out of the way of the rest of the
+  /// settings window is better than blocking on it forever.
+  const checkSetup = useCallback(async () => {
+    try {
+      const res = (await invoke("setup_status")) as SetupStatus;
+      setSetupStatus(res);
+    } catch {
+      setSetupStatus({ ready: true, missing_prerequisites: [], missing_models: [] });
+    }
+  }, []);
+
+  useEffect(() => {
+    void checkSetup();
+  }, [checkSetup]);
+
+  // Listens for `run_setup`'s progress for the life of the window, not just
+  // while the Setup pane is on screen — a user who switches to another pane
+  // mid-download must not lose the running total, and `Finished`/`Failed`
+  // still need to land on `installing`/`notice` wherever they arrive.
+  useEffect(() => {
+    const unlistenPromise = listen<SetupProgressEvent>("setup-progress", (event) => {
+      const payload = event.payload;
+      if (payload.kind === "downloading") {
+        setDownloads((prev) => ({
+          ...prev,
+          [payload.name]: { display: payload.display, done: payload.done, total: payload.total },
+        }));
+      } else if (payload.kind === "finished") {
+        setInstalling(false);
+        setDownloads({});
+        setNotice(
+          "Installation abgeschlossen. Starte OpenWhisprFlow neu, damit die neuen Modelle geladen werden.",
+        );
+        void checkSetup();
+      } else if (payload.kind === "failed") {
+        setInstalling(false);
+        setInstallError(payload.message);
+      }
+    });
+    return () => {
+      unlistenPromise.then((unlisten) => unlisten());
+    };
+  }, [checkSetup]);
+
+  const startInstall = useCallback(() => {
+    setInstalling(true);
+    setInstallError(null);
+    setDownloads({});
+    // Resolution/rejection both also arrive as "setup-progress" events
+    // (Finished/Failed), which is what actually drives `installing` and
+    // `installError` back down — this `catch` exists only so a rejected
+    // invoke doesn't surface as an unhandled promise rejection.
+    invoke("run_setup").catch(() => {});
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -207,10 +303,14 @@ export default function Settings() {
     [schedule],
   );
 
-  const categories = useMemo(
-    () => (config ? categorize(Object.keys(config)) : []),
-    [config],
-  );
+  const categories = useMemo(() => {
+    const base = config ? categorize(Object.keys(config)) : [];
+    // Prepended, not appended: a first-run user's very first pane should be
+    // the one telling them what's missing, not the last thing they scroll
+    // past to find it. Disappears on its own once `setupStatus.ready` flips
+    // true — see `SETUP_CATEGORY`'s doc comment.
+    return setupStatus && !setupStatus.ready ? [SETUP_CATEGORY, ...base] : base;
+  }, [config, setupStatus]);
 
   // The first pane, until the user picks one. Resolved rather than stored so a
   // config whose sections changed under us cannot leave the sidebar pointing
@@ -424,6 +524,20 @@ export default function Settings() {
                   animate={{ opacity: 1, y: 0 }}
                   transition={SETTLE}
                 >
+                  {/* Not config-backed (see `SETUP_CATEGORY`'s doc comment),
+                      so it renders alongside `shown.map` below rather than
+                      through it — `current.sections` is empty for this
+                      category, so that map contributes nothing here on its
+                      own. */}
+                  {!searching && current.id === "setup" && setupStatus && (
+                    <SetupPane
+                      status={setupStatus}
+                      downloads={downloads}
+                      installing={installing}
+                      installError={installError}
+                      onInstall={startInstall}
+                    />
+                  )}
                   {shown.map(({ section, keys }) => (
                     <SectionCard
                       key={section}
@@ -574,5 +688,135 @@ function SectionCard({
         )}
       </div>
     </section>
+  );
+}
+
+/// Renders one download's progress as a fraction of a known total, or (no
+/// `Content-Length` header) as a raw MB count climbing with no visible
+/// ceiling — the same fallback `openwhisprflow --update-lock`'s own terminal
+/// output uses for the same reason (`setup.rs`'s `progress_line`).
+function downloadStatusText(progress: DownloadProgress | undefined, installing: boolean): string {
+  if (!progress) return installing ? "wartet…" : "fehlt";
+  if (progress.total !== null) {
+    const pct = Math.min(100, Math.round((progress.done / progress.total) * 100));
+    return `${pct} %`;
+  }
+  return `${Math.round(progress.done / (1 << 20))} MB`;
+}
+
+/// The first-run Setup pane (spec §7, Task 15): the one pane in this window
+/// that renders from `setup_status()`/`run_setup()` rather than from
+/// `config.toml` — see `SETUP_CATEGORY`'s doc comment in `schema.ts` for why
+/// it gets its own component instead of a `SectionCard`.
+function SetupPane({
+  status,
+  downloads,
+  installing,
+  installError,
+  onInstall,
+}: {
+  status: SetupStatus;
+  downloads: Record<string, DownloadProgress>;
+  installing: boolean;
+  installError: string | null;
+  onInstall: () => void;
+}) {
+  const { missing_prerequisites: missingPrerequisites, missing_models: missingModels } = status;
+
+  return (
+    <>
+      <section className="group">
+        <div className="group-head">
+          <h2>Voraussetzungen</h2>
+        </div>
+        <p className="note">
+          Diese Programme kommen nicht von OpenWhisprFlow selbst und müssen von Hand
+          installiert werden.
+        </p>
+        <div className="card">
+          {missingPrerequisites.length === 0 ? (
+            <div className="setup-row ok">
+              <Icon name="check" className="icon-sm" />
+              <span>Alle benötigten Programme sind installiert.</span>
+            </div>
+          ) : (
+            missingPrerequisites.map((pkg) => (
+              <div className="setup-row missing" key={pkg}>
+                <Icon name="warn" className="icon-sm" />
+                <span>{pkg} fehlt.</span>
+              </div>
+            ))
+          )}
+        </div>
+        {missingPrerequisites.length > 0 && (
+          <p className="setup-command">
+            Installieren mit: <code>sudo pacman -S {missingPrerequisites.join(" ")}</code>
+          </p>
+        )}
+      </section>
+
+      <section className="group">
+        <div className="group-head">
+          <h2>Modelle</h2>
+        </div>
+        <p className="note">
+          Spracherkennung, Erkennung von Sprachpausen und Nachbearbeitung laufen lokal
+          und brauchen dafür diese Modelle — insgesamt etwa 1,1 GB.
+        </p>
+        <div className="card">
+          {missingModels.length === 0 ? (
+            <div className="setup-row ok">
+              <Icon name="check" className="icon-sm" />
+              <span>Alle Modelle sind vorhanden.</span>
+            </div>
+          ) : (
+            missingModels.map((m) => {
+              const progress = downloads[m.name];
+              const done = !!progress && progress.total !== null && progress.done >= progress.total;
+              return (
+                <div className={`setup-row${done ? " ok" : " missing"}`} key={m.name}>
+                  <Icon name={done ? "check" : "warn"} className="icon-sm" />
+                  <div className="setup-row__body">
+                    <div className="setup-row__head">
+                      <span>{m.display}</span>
+                      <span className="setup-row__status">
+                        {downloadStatusText(progress, installing)}
+                      </span>
+                    </div>
+                    {progress && !done && (
+                      <div className="progressbar">
+                        <div
+                          className="progressbar__fill"
+                          style={{
+                            width:
+                              progress.total !== null
+                                ? `${Math.min(100, (progress.done / progress.total) * 100)}%`
+                                : "35%",
+                          }}
+                        />
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            })
+          )}
+        </div>
+        {missingModels.length > 0 && (
+          <div className="setup-actions">
+            <button type="button" className="add" onClick={onInstall} disabled={installing}>
+              {installing ? "Installation läuft…" : "Installation starten"}
+            </button>
+          </div>
+        )}
+      </section>
+
+      {installError && (
+        <div className="banner error">
+          <Icon name="warn" className="icon-sm" />
+          <span>{installError}</span>
+        </div>
+      )}
+    </>
   );
 }

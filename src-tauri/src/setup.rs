@@ -118,21 +118,27 @@ fn print_debug_summary(
     );
 }
 
-/// Carries the progress-reporting state from one `progress_line` call to the
-/// next: how many bytes had been reported as of the last line printed, and
-/// for which URL that count applies.
-#[derive(Default)]
-struct ProgressState {
+/// Carries the progress-reporting state from one report decision to the
+/// next: how many bytes had been reported as of the last report, and for
+/// which URL that count applies. Shared by every consumer of
+/// `download_all`'s progress callback -- the CLI's `progress_line` below and
+/// the Setup pane's structured `"setup-progress"` events in `provision.rs`
+/// -- so the underflow fix `crosses_report_threshold` documents lives in
+/// exactly one place instead of being re-derived (and possibly re-broken) by
+/// each caller.
+#[derive(Default, Clone)]
+pub(crate) struct ProgressState {
     last: u64,
     last_url: String,
 }
 
-/// Decides whether a progress line should be printed for this update, and
-/// returns the state to carry into the next call.
+/// Decides whether *any* consumer of `download_all`'s progress callback
+/// should report now, and returns the state to carry into the next call.
 ///
 /// Reports roughly every 8 MB within a single artifact's download, plus
 /// always on completion (`Some(done) == total`), so a 622 MB download does
-/// not spam the terminal.
+/// not spam whatever is consuming these reports (a terminal, or a Tauri
+/// event channel).
 ///
 /// A new `url` resets the "since last report" byte count to 0 instead of
 /// comparing the new download's `done` (which starts back at 0) against the
@@ -141,34 +147,39 @@ struct ProgressState {
 /// `u64` and panicked partway through a real ~1.1 GB, three-artifact run the
 /// first time `download_all` moved from the ~487 MB parakeet download to the
 /// ~629 KB silero download.
+pub(crate) fn crosses_report_threshold(
+    url: &str,
+    done: u64,
+    total: Option<u64>,
+    state: ProgressState,
+) -> (bool, ProgressState) {
+    let last = if url == state.last_url { state.last } else { 0 };
+    let report = done - last > 8 << 20 || Some(done) == total;
+    let new_last = if report { done } else { last };
+    (
+        report,
+        ProgressState {
+            last: new_last,
+            last_url: url.to_string(),
+        },
+    )
+}
+
+/// Decides whether a progress line should be printed for this update, and
+/// returns the state to carry into the next call. The CLI-specific half
+/// (formatting) of `crosses_report_threshold`'s decision.
 fn progress_line(
     url: &str,
     done: u64,
     total: Option<u64>,
     state: ProgressState,
 ) -> (Option<String>, ProgressState) {
-    let last = if url == state.last_url { state.last } else { 0 };
-    if done - last > 8 << 20 || Some(done) == total {
-        let line = match total {
-            Some(t) => format!("  {:>5.1}%  {}", 100.0 * done as f64 / t as f64, url),
-            None => format!("  {} MB  {}", done >> 20, url),
-        };
-        (
-            Some(line),
-            ProgressState {
-                last: done,
-                last_url: url.to_string(),
-            },
-        )
-    } else {
-        (
-            None,
-            ProgressState {
-                last,
-                last_url: url.to_string(),
-            },
-        )
-    }
+    let (report, new_state) = crosses_report_threshold(url, done, total, state);
+    let line = report.then(|| match total {
+        Some(t) => format!("  {:>5.1}%  {}", 100.0 * done as f64 / t as f64, url),
+        None => format!("  {} MB  {}", done >> 20, url),
+    });
+    (line, new_state)
 }
 
 /// Prints one `<label>  <name>  (<why>)` line, columns aligned so a run of
@@ -186,7 +197,12 @@ fn status_line(label: &str, name: &str, why: &str) {
 /// failing obscurely later -- e.g. `wtype` missing at dictation time, or
 /// (see below) `llama-server` starting but refusing every model with
 /// ggml's "no backends are loaded" error.
-fn check_prerequisites() -> Vec<&'static str> {
+///
+/// `pub(crate)`: the Setup pane's `setup_status` command (`provision.rs`)
+/// reports this alongside model presence, which is a separate question
+/// (`owf_core::models::verify`) -- neither subsumes the other, so both are
+/// checked and reported independently rather than duplicating either check.
+pub(crate) fn check_prerequisites() -> Vec<&'static str> {
     // (binary, why it is needed, pacman package that provides it, fatal)
     let checks = [
         ("llama-server", "S1-mini normalization", "llama-cpp", true),

@@ -13,6 +13,7 @@ mod bench;
 pub mod cli;
 pub mod client;
 mod client_stream;
+mod provision;
 mod replay;
 mod settings_cmds;
 mod setup;
@@ -149,7 +150,9 @@ pub fn run() {
             overlay_ready,
             settings_cmds::get_config,
             settings_cmds::set_config,
-            settings_cmds::list_input_devices
+            settings_cmds::list_input_devices,
+            provision::setup_status,
+            provision::run_setup
         ])
         .setup(move |app| {
             let window = app
@@ -202,6 +205,25 @@ pub fn run() {
                     // loop blocks, and a blocked event loop is a frozen
                     // window and an unclickable tray.
                     std::thread::spawn(move || owf_core::server::serve(daemon, listener));
+
+                    // Task 15: until the tray exists (Task 12, blocked), a
+                    // hidden settings window that nothing ever shows is a
+                    // dead end for a first-run user with no models yet --
+                    // there is no other way into the Setup pane. This is the
+                    // one thing standing in for that tray click today: a
+                    // one-time check, off the event-loop thread (it hashes
+                    // whatever models are already on disk), that opens
+                    // Settings for exactly the machines that need it and
+                    // does nothing on every other run.
+                    let setup_check_handle = app.handle().clone();
+                    std::thread::spawn(move || {
+                        if !provision::is_ready_or_assume_not("openwhisprflow") {
+                            if let Some(w) = setup_check_handle.get_webview_window(SETTINGS_LABEL) {
+                                let _ = w.show();
+                                let _ = w.set_focus();
+                            }
+                        }
+                    });
                 }
             }
 

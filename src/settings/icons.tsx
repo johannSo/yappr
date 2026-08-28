@@ -81,6 +81,15 @@ const PATHS: Record<string, ReactNode> = {
       <path d="M15.8 15.8 21 21" />
     </>
   ),
+  /// The Setup pane's sidebar glyph: an arrow landing in a tray, read as
+  /// "fetch and place" rather than the plain down-arrow `chevron` already
+  /// means "expand this".
+  download: (
+    <>
+      <path d="M12 3.5v11M7.5 10l4.5 4.5 4.5-4.5" />
+      <path d="M4.5 18.5h15" />
+    </>
+  ),
 };
 
 export function Icon({ name, className }: Props) {

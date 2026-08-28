@@ -1492,7 +1492,20 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
             }
             match current {
                 WARMING => Response::err("warming"),
-                FAILED => Response::err("daemon failed to start; see logs"),
+                // The real stored reason, not a generic pointer to logs: on a
+                // fresh install with no models yet, this is
+                // `SherpaTranscriber`/`SileroTrimmer`'s own "model paths"
+                // error, which is what tells a `--toggle` user to open the
+                // Setup pane rather than a log file. `Status` already does
+                // the same thing (`r.err = daemon.fatal_error`); this just
+                // stops `ptt-start`'s own refusal from being the one place
+                // that still hides it.
+                FAILED => {
+                    let reason = lock_ignoring_poison(&daemon.fatal_error)
+                        .clone()
+                        .unwrap_or_else(|| "see logs".to_string());
+                    Response::err(format!("daemon failed to start: {reason}"))
+                }
                 RECORDING => Response::ok(State::Recording), // idempotent
                 s if is_busy(s) => {
                     // Spec 6.1: `ptt-start` while Transcribing/Normalizing/
@@ -3030,6 +3043,56 @@ mod tests {
 
         let ptt_start = dispatch(&daemon, Request::PttStart);
         assert!(!ptt_start.ok, "ptt-start must be rejected against a daemon with no working pipeline");
+    }
+
+    /// Task 15: on a fresh install with no models yet, `warm_up` fails with
+    /// `SherpaTranscriber`/`SileroTrimmer`'s own "model paths" error and the
+    /// daemon lands in `FAILED` with that exact message stored -- see
+    /// `crates/owf-core/src/asr.rs`'s `SherpaTranscriber::new`. `ptt-start`
+    /// (and therefore `--toggle`, which delegates to it for every
+    /// non-`RECORDING` state) must state that real reason, not the generic
+    /// "see logs" `snapshot_event` falls back to when no reason was ever
+    /// stored -- a user's only interface to this is a shortcut with no
+    /// terminal, and "see logs" is not a stated reason to someone who has no
+    /// logs open.
+    #[test]
+    fn ptt_start_against_a_failed_daemon_states_the_real_reason_not_a_generic_one() {
+        let daemon = fake_daemon(FAILED);
+        *lock_ignoring_poison(&daemon.fatal_error) = Some(
+            "OfflineRecognizer::create returned None — check model paths and model_type"
+                .to_string(),
+        );
+
+        let resp = dispatch(&daemon, Request::PttStart);
+
+        assert!(!resp.ok);
+        assert_eq!(
+            resp.err.as_deref(),
+            Some(
+                "daemon failed to start: OfflineRecognizer::create returned None — check model paths and model_type"
+            )
+        );
+
+        // Toggle delegates to PttStart for every state but RECORDING
+        // (`toggle_target`), so the same stated reason must reach a
+        // `--toggle` invocation too, not just a direct `ptt-start`.
+        let toggled = dispatch(&daemon, Request::Toggle);
+        assert_eq!(toggled.err, resp.err);
+    }
+
+    /// The fallback half of the same change: `fatal_error` is always
+    /// populated by the time `FAILED` is externally observable (see
+    /// `snapshot_event`'s doc comment), but this keeps `ptt-start`'s own
+    /// formatting total rather than panicking or printing "None" if that
+    /// were ever not true.
+    #[test]
+    fn ptt_start_against_a_failed_daemon_with_no_stored_reason_falls_back_gracefully() {
+        let daemon = fake_daemon(FAILED);
+
+        let resp = dispatch(&daemon, Request::PttStart);
+
+        assert!(!resp.ok);
+        assert_eq!(resp.err.as_deref(), Some("daemon failed to start: see logs"));
     }
 
     /// The specific gap Work Item 3 names: a fatal warm-up failure used to

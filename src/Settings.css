@@ -989,6 +989,118 @@ button:disabled {
   }
 }
 
+/* ------------------------------------------------------------- setup pane
+
+   Rows shaped like `.row` (same padding rhythm, same inset hairline between
+   siblings, same corner rounding on the first/last child) but not `.row`
+   itself: nothing here has a control column or a reset gutter, so reusing
+   `.row-head`'s grid would just leave both empty. */
+
+.setup-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  min-height: 2.875rem;
+  padding: 0.5625rem 1rem;
+}
+
+.setup-row + .setup-row::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 1rem;
+  right: 0;
+  height: 1px;
+  background: var(--hairline);
+}
+
+.setup-row:first-child {
+  border-radius: var(--radius) var(--radius) 0 0;
+}
+
+.setup-row:last-child {
+  border-radius: 0 0 var(--radius) var(--radius);
+}
+
+.setup-row:only-child {
+  border-radius: var(--radius);
+}
+
+.setup-row .icon-sm {
+  flex: none;
+}
+
+.setup-row.ok {
+  color: var(--ok);
+}
+
+/* Amber, not red: a missing prerequisite or model is a step not yet taken,
+   not a failure -- `--danger-ink` stays reserved for `.banner.error`, where
+   something actually went wrong. */
+.setup-row.missing {
+  color: var(--warn-ink);
+}
+
+.setup-row__body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.375rem;
+}
+
+.setup-row__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+  /* No color of its own: inherits `--text`/`--warn-ink`/`--ok` from
+     `.setup-row`'s own state, the same way its icon does. */
+}
+
+.setup-row__status {
+  flex: none;
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.progressbar {
+  height: 0.3125rem;
+  border-radius: 999px;
+  background: var(--sunk);
+  overflow: hidden;
+}
+
+.progressbar__fill {
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 0.2s ease;
+}
+
+.setup-actions {
+  display: flex;
+  justify-content: flex-end;
+  padding: 0.75rem 1rem;
+  border-top: 1px solid var(--hairline);
+}
+
+.setup-command {
+  margin: 0.5rem 0.25rem 0;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.setup-command code {
+  font-family: ui-monospace, "SFMono-Regular", monospace;
+  font-size: 0.9em;
+  background: var(--sunk);
+  border-radius: 0.25rem;
+  padding: 0 0.3125rem;
+}
+
 /* ---------------------------------------------------------------- narrower
 
    The window opens at 940 px but this is a tiling compositor, so a narrower
@@ -1092,7 +1204,9 @@ button:disabled {
 
   .muted,
   .note,
-  .topbar__count {
+  .topbar__count,
+  .setup-row__status,
+  .setup-command {
     color: var(--text);
   }
 }
