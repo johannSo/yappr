@@ -193,13 +193,30 @@ fn can_build_at(device: &cpal::Device, channels: usize, rate: u32) -> bool {
         .is_ok()
 }
 
+/// The value `[audio] device` takes to mean "whatever the host calls the
+/// default input". Not a device name: the default device's own name is not
+/// present in `input_devices()` at all on this machine.
+pub const DEFAULT_DEVICE: &str = "default";
+
+/// The single string that identifies a device, both to `[audio] device` in
+/// config.toml and to the settings GUI's dropdown.
+///
+/// Shared by `setup_device` (which matches against it) and
+/// `list_input_devices` (which offers it), because they must agree exactly: a
+/// GUI that writes a name the daemon cannot resolve produces a config that
+/// fails at the next dictation, which is strictly worse than editing the TOML
+/// by hand. One function means they cannot drift.
+fn device_key(device: &cpal::Device) -> String {
+    device.to_string()
+}
+
 fn setup_device(cfg: &AudioConfig) -> Result<DeviceSetup> {
     let host = cpal::default_host();
-    let device = if cfg.device == "default" {
+    let device = if cfg.device == DEFAULT_DEVICE {
         host.default_input_device().context("no default input device")?
     } else {
         host.input_devices()?
-            .find(|d| d.to_string() == cfg.device)
+            .find(|d| device_key(d) == cfg.device)
             .with_context(|| format!("input device not found: {}", cfg.device))?
     };
 
@@ -226,7 +243,7 @@ fn setup_device(cfg: &AudioConfig) -> Result<DeviceSetup> {
     };
 
     tracing::info!(rate, channels, device = %device, "input device selected");
-    let name = device.to_string();
+    let name = device_key(&device);
 
     Ok(DeviceSetup {
         max_samples_native: rate as usize * channels * cfg.max_seconds as usize,
@@ -363,6 +380,79 @@ fn audio_thread_main(
     // let `stream` (if any) drop right here, on this thread.
 }
 
+/// Runs `f` on a worker thread and gives up after `timeout`.
+///
+/// Device enumeration is the reason this exists. Invariant 6 -- every
+/// subprocess call goes through `procutil::run_with_timeout` -- was written
+/// after a hung `wtype` wedged the daemon's single-threaded accept loop
+/// forever. `cpal` enumeration on a sick ALSA or PipeWire stack is the same
+/// hazard reached by a different route: it is an in-process call, so
+/// `procutil` cannot help, but it can block just as indefinitely.
+///
+/// The worker thread is deliberately not killed on timeout -- there is no safe
+/// way to do that -- it is abandoned. The daemon stays responsive, and a
+/// wedged enumeration costs one leaked thread rather than the whole process.
+fn with_timeout<T: Send + 'static>(
+    timeout: Duration,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(timeout)
+        .map_err(|_| anyhow::anyhow!("timed out after {timeout:?}"))
+}
+
+/// The input devices `cpal` can see, shaped for the settings GUI's dropdown.
+///
+/// The raw enumeration is not directly usable, as measured on this machine:
+///
+/// - The host default reports its name as `Default Audio Device`, and that
+///   name appears nowhere in `input_devices()`. Selecting it by name is
+///   therefore impossible -- but `[audio] device` already special-cases the
+///   literal `"default"`, so that is what the first row offers.
+/// - Four distinct devices came back with the identical name
+///   `HDA Intel PCH, ALC3271 Analog`. Since `setup_device` resolves a name by
+///   taking the *first* match, the duplicates are not separately selectable by
+///   any config this GUI could write, so offering four identical rows would
+///   promise a choice that does not exist.
+pub fn list_input_devices(timeout: Duration) -> Result<Vec<crate::proto::InputDevice>> {
+    with_timeout(timeout, || {
+        let host = cpal::default_host();
+        let names = host.input_devices()?.map(|d| device_key(&d)).collect();
+        Ok(shape_device_list(names))
+    })?
+}
+
+/// The pure half of [`list_input_devices`]: prepend the host-default row and
+/// drop unselectable duplicates. Separated so the shaping rules are testable
+/// without a sound card.
+///
+/// Deliberately does *not* report whether a device can be opened. That probe
+/// existed and was removed: measured from inside the daemon, it reported
+/// `false` for every device -- including the one dictation was working on --
+/// because the daemon holds its own recorder open, and a second stream on the
+/// same device from the same process fails. From a standalone process the same
+/// probe reported `true` for all of them. A flag that is wrong precisely for
+/// the device the user is using would grey out their working microphone, so
+/// there is no flag. A device that cannot be opened fails at the next
+/// dictation, with the error the daemon already surfaces for that.
+fn shape_device_list(enumerated: Vec<String>) -> Vec<crate::proto::InputDevice> {
+    let mut out = vec![crate::proto::InputDevice {
+        name: DEFAULT_DEVICE.to_string(),
+        is_default: true,
+    }];
+    let mut seen = std::collections::HashSet::new();
+    for name in enumerated {
+        if name == DEFAULT_DEVICE || !seen.insert(name.clone()) {
+            continue;
+        }
+        out.push(crate::proto::InputDevice { name, is_default: false });
+    }
+    out
+}
+
 /// Captures microphone audio and always yields 16 kHz mono `f32` samples.
 ///
 /// Everything cpal-related — the host, the device, and the `Stream` — lives
@@ -462,6 +552,61 @@ impl Drop for Recorder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn names(list: &[crate::proto::InputDevice]) -> Vec<&str> {
+        list.iter().map(|d| d.name.as_str()).collect()
+    }
+
+    /// `[audio] device = "default"` is the only way to say "host default",
+    /// because the default device's own name is absent from the enumeration.
+    /// The dropdown must therefore always offer it, even on a machine with no
+    /// input devices at all.
+    #[test]
+    fn the_device_list_always_opens_with_the_host_default() {
+        assert_eq!(names(&shape_device_list(vec![])), ["default"]);
+        assert!(shape_device_list(vec![])[0].is_default);
+    }
+
+    /// Measured on this machine: four devices, one name. `setup_device`
+    /// resolves a name to the first match, so the other three are not
+    /// selectable by any config this GUI could write.
+    #[test]
+    fn devices_sharing_a_name_collapse_to_one_selectable_row() {
+        let hw = |n: &str| n.to_string();
+        let got = shape_device_list(vec![
+            hw("HDA Intel PCH"),
+            hw("HDA Intel PCH"),
+            hw("PipeWire"),
+            hw("HDA Intel PCH"),
+        ]);
+        assert_eq!(names(&got), ["default", "HDA Intel PCH", "PipeWire"]);
+    }
+
+    /// A host that really does enumerate something called `default` must not
+    /// produce two rows the GUI renders identically.
+    #[test]
+    fn an_enumerated_device_named_default_does_not_duplicate_the_synthetic_row() {
+        let got = shape_device_list(vec!["default".to_string()]);
+        assert_eq!(names(&got), ["default"]);
+    }
+
+    #[test]
+    fn with_timeout_returns_a_fast_result() {
+        let got = with_timeout(Duration::from_secs(5), || 7).unwrap();
+        assert_eq!(got, 7);
+    }
+
+    /// The property the daemon depends on: a call that never returns must not
+    /// become a daemon that never answers again.
+    #[test]
+    fn with_timeout_gives_up_on_a_worker_that_never_finishes() {
+        let err = with_timeout(Duration::from_millis(50), || {
+            std::thread::sleep(Duration::from_secs(30));
+            7
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "got: {err}");
+    }
 
     #[test]
     fn downmix_averages_interleaved_channels() {

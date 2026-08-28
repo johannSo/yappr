@@ -101,6 +101,16 @@ impl Normalizer for SpyNormalizer {
     }
 }
 
+/// Captures the raw transcript the normalizer was handed, and echoes it back
+/// unchanged so the guardrail accepts it.
+struct RawSpyNormalizer(std::sync::Mutex<Option<String>>);
+impl Normalizer for RawSpyNormalizer {
+    fn normalize(&self, _: &str, raw: &str) -> anyhow::Result<String> {
+        *self.0.lock().unwrap() = Some(raw.to_string());
+        Ok(raw.to_string())
+    }
+}
+
 fn samples() -> Vec<f32> {
     vec![0.1; 16_000]
 }
@@ -755,3 +765,155 @@ fn the_stage_events_sink_cannot_influence_the_pipeline_outcome() {
     assert!(out.normalized);
     assert_eq!(calls.0.load(std::sync::atomic::Ordering::SeqCst), 2, "Normalizing + Injecting");
 }
+
+/// Regression for the defect that motivated `owf_core::finish`, reproduced
+/// from a real capture (`~/owf/logs/20260828-094124-489.json`): Parakeet
+/// transcribed correct German, S1-mini returned it with the opening letter
+/// lowercased and the closing full stop removed, and the guardrail accepted
+/// it -- `guardrail::tokenize` lowercases and strips punctuation before
+/// comparing, so exactly this damage is invisible to it. The accepted
+/// cleanup was then assigned straight to `text` and injected as-is, which is
+/// why capitalisation looked "always wrong" while the rejection and
+/// normalizer-error paths (which go through `rule_based_fallback`) looked
+/// fine. Verbatim rather than paraphrased so the test keeps describing the
+/// utterance that actually failed.
+#[test]
+fn an_accepted_cleanup_is_still_capitalised_and_terminated() {
+    let raw = "Nur das einzige Problem ist, dass am Anfang die Gro\u{df}schreibung immer \
+               falsch ist und am Ende keine Satzzeichen gesetzt werden. Ich fix das auch gleich mit.";
+    let damaged = "Nur das einzige Problem ist, dass am Anfang die Gro\u{df}schreibung immer \
+                   falsch ist und am Ende keine Satzzeichen gesetzt werden. ich fix das auch gleich mit";
+
+    let p = Pipeline::new(
+        Config::from_str("").unwrap(),
+        Box::new(FixedAsr(raw.into())),
+        Box::new(WholeBuffer),
+        Box::new(AlwaysEnglish),
+        Box::new(FixedNormalizer(damaged.into())),
+        Box::new(MockInjector::default()),
+    );
+
+    let out = p.process(&samples(), None).unwrap().expect("some outcome");
+    assert!(out.normalized, "the guardrail accepts this cleanup; the test is pointless if it doesn't");
+    assert!(out.text.starts_with("Nur das einzige"), "got {:?}", out.text);
+    assert!(
+        out.text.trim_end().ends_with("gleich mit."),
+        "the accepted cleanup must still be terminated, got {:?}",
+        out.text
+    );
+}
+
+/// The other half of the same choke point: a cleanup that opens lowercase
+/// must be capitalised even when nothing else about it is wrong. Taken from
+/// `~/owf/logs/20260828-094044-799.json`, where `Au\u{df}erdem` came back as
+/// `au\u{df}erdem` -- a multi-byte opening letter, which is the case a
+/// byte-indexed fix would corrupt.
+#[test]
+fn an_accepted_cleanup_with_a_multi_byte_opening_letter_is_capitalised() {
+    let p = Pipeline::new(
+        Config::from_str("").unwrap(),
+        Box::new(FixedAsr("Au\u{df}erdem m\u{f6}chte ich da so ein Men\u{fc} haben.".into())),
+        Box::new(WholeBuffer),
+        Box::new(AlwaysEnglish),
+        Box::new(FixedNormalizer("au\u{df}erdem m\u{f6}chte ich da so ein Men\u{fc} haben".into())),
+        Box::new(MockInjector::default()),
+    );
+
+    let out = p.process(&samples(), None).unwrap().expect("some outcome");
+    assert!(out.normalized);
+    assert_eq!(out.text, "Au\u{df}erdem m\u{f6}chte ich da so ein Men\u{fc} haben. ");
+}
+
+const VOCAB_CONFIG: &str = r#"
+[vocabulary]
+terms = ["Hyprland"]
+
+[[vocabulary.replacements]]
+from = "Settings-SQUI"
+to = "Settings-GUI"
+"#;
+
+/// The real misrecognition from `~/owf/logs/20260828-094008-643.json`:
+/// Parakeet heard "Settings-SQUI". Short acronyms cannot be matched fuzzily
+/// (see `owf_core::config::Replacement`), so this is the exact-replacement
+/// path, proven all the way through to what gets injected.
+#[test]
+fn the_vocabulary_corrects_the_transcript_before_it_is_injected() {
+    let p = Pipeline::new(
+        Config::from_str(VOCAB_CONFIG).unwrap(),
+        Box::new(FixedAsr("Kannst du mir eine Settings-SQUI f\u{fc}r diese App bauen?".into())),
+        Box::new(WholeBuffer),
+        Box::new(AlwaysEnglish),
+        Box::new(BrokenNormalizer),
+        Box::new(MockInjector::default()),
+    );
+
+    let out = p.process(&samples(), None).unwrap().expect("some outcome");
+    assert!(out.text.contains("Settings-GUI"), "got {:?}", out.text);
+    assert!(!out.text.contains("SQUI"), "the misrecognition survived: {:?}", out.text);
+}
+
+/// The vocabulary runs *before* normalization on purpose: S1-mini produces
+/// better output when the words in front of it are real, and the guardrail's
+/// overlap check then compares the same text on both sides. Asserting on what
+/// the normalizer was actually handed, rather than on the final string, is
+/// what pins the ordering -- a version that corrected the text afterwards
+/// would still pass a test that only looked at the output.
+#[test]
+fn the_normalizer_is_handed_the_vocabulary_corrected_transcript() {
+    let spy = std::sync::Arc::new(RawSpyNormalizer(std::sync::Mutex::new(None)));
+    let p = Pipeline::new(
+        Config::from_str(VOCAB_CONFIG).unwrap(),
+        Box::new(FixedAsr("Ich nutze Hyperland taeglich zum Arbeiten.".into())),
+        Box::new(WholeBuffer),
+        Box::new(AlwaysEnglish),
+        Box::new(SharedNormalizer(spy.clone())),
+        Box::new(MockInjector::default()),
+    );
+
+    let out = p.process(&samples(), None).unwrap().expect("some outcome");
+    let seen = spy.0.lock().unwrap().clone().expect("the normalizer should have run");
+    assert_eq!(seen, "Ich nutze Hyprland taeglich zum Arbeiten.");
+    assert!(out.text.starts_with("Ich nutze Hyprland"), "got {:?}", out.text);
+}
+
+/// Wraps a shared normalizer so a test can keep a handle on it after the
+/// pipeline has taken ownership.
+struct SharedNormalizer(std::sync::Arc<RawSpyNormalizer>);
+impl Normalizer for SharedNormalizer {
+    fn normalize(&self, control: &str, raw: &str) -> anyhow::Result<String> {
+        self.0.normalize(control, raw)
+    }
+}
+
+/// A characterisation test, not a TDD cycle: this passed the moment it was
+/// written, because `update_reloadable` swaps `cfg` wholesale. It is here
+/// because the settings GUI is going to depend on exactly that -- editing the
+/// vocabulary must take effect on `owf-ctl reload`, with no daemon restart --
+/// and `update_reloadable` already refuses one section (`[normalize].enabled`)
+/// for reasons that could plausibly be extended to another. Pinning it now
+/// makes that a deliberate decision rather than an accident.
+#[test]
+fn a_reload_applies_a_new_vocabulary_without_restarting_the_daemon() {
+    let mut p = Pipeline::new(
+        Config::from_str("").unwrap(),
+        Box::new(FixedAsr("Ich nutze Hyperland taeglich.".into())),
+        Box::new(WholeBuffer),
+        Box::new(AlwaysEnglish),
+        Box::new(BrokenNormalizer),
+        Box::new(MockInjector::default()),
+    );
+
+    let before = p.process(&samples(), None).unwrap().expect("some outcome");
+    assert!(before.text.contains("Hyperland"), "no vocabulary yet: {:?}", before.text);
+
+    p.update_reloadable(
+        Config::from_str(VOCAB_CONFIG).unwrap(),
+        Box::new(MockInjector::default()),
+    )
+    .expect("a vocabulary change must not require a restart");
+
+    let after = p.process(&samples(), None).unwrap().expect("some outcome");
+    assert!(after.text.contains("Hyprland"), "reload did not apply: {:?}", after.text);
+}
+

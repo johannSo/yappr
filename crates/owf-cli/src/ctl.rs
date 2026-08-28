@@ -3,34 +3,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use owf_core::proto::{self, Request};
 
-fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    match refs.as_slice() {
-        ["ptt-start"] => send(Request::PttStart),
-        ["ptt-stop"] => send(Request::PttStop),
-        ["cancel"] => send(Request::Cancel),
-        ["status"] => send(Request::Status),
-        ["reload"] => send(Request::Reload),
-        ["subscribe"] => subscribe(),
-        ["debug"] => debug_summary(),
-        ["setup"] => setup(false),
-        ["setup", "--update-lock"] => setup(true),
-        ["setup", "--print-hypr"] => {
-            print!("{}", owf_core::hypr::hypr_config());
-            Ok(())
-        }
-        ["setup", "--purge-logs"] => purge_logs(),
-        _ => {
-            eprintln!(
-                "usage: owf-ctl <ptt-start|ptt-stop|cancel|status|reload|subscribe|debug>\n\
-                 \x20      owf-ctl setup [--update-lock|--print-hypr|--purge-logs]"
-            );
-            std::process::exit(2);
-        }
-    }
-}
-
 /// Connects to the daemon, sends `Request::Subscribe`, and prints every
 /// `OverlayEvent` NDJSON line it receives until the daemon closes the
 /// connection -- the same wire path the overlay itself will use (spec 12).
@@ -41,7 +13,7 @@ fn main() -> Result<()> {
 ///
 /// This only ever reads from the daemon; it never sends `ptt-start` or any
 /// other command, so running it opens no microphone.
-fn subscribe() -> Result<()> {
+pub fn subscribe() -> Result<()> {
     use std::io::{BufRead, BufReader, Write as _};
     use std::os::unix::net::UnixStream;
 
@@ -71,7 +43,7 @@ fn subscribe() -> Result<()> {
 /// see `owf_core::debug` and `[debug]` in config.toml. Reads straight off
 /// disk (not through the daemon): the debug facility writes independently
 /// of `owf-ctl`, so there is nothing to ask the daemon for.
-fn debug_summary() -> Result<()> {
+pub fn debug_summary() -> Result<()> {
     let cfg = owf_core::config::Config::load().context("loading config")?;
     if !cfg.debug.enabled {
         eprintln!("[debug].enabled is false in config.toml -- no records are being written");
@@ -136,6 +108,20 @@ fn print_debug_summary(
         None => println!("  raw transcript: (none)"),
     }
 
+    match &record.vocab {
+        Some(subs) if !subs.is_empty() => {
+            println!("  vocabulary: {} correction(s)", subs.len());
+            for sub in subs {
+                let how = if sub.fuzzy { "fuzzy" } else { "exact" };
+                println!("      {:?} -> {:?} ({how})", sub.from, sub.to);
+            }
+        }
+        // Distinguished on purpose: "nothing matched" is the answer to a
+        // different question than "the section is not configured", and a user
+        // debugging a rule that will not fire needs to tell them apart.
+        _ => println!("  vocabulary: no corrections applied"),
+    }
+
     match &record.inject {
         Some(i) => println!("  final text ({}): {:?}", i.backend, i.final_text),
         None => println!("  final text: (nothing was injected)"),
@@ -168,7 +154,7 @@ fn print_debug_summary(
 /// Exits non-zero when the daemon reports `ok: false` (a rejected command,
 /// e.g. "busy"), matching the exit-status contract a Hyprland `bind = ...,
 /// exec, owf-ctl ...` invocation can rely on.
-fn send(req: Request) -> Result<()> {
+pub fn send(req: Request) -> Result<()> {
     let resp = proto::send(&req)?;
     println!("{}", serde_json::to_string(&resp)?);
     if !resp.ok {
@@ -372,7 +358,7 @@ fn ggml_backend_present() -> bool {
         .any(|dir| dir_has_backend(dir) || dir_has_backend(&dir.join("ggml")))
 }
 
-fn setup(update_lock: bool) -> Result<()> {
+pub fn setup(update_lock: bool) -> Result<()> {
     eprintln!("prerequisites:");
     let missing = check_prerequisites();
     if !missing.is_empty() {
@@ -430,7 +416,7 @@ fn purge_logs_at(path: &Path) -> Result<PurgeOutcome> {
 /// in particular, is untouched) -- and, being destructive, always says
 /// exactly what it did: the path it removed, or that there was nothing to
 /// remove.
-fn purge_logs() -> Result<()> {
+pub fn purge_logs() -> Result<()> {
     let path = owf_core::paths::rejections_file();
     match purge_logs_at(&path)? {
         PurgeOutcome::Removed => println!("removed {} -- rejection dataset cleared", path.display()),
@@ -438,6 +424,21 @@ fn purge_logs() -> Result<()> {
             println!("{} does not exist -- nothing to remove", path.display())
         }
     }
+    Ok(())
+}
+
+/// The settings window's binary, expected on `PATH` the same way this one is.
+const SETTINGS_BINARY: &str = "openwhisprflow-settings";
+
+/// Starts the settings window and returns immediately.
+///
+/// Deliberately not waited on: this is invoked from a shell or a keybinding,
+/// and blocking until the user closes the window would leave a terminal (or a
+/// compositor exec) hanging for as long as they take to change a setting.
+pub fn open_settings() -> Result<()> {
+    std::process::Command::new(SETTINGS_BINARY).spawn().with_context(|| {
+        format!("cannot start `{SETTINGS_BINARY}` -- is it built and on your PATH?")
+    })?;
     Ok(())
 }
 

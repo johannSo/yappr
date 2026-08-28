@@ -23,6 +23,11 @@ fn hold_for(event: &OverlayEvent) -> Duration {
         OverlayEvent::BusyRejected => Duration::from_millis(1_200),
         OverlayEvent::Error { .. } => Duration::from_millis(2_500),
         OverlayEvent::Done { .. } => Duration::from_millis(1_500),
+        // Deliberately short: this state exists only for as long as the
+        // microphone takes to go live, and a replay that held it for a
+        // comfortable screenshot duration would misrepresent how briefly a
+        // user actually sees it.
+        OverlayEvent::Opening => Duration::from_millis(120),
         OverlayEvent::Warming
         | OverlayEvent::Idle
         | OverlayEvent::Transcribing
@@ -150,6 +155,7 @@ mod tests {
         let has = |pred: &dyn Fn(&OverlayEvent) -> bool| events.iter().any(pred);
         assert!(has(&|e| matches!(e, OverlayEvent::Warming)), "missing warming");
         assert!(has(&|e| matches!(e, OverlayEvent::Idle)), "missing idle");
+        assert!(has(&|e| matches!(e, OverlayEvent::Opening)), "missing opening");
         assert!(has(&|e| matches!(e, OverlayEvent::Recording { .. })), "missing recording");
         assert!(has(&|e| matches!(e, OverlayEvent::Transcribing)), "missing transcribing");
         assert!(has(&|e| matches!(e, OverlayEvent::Normalizing)), "missing normalizing");

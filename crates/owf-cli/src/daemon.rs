@@ -11,6 +11,7 @@ use signal_hook::iterator::Signals;
 use std::cell::Cell;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard};
@@ -19,6 +20,7 @@ use std::time::{Duration, Instant};
 use owf_core::asr::SherpaTranscriber;
 use owf_core::capture::{CaptureStats, Recorder};
 use owf_core::config::{AudioConfig, Config, DebugConfig, NormalizeConfig};
+use owf_core::config_write;
 use owf_core::inject;
 use owf_core::lang::WhatlangDetector;
 use owf_core::llama::LlamaServer;
@@ -55,6 +57,30 @@ const FAILED: u8 = 6;
 
 fn is_busy(v: u8) -> bool {
     matches!(v, TRANSCRIBING | NORMALIZING | INJECTING)
+}
+
+/// Enumerating devices talks to ALSA/PipeWire, which can hang. Bounded for
+/// the same reason invariant 6 bounds every subprocess call.
+const DEVICE_LIST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Which of a config change's sections cannot take effect without a restart.
+///
+/// This lives here, in Rust, rather than in the settings GUI: the rule is a
+/// restatement of what `Pipeline::update_reloadable` will and will not swap,
+/// and a second copy in TypeScript would drift from it the first time the
+/// pipeline learned to reload something new.
+fn restart_reason(old: &Config, new: &Config) -> Option<String> {
+    let mut sections = Vec::new();
+    if old.asr != new.asr {
+        sections.push("[asr] -- the ASR model is loaded once, at startup");
+    }
+    if old.normalize != new.normalize {
+        sections.push("[normalize] -- llama-server is spawned once, at startup");
+    }
+    if sections.is_empty() {
+        return None;
+    }
+    Some(format!("saved, but a daemon restart is needed for: {}", sections.join("; ")))
 }
 
 fn state_of(v: u8) -> State {
@@ -131,7 +157,12 @@ struct Daemon {
     recorder: Mutex<Option<Recorder>>,
     /// Kept so `ensure_recorder` can retry `Recorder::new` later with the
     /// same settings, independent of how many times it has already failed.
-    audio_cfg: AudioConfig,
+    /// Behind a mutex so `set-config` can point the daemon at a different
+    /// microphone without a restart: changing it and clearing `recorder`
+    /// makes the next dictation build a recorder on the new device. The
+    /// microphone is the most-changed setting in the settings GUI, and
+    /// "restart the daemon" would be a poor answer for it.
+    audio_cfg: Mutex<AudioConfig>,
     pipeline: Mutex<Option<Pipeline>>,
     /// Owns the supervised `llama-server` child (R3): storing it here, rather
     /// than leaking it with `mem::forget`, keeps `LlamaServer::drop` reachable
@@ -143,7 +174,11 @@ struct Daemon {
     /// replacement.
     llama: Mutex<Option<LlamaServer>>,
     window_class: Mutex<Option<String>>,
-    max_seconds: u32,
+    /// Where `get-config`/`set-config` read and write. A field rather than a
+    /// call to `paths::config_file()` at each use site so tests can point it
+    /// at a scratch file: `set-config` *writes*, and a test running against
+    /// the real path would overwrite the config of whoever ran the suite.
+    config_path: PathBuf,
     /// Bumped by every `start_recording`. The 120 s safety-valve timer it
     /// spawns captures the epoch at spawn time and only acts if the epoch is
     /// still current -- otherwise a timer left over from an earlier session
@@ -330,7 +365,7 @@ fn open_debug_log_file(debug: &DebugConfig) -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new().create(true).append(true).open(logs_dir.join("daemon.log"))
 }
 
-fn main() -> Result<()> {
+pub fn run() -> Result<()> {
     // Single-instance guard: an exclusive, non-blocking lock on a runtime
     // file, held for the life of the process via `lock` staying in scope.
     let lock_path = paths::runtime_lock();
@@ -396,11 +431,11 @@ fn main() -> Result<()> {
     let daemon = Arc::new(Daemon {
         state: AtomicU8::new(WARMING),
         recorder: Mutex::new(recorder),
-        audio_cfg: cfg.audio.clone(),
+        audio_cfg: Mutex::new(cfg.audio.clone()),
         pipeline: Mutex::new(None),
         llama: Mutex::new(None),
         window_class: Mutex::new(None),
-        max_seconds: cfg.audio.max_seconds,
+        config_path: paths::config_file(),
         recording_epoch: AtomicU64::new(0),
         subscribers: Mutex::new(Vec::new()),
         normalize_enabled: cfg.normalize.enabled,
@@ -1235,6 +1270,86 @@ fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
                 Err(e) => Response::err(format!("config error: {e}")),
             }
         }
+        Request::GetConfig => match Config::load_from(&daemon.config_path) {
+            Ok(cfg) => {
+                let mut r = Response::ok(state_of(current));
+                r.config = Some(serde_json::to_value(&cfg).expect("Config serializes"));
+                r.config_path = Some(daemon.config_path.display().to_string());
+                // What the settings GUI's per-row reset button restores to.
+                // Sent from here rather than reconstructed in the GUI for the
+                // same reason `config` is: `Config` is the only thing that
+                // knows its own defaults, and a second copy in TypeScript
+                // would be free to drift from it.
+                r.defaults =
+                    Some(serde_json::to_value(Config::default()).expect("Config serializes"));
+                r
+            }
+            Err(e) => Response::err(format!("config error: {e}")),
+        },
+
+        Request::ListInputDevices => {
+            match owf_core::capture::list_input_devices(DEVICE_LIST_TIMEOUT) {
+                Ok(devices) => {
+                    let mut r = Response::ok(state_of(current));
+                    r.devices = Some(devices);
+                    r
+                }
+                Err(e) => Response::err(format!("listing input devices: {e}")),
+            }
+        }
+
+        Request::SetConfig { config } => {
+            // Same guard as `reload`: swapping the pipeline's config or
+            // dropping the recorder mid-utterance is not something to do.
+            if current != IDLE {
+                return Response::err("changing settings requires idle");
+            }
+            let old = match Config::load_from(&daemon.config_path) {
+                Ok(c) => c,
+                Err(e) => return Response::err(format!("config error: {e}")),
+            };
+            // Writes only if the result validates; on rejection the file on
+            // disk is untouched. See `owf_core::config_write`.
+            if let Err(e) = config_write::save_config(&daemon.config_path, &config) {
+                return Response::err(format!("{e:#}"));
+            }
+            let new_cfg = match Config::load_from(&daemon.config_path) {
+                Ok(c) => c,
+                Err(e) => return Response::err(format!("config error after write: {e}")),
+            };
+
+            let reason = restart_reason(&old, &new_cfg);
+
+            // Best-effort live apply. `update_reloadable` refuses a
+            // `[normalize].enabled` flip, which is exactly one of the cases
+            // `restart_reason` already reports, so its error is not an error
+            // here -- the file is written either way, and the response tells
+            // the truth about what took effect.
+            let injector = inject::build(&new_cfg.inject);
+            {
+                let mut guard = lock_ignoring_poison(&daemon.pipeline);
+                if let Some(p) = guard.as_mut() {
+                    if let Err(e) = p.update_reloadable(new_cfg.clone(), injector) {
+                        tracing::info!(error = %e, "set-config: live reload declined");
+                    }
+                }
+            }
+
+            if new_cfg.audio != old.audio {
+                *lock_ignoring_poison(&daemon.audio_cfg) = new_cfg.audio.clone();
+                // Dropped, not rebuilt: `ensure_recorder` constructs lazily on
+                // the next `ptt-start`, so a device that is currently
+                // unplugged costs a failed dictation rather than a failed save.
+                *lock_ignoring_poison(&daemon.recorder) = None;
+                tracing::info!(device = %new_cfg.audio.device, "set-config: recorder will be rebuilt");
+            }
+
+            let mut r = Response::ok(State::Idle);
+            r.restart_required = Some(reason.is_some());
+            r.restart_reason = reason;
+            r
+        }
+
         // Never actually reached: `handle` special-cases `Subscribe` before
         // it ever calls `dispatch`, since a subscriber gets a long-lived
         // event stream instead of one `Response` (see `handle`'s doc
@@ -1277,6 +1392,20 @@ fn recording_start_failed(daemon: &Daemon, reason: String) -> Response {
 }
 
 fn start_recording(daemon: &Arc<Daemon>) -> Response {
+    // Tell the overlay "wait" *before* anything that can take real time.
+    // The microphone is not live yet: `ensure_recorder` below may still have
+    // to build the recorder, and even once `start()` has returned,
+    // ALSA/PipeWire delivers the first buffer tens of milliseconds later
+    // (measured ~55 ms through PipeWire on this hardware). Speech in that
+    // window is genuinely lost, so the user must be told to hold off rather
+    // than shown live bars over a mic that is not capturing.
+    //
+    // This has to be broadcast here, not further down next to the state
+    // store, because `start()`'s own audio callback can fire before this
+    // function reaches that point -- emitting `Recording` first and leaving
+    // a "wait" pill to land *after* capture had already gone live.
+    daemon.broadcast(OverlayEvent::Opening);
+
     // I7: construct the recorder (or retry a previous failure) before doing
     // anything else -- and I4: query the window class *after* capture has
     // actually started, not before. `hyprctl` is a subprocess spawn (bounded
@@ -1284,7 +1413,7 @@ fn start_recording(daemon: &Arc<Daemon>) -> Response {
     // beginning of every utterance behind that spawn, which also contradicts
     // `hypr.rs`'s own claim that this call is off the critical path.
     if let Err(e) = ensure_recorder(&daemon.recorder, || {
-        Recorder::new(&daemon.audio_cfg).map_err(|e| e.to_string())
+        Recorder::new(&lock_ignoring_poison(&daemon.audio_cfg).clone()).map_err(|e| e.to_string())
     }) {
         return recording_start_failed(daemon, format!("no microphone: {e}"));
     }
@@ -1332,14 +1461,18 @@ fn start_recording(daemon: &Arc<Daemon>) -> Response {
     // call, never from a still-in-flight earlier one.
     let epoch = daemon.recording_epoch.fetch_add(1, Ordering::SeqCst) + 1;
     daemon.state.store(RECORDING, Ordering::SeqCst);
-    // Emitted once here, immediately, rather than waiting for the first
-    // throttled callback: without it the overlay's live bars would only
-    // appear up to `LEVEL_EMIT_INTERVAL` after the mic actually opened.
-    daemon.broadcast(OverlayEvent::Recording { level: 0.0, elapsed_ms: 0 });
+    // Deliberately does NOT broadcast a synthetic `Recording { level: 0.0 }`
+    // here any more. That placeholder used to exist so the bars appeared
+    // without waiting for the first throttled callback -- but it announced
+    // "recording" while the microphone had not yet produced a single sample,
+    // which is exactly the lie the `Opening` event above replaces. The first
+    // real audio callback emits `Recording` itself with no throttle delay
+    // (`should_emit_level`'s `last_emitted` starts `None`), so the bars still
+    // appear at the earliest honest moment: when capture is actually live.
 
     // Safety valve: a stuck key must not leave the microphone hot (spec 6.1).
     let d = Arc::clone(daemon);
-    let limit = Duration::from_secs(d.max_seconds as u64);
+    let limit = Duration::from_secs(lock_ignoring_poison(&d.audio_cfg).max_seconds as u64);
     std::thread::spawn(move || {
         std::thread::sleep(limit);
         // Only act if this is still the same recording session: a stale
@@ -1825,6 +1958,22 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1, "the constructor should only run once");
     }
 
+    /// The `Opening` ("wait") pill ends when the first audio callback emits
+    /// `Recording`. That handoff is only immediate because the very first
+    /// callback is never throttled -- if `should_emit_level` ever started
+    /// suppressing it, the user would sit on a "wait" pill for up to
+    /// `LEVEL_EMIT_INTERVAL` after the microphone had genuinely gone live.
+    #[test]
+    fn the_first_level_callback_is_never_throttled_so_wait_ends_as_soon_as_audio_arrives() {
+        let now = Instant::now();
+        assert!(
+            should_emit_level(None, now, LEVEL_EMIT_INTERVAL),
+            "the first callback after ptt-start must emit immediately"
+        );
+        // ... and the throttle still applies from the second one onward.
+        assert!(!should_emit_level(Some(now), now, LEVEL_EMIT_INTERVAL));
+    }
+
     /// I7: a failed construction must propagate the error and leave the slot
     /// exactly as it was (empty), so the very next call retries rather than
     /// getting stuck on a poisoned placeholder -- this is what lets a
@@ -1899,6 +2048,51 @@ mod tests {
     }
 
     // -- Overlay state broadcast (M2 Task 1) -----------------------------
+
+    /// The classification table in the settings-GUI spec, made executable.
+    /// Each of these is a claim the GUI shows the user as a banner (or does
+    /// not), so getting it wrong means telling them a change took effect when
+    /// it did not.
+    #[test]
+    fn live_reloadable_sections_do_not_ask_for_a_restart() {
+        let base = Config::from_str("").unwrap();
+        for toml in [
+            "[guardrail]\nngram_size = 8\n",
+            "[inject]\ntrailing_space = false\n",
+            "[style_default]\nstyling = \"formal\"\n",
+            "[vocabulary]\nterms = [\"Hyprland\"]\n",
+            "[debug]\nenabled = true\n",
+            // Live via the rebuilt recorder -- see `set-config`'s handler.
+            "[audio]\ndevice = \"hw:1,0\"\n",
+            "[audio]\nmax_seconds = 60\n",
+        ] {
+            let changed = Config::from_str(toml).unwrap();
+            assert_eq!(
+                restart_reason(&base, &changed),
+                None,
+                "should be live-reloadable: {toml:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn changing_the_asr_or_normalizer_asks_for_a_restart() {
+        let base = Config::from_str("").unwrap();
+
+        let asr = Config::from_str("[asr]\nnum_threads = 8\n").unwrap();
+        let reason = restart_reason(&base, &asr).expect("asr needs a restart");
+        assert!(reason.contains("[asr]"), "got: {reason}");
+
+        let norm = Config::from_str("[normalize]\ntimeout_ms = 9000\n").unwrap();
+        let reason = restart_reason(&base, &norm).expect("normalize needs a restart");
+        assert!(reason.contains("[normalize]"), "got: {reason}");
+    }
+
+    #[test]
+    fn an_unchanged_config_asks_for_nothing() {
+        let base = Config::from_str("").unwrap();
+        assert_eq!(restart_reason(&base, &base.clone()), None);
+    }
 
     #[test]
     fn state_of_reports_the_real_busy_substage_not_a_collapsed_busy() {
@@ -2022,14 +2216,20 @@ mod tests {
     /// See `a_late_subscriber_sees_the_degraded_badge_replayed_on_connect`,
     /// the test that needs `true`.
     fn fake_daemon_with_normalize(initial_state: u8, normalize_enabled: bool) -> Arc<Daemon> {
+        fake_daemon_at(initial_state, normalize_enabled, PathBuf::from("/nonexistent/owf-test/config.toml"))
+    }
+
+    /// The seam the config handlers need: `set-config` writes, so a test must
+    /// never be pointed at the real `paths::config_file()`.
+    fn fake_daemon_at(initial_state: u8, normalize_enabled: bool, config_path: PathBuf) -> Arc<Daemon> {
         Arc::new(Daemon {
             state: AtomicU8::new(initial_state),
             recorder: Mutex::new(None),
-            audio_cfg: AudioConfig::default(),
+            audio_cfg: Mutex::new(AudioConfig::default()),
             pipeline: Mutex::new(None),
             llama: Mutex::new(None),
             window_class: Mutex::new(None),
-            max_seconds: 120,
+            config_path: config_path.clone(),
             recording_epoch: AtomicU64::new(0),
             subscribers: Mutex::new(Vec::new()),
             normalize_enabled,
@@ -2038,6 +2238,145 @@ mod tests {
             housekeeping: Mutex::new(None),
             last_timings: Mutex::new(None),
         })
+    }
+
+    fn scratch_config(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("owf-daemon-cfg-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[audio]\ndevice = \"default\"   # kommentiert\n").unwrap();
+        path
+    }
+
+    #[test]
+    fn get_config_returns_the_whole_config_and_the_path_it_came_from() {
+        let path = scratch_config("get");
+        let daemon = fake_daemon_at(IDLE, false, path.clone());
+
+        let r = dispatch(&daemon, Request::GetConfig);
+
+        assert!(r.ok, "{:?}", r.err);
+        let config = r.config.expect("config missing");
+        assert_eq!(config["audio"]["device"], "default");
+        // Every section must be present -- the settings GUI renders whatever
+        // it is given, so a section missing here is a section the user cannot
+        // reach.
+        for section in
+            ["audio", "asr", "normalize", "guardrail", "inject", "vocabulary", "debug"]
+        {
+            assert!(config.get(section).is_some(), "section missing: {section}");
+        }
+        assert_eq!(r.config_path.as_deref(), Some(path.to_str().unwrap()));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The settings GUI's per-row reset button restores a field to its
+    /// default, and the only place that knows the defaults is `Config` itself.
+    /// Shipping them alongside the config is what keeps the GUI from carrying
+    /// a second, drifting copy of the schema -- the same reason `config`
+    /// crosses as JSON rather than as a mirrored struct.
+    #[test]
+    fn get_config_also_returns_the_defaults_the_gui_resets_a_field_to() {
+        let path = scratch_config("get-defaults");
+        let daemon = fake_daemon_at(IDLE, false, path.clone());
+
+        let r = dispatch(&daemon, Request::GetConfig);
+
+        assert!(r.ok, "{:?}", r.err);
+        let config = r.config.expect("config missing");
+        let defaults = r.defaults.expect("defaults missing");
+        // Every section the GUI can render must have a default to reset to.
+        // A section present in one and absent from the other means rows that
+        // show no reset button at all, which reads as "this is the default".
+        let sections: Vec<&String> = config.as_object().expect("config is an object").keys().collect();
+        assert!(!sections.is_empty());
+        for section in sections {
+            assert!(defaults.get(section).is_some(), "default missing for section: {section}");
+        }
+        // The scratch config sets `audio.device` explicitly; the default is
+        // whatever `Config::default()` says, which is what makes the two
+        // distinguishable at all.
+        assert_eq!(defaults["audio"]["device"], serde_json::json!("default"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn set_config_writes_the_change_and_reports_that_nothing_needs_a_restart() {
+        let path = scratch_config("set-live");
+        let daemon = fake_daemon_at(IDLE, false, path.clone());
+
+        let r = dispatch(
+            &daemon,
+            Request::SetConfig {
+                config: serde_json::json!({"vocabulary": {"terms": ["Hyprland"]}}),
+            },
+        );
+
+        assert!(r.ok, "{:?}", r.err);
+        assert_eq!(r.restart_required, Some(false));
+        let on_disk = Config::load_from(&path).unwrap();
+        assert_eq!(on_disk.vocabulary.terms, ["Hyprland"]);
+        // The comment the user wrote survives a GUI save.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("# kommentiert"), "comment lost:\n{raw}");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn set_config_reports_the_sections_that_need_a_restart() {
+        let path = scratch_config("set-restart");
+        let daemon = fake_daemon_at(IDLE, false, path.clone());
+
+        let r = dispatch(
+            &daemon,
+            Request::SetConfig { config: serde_json::json!({"asr": {"num_threads": 8}}) },
+        );
+
+        assert!(r.ok, "{:?}", r.err);
+        assert_eq!(r.restart_required, Some(true));
+        assert!(r.restart_reason.unwrap().contains("[asr]"));
+        // Written regardless: the file is the source of truth, and the change
+        // takes effect at the next start.
+        assert_eq!(Config::load_from(&path).unwrap().asr.num_threads, 8);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn set_config_rejects_an_invalid_config_and_leaves_the_file_untouched() {
+        let path = scratch_config("set-invalid");
+        let before = std::fs::read_to_string(&path).unwrap();
+        let daemon = fake_daemon_at(IDLE, false, path.clone());
+
+        let r = dispatch(
+            &daemon,
+            Request::SetConfig {
+                config: serde_json::json!({"guardrail": {"min_overlap_english": 9.0}}),
+            },
+        );
+
+        assert!(!r.ok, "an out-of-range threshold must not be accepted");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "the file was modified");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Same guard as `reload`: swapping config or dropping the recorder while
+    /// an utterance is in flight is not something to do.
+    #[test]
+    fn set_config_is_refused_while_the_daemon_is_busy() {
+        let path = scratch_config("set-busy");
+        let before = std::fs::read_to_string(&path).unwrap();
+        let daemon = fake_daemon_at(RECORDING, false, path.clone());
+
+        let r = dispatch(
+            &daemon,
+            Request::SetConfig { config: serde_json::json!({"asr": {"num_threads": 8}}) },
+        );
+
+        assert!(!r.ok);
+        assert!(r.err.unwrap().contains("idle"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// The concern behind giving `Subscribe` its own thread, proven

@@ -1,7 +1,11 @@
-/* The overlay window is exactly 280x72 logical px, transparent, and
-   undecorated (tauri.conf.json). Every element here must render correctly
-   on top of an arbitrary desktop background, so the pill itself supplies
-   all of its own contrast rather than relying on the page. */
+/* The overlay window is a 420x120 logical-px transparent *canvas*, undecorated
+   and click-through (tauri.conf.json). The capsule drawn on it is smaller than
+   that and changes size with what it is saying, which is the whole reason the
+   window is bigger than any one state needs: a surface cannot spring wider
+   than the hole it is drawn through.
+
+   Every element here renders on top of an arbitrary desktop background, so the
+   capsule supplies all of its own contrast rather than relying on the page. */
 
 :root,
 html,
@@ -14,181 +18,407 @@ body,
   background: transparent;
   overflow: hidden;
   -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+:root {
+  /* -- The material. --------------------------------------------------------
+
+     Deliberately dark in both system appearances, unlike the settings window,
+     which follows the user's theme. A HUD floats over content nobody chose --
+     a white wallpaper, a photo, a dark terminal -- and the only way to stay
+     legible against all of them is to bring your own ground. Apple's own
+     always-on-top HUDs make the same trade. */
+  --mat: rgba(26, 26, 30, 0.72);
+  --mat-edge: rgba(255, 255, 255, 0.1);
+  --mat-sheen: rgba(255, 255, 255, 0.14);
+
+  --ink: #f5f5f7;
+  /* Secondary text on a translucent surface: heavier and slightly tracked
+     out rather than merely greyer, because a flat grey loses the moment the
+     wallpaper behind the blur changes (vibrancy, not opacity). */
+  --ink-2: rgba(245, 245, 247, 0.68);
+
+  --accent: #0a84ff;
+  --accent-2: #64d2ff;
+  --ok: #30d158;
+  --warn: #ff9f0a;
+  --rec: #ff453a;
+
+  --radius: 22px;
+  --shadow:
+    0 18px 40px -10px rgba(0, 0, 0, 0.55),
+    0 4px 12px -2px rgba(0, 0, 0, 0.35);
 }
 
 body {
   font-family:
-    -apple-system, "Segoe UI", "Noto Sans", Cantarell, Ubuntu, Roboto,
-    "Helvetica Neue", Arial, sans-serif;
+    system-ui, -apple-system, "Segoe UI", "Noto Sans", Cantarell, Ubuntu,
+    Roboto, "Helvetica Neue", Arial, sans-serif;
 }
 
-.pill-wrap {
-  /* The window is `alwaysOnTop`/`closable:false` (tauri.conf.json) and this
-     wrapper spans the whole 280x72 window -- without this, the pill sits
-     over whatever's beneath it and eats clicks meant for that window the
-     entire time it's visible, on top of already being unclosable. Nothing
-     in this UI is ever supposed to be clicked (fix 4). */
+/* The canvas. Bottom-anchored, so a capsule that grows for a two-line preview
+   grows *upward* and its bottom edge -- the edge the eye lines up against the
+   screen edge -- never moves. `pointer-events: none` because the window is
+   alwaysOnTop and closable:false: nothing in this UI is ever meant to be
+   clicked, and without this it would eat clicks meant for the window beneath
+   it for as long as it is visible. */
+.stage {
   pointer-events: none;
+  position: relative;
   display: flex;
-  align-items: center;
+  align-items: flex-end;
   justify-content: center;
   width: 100%;
   height: 100%;
-  padding: 8px;
+  padding: 12px;
+  box-sizing: border-box;
+}
+
+/* ------------------------------------------------------------- the capsule */
+
+.capsule {
+  pointer-events: none;
   box-sizing: border-box;
   position: relative;
-}
-
-.pill {
-  box-sizing: border-box;
   display: flex;
   align-items: center;
-  justify-content: center;
-  gap: 10px;
-  min-width: 120px;
+  gap: 12px;
+  min-height: 52px;
   max-width: 100%;
-  height: 56px;
-  padding: 0 18px;
-  border-radius: 28px;
-  background: rgba(22, 22, 26, 0.86);
-  border: 1px solid rgba(255, 255, 255, 0.09);
+  padding: 10px 20px;
+  border-radius: var(--radius);
+
+  background: var(--mat);
+  border: 1px solid var(--mat-edge);
+  /* The inset highlight is the light catching the top edge of a real pane of
+     glass; without it a blurred rectangle reads as a hole, not a surface. */
   box-shadow:
-    0 10px 30px rgba(0, 0, 0, 0.4),
-    0 1px 0 rgba(255, 255, 255, 0.04) inset;
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
-  color: #f4f4f6;
+    var(--shadow),
+    inset 0 1px 0 var(--mat-sheen);
+  backdrop-filter: blur(30px) saturate(180%);
+  -webkit-backdrop-filter: blur(30px) saturate(180%);
+
+  color: var(--ink);
   font-size: 14px;
   font-weight: 500;
-  letter-spacing: 0.1px;
-  white-space: nowrap;
-  animation: pill-in 140ms ease-out;
-  pointer-events: none;
+  /* Body-size text sits at neutral tracking; only the large numerals and the
+     small caps below get a size-specific adjustment. */
+  letter-spacing: 0;
+  line-height: 1.35;
+  /* Motion writes `transform`/`opacity`/`filter` on this element every frame
+     of a transition; say so, and keep it on its own compositor layer for the
+     backdrop blur's sake either way. */
+  will-change: transform, opacity, filter;
 }
 
-/* -- Spec 15: normalization-degraded badge, a small persistent dot rather
-   than text -- it sits alongside whatever the state pill above is already
-   showing, not in place of it, so it has to stay out of the way of the
-   pill's own label/preview text. */
-
-.badge--degraded {
-  position: absolute;
-  top: 6px;
-  right: 6px;
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  background: #f5a524;
-  border: 1.5px solid rgba(22, 22, 26, 0.86);
-  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.1);
-}
-
-@keyframes pill-in {
-  from {
-    opacity: 0;
-    transform: translateY(4px) scale(0.97);
-  }
-  to {
-    opacity: 1;
-    transform: none;
-  }
-}
-
-.pill__label {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.pill__preview {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: #f4f4f6;
-}
-
-.pill__timer {
-  flex: none;
-  font-variant-numeric: tabular-nums;
-  font-size: 13px;
-  color: rgba(244, 244, 246, 0.72);
-  margin-left: 2px;
-}
-
-/* -- Recording: the live meter, the user's proof the mic is hearing them */
-
-.bars {
+.capsule__content {
   display: flex;
-  align-items: flex-end;
-  gap: 3px;
-  height: 28px;
-  flex: 1 1 auto;
+  align-items: center;
+  gap: 12px;
   min-width: 0;
 }
 
-.bar {
-  width: 3px;
-  min-height: 3px;
-  border-radius: 2px;
-  background: linear-gradient(180deg, #93d9ff 0%, #4ba8e8 100%);
-  transition: height 90ms ease-out;
+.label {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-/* -- Indeterminate spinner: warming / transcribing / normalizing / injecting */
+/* An error reason comes from the daemon and can be a sentence. It is the one
+   label allowed to wrap rather than be cut off: a truncated error is a worse
+   error. */
+.label--wrap {
+  white-space: normal;
+  max-width: 300px;
+}
 
-.spinner {
+/* -- done: the confirmation glance ----------------------------------------- */
+
+.preview {
+  min-width: 0;
+  max-width: 316px;
+  color: var(--ink);
+  font-weight: 450;
+  /* Two lines of a real sentence, then stop. This is a glance that confirms
+     what was typed, not a place to read it back. */
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+}
+
+.capsule--done {
+  border-color: rgba(48, 209, 88, 0.32);
+}
+
+/* -- error / busy: states that replace the material rather than tint it -----
+
+   Measured, not eyeballed. White on rgb(140,22,22) is 9.4:1 and on
+   rgb(122,74,0) is 7.5:1, both comfortably past WCAG AA rather than sitting
+   on its edge -- the previous accents measured 3.5:1 and 5.9:1 at their true
+   rendered values. Near-opaque on purpose: an error must not be able to lose
+   its contrast to whatever happens to be behind it. */
+
+.capsule--error {
+  background: rgba(140, 22, 22, 0.94);
+  border-color: rgba(255, 138, 128, 0.4);
+  color: #fff;
+}
+
+.capsule--busy {
+  background: rgba(122, 74, 0, 0.94);
+  border-color: rgba(255, 214, 122, 0.42);
+  color: #fff;
+}
+
+/* ------------------------------------------------------------------- dots */
+
+.dot {
   flex: none;
-  width: 14px;
-  height: 14px;
+  width: 9px;
+  height: 9px;
   border-radius: 50%;
-  border: 2px solid rgba(244, 244, 246, 0.22);
-  border-top-color: #f4f4f6;
-  animation: spin 0.8s linear infinite;
 }
 
-@keyframes spin {
+.dot--wait {
+  background: var(--warn);
+  box-shadow: 0 0 0 4px rgba(255, 159, 10, 0.16);
+}
+
+/* The universal "this is recording" mark, and the only red in a state that
+   isn't an error -- a small dot on a neutral surface reads as a tally light,
+   where a red capsule would read as a fault. */
+.dot--rec {
+  background: var(--rec);
+  box-shadow: 0 0 0 4px rgba(255, 69, 58, 0.16);
+  animation: rec-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes rec-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.5;
+    transform: scale(0.82);
+  }
+}
+
+/* Warming: one slow breath. Nothing to count, so nothing that looks like a
+   count -- a spinner here would promise progress the state cannot report. */
+.breather {
+  flex: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--accent-2);
+  animation: breathe 1.9s ease-in-out infinite;
+}
+
+@keyframes breathe {
+  0%,
+  100% {
+    transform: scale(0.72);
+    opacity: 0.55;
+  }
+  50% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+/* ------------------------------------------------------------- the meter */
+
+.meter {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  height: 26px;
+  flex: none;
+}
+
+/* Mirrored around the centre line: `scaleY` from a centred origin grows the
+   bar in both directions at once, which is how a level meter reads as
+   amplitude rather than as a bar chart. Transform-only, so the compositor
+   handles all twenty updates a second without touching layout. */
+.meter__bar {
+  width: 3px;
+  height: 100%;
+  border-radius: 2px;
+  background: linear-gradient(180deg, var(--accent-2) 0%, var(--accent) 100%);
+  transform-origin: center;
+  transition: transform 110ms cubic-bezier(0.22, 1, 0.36, 1);
+  will-change: transform;
+}
+
+.timer {
+  flex: none;
+  /* Tabular figures, or the capsule twitches a pixel wider every tenth of a
+     second as the digits change width. */
+  font-variant-numeric: tabular-nums;
+  font-size: 13px;
+  letter-spacing: 0.01em;
+  color: var(--ink-2);
+}
+
+/* -------------------------------------------------- the post-release rail */
+
+.run {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 132px;
+}
+
+.rail {
+  display: flex;
+  gap: 4px;
+  height: 3px;
+}
+
+.rail__seg {
+  position: relative;
+  flex: 1;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.14);
+  overflow: hidden;
+  transition: background 260ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.rail__seg.is-done {
+  background: var(--accent);
+}
+
+/* The stage actually running gets a sweep rather than a fill: it is in
+   progress, and a static half-filled bar would claim a fraction the pipeline
+   never reports. */
+.rail__seg.is-live::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--accent) 45%,
+    var(--accent-2) 55%,
+    transparent 100%
+  );
+  animation: sweep 1.15s ease-in-out infinite;
+  will-change: transform;
+}
+
+@keyframes sweep {
+  from {
+    transform: translateX(-100%);
+  }
   to {
-    transform: rotate(360deg);
+    transform: translateX(100%);
   }
 }
 
-/* -- State accents --
+/* ----------------------------------------------------------------- glyphs */
 
-   Measured against rendered screenshots (not just the declared hex/rgba
-   values -- see the M2 legibility fix report), text stays the pill's base
-   #f4f4f6 throughout. .pill--busy was the one accent that measured below
-   WCAG AA (4.5:1) at its true steady-state render (3.47:1); .pill--error
-   already cleared AA (5.94:1) but only barely, so both were darkened/
-   opacified for a comfortable margin (6.50:1 / 5.28:1) rather than a
-   razor's-edge pass. */
-
-.pill--error {
-  background: rgba(176, 24, 24, 0.97);
-  border-color: rgba(252, 165, 165, 0.4);
+.glyph {
+  flex: none;
+  width: 20px;
+  height: 20px;
 }
 
-.pill--busy {
-  background: rgba(150, 90, 0, 0.97);
-  border-color: rgba(253, 224, 71, 0.42);
+.glyph--ok {
+  color: var(--ok);
 }
 
-.pill--done {
-  border-color: rgba(134, 239, 172, 0.28);
+.glyph--warn {
+  color: #ffd2cd;
 }
 
-/* -- Respect the user's motion preference: no rotation, no bar-height
-   animation, no entrance transform. State is still fully legible without
-   any of it -- the text/label always carries the meaning. -- */
+/* ------------------------------------------ spec 15: degraded normalization
 
+   A separator plus a dot at the capsule's trailing edge. It is grouped with
+   the state content, never a replacement for it, and it is `layout`-animated
+   so its arrival widens the capsule rather than crowding whatever is already
+   in there. */
+
+.degraded {
+  display: flex;
+  align-items: center;
+  flex: none;
+  padding-left: 12px;
+  margin-left: 2px;
+  border-left: 1px solid rgba(255, 255, 255, 0.14);
+}
+
+.degraded__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--warn);
+  box-shadow: 0 0 0 3px rgba(255, 159, 10, 0.18);
+}
+
+/* ------------------------------------------------------- user preferences */
+
+/* Motion's `reducedMotion="user"` already drops every spring transform in
+   `Overlay.tsx` and keeps the opacity cross-fades. What is left to switch off
+   is the CSS: the two looping oscillations, the sweep, and the meter's
+   per-sample easing. The meter still *moves* -- it is the only evidence the
+   microphone is live -- it just stops interpolating between samples. */
 @media (prefers-reduced-motion: reduce) {
-  .pill {
+  .dot--rec,
+  .breather {
     animation: none;
+    opacity: 1;
+    transform: none;
   }
-  .bar {
+
+  .rail__seg.is-live::after {
+    animation: none;
+    background: var(--accent);
+    opacity: 0.6;
+  }
+
+  .meter__bar {
     transition: none;
   }
-  .spinner {
-    animation: none;
-    opacity: 0.9;
+}
+
+/* A translucent surface is a preference, not a requirement. Frost it up to
+   near-solid and drop the blur when the user has asked for less of it. */
+@media (prefers-reduced-transparency: reduce) {
+  .capsule {
+    background: rgb(26, 26, 30);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+
+  .capsule--error {
+    background: rgb(140, 22, 22);
+  }
+
+  .capsule--busy {
+    background: rgb(122, 74, 0);
+  }
+}
+
+@media (prefers-contrast: more) {
+  .capsule {
+    background: rgb(16, 16, 18);
+    border-color: rgba(255, 255, 255, 0.55);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+
+  .timer,
+  .ink-2 {
+    color: #fff;
+  }
+
+  .rail__seg {
+    background: rgba(255, 255, 255, 0.4);
   }
 }

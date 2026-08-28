@@ -15,9 +15,17 @@ use wire::OverlayEvent;
 
 /// Must match the window `label` in `tauri.conf.json`.
 const OVERLAY_LABEL: &str = "overlay";
-/// Spec 12: 280 x 72 px.
-const OVERLAY_WIDTH_LOGICAL: f64 = 280.0;
-const OVERLAY_HEIGHT_LOGICAL: f64 = 72.0;
+/// The transparent *canvas* the capsule is drawn on -- not the capsule's own
+/// size. Spec 12 fixed both at 280 x 72 because the pill was a fixed-size
+/// pill; it is now a surface that springs its width and height to whatever
+/// state it is showing (a bare recording meter is narrow, a two-line "done"
+/// preview is wide and tall), so the window has to be the largest box any
+/// state can need rather than the size of any one of them. The capsule is
+/// bottom-anchored inside it (`.stage` in `Overlay.css`), so growing upward
+/// leaves its bottom edge -- the edge the user's eye tracks against the
+/// screen edge -- exactly where it was.
+const OVERLAY_WIDTH_LOGICAL: f64 = 420.0;
+const OVERLAY_HEIGHT_LOGICAL: f64 = 120.0;
 /// Default gap between the overlay's bottom edge and the screen's bottom
 /// edge. Overridable with `OWF_OVERLAY_MARGIN` (logical px) -- spec 12
 /// calls out "position is configurable"; this env var is the M2 mechanism
@@ -25,7 +33,13 @@ const OVERLAY_HEIGHT_LOGICAL: f64 = 72.0;
 /// table suggests) is future work: this crate deliberately does not depend
 /// on `owf-core`'s config loader (see `wire.rs`'s module doc for the same
 /// reasoning applied to the wire format).
-const DEFAULT_BOTTOM_MARGIN_LOGICAL: f64 = 24.0;
+///
+/// This is the gap to the *window*, and the window is now a canvas larger
+/// than the capsule drawn on it -- `.stage` in `Overlay.css` insets the
+/// capsule another 12 px from the canvas's bottom edge. The two are split so
+/// that 12 + 12 lands the capsule at the same 24 logical px off the screen
+/// edge the old fixed 280x72 window sat at.
+const DEFAULT_BOTTOM_MARGIN_LOGICAL: f64 = 12.0;
 
 /// Re-applies the bottom-centre position (spec 12). A Tauri command rather
 /// than a one-shot call in `setup()` because on Wayland a window has no

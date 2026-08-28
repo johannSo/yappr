@@ -9,6 +9,11 @@ thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
+# Surgical, comment-preserving config writes for the settings GUI: serializing
+# `Config` back with `toml::to_string` would flatten every comment and reorder
+# every section of a file the user is also invited to edit by hand. Already in
+# Cargo.lock as a transitive dependency of `toml`, so this adds no graph node.
+toml_edit = "0.25"
 tracing.workspace = true
 dirs.workspace = true
 regex.workspace = true
@@ -19,6 +24,9 @@ bzip2 = "0.5"
 sherpa-onnx = "1.13.6"
 hound = "3.5"
 whatlang = "0.18"
+# Levenshtein for the dictation vocabulary. Already in Cargo.lock as a
+# transitive dependency, so this adds no node to the graph.
+strsim = "0.11"
 cpal = "0.18"
 rubato = "5.0"
 

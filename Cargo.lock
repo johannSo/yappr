@@ -2897,6 +2897,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "openwhisprflow-settings"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+]
+
+[[package]]
 name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2942,9 +2952,11 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "sherpa-onnx",
+ "strsim",
  "tar",
  "thiserror 2.0.20",
  "toml 1.1.4+spec-1.1.0",
+ "toml_edit 0.25.13+spec-1.1.0",
  "tracing",
  "ureq 3.4.0",
  "whatlang",
@@ -4701,6 +4713,7 @@ dependencies = [
  "indexmap 2.14.0",
  "toml_datetime 1.1.1+spec-1.1.0",
  "toml_parser",
+ "toml_writer",
  "winnow 1.0.4",
 ]
 

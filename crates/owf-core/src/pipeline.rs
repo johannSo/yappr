@@ -16,6 +16,7 @@ use crate::asr::Transcriber;
 use crate::capture::CaptureStats;
 use crate::config::Config;
 use crate::debug;
+use crate::finish::finish;
 use crate::guardrail::{self, RejectReason, Verdict};
 use crate::inject::{self, ClipboardInjector, TextInjector};
 use crate::lang::{Lang, LanguageDetector};
@@ -24,6 +25,7 @@ use crate::paths;
 use crate::proto::OverlayEvent;
 use crate::style;
 use crate::vad::Trimmer;
+use crate::vocab;
 
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
 pub struct Timings {
@@ -287,6 +289,7 @@ impl Pipeline {
             trim: None,
             vad: debug::VadDebug::not_found(),
             asr_raw: None,
+            vocab: None,
             lang: None,
             normalize: None,
             guardrail: None,
@@ -312,6 +315,23 @@ impl Pipeline {
         if raw.trim().is_empty() {
             tracing::info!("empty transcript");
             return Ok(None); // dbg drops here: writes a record with the (empty) transcript.
+        }
+
+        // Before language detection, normalization and the guardrail, so all
+        // three see the corrected text: S1-mini produces better output when
+        // the words in front of it are real ones, and the guardrail's overlap
+        // check then compares the same transcript on both sides instead of
+        // penalising the normalizer for keeping a term the vocabulary had
+        // already fixed. `raw` is shadowed deliberately -- `dbg.asr_raw`
+        // above still holds what the ASR actually said, which is the value
+        // you need when a vocabulary rule misfires.
+        let corrections = vocab::apply(&self.cfg.vocabulary, &raw);
+        let raw = corrections.text;
+        if !corrections.substitutions.is_empty() {
+            tracing::debug!(count = corrections.substitutions.len(), "vocabulary corrections applied");
+            if dbg.ctx.is_some() {
+                dbg.vocab = Some(corrections.substitutions);
+            }
         }
 
         let lang = self.detector.detect(&raw);
@@ -379,6 +399,22 @@ impl Pipeline {
         dbg.normalize = Some(normalize_debug);
         dbg.guardrail = guardrail_debug;
 
+        // The single point every path out of this function converges on
+        // before injection, and therefore the only place capitalisation and
+        // terminal punctuation can be guaranteed rather than hoped for.
+        // Doing it here instead of at each site that assigns `text` is the
+        // same argument `DebugRecordGuard` makes: `text` is written on three
+        // paths today (rule-based fallback, accepted cleanup, and fallback
+        // again after a rejection or a normalizer error) and only the
+        // fallback ones were finished, so an accepted S1-mini cleanup was
+        // injected exactly as the model returned it -- routinely lowercased
+        // at the opening letter and stripped of its final stop, which the
+        // guardrail cannot see (`guardrail::tokenize` lowercases and drops
+        // punctuation before comparing). `finish` is idempotent, so the
+        // paths that already went through `rule_based_fallback` are
+        // unaffected.
+        text = finish(&text);
+
         if self.cfg.inject.trailing_space {
             text.push(' ');
         }
@@ -438,6 +474,7 @@ struct DebugRecordGuard<'a> {
     trim: Option<(usize, usize)>,
     vad: debug::VadDebug,
     asr_raw: Option<String>,
+    vocab: Option<Vec<vocab::Substitution>>,
     lang: Option<Lang>,
     normalize: Option<debug::NormalizeDebug>,
     guardrail: Option<debug::GuardrailDebug>,
@@ -463,6 +500,7 @@ impl Drop for DebugRecordGuard<'_> {
                 trimmed,
                 vad: self.vad.clone(),
                 asr_raw: asr_raw.as_deref(),
+                vocab: self.vocab.take(),
                 lang: self.lang,
                 normalize: self.normalize.take(),
                 guardrail: self.guardrail.take(),

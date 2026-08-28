@@ -12,6 +12,7 @@
 # --- Scenario 1: warm-up, then a normal dictation to completion ---
 {"event":"warming"}
 {"event":"idle"}
+{"event":"opening"}
 {"event":"recording","level":0.01,"elapsed_ms":50}
 {"event":"recording","level":0.03,"elapsed_ms":100}
 {"event":"recording","level":0.08,"elapsed_ms":150}
@@ -42,6 +43,7 @@
 {"event":"idle"}
 
 # --- Scenario 2: a short recording that yields no speech ---
+{"event":"opening"}
 {"event":"recording","level":0.02,"elapsed_ms":50}
 {"event":"recording","level":0.03,"elapsed_ms":100}
 {"event":"recording","level":0.01,"elapsed_ms":150}

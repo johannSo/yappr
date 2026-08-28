@@ -8,6 +8,18 @@ const host = process.env.TAURI_DEV_HOST;
 export default defineConfig(async () => ({
   plugins: [react()],
 
+  // Two pages, one toolchain: the overlay (index.html) and the settings window
+  // (settings.html). Both Tauri apps point `frontendDist` at the same `dist/`,
+  // so a single `bun run build` produces both.
+  build: {
+    rollupOptions: {
+      input: {
+        overlay: "index.html",
+        settings: "settings.html",
+      },
+    },
+  },
+
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
   // 1. prevent Vite from obscuring rust errors

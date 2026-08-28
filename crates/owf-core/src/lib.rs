@@ -1,7 +1,9 @@
 pub mod asr;
 pub mod capture;
 pub mod config;
+pub mod config_write;
 pub mod debug;
+pub mod finish;
 pub mod guardrail;
 pub mod hypr;
 pub mod inject;
@@ -15,3 +17,4 @@ pub(crate) mod procutil;
 pub mod proto;
 pub mod style;
 pub mod vad;
+pub mod vocab;

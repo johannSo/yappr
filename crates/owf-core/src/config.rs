@@ -328,6 +328,65 @@ impl Default for OverlayConfig {
     }
 }
 
+/// One hand-written correction, applied before any fuzzy matching. This is
+/// the mechanism for short acronyms, which fuzzy matching cannot serve: a
+/// three-character term is within edit distance 2 of most three-letter words
+/// in the language, so matching `GUI` loosely enough to catch a mis-heard
+/// `SQUI` would also catch `gut` and `gib`. Length is what makes fuzzy
+/// matching safe, so anything short belongs here instead.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Replacement {
+    pub from: String,
+    pub to: String,
+}
+
+/// Spec 7.3's dictation vocabulary: names, jargon and acronyms the ASR has
+/// never seen, corrected after transcription.
+///
+/// Two mechanisms rather than one, because neither covers the other's cases.
+/// `terms` are matched fuzzily, so a term survives a small misrecognition
+/// (`Hyperland` -> `Hyprland`) without anyone enumerating how it might be got
+/// wrong; `replacements` are exact, for the short strings fuzzy matching is
+/// structurally unsafe for.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VocabularyConfig {
+    #[serde(default = "d_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub terms: Vec<String>,
+    #[serde(default)]
+    pub replacements: Vec<Replacement>,
+    /// The share of a term that may be wrong and still match: 0.25 allows two
+    /// wrong characters in an eight-character term. `0.0` disables fuzzy
+    /// matching without disabling `replacements`.
+    #[serde(default = "d_max_error_ratio")]
+    pub max_error_ratio: f64,
+    /// Terms shorter than this are matched exactly only -- see `Replacement`.
+    #[serde(default = "d_min_term_chars")]
+    pub min_term_chars: usize,
+}
+
+fn d_max_error_ratio() -> f64 {
+    0.25
+}
+fn d_min_term_chars() -> usize {
+    5
+}
+
+impl Default for VocabularyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: d_true(),
+            terms: Vec::new(),
+            replacements: Vec::new(),
+            max_error_ratio: d_max_error_ratio(),
+            min_term_chars: d_min_term_chars(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugConfig {
@@ -372,6 +431,8 @@ pub struct Config {
     #[serde(default)]
     pub style_rules: Vec<StyleRule>,
     #[serde(default)]
+    pub vocabulary: VocabularyConfig,
+    #[serde(default)]
     pub debug: DebugConfig,
 }
 
@@ -393,12 +454,22 @@ impl Config {
 
     /// Loads the config, writing a commented default file if none exists.
     pub fn load() -> Result<Self> {
-        let p = paths::config_file();
+        Self::load_from(&paths::config_file())
+    }
+
+    /// [`Config::load`] against an explicit path.
+    ///
+    /// The path is a parameter so the daemon can be pointed at a scratch file
+    /// in tests. `set-config` *writes* the config, and a test exercising it
+    /// against `paths::config_file()` would overwrite the real config of
+    /// whoever ran the suite -- the same hazard `paths::rejections_file()`
+    /// already carries a warning about.
+    pub fn load_from(p: &std::path::Path) -> Result<Self> {
         if !p.exists() {
             std::fs::create_dir_all(p.parent().unwrap())?;
-            std::fs::write(&p, DEFAULT_CONFIG_TOML)?;
+            std::fs::write(p, DEFAULT_CONFIG_TOML)?;
         }
-        let s = std::fs::read_to_string(&p)
+        let s = std::fs::read_to_string(p)
             .with_context(|| format!("reading {}", p.display()))?;
         Self::from_str(&s)
     }
@@ -472,6 +543,25 @@ impl Config {
                 format!("invalid regex in style_rules match_class: {}", rule.match_class)
             })?;
         }
+        if !(0.0..=1.0).contains(&self.vocabulary.max_error_ratio) {
+            bail!(
+                "vocabulary.max_error_ratio must be between 0.0 and 1.0, got {}",
+                self.vocabulary.max_error_ratio
+            );
+        }
+        if self.vocabulary.min_term_chars == 0 {
+            bail!("vocabulary.min_term_chars must be at least 1");
+        }
+        for r in &self.vocabulary.replacements {
+            if r.from.trim().is_empty() {
+                bail!("vocabulary.replacements: `from` must not be empty");
+            }
+        }
+        for t in &self.vocabulary.terms {
+            if t.trim().is_empty() {
+                bail!("vocabulary.terms must not contain empty entries");
+            }
+        }
         if self.debug.dir.trim().is_empty() {
             bail!("debug.dir must not be empty");
         }
@@ -527,6 +617,25 @@ context = "general"        # general | email
 # match_class = "(?i)thunderbird|^Mail$"
 # styling = "semi-formal"
 # context = "email"
+
+[vocabulary]
+# Names, jargon and acronyms the ASR has never heard, corrected after
+# transcription. `terms` are matched fuzzily, so a term still lands when it was
+# misrecognised slightly; `replacements` are exact.
+#
+# Short strings belong in `replacements`, not `terms`: a three-character term
+# is within two edits of most three-letter words, so matching it loosely enough
+# to catch a mis-heard "SQUI" would also rewrite "gut" and "gib".
+enabled = true
+terms = []
+max_error_ratio = 0.25   # 0.25 = two wrong characters allowed in an eight-character term
+min_term_chars = 5       # shorter terms are matched exactly only
+
+# terms = ["Hyprland", "sherpa-onnx", "Parakeet"]
+
+# [[vocabulary.replacements]]
+# from = "Settings-SQUI"
+# to = "Settings-GUI"
 
 [debug]
 # Diagnostics for tracking down capture/VAD/normalization bugs: per-utterance
@@ -700,5 +809,64 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().to_lowercase().contains("regex"), "got: {err}");
+    }
+
+    #[test]
+    fn the_vocabulary_section_loads_with_documented_defaults() {
+        let c = Config::from_str("").unwrap();
+        assert!(c.vocabulary.enabled);
+        assert!(c.vocabulary.terms.is_empty());
+        assert!(c.vocabulary.replacements.is_empty());
+        assert_eq!(c.vocabulary.max_error_ratio, 0.25);
+        assert_eq!(c.vocabulary.min_term_chars, 5);
+    }
+
+    #[test]
+    fn a_vocabulary_section_with_terms_and_replacements_loads() {
+        let c = Config::from_str(
+            r#"
+            [vocabulary]
+            terms = ["Hyprland", "sherpa-onnx"]
+
+            [[vocabulary.replacements]]
+            from = "Settings-SQUI"
+            to = "Settings-GUI"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.vocabulary.terms, ["Hyprland", "sherpa-onnx"]);
+        assert_eq!(c.vocabulary.replacements.len(), 1);
+        assert_eq!(c.vocabulary.replacements[0].from, "Settings-SQUI");
+        assert_eq!(c.vocabulary.replacements[0].to, "Settings-GUI");
+    }
+
+    #[test]
+    fn unknown_vocabulary_key_is_a_load_error() {
+        let err = Config::from_str("[vocabulary]\nfoo = 1\n").unwrap_err();
+        assert!(err.to_string().contains("foo"), "got: {err}");
+    }
+
+    /// A ratio above 1.0 would let a term match a token sharing not a single
+    /// character with it, turning the vocabulary into a text shredder. Caught
+    /// at load rather than producing nonsense at dictation time.
+    #[test]
+    fn an_out_of_range_max_error_ratio_is_a_load_error() {
+        let err = Config::from_str("[vocabulary]\nmax_error_ratio = 1.5\n").unwrap_err();
+        assert!(err.to_string().contains("max_error_ratio"), "got: {err}");
+        let err = Config::from_str("[vocabulary]\nmax_error_ratio = -0.1\n").unwrap_err();
+        assert!(err.to_string().contains("max_error_ratio"), "got: {err}");
+    }
+
+    #[test]
+    fn an_empty_replacement_source_is_a_load_error() {
+        let err = Config::from_str(
+            r#"
+            [[vocabulary.replacements]]
+            from = ""
+            to = "something"
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("from"), "got: {err}");
     }
 }

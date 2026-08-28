@@ -64,7 +64,7 @@ fn print_measurement(label: &str, m: &Measurement) {
     println!();
 }
 
-fn main() -> Result<()> {
+pub fn run() -> Result<()> {
     let path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "crates/owf-core/fixtures/hello_english.wav".to_string());

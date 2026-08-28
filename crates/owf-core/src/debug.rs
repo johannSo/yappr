@@ -189,6 +189,12 @@ pub struct DebugRecord {
     pub audio: AudioDebug,
     pub vad: VadDebug,
     pub asr_raw: Option<String>,
+    /// The vocabulary corrections that fired, or `None` when none did.
+    /// `#[serde(default)]` so records written before the vocabulary existed
+    /// still deserialize -- `owf-ctl debug` reads whatever is newest on disk,
+    /// which may well predate this field.
+    #[serde(default)]
+    pub vocab: Option<Vec<crate::vocab::Substitution>>,
     pub lang: Option<String>,
     pub normalize: Option<NormalizeDebug>,
     pub guardrail: Option<GuardrailDebug>,
@@ -238,6 +244,7 @@ pub struct DebugInput<'a> {
     pub trimmed: Option<&'a [f32]>,
     pub vad: VadDebug,
     pub asr_raw: Option<&'a str>,
+    pub vocab: Option<Vec<crate::vocab::Substitution>>,
     pub lang: Option<Lang>,
     pub normalize: Option<NormalizeDebug>,
     pub guardrail: Option<GuardrailDebug>,
@@ -274,6 +281,7 @@ pub fn record_utterance(dir: &Path, ts: &str, save_audio: bool, input: DebugInpu
         },
         vad: input.vad,
         asr_raw: input.asr_raw.map(str::to_string),
+        vocab: input.vocab,
         lang: input.lang.map(lang_str).map(str::to_string),
         normalize: input.normalize,
         guardrail: input.guardrail,
@@ -466,6 +474,7 @@ mod tests {
             },
             vad: VadDebug::span(3_200, 15_800),
             asr_raw: Some("hello there".to_string()),
+            vocab: None,
             lang: Some("English".to_string()),
             normalize: Some(NormalizeDebug {
                 control: "[Styling: casual] [Structure: prose] [Context: general]".to_string(),
@@ -548,6 +557,7 @@ mod tests {
                 trimmed: Some(&[0.2]),
                 vad: VadDebug::span(1, 2),
                 asr_raw: Some("hi"),
+                vocab: None,
                 lang: Some(Lang::English),
                 normalize: None,
                 guardrail: None,
@@ -586,6 +596,7 @@ mod tests {
                 trimmed: None,
                 vad: VadDebug::not_found(),
                 asr_raw: None,
+                vocab: None,
                 lang: None,
                 normalize: None,
                 guardrail: None,

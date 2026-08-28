@@ -5,7 +5,9 @@ use std::os::unix::net::UnixStream;
 
 use crate::paths;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Not `Copy` any more: `SetConfig` carries the whole config as JSON. Every
+/// existing variant's wire form is unchanged.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "kebab-case")]
 pub enum Request {
     PttStart,
@@ -21,6 +23,24 @@ pub enum Request {
     /// request -- see `owf-daemon.rs`'s `handle`, which special-cases it
     /// before ever reaching `dispatch`.
     Subscribe,
+    /// The whole `Config` as JSON, for the settings GUI. Sent as JSON rather
+    /// than TOML so the GUI never needs the Rust type -- there is no fourth
+    /// hand-maintained copy of the config schema.
+    GetConfig,
+    /// Merges `config` into `config.toml`, preserving its comments, and
+    /// applies whatever can be applied without a restart. Rejected outright if
+    /// the result would not load.
+    SetConfig { config: serde_json::Value },
+    /// The input devices `cpal` can see, for the device dropdown.
+    ListInputDevices,
+}
+
+/// One row of the settings GUI's microphone dropdown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputDevice {
+    pub name: String,
+    /// Whether this is the host's default input.
+    pub is_default: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,6 +76,19 @@ pub enum State {
 pub enum OverlayEvent {
     Warming,
     Idle,
+    /// `ptt-start` has been accepted but the microphone is not delivering
+    /// samples yet: `ensure_recorder` may still have to build the recorder,
+    /// and even after `Recorder::start` returns, ALSA/PipeWire hands over the
+    /// first buffer tens of milliseconds later (measured ~55 ms through
+    /// PipeWire on this hardware). Speech in that window is genuinely lost,
+    /// so the overlay is expected to render this as "wait" rather than live
+    /// bars over a microphone that is not capturing yet.
+    ///
+    /// The very next `Recording` event marks the moment real audio arrived --
+    /// the first audio callback is never throttled (`should_emit_level`'s
+    /// `last_emitted` starts `None`), so it is emitted as soon as capture is
+    /// genuinely live, not up to `LEVEL_EMIT_INTERVAL` afterwards.
+    Opening,
     /// Spec 7.1: emitted at roughly 50 ms cadence while recording, not per
     /// audio callback. `level` is the RMS of the most recent capture window;
     /// `elapsed_ms` is time since this recording started.
@@ -103,15 +136,59 @@ pub struct Response {
     /// with no field anywhere reflecting the gap.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub normalize_available: Option<bool>,
+    /// `GetConfig` only: the whole config as JSON.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config: Option<serde_json::Value>,
+    /// `GetConfig` only: where that config lives, so the GUI can name the file
+    /// it is editing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_path: Option<String>,
+    /// `GetConfig` only: `Config::default()` as JSON, shaped exactly like
+    /// `config`. The settings GUI's per-row reset button restores a field to
+    /// the value found here, and hides itself on a field that already matches.
+    /// It travels on the wire for the same reason `config` does: the GUI has
+    /// no copy of the config schema, so a defaults table maintained there
+    /// would be a second one, free to drift from the Rust it claims to
+    /// describe.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub defaults: Option<serde_json::Value>,
+    /// `ListInputDevices` only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub devices: Option<Vec<InputDevice>>,
+    /// `SetConfig` only: whether the change needs a daemon restart to take
+    /// effect. Computed by the daemon, never by the GUI -- the rule already
+    /// exists in `Pipeline::update_reloadable` and must not exist twice.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restart_required: Option<bool>,
+    /// `SetConfig` only: which settings need it, in words the GUI can show.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restart_reason: Option<String>,
 }
 
 impl Response {
+    fn blank(ok: bool) -> Self {
+        Self {
+            ok,
+            state: None,
+            err: None,
+            warm: None,
+            last_ms: None,
+            normalize_available: None,
+            config: None,
+            config_path: None,
+            defaults: None,
+            devices: None,
+            restart_required: None,
+            restart_reason: None,
+        }
+    }
+
     pub fn ok(state: State) -> Self {
-        Self { ok: true, state: Some(state), err: None, warm: None, last_ms: None, normalize_available: None }
+        Self { ok: true, state: Some(state), ..Self::blank(true) }
     }
 
     pub fn err(msg: impl Into<String>) -> Self {
-        Self { ok: false, state: None, err: Some(msg.into()), warm: None, last_ms: None, normalize_available: None }
+        Self { err: Some(msg.into()), ..Self::blank(false) }
     }
 }
 
@@ -151,6 +228,21 @@ mod tests {
             serde_json::to_string(&Request::Subscribe).unwrap(),
             r#"{"cmd":"subscribe"}"#
         );
+        assert_eq!(
+            serde_json::to_string(&Request::GetConfig).unwrap(),
+            r#"{"cmd":"get-config"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::ListInputDevices).unwrap(),
+            r#"{"cmd":"list-input-devices"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::SetConfig {
+                config: serde_json::json!({"audio": {"device": "default"}})
+            })
+            .unwrap(),
+            r#"{"cmd":"set-config","config":{"audio":{"device":"default"}}}"#
+        );
     }
 
     #[test]
@@ -162,6 +254,9 @@ mod tests {
             Request::Status,
             Request::Reload,
             Request::Subscribe,
+            Request::GetConfig,
+            Request::ListInputDevices,
+            Request::SetConfig { config: serde_json::json!({"asr": {"num_threads": 2}}) },
         ] {
             let s = serde_json::to_string(&r).unwrap();
             assert_eq!(serde_json::from_str::<Request>(&s).unwrap(), r);
@@ -200,6 +295,21 @@ mod tests {
         assert_eq!(v["state"], serde_json::json!("recording"));
     }
 
+    /// `defaults` is what the settings GUI's per-row reset button restores to.
+    /// It is absent from every response that is not a `GetConfig` reply, the
+    /// same contract `config` and `config_path` already keep -- a GUI that
+    /// sees it on a `Status` reply would be reading a field nobody populates.
+    #[test]
+    fn a_response_omits_defaults_unless_something_puts_them_there() {
+        let v: serde_json::Value = serde_json::to_value(Response::ok(State::Idle)).unwrap();
+        assert!(v.get("defaults").is_none(), "defaults leaked into a plain ok response");
+
+        let mut r = Response::ok(State::Idle);
+        r.defaults = Some(serde_json::json!({"audio": {"device": "default"}}));
+        let v: serde_json::Value = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["defaults"]["audio"]["device"], serde_json::json!("default"));
+    }
+
     /// Every `OverlayEvent` variant round-trips through serde -- the overlay
     /// frontend and `owf-ctl subscribe` are both written against this exact
     /// wire form, so a variant that fails to round-trip here would silently
@@ -236,6 +346,7 @@ mod tests {
     fn overlay_events_serialise_to_the_documented_wire_form() {
         assert_eq!(serde_json::to_string(&OverlayEvent::Warming).unwrap(), r#"{"event":"warming"}"#);
         assert_eq!(serde_json::to_string(&OverlayEvent::Idle).unwrap(), r#"{"event":"idle"}"#);
+        assert_eq!(serde_json::to_string(&OverlayEvent::Opening).unwrap(), r#"{"event":"opening"}"#);
         assert_eq!(
             serde_json::to_string(&OverlayEvent::Recording { level: 0.5, elapsed_ms: 100 }).unwrap(),
             r#"{"event":"recording","level":0.5,"elapsed_ms":100}"#
@@ -324,6 +435,7 @@ mod tests {
         for variant in [
             "warming",
             "idle",
+            "opening",
             "transcribing",
             "normalizing",
             "injecting",

@@ -29,6 +29,11 @@ use serde::{Deserialize, Serialize};
 pub enum OverlayEvent {
     Warming,
     Idle,
+    /// `ptt-start` accepted, but the microphone is not delivering samples
+    /// yet (~55 ms through PipeWire on this hardware). Rendered as "wait":
+    /// speech in this window is lost, so the user must not be shown live
+    /// bars yet. The next `Recording` event is the moment capture went live.
+    Opening,
     /// `level` is the RMS of the most recent ~50ms capture window;
     /// `elapsed_ms` is time since this recording started.
     Recording { level: f32, elapsed_ms: u64 },
@@ -68,6 +73,7 @@ mod tests {
         let events = [
             OverlayEvent::Warming,
             OverlayEvent::Idle,
+            OverlayEvent::Opening,
             OverlayEvent::Recording { level: 0.42, elapsed_ms: 1_234 },
             OverlayEvent::Transcribing,
             OverlayEvent::Normalizing,
@@ -96,6 +102,7 @@ mod tests {
     fn wire_form_matches_owf_core_proto() {
         assert_eq!(serde_json::to_string(&OverlayEvent::Warming).unwrap(), r#"{"event":"warming"}"#);
         assert_eq!(serde_json::to_string(&OverlayEvent::Idle).unwrap(), r#"{"event":"idle"}"#);
+        assert_eq!(serde_json::to_string(&OverlayEvent::Opening).unwrap(), r#"{"event":"opening"}"#);
         assert_eq!(
             serde_json::to_string(&OverlayEvent::Recording { level: 0.5, elapsed_ms: 100 }).unwrap(),
             r#"{"event":"recording","level":0.5,"elapsed_ms":100}"#

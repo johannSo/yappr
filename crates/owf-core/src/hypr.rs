@@ -87,12 +87,12 @@ o.bind("SUPER + ALT + D", "Dictation: cancel", "owf-ctl cancel")
 -- `[[bin]]` override) must be autostarted alongside the daemon; before this
 -- fix only the daemon was, so a user who applied this snippet got window
 -- rules (below) for a window that never appeared. Named bare, on PATH, the
--- same way `owf-daemon` is: this project has no separate install step for
+-- same way `owf-ctl` is: this project has no separate install step for
 -- the overlay binary that would justify a more fragile absolute path (e.g.
 -- `~/.cargo/bin/openwhisprflow` after `cargo install --path src-tauri`, or
 -- wherever a packaged `tauri build` bundle happens to put it) -- put it on
--- PATH the same way `owf-daemon`/`owf-ctl` are expected to be.
-o.launch_on_start("owf-daemon")
+-- PATH the same way `owf-ctl` is expected to be.
+o.launch_on_start("owf-ctl daemon")
 o.launch_on_start("openwhisprflow")
 
 -- Add to ~/.config/hypr/windows.lua
@@ -146,10 +146,10 @@ o.window("openwhisprflow", {
 /// Hyprland session on hand to test against directly. `no_dim` is left out of
 /// this block because it has no independently confirmed classic spelling.
 pub const HYPR_CONFIG_CONF: &str = r#"# OpenWhisprFlow
-exec-once = owf-daemon
+exec-once = owf-ctl daemon
 # Spec 5.1: autostart the overlay ("openwhisprflow", the Tauri app's own
 # binary name -- see src-tauri/Cargo.toml) alongside the daemon, the same way
-# and on the same assumption (bare name, on PATH) as owf-daemon above -- see
+# and on the same assumption (bare name, on PATH) as owf-ctl above -- see
 # HYPR_CONFIG_LUA's doc comment for why an absolute path was rejected.
 exec-once = openwhisprflow
 
@@ -241,7 +241,7 @@ mod tests {
         assert!(HYPR_CONFIG_LUA.contains(r#"o.bind("SUPER + D", "Dictate (hold to talk)", "owf-ctl ptt-start")"#));
         assert!(HYPR_CONFIG_LUA
             .contains(r#"o.bind("SUPER + D", nil, "owf-ctl ptt-stop", { release = true })"#));
-        assert!(HYPR_CONFIG_LUA.contains("o.launch_on_start(\"owf-daemon\")"));
+        assert!(HYPR_CONFIG_LUA.contains("o.launch_on_start(\"owf-ctl daemon\")"));
         assert!(HYPR_CONFIG_LUA.contains("owf-ctl cancel"));
     }
 
@@ -250,7 +250,7 @@ mod tests {
     /// (`openwhisprflow`, the Tauri overlay app) that never launched.
     #[test]
     fn the_lua_config_autostarts_the_overlay_alongside_the_daemon() {
-        assert!(HYPR_CONFIG_LUA.contains("o.launch_on_start(\"owf-daemon\")"));
+        assert!(HYPR_CONFIG_LUA.contains("o.launch_on_start(\"owf-ctl daemon\")"));
         assert!(
             HYPR_CONFIG_LUA.contains("o.launch_on_start(\"openwhisprflow\")"),
             "the Tauri overlay binary must be autostarted too (spec 5.1), not just the daemon"
@@ -330,13 +330,13 @@ mod tests {
     fn the_conf_config_still_serves_classic_installations() {
         assert!(HYPR_CONFIG_CONF.contains("bind  = SUPER, D,       exec, owf-ctl ptt-start"));
         assert!(HYPR_CONFIG_CONF.contains("bindr = SUPER, D,       exec, owf-ctl ptt-stop"));
-        assert!(HYPR_CONFIG_CONF.contains("exec-once = owf-daemon"));
+        assert!(HYPR_CONFIG_CONF.contains("exec-once = owf-ctl daemon"));
     }
 
     /// F2 / spec 5.1, the `.conf` side of the same fix.
     #[test]
     fn the_conf_config_autostarts_the_overlay_alongside_the_daemon() {
-        assert!(HYPR_CONFIG_CONF.contains("exec-once = owf-daemon"));
+        assert!(HYPR_CONFIG_CONF.contains("exec-once = owf-ctl daemon"));
         assert!(
             HYPR_CONFIG_CONF.contains("exec-once = openwhisprflow"),
             "the Tauri overlay binary must be autostarted too (spec 5.1), not just the daemon"

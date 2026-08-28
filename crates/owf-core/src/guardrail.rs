@@ -133,21 +133,14 @@ pub fn evaluate(raw: &str, cleaned: &str, lang: Lang, cfg: &GuardrailConfig) -> 
 /// The minimal cleanup applied to raw ASR text when normalization is skipped
 /// or rejected. Deliberately tiny: the user should be able to tell at a glance
 /// that S1-mini did not run. See spec 9.2.
+///
+/// Collapsing runs of whitespace is all that is left here; capitalisation and
+/// terminal punctuation moved to [`crate::finish`], which the pipeline applies
+/// to *every* path rather than only this one. Keeping a second copy of that
+/// logic here is what let the two implementations drift in the first place --
+/// this one capitalised and terminated, the accepted-cleanup path did neither.
 pub fn rule_based_fallback(raw: &str) -> String {
-    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.is_empty() {
-        return String::new();
-    }
-    let mut chars: Vec<char> = collapsed.chars().collect();
-    if let Some(i) = chars.iter().position(|c| c.is_alphabetic()) {
-        let upper: Vec<char> = chars[i].to_uppercase().collect();
-        chars.splice(i..=i, upper);
-    }
-    let mut s: String = chars.into_iter().collect();
-    if !s.ends_with(['.', '!', '?', '\u{2026}']) {
-        s.push('.');
-    }
-    s
+    crate::finish::finish(&raw.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
 #[cfg(test)]
@@ -356,7 +349,13 @@ mod tests {
         assert_eq!(rule_based_fallback("hey!"), "Hey!");
         assert_eq!(rule_based_fallback(""), "");
         assert_eq!(rule_based_fallback("   "), "");
-        // Leading non-alphabetic characters must not block capitalisation.
-        assert_eq!(rule_based_fallback("42 things happened"), "42 Things happened.");
+        // Leading brackets and quotes must not block capitalisation...
+        assert_eq!(rule_based_fallback("\"hello there\""), "\"Hello there\".");
+        // ...but a leading digit must, since the sentence really does start
+        // with that number. This used to produce `42 Things happened.`,
+        // capitalising a word in mid-sentence, because the search was for the
+        // first *alphabetic* character rather than the first alphanumeric
+        // one. See `crate::finish`, which now owns this rule.
+        assert_eq!(rule_based_fallback("42 things happened"), "42 things happened.");
     }
 }

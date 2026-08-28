@@ -16,17 +16,16 @@ hound = "3.5"
 # of this binary.
 signal-hook = "0.3"
 
+[lib]
+name = "owf_cli"
+path = "src/lib.rs"
+
+# One binary, three jobs. `owf-ctl` keeps the name because the compositor's
+# push-to-talk keybinding runs it on every key press and release; the daemon
+# and the benchmark became `owf-ctl daemon` and `owf-ctl bench`.
 [[bin]]
 name = "owf-ctl"
 path = "src/bin/owf-ctl.rs"
-
-[[bin]]
-name = "owf-bench"
-path = "src/bin/owf-bench.rs"
-
-[[bin]]
-name = "owf-daemon"
-path = "src/bin/owf-daemon.rs"
 
 [dev-dependencies]
 owf-core = { path = "../owf-core", features = ["test-util"] }

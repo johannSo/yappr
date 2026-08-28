@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow, type Window as TauriWindow } from "@tauri-apps/api/window";
+import { AnimatePresence, MotionConfig, motion, type Transition } from "motion/react";
 import "./Overlay.css";
 
 // Wire shape emitted by the Rust backend (`src-tauri/src/wire.rs`), which
@@ -12,6 +13,11 @@ import "./Overlay.css";
 type OverlayEvent =
   | { event: "warming" }
   | { event: "idle" }
+  // ptt-start accepted, but the mic has not produced a sample yet (~55 ms
+  // through PipeWire here). Rendered as "wait" so the user does not start
+  // talking into a microphone that is not capturing; the next `recording`
+  // event is the moment capture genuinely went live.
+  | { event: "opening" }
   | { event: "recording"; level: number; elapsed_ms: number }
   | { event: "transcribing" }
   | { event: "normalizing" }
@@ -21,13 +27,14 @@ type OverlayEvent =
   | { event: "busy_rejected" }
   // Spec 15 (M2 Task 3): normalization availability, independent of the
   // pipeline's own state -- rendered as a small persistent badge alongside
-  // whatever the state-driven pill is already showing, never in place of it.
+  // whatever the state-driven capsule is already showing, never in place of
+  // it.
   | { event: "normalize_degraded"; reason: string }
   | { event: "normalize_recovered" };
 
-// How many of the most recent `recording` levels to keep for the bar
-// meter. At the spec's ~50ms cadence this is roughly 1.4s of history --
-// enough to look alive without the bars feeling like a full waveform.
+// How many of the most recent `recording` levels to keep for the meter.
+// At the spec's ~50ms cadence this is roughly 1.4s of history -- enough to
+// look alive without the bars feeling like a full waveform.
 const RECORDING_HISTORY = 28;
 
 // Presentation durations from spec 12's table. These are UI-only timers
@@ -36,11 +43,23 @@ const RECORDING_HISTORY = 28;
 const DONE_FLASH_MS = 800;
 const ERROR_FLASH_MS = 2000;
 const BUSY_FLASH_MS = 400;
-const PREVIEW_MAX_CHARS = 60;
+const PREVIEW_MAX_CHARS = 96;
+
+// How long the capsule's exit animation is given before the native window
+// is actually hidden. The window used to vanish on the same frame the React
+// tree emptied, which threw away the exit half of every transition: a thing
+// that arrives by rising and materialising should leave the same way it came
+// (Apple's spatial-consistency rule), and it cannot if the surface it is
+// drawn on disappears first. Kept deliberately short, and armed on a timer
+// that `showOnce` clears rather than one that can outlive its own state --
+// the failure this must never reintroduce is a window left on screen with
+// nothing in it.
+const EXIT_MS = 260;
 
 type ViewState =
   | { kind: "hidden" }
   | { kind: "warming" }
+  | { kind: "opening" }
   | { kind: "recording"; levels: number[]; elapsedMs: number }
   | { kind: "transcribing" }
   | { kind: "normalizing" }
@@ -48,6 +67,35 @@ type ViewState =
   | { kind: "done"; preview: string }
   | { kind: "error"; reason: string }
   | { kind: "busy" };
+
+// Motion, in the two shapes this UI has any use for.
+//
+// Apple parameterises a spring as *damping ratio* (how much it overshoots)
+// and *response* (how quickly it reaches the target) rather than as
+// mass/stiffness/damping, and Motion's `bounce`/`duration` pair is the same
+// two knobs under different names: `bounce: 0` is critically damped, and
+// `duration` here is a settle time, not a fixed playback length -- an
+// interrupted spring re-targets from wherever it currently is.
+//
+// SETTLE is the default for everything: no overshoot, nothing distracting.
+// LAND is used in exactly one place, the moment the pipeline finishes and
+// the capsule grows to show what was typed, because that transition is the
+// one that has momentum behind it -- overshoot on an arrival reads as
+// arrival; overshoot on a label change reads as a wobble.
+const SETTLE = { type: "spring", bounce: 0, duration: 0.4 } as const;
+const LAND = { type: "spring", bounce: 0.22, duration: 0.45 } as const;
+// `busy_rejected` is on screen for BUSY_FLASH_MS, which spec 12 sets at 400 ms.
+// A 400 ms settle inside a 400 ms flash means the capsule spends its whole life
+// arriving and never actually lands -- the state reads as a smear rather than
+// as a word. The spec's duration is the constraint, so the spring gives way:
+// this one settles in well under half the time it is allowed.
+const SNAP = { type: "spring", bounce: 0, duration: 0.22 } as const;
+
+// Enter and exit are the same path in reverse (rise + materialise / sink +
+// dissolve), not two different animations. The blur is what makes the
+// surface read as a *material* arriving rather than a rectangle fading up.
+const CAPSULE_IN = { opacity: 1, y: 0, scale: 1, filter: "blur(0px)" };
+const CAPSULE_OUT = { opacity: 0, y: 12, scale: 0.94, filter: "blur(10px)" };
 
 // Wayland gives a window no monitor to query until it has been mapped at
 // least once (there is no X11-style "primary monitor" concept), so the
@@ -67,11 +115,16 @@ function truncate(text: string, max: number): string {
 }
 
 /// RMS levels from the capture thread run roughly 0..0.3 for normal speech.
-/// Map that onto a visible bar-height percentage with a floor, so a quiet
-/// moment still shows a faint "listening" bar rather than a flat line.
-function levelToHeightPercent(level: number): number {
+/// Map that onto a `scaleY` factor with a floor, so a quiet moment still
+/// shows a faint "listening" line rather than nothing at all.
+///
+/// A scale rather than a height: the bars are a fixed-size box the
+/// compositor can transform on its own thread, where animating `height`
+/// would put a layout pass on the main thread twenty times a second for the
+/// whole duration of a dictation.
+function levelToScale(level: number): number {
   const clamped = Math.max(0, Math.min(1, level / 0.3));
-  return 10 + clamped * 90;
+  return 0.06 + clamped * 0.94;
 }
 
 export default function Overlay() {
@@ -82,6 +135,11 @@ export default function Overlay() {
   const [degraded, setDegraded] = useState<string | null>(null);
   const levelsRef = useRef<number[]>([]);
   const hideTimer = useRef<number | undefined>(undefined);
+  // Separate from `hideTimer` on purpose. `hideTimer` decides *when a state
+  // stops being shown*; this one only defers the native `win.hide()` far
+  // enough for the exit animation to play. Conflating them would put the
+  // flash durations and the animation length in one number.
+  const exitTimer = useRef<number | undefined>(undefined);
   // Whether the window is currently shown-and-positioned. `recording` events
   // arrive at spec 7.1's ~50ms cadence (~20/s) for the whole duration of a
   // dictation; calling `showAndPosition` -- a `win.show()` IPC round trip
@@ -103,7 +161,20 @@ export default function Overlay() {
       }
     };
 
+    const clearExitTimer = () => {
+      if (exitTimer.current !== undefined) {
+        window.clearTimeout(exitTimer.current);
+        exitTimer.current = undefined;
+      }
+    };
+
     const showOnce = () => {
+      // A state arriving inside the exit window cancels the pending native
+      // hide and lets the capsule spring back from wherever its exit had
+      // got to, rather than waiting for it to finish and starting again --
+      // an animation the user has overtaken must be redirectable, not
+      // replayed from the top.
+      clearExitTimer();
       if (visible.current) return;
       visible.current = true;
       showAndPosition(win);
@@ -112,7 +183,11 @@ export default function Overlay() {
     const hide = () => {
       visible.current = false;
       setView({ kind: "hidden" });
-      win.hide().catch(() => {});
+      clearExitTimer();
+      exitTimer.current = window.setTimeout(() => {
+        exitTimer.current = undefined;
+        win.hide().catch(() => {});
+      }, EXIT_MS);
     };
 
     const scheduleHide = (ms: number) => {
@@ -128,7 +203,7 @@ export default function Overlay() {
       // new `view` (a stale timer left ticking would otherwise fire mid-way
       // through that new state and wrongly hide the window), and explicitly
       // *not* from `idle` -- a redundant `Idle` racing in behind a terminal
-      // event (or one that slips past the daemon-side fix in `owf-daemon.rs`)
+      // event (or one that slips past the daemon-side fix in `daemon.rs`)
       // must not be able to cut a flash short. It is also not called from
       // the two `normalize_*` branches or the `default` case, neither of
       // which touch `view` at all.
@@ -149,6 +224,13 @@ export default function Overlay() {
             levelsRef.current = [];
             hide();
           }
+          break;
+
+        case "opening":
+          clearHideTimer();
+          levelsRef.current = [];
+          setView({ kind: "opening" });
+          showOnce();
           break;
 
         case "recording": {
@@ -211,8 +293,8 @@ export default function Overlay() {
           // Forward-compatible (fix 4): an event this build doesn't know
           // about yet must be a no-op, never fall through to cancelling a
           // pending timer or otherwise touching `view` -- a build that
-          // predates a new variant must not risk a stuck, unclosable pill
-          // over one it can't render.
+          // predates a new variant must not risk a stuck, unclosable
+          // capsule over one it can't render.
           break;
       }
     });
@@ -220,102 +302,262 @@ export default function Overlay() {
     return () => {
       unlistenPromise.then((unlisten) => unlisten());
       clearHideTimer();
+      clearExitTimer();
     };
   }, []);
 
-  // Idle renders nothing at all: the window is natively hidden (spec 12 --
-  // "hidden when idle", not a transparent rectangle sitting there able to
-  // catch clicks), and an empty page means no stray paint while it's
-  // transitioning to hidden.
-  if (view.kind === "hidden") return null;
-
   return (
-    <div className="pill-wrap">
-      <div className={`pill pill--${view.kind}`} role="status" aria-live="polite">
-        <PillContent view={view} />
+    // `reducedMotion="user"` is the whole of this UI's reduced-motion
+    // handling for transforms: Motion drops every translate/scale/rotate and
+    // keeps opacity, which leaves each state's meaning -- carried by its
+    // words and its glyph -- completely intact. The parts CSS animates
+    // (the meter, the stage rail, the record dot) opt out in `Overlay.css`.
+    <MotionConfig reducedMotion="user">
+      <div className="stage">
+        <AnimatePresence initial={false}>
+          {view.kind !== "hidden" && (
+            <motion.div
+              key="capsule"
+              layout
+              className={`capsule capsule--${view.kind}`}
+              role="status"
+              aria-live="polite"
+              initial={CAPSULE_OUT}
+              animate={CAPSULE_IN}
+              exit={CAPSULE_OUT}
+              transition={CAPSULE_SPRING[view.kind] ?? SETTLE}
+            >
+              {/* `popLayout` pulls the outgoing content out of flow the
+                  instant it starts leaving, so the capsule's `layout` spring
+                  starts resizing towards the *new* content immediately
+                  instead of waiting out a cross-fade at the old width. */}
+              <AnimatePresence mode="popLayout" initial={false}>
+                <motion.div
+                  key={view.kind}
+                  className="capsule__content"
+                  initial={{ opacity: 0, y: 6, filter: "blur(4px)" }}
+                  animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
+                  exit={{ opacity: 0, y: -6, filter: "blur(4px)" }}
+                  transition={SETTLE}
+                >
+                  <CapsuleContent view={view} />
+                </motion.div>
+              </AnimatePresence>
+
+              {/* Spec 15: alongside whatever the state above is showing, not
+                  in place of it -- see the `OverlayEvent` union's comment.
+                  Inside the capsule rather than floating in the window's
+                  corner, because a dot that belongs to this surface should
+                  sit on it: proximity is what says the two are about the
+                  same thing. */}
+              <AnimatePresence initial={false}>
+                {degraded !== null && (
+                  <motion.span
+                    key="degraded"
+                    layout
+                    className="degraded"
+                    title={degraded}
+                    aria-label={degraded}
+                    role="status"
+                    initial={{ opacity: 0, scale: 0.5 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    exit={{ opacity: 0, scale: 0.5 }}
+                    transition={SETTLE}
+                  >
+                    <span className="degraded__dot" aria-hidden="true" />
+                  </motion.span>
+                )}
+              </AnimatePresence>
+            </motion.div>
+          )}
+        </AnimatePresence>
       </div>
-      {/* Spec 15: a persistent badge alongside whatever the state-driven
-          pill above is already showing, not a replacement for it -- see the
-          `OverlayEvent` union's comment. */}
-      {degraded !== null && (
-        <span className="badge badge--degraded" role="status" title={degraded} aria-label={degraded} />
-      )}
-    </div>
+    </MotionConfig>
   );
 }
 
-function PillContent({ view }: { view: ViewState }) {
+/// The spring each state arrives on, where it is not the house default.
+/// `done` is the one arrival with momentum behind it and gets a little
+/// overshoot; `busy` has to fit inside a 400 ms flash and gets less time.
+const CAPSULE_SPRING: Partial<Record<ViewState["kind"], Transition>> = {
+  done: LAND,
+  busy: SNAP,
+};
+
+/// Which segment of the three-step rail is currently running. The pipeline
+/// can skip the middle one (normalization off, or degraded to a rule-based
+/// cleanup), which is why this is a lookup rather than a counter -- the rail
+/// jumps straight to the last segment and the spring carries it there in one
+/// continuous move.
+const STAGE_INDEX: Record<string, number> = {
+  transcribing: 0,
+  normalizing: 1,
+  injecting: 2,
+};
+
+function CapsuleContent({ view }: { view: ViewState }) {
   switch (view.kind) {
     case "warming":
       return (
         <>
-          <Spinner />
-          <span className="pill__label">loading models</span>
+          <Breather />
+          <span className="label">loading models</span>
+        </>
+      );
+
+    case "opening":
+      // No spinner and no rail: both read as "the machine is busy, sit
+      // tight", which is the same thing `transcribing`/`cleaning` say. This
+      // is an instruction to the *user*, so it is a word plus a steady dot.
+      return (
+        <>
+          <span className="dot dot--wait" aria-hidden="true" />
+          <span className="label">wait…</span>
         </>
       );
 
     case "recording":
       return (
         <>
-          <Bars levels={view.levels} />
-          <span className="pill__timer">{(view.elapsedMs / 1000).toFixed(1)}s</span>
+          <span className="dot dot--rec" aria-hidden="true" />
+          <Meter levels={view.levels} />
+          <span className="timer">{(view.elapsedMs / 1000).toFixed(1)}s</span>
         </>
       );
 
     case "transcribing":
-      return (
-        <>
-          <Spinner />
-          <span className="pill__label">transcribing</span>
-        </>
-      );
-
     case "normalizing":
+    case "injecting": {
+      const labels = {
+        transcribing: "transcribing",
+        normalizing: "cleaning",
+        injecting: "typing",
+      } as const;
       return (
-        <>
-          <Spinner />
-          <span className="pill__label">cleaning</span>
-        </>
+        <div className="run">
+          <span className="label">{labels[view.kind]}</span>
+          <StageRail index={STAGE_INDEX[view.kind]} />
+        </div>
       );
-
-    case "injecting":
-      return (
-        <>
-          <Spinner />
-          <span className="pill__label">typing</span>
-        </>
-      );
+    }
 
     case "done":
-      return <span className="pill__preview">{view.preview}</span>;
+      return (
+        <>
+          <Check />
+          <span className="preview">{view.preview}</span>
+        </>
+      );
 
     case "error":
-      return <span className="pill__label">{view.reason}</span>;
+      return (
+        <>
+          <Warn />
+          <span className="label label--wrap">{view.reason}</span>
+        </>
+      );
 
     case "busy":
-      return <span className="pill__label">busy</span>;
+      return (
+        <>
+          <span className="dot dot--wait" aria-hidden="true" />
+          <span className="label">busy</span>
+        </>
+      );
 
     case "hidden":
       return null;
   }
 }
 
-function Spinner() {
-  return <span className="spinner" aria-hidden="true" />;
+/// Warming has no progress to report and no stages to walk, so it gets the
+/// one shape that honestly means "alive, nothing to count": a slow breath.
+function Breather() {
+  return <span className="breather" aria-hidden="true" />;
 }
 
-function Bars({ levels }: { levels: number[] }) {
+/// The live meter -- the user's proof the microphone is hearing them.
+///
+/// Always renders its full width of slots and fills them from the right, so
+/// the meter reads as history scrolling past a fixed window instead of a
+/// block that grows sideways for the first 1.4 s of every dictation and
+/// drags the capsule's width along with it.
+function Meter({ levels }: { levels: number[] }) {
+  const pad = RECORDING_HISTORY - levels.length;
   return (
-    <div className="bars" aria-hidden="true">
-      {levels.map((level, i) => (
+    <div className="meter" aria-hidden="true">
+      {Array.from({ length: RECORDING_HISTORY }, (_, i) => {
+        const level = i < pad ? 0 : levels[i - pad];
+        return (
+          <span
+            // Index is stable and order-preserving for this fixed-length
+            // rolling window, so it's an acceptable key here.
+            key={i}
+            className="meter__bar"
+            style={{ transform: `scaleY(${levelToScale(level)})` }}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
+/// The three post-release stages as a rail rather than a spinner.
+///
+/// A spinner says "wait, indefinitely". This says the same thing a spinner
+/// does about *being busy*, and additionally where in a known sequence the
+/// work is -- which is the difference between a wait that feels open-ended
+/// and one that visibly has an end.
+function StageRail({ index }: { index: number }) {
+  return (
+    <div className="rail" aria-hidden="true">
+      {[0, 1, 2].map((i) => (
         <span
-          // Index is stable and order-preserving for this fixed-length
-          // rolling window, so it's an acceptable key here.
           key={i}
-          className="bar"
-          style={{ height: `${levelToHeightPercent(level)}%` }}
+          className={`rail__seg${i < index ? " is-done" : ""}${i === index ? " is-live" : ""}`}
         />
       ))}
     </div>
+  );
+}
+
+/// Drawn rather than faded in: a check that draws itself along its own
+/// stroke is the shape of the action it reports -- something completing.
+function Check() {
+  return (
+    <svg className="glyph glyph--ok" viewBox="0 0 24 24" aria-hidden="true">
+      <motion.path
+        d="M5 12.5 10 17.5 19.5 7"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2.4"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        initial={{ pathLength: 0 }}
+        animate={{ pathLength: 1 }}
+        transition={{ duration: 0.28, ease: [0.22, 1, 0.36, 1] }}
+      />
+    </svg>
+  );
+}
+
+function Warn() {
+  return (
+    <svg className="glyph glyph--warn" viewBox="0 0 24 24" aria-hidden="true">
+      <path
+        d="M12 3.6 1.9 20.4h20.2L12 3.6Z"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.9"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M12 10v4.6M12 17.7v.4"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.9"
+        strokeLinecap="round"
+      />
+    </svg>
   );
 }

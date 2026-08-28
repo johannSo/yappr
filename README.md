@@ -6,8 +6,9 @@ Everything runs locally — no network calls at dictation time.
 
 ## How it works
 
-`owf-daemon` is a long-lived background process that owns a Unix socket.
-`owf-ctl` is the thin client a Hyprland keybind runs on key press/release.
+`owf-ctl` is the only binary. `owf-ctl daemon` is a long-lived background
+process that owns a Unix socket; the same binary run as `owf-ctl ptt-start` is
+the thin client a Hyprland keybind invokes on key press/release.
 One dictation goes through this pipeline:
 
 1. **Capture** — the microphone is recorded at 16 kHz mono while the key is held.
@@ -64,10 +65,27 @@ below.
 ```bash
 cargo build --release -p owf-cli
 mkdir -p ~/.local/bin
-install -m755 target/release/owf-daemon target/release/owf-ctl ~/.local/bin/
+install -m755 target/release/owf-ctl ~/.local/bin/
+
+# Settings window (optional but recommended)
+cargo build --release -p openwhisprflow-settings --features custom-protocol
+install -m755 target/release/openwhisprflow-settings ~/.local/bin/
 ```
 
 Make sure `~/.local/bin` is on your `PATH`.
+
+If you are upgrading from a build that installed `owf-daemon` and `owf-bench`
+as separate binaries, delete them — a stale `owf-daemon` on your `PATH` keeps
+working and keeps running the *old* code, which is the worst possible failure
+mode:
+
+```bash
+rm -f ~/.local/bin/owf-daemon ~/.local/bin/owf-bench
+```
+
+and change `o.launch_on_start("owf-daemon")` to `o.launch_on_start("owf-ctl daemon")`
+in `~/.config/hypr/autostart.lua`. The push-to-talk keybindings need no change:
+`owf-ctl ptt-start` and its siblings are spelled exactly as before.
 
 ## Set up models
 
@@ -115,7 +133,7 @@ o.bind("SUPER + ALT + D", "Dictation: cancel", "owf-ctl cancel")
 and the daemon in `~/.config/hypr/autostart.lua`:
 
 ```lua
-o.launch_on_start("owf-daemon")
+o.launch_on_start("owf-ctl daemon")
 ```
 
 Check first that those keys are free — `omarchy menu keybindings --print` on
@@ -148,8 +166,21 @@ machine rather than against documentation of unknown vintage.
 Then log out and back in so the daemon autostarts, or start it once by hand:
 
 ```bash
-owf-daemon &
+owf-ctl daemon &
 ```
+
+## Settings window
+
+```bash
+owf-ctl settings
+```
+
+Everything in `config.toml` is editable there, including the microphone and the
+dictation vocabulary. Saving writes the file in place: comments and layout
+survive, a save that changes nothing leaves the file byte-identical, and a
+config that would not load is rejected before anything is written. Changes to
+`[asr]` and `[normalize]` need a daemon restart; the window says so. Everything
+else, the microphone included, takes effect at the next dictation.
 
 ## Configuration
 
@@ -193,7 +224,7 @@ watching the result. Treat dictation as unverified until this is done:
 - [ ] Killing `llama-server` mid-session still types raw ASR text (with a logged warning) instead of failing
 - [ ] A German dictation, and whether the guardrail fires for it (check `rejections.jsonl`)
 - [ ] `~/.local/state/openwhisprflow/rejections.jsonl` contains valid JSON, one object per line
-- [ ] A second `owf-daemon` refuses to start with "already running"
+- [ ] A second `owf-ctl daemon` refuses to start with "already running"
 - [ ] Stopwatch timing from key release to text appearing, for comparison against the estimate above
 
 This machine additionally cannot run `llama-server` at all right now (see
