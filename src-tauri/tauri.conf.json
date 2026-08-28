@@ -12,9 +12,27 @@
   "app": {
     "windows": [
       {
-        "title": "openwhisprflow",
-        "width": 800,
-        "height": 600
+        "label": "overlay",
+        "title": "openwhisprflow overlay",
+        "width": 280,
+        "height": 72,
+        "minWidth": 280,
+        "minHeight": 72,
+        "maxWidth": 280,
+        "maxHeight": 72,
+        "resizable": false,
+        "maximizable": false,
+        "minimizable": false,
+        "closable": false,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "focus": false,
+        "focusable": false,
+        "visible": false,
+        "acceptFirstMouse": false
       }
     ],
     "security": {

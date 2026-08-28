@@ -1,0 +1,53 @@
+# Checked-in NDJSON OverlayEvent fixture for `openwhisprflow --replay`.
+# Exercises every wire::OverlayEvent variant (M2 Task 5 acceptance
+# evidence) across three scenarios: a full successful dictation, a
+# no-speech error, and a busy rejection. Lines starting with '#' and blank
+# lines are ignored by the replay loader.
+#
+# The recording burst below has a realistic ~50ms cadence (spec 7.1) and
+# varying levels so the overlay's live bars actually move rather than
+# holding one height.
+
+# --- Scenario 1: warm-up, then a normal dictation to completion ---
+{"event":"warming"}
+{"event":"idle"}
+{"event":"recording","level":0.01,"elapsed_ms":50}
+{"event":"recording","level":0.03,"elapsed_ms":100}
+{"event":"recording","level":0.08,"elapsed_ms":150}
+{"event":"recording","level":0.15,"elapsed_ms":200}
+{"event":"recording","level":0.22,"elapsed_ms":250}
+{"event":"recording","level":0.28,"elapsed_ms":300}
+{"event":"recording","level":0.19,"elapsed_ms":350}
+{"event":"recording","level":0.09,"elapsed_ms":400}
+{"event":"recording","level":0.04,"elapsed_ms":450}
+{"event":"recording","level":0.02,"elapsed_ms":500}
+{"event":"recording","level":0.12,"elapsed_ms":550}
+{"event":"recording","level":0.26,"elapsed_ms":600}
+{"event":"recording","level":0.31,"elapsed_ms":650}
+{"event":"recording","level":0.24,"elapsed_ms":700}
+{"event":"recording","level":0.14,"elapsed_ms":750}
+{"event":"recording","level":0.06,"elapsed_ms":800}
+{"event":"recording","level":0.03,"elapsed_ms":850}
+{"event":"recording","level":0.17,"elapsed_ms":900}
+{"event":"recording","level":0.25,"elapsed_ms":950}
+{"event":"recording","level":0.30,"elapsed_ms":1000}
+{"event":"recording","level":0.21,"elapsed_ms":1050}
+{"event":"recording","level":0.10,"elapsed_ms":1100}
+{"event":"recording","level":0.05,"elapsed_ms":1150}
+{"event":"transcribing"}
+{"event":"normalizing"}
+{"event":"injecting"}
+{"event":"done","preview":"Let's sync tomorrow at ten to go over the quarterly numbers"}
+{"event":"idle"}
+
+# --- Scenario 2: a short recording that yields no speech ---
+{"event":"recording","level":0.02,"elapsed_ms":50}
+{"event":"recording","level":0.03,"elapsed_ms":100}
+{"event":"recording","level":0.01,"elapsed_ms":150}
+{"event":"transcribing"}
+{"event":"error","reason":"no speech detected"}
+{"event":"idle"}
+
+# --- Scenario 3: a second ptt-start while the pipeline is busy ---
+{"event":"busy_rejected"}
+{"event":"idle"}
