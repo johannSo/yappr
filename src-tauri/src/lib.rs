@@ -21,7 +21,7 @@ mod tray;
 
 use tauri::{Emitter, Manager, PhysicalPosition};
 
-use owf_core::proto::{OverlayEvent, Request, State};
+use owf_core::proto::{OverlayEvent, Request};
 use owf_core::server::{dispatch, shutdown, Daemon, EventSink};
 
 /// Must match the window `label` in `tauri.conf.json`.
@@ -133,61 +133,38 @@ impl EventSink for TauriSink {
 }
 
 impl TauriSink {
-    /// Pushes the tray icon's next `State`, derived from `event` -- see
-    /// `tray.rs`'s module doc ("Icon and daemon state") for the full
-    /// reasoning. In short: `daemon.state` and its broadcasts are not
-    /// consistently ordered (`Done` is broadcast while `daemon.state` is
-    /// still `INJECTING`; a transient per-utterance `Error` is broadcast
-    /// while it is still `TRANSCRIBING`; `IdleOnExit`'s reset to `IDLE`
-    /// afterward broadcasts nothing), so re-asking `Request::Status` on
-    /// every broadcast -- this function's review round 1 shape -- read the
-    /// *pre-transition* state and left the tray showing a busy icon for the
-    /// entire idle period after every completed dictation. Deriving
-    /// straight from `event` via `tray::state_from_event` is exact for
-    /// every case that function can resolve, and cheaper: no `tauri::State`
-    /// lookup, no extra `Mutex` lock, no `serde_json` allocation, on what is
-    /// otherwise a 20 Hz path while recording.
-    ///
-    /// `OverlayEvent::Error` is the one event `state_from_event` cannot
-    /// resolve alone: it is broadcast identically for the one fatal,
-    /// permanent warm-up failure (`State::Error`) and for an ordinary
-    /// per-utterance failure (which leaves the daemon genuinely `Idle`
-    /// again immediately), and `State::Error`'s own doc comment says the
-    /// two must stay distinct. Only for that one case does this still ask
-    /// `Request::Status`: `State::Error` is set only on the warm-up path
-    /// (`server.rs`'s `warm_up` `Err` arm, before it ever broadcasts), so
-    /// "`Status` reports anything other than `State::Error`" unambiguously
-    /// means this was the transient case, mapped to `Idle`.
+    /// Pushes the tray icon's next `State`, if any -- the decision itself
+    /// is [`tray::icon_state_for`], a pure function this method's only job
+    /// is to feed. See that function's doc comment (and `tray.rs`'s module
+    /// doc, "Icon and daemon state") for the full reasoning; in short,
+    /// deriving from `event` beats re-asking `Request::Status` on every
+    /// broadcast (review round 1's bug), and `Request::Status` is asked at
+    /// all only for `OverlayEvent::Error` (review round 2: this call
+    /// pattern, not `tray::state_from_event`'s match body, was where that
+    /// bug actually lived and was invisible to every test).
     ///
     /// `try_state` rather than `state` for that lookup: it can in principle
     /// run before `setup()` has finished calling `app.manage(Server(..))`
     /// (warm-up is spawned from inside `owf_core::server::start`, before it
-    /// returns to `setup()`), in which case this is a no-op for that one
-    /// `Error` -- harmless, since the tray already shows its correct
-    /// initial `State::Warming` icon until the next event arrives.
+    /// returns to `setup()`), in which case `status` below is `None` for
+    /// that one `Error` -- harmless: `icon_state_for` treats a `None`
+    /// status as "nothing to resolve `Error` with", same as `--replay`.
     fn refresh_tray_icon(&self, event: &OverlayEvent) {
-        if let Some(state) = tray::state_from_event(event) {
+        // Only `Error` needs `Request::Status` at all (see
+        // `tray::icon_state_for`'s doc comment) -- every other event is
+        // resolved by `tray::state_from_event` alone, so this must not
+        // dispatch on the 20 Hz `Recording` path.
+        let status = if matches!(event, OverlayEvent::Error { .. }) {
+            self.app
+                .try_state::<settings_cmds::Server>()
+                .and_then(|server| server.0.clone())
+                .and_then(|daemon| dispatch(&daemon, Request::Status).state)
+        } else {
+            None
+        };
+        if let Some(state) = tray::icon_state_for(event, status) {
             self.tray.set_state(state);
-            return;
         }
-        // `state_from_event` maps every event except `Error` (not a
-        // `State` transition at all for `BusyRejected`/
-        // `NormalizeDegraded`/`NormalizeRecovered` -- leave the icon as it
-        // is) and `Error` itself, resolved below.
-        if !matches!(event, OverlayEvent::Error { .. }) {
-            return;
-        }
-        let Some(server) = self.app.try_state::<settings_cmds::Server>() else {
-            return;
-        };
-        let Some(daemon) = server.0.clone() else {
-            return;
-        };
-        let state = match dispatch(&daemon, Request::Status).state {
-            Some(State::Error) => State::Error,
-            _ => State::Idle,
-        };
-        self.tray.set_state(state);
     }
 }
 

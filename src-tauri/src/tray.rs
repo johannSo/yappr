@@ -188,6 +188,45 @@ pub(crate) fn state_from_event(event: &OverlayEvent) -> Option<State> {
     }
 }
 
+/// The tray's whole icon-update decision for one broadcast, as a pure
+/// function -- extracted from `TauriSink::refresh_tray_icon` (`lib.rs`) so
+/// it is testable without an `AppHandle`, a `Daemon`, or a live tray.
+///
+/// Review round 2 found that round 1's fix -- deriving from `event` via
+/// [`state_from_event`], with `Request::Status` asked only for `Error` --
+/// was correct, but lived entirely in `refresh_tray_icon`'s call pattern,
+/// which had no test at all: the six `tray::` tests all exercised
+/// `state_from_event`, whose match body round 1 never actually changed.
+/// The bug that round fixed (the icon showing the busy state after every
+/// completed dictation) would have been just as invisible to the suite as
+/// the fix for it. This function is what closes that gap: everything
+/// `refresh_tray_icon` decides, in one place a test can call directly.
+///
+/// `status` is what a `Request::Status` dispatch reported at the same
+/// moment (`response.state`), or `None` when there is no daemon to ask --
+/// under `--replay`, or when `refresh_tray_icon` didn't need to ask at all.
+/// It only matters for `OverlayEvent::Error`, the one event
+/// [`state_from_event`] cannot resolve alone: `Some(State::Error)` means
+/// the one fatal, permanent warm-up failure (`State::Error` is stored only
+/// on that path, `server.rs`'s `warm_up` `Err` arm); any other `Some`
+/// means an ordinary per-utterance failure, mapped to `Idle`; `None` means
+/// there was nothing to ask, so the icon is left exactly as it was --
+/// matching `--replay`'s own behaviour, which never resolves `Error` at
+/// all.
+pub(crate) fn icon_state_for(event: &OverlayEvent, status: Option<State>) -> Option<State> {
+    if let Some(state) = state_from_event(event) {
+        return Some(state);
+    }
+    if !matches!(event, OverlayEvent::Error { .. }) {
+        return None;
+    }
+    match status {
+        Some(State::Error) => Some(State::Error),
+        Some(_) => Some(State::Idle),
+        None => None,
+    }
+}
+
 /// The `ksni::Tray` model. Holds an `AppHandle`, not an `Arc<Daemon>`
 /// directly, so it works unchanged under `--replay` -- [`OwfTray::quit`]
 /// looks up `settings_cmds::Server` lazily, at click time, rather than
@@ -401,5 +440,61 @@ mod tests {
             None
         );
         assert_eq!(state_from_event(&OverlayEvent::NormalizeRecovered), None);
+    }
+
+    // -- `icon_state_for` (review round 2: the call pattern that was
+    // actually broken, extracted so it is testable at all) -----------------
+
+    #[test]
+    fn icon_state_for_maps_done_to_idle_regardless_of_status() {
+        let done = OverlayEvent::Done { preview: "hallo".to_string() };
+        assert_eq!(icon_state_for(&done, None), Some(State::Idle));
+        assert_eq!(icon_state_for(&done, Some(State::Injecting)), Some(State::Idle));
+    }
+
+    #[test]
+    fn icon_state_for_maps_opening_to_recording_regardless_of_status() {
+        assert_eq!(icon_state_for(&OverlayEvent::Opening, None), Some(State::Recording));
+    }
+
+    /// The one case this whole review round exists for: a warm-up failure
+    /// genuinely reports `State::Error` from `Request::Status`, and the
+    /// tray must show it.
+    #[test]
+    fn icon_state_for_maps_error_to_error_when_status_confirms_it_is_fatal() {
+        let error = OverlayEvent::Error { reason: "warm-up failed: x".to_string() };
+        assert_eq!(icon_state_for(&error, Some(State::Error)), Some(State::Error));
+    }
+
+    /// The transient case that was silently wrong before this review round:
+    /// an ordinary "no speech detected" `Error` is broadcast while
+    /// `daemon.state` is still busy (`Transcribing` here), and must still
+    /// resolve to `Idle`, not `Error`.
+    #[test]
+    fn icon_state_for_maps_error_to_idle_when_status_reports_a_transient_failure() {
+        let error = OverlayEvent::Error { reason: "no speech detected".to_string() };
+        assert_eq!(icon_state_for(&error, Some(State::Transcribing)), Some(State::Idle));
+    }
+
+    /// No daemon to ask (`--replay`, or a settings command that failed to
+    /// resolve one) leaves the icon exactly where it was, matching
+    /// `--replay`'s own behaviour, which never resolves `Error` at all.
+    #[test]
+    fn icon_state_for_leaves_the_icon_unchanged_on_error_with_no_status_to_ask() {
+        let error = OverlayEvent::Error { reason: "x".to_string() };
+        assert_eq!(icon_state_for(&error, None), None);
+    }
+
+    #[test]
+    fn icon_state_for_leaves_the_icon_unchanged_on_events_that_are_not_state_transitions() {
+        assert_eq!(icon_state_for(&OverlayEvent::BusyRejected, Some(State::Recording)), None);
+        assert_eq!(
+            icon_state_for(
+                &OverlayEvent::NormalizeDegraded { reason: "x".to_string() },
+                Some(State::Idle)
+            ),
+            None
+        );
+        assert_eq!(icon_state_for(&OverlayEvent::NormalizeRecovered, Some(State::Idle)), None);
     }
 }
