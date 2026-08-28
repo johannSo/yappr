@@ -27,7 +27,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// begins -- a child blocked reading stdin forever is exactly the kind of
 /// hang this function exists to bound, so the write happens up front rather
 /// than racing the poll loop's own timeout accounting.
-pub(crate) fn run_with_timeout(
+pub fn run_with_timeout(
     mut command: Command,
     timeout: Duration,
     stdin: Option<&[u8]>,

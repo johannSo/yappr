@@ -23,6 +23,10 @@ tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 owf-core = { path = "../crates/owf-core" }
+anyhow = "1"
+# For `bench.rs`'s `read_wav_16k_mono`, moved here from `owf-cli` (matches
+# its pinned version).
+hound = "3.5"
 
 # Linux-only, and only for one call: WebKitGTK's WebView widget enforces an
 # internal minimum natural size (~200 logical px tall) that GTK's box

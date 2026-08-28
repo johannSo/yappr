@@ -2888,7 +2888,9 @@ dependencies = [
 name = "openwhisprflow"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "gtk",
+ "hound",
  "owf-core",
  "serde",
  "serde_json",
@@ -2928,7 +2930,6 @@ name = "owf-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "hound",
  "owf-core",
  "serde",
  "serde_json",

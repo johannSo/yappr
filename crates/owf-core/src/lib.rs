@@ -13,7 +13,7 @@ pub mod models;
 pub mod normalize;
 pub mod paths;
 pub mod pipeline;
-pub(crate) mod procutil;
+pub mod procutil;
 pub mod proto;
 pub mod server;
 pub mod style;

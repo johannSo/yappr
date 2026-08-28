@@ -5,9 +5,13 @@
 //! `--replay <path>` (`replay.rs`), and forwards whatever it receives to
 //! the frontend as a Tauri event. All rendering decisions live in `src/`.
 
+mod bench;
 pub mod cli;
+pub mod client;
+mod client_stream;
 mod connection;
 mod replay;
+mod setup;
 
 use tauri::{Emitter, Manager, PhysicalPosition};
 

@@ -1,23 +1,13 @@
-//! One command, three jobs.
+//! What is left of `owf-ctl` after the one-process-app move.
 //!
-//! `owf-daemon`, `owf-ctl` and `owf-bench` used to be three binaries built
-//! from three files under `src/bin/`. They are one binary now: [`ctl`] and
-//! [`bench`] moved here unchanged. The daemon moved one hop further, into
-//! `owf_core::server`, so a later Tauri app can host it in-process without
-//! this crate's binary in between. What the merge had to preserve is the
-//! push-to-talk keybinding, which the compositor runs on every key press
-//! and release --
-//! `o.bind("SUPER + D", ..., "owf-ctl ptt-start")` and its `release = true`
-//! twin. Keeping `owf-ctl` as the command name is what makes those keep
-//! working with no change to anyone's Hyprland config; the daemon and the
-//! bench became subcommands of it.
-//!
-//! [`route`] is deliberately a pure function over `argv[1..]`, so the promise
-//! above is a unit test rather than something that has to be tried on a live
-//! desktop.
-
-pub mod bench;
-pub mod ctl;
+//! `bench` and `ctl` (now `setup`/`client_stream` in `src-tauri`) moved to
+//! the `openwhisprflow` binary, which is what actually dispatches them now
+//! -- see `src-tauri/src/client.rs`. This crate no longer builds a binary of
+//! its own; it keeps only [`route`], the pure function that used to decide
+//! what `owf-ctl`'s argv meant, until Task 11 deletes the crate entirely.
+//! It stays a pure function over `argv[1..]` so the routing contract it
+//! pins remains a unit test rather than something that has to be tried on a
+//! live desktop.
 
 use owf_core::proto::Request;
 
@@ -74,28 +64,6 @@ pub fn route(args: &[&str]) -> Route {
         ["settings"] => Route::Settings,
         ["bench"] => Route::Bench,
         _ => Route::Usage,
-    }
-}
-
-pub fn dispatch(route: Route) -> anyhow::Result<()> {
-    match route {
-        Route::Daemon => owf_core::server::run(),
-        Route::Bench => bench::run(),
-        Route::Send(req) => ctl::send(req),
-        Route::Subscribe => ctl::subscribe(),
-        Route::Debug => ctl::debug_summary(),
-        Route::Setup(SetupMode::Plain) => ctl::setup(false),
-        Route::Setup(SetupMode::UpdateLock) => ctl::setup(true),
-        Route::Setup(SetupMode::PrintHypr) => {
-            print!("{}", owf_core::hypr::hypr_config());
-            Ok(())
-        }
-        Route::Setup(SetupMode::PurgeLogs) => ctl::purge_logs(),
-        Route::Settings => ctl::open_settings(),
-        Route::Usage => {
-            eprintln!("{USAGE}");
-            std::process::exit(2)
-        }
     }
 }
 

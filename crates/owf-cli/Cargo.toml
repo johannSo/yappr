@@ -8,18 +8,14 @@ owf-core = { path = "../owf-core" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-hound = "3.5"
 
 [lib]
 name = "owf_cli"
 path = "src/lib.rs"
 
-# One binary, three jobs. `owf-ctl` keeps the name because the compositor's
-# push-to-talk keybinding runs it on every key press and release; the daemon
-# and the benchmark became `owf-ctl daemon` and `owf-ctl bench`.
-[[bin]]
-name = "owf-ctl"
-path = "src/bin/owf-ctl.rs"
+# No `[[bin]]` any more: the `openwhisprflow` binary now dispatches every
+# route this crate produces (`src-tauri/src/client.rs`). This crate keeps
+# only `route()` until Task 11 deletes it entirely.
 
 [dev-dependencies]
 owf-core = { path = "../owf-core", features = ["test-util"] }

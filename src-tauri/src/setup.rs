@@ -1,43 +1,11 @@
+//! `openwhisprflow --setup`, `--debug` and `--purge-logs`: everything that
+//! inspects or provisions the local install without talking to the daemon.
+//! `send()` and `open_settings()` used to live here too; `client::dispatch`
+//! replaces both directly, so they were deleted rather than moved.
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use owf_core::proto::{self, Request};
-
-/// Connects to the daemon, sends `Request::Subscribe`, and prints every
-/// `OverlayEvent` NDJSON line it receives until the daemon closes the
-/// connection -- the same wire path the overlay itself will use (spec 12).
-/// A plain pass-through rather than parsing each line into an `OverlayEvent`
-/// and re-serializing it: the daemon's own wire format *is* the thing being
-/// sanity-checked here, so printing anything other than exactly what came
-/// off the socket would hide a wire-format bug rather than surface it.
-///
-/// This only ever reads from the daemon; it never sends `ptt-start` or any
-/// other command, so running it opens no microphone.
-pub fn subscribe() -> Result<()> {
-    use std::io::{BufRead, BufReader, Write as _};
-    use std::os::unix::net::UnixStream;
-
-    let sock = owf_core::paths::runtime_socket();
-    let stream = UnixStream::connect(&sock).with_context(|| {
-        format!("cannot reach the daemon at {} — is owf-daemon running?", sock.display())
-    })?;
-    let mut writer = stream.try_clone().context("cloning socket for writing")?;
-    writeln!(writer, "{}", serde_json::to_string(&Request::Subscribe)?)?;
-    writer.flush()?;
-
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let n = reader.read_line(&mut line).context("reading from the daemon")?;
-        if n == 0 {
-            break; // the daemon closed the connection.
-        }
-        print!("{line}");
-        std::io::stdout().flush().ok();
-    }
-    Ok(())
-}
 
 /// Prints a short summary of the most recently written debug record --
 /// see `owf_core::debug` and `[debug]` in config.toml. Reads straight off
@@ -148,19 +116,6 @@ fn print_debug_summary(
         trimmed_wav.display(),
         if trimmed_wav.exists() { "" } else { " (missing)" }
     );
-}
-
-/// Sends one request to the daemon and prints its response line verbatim.
-/// Exits non-zero when the daemon reports `ok: false` (a rejected command,
-/// e.g. "busy"), matching the exit-status contract a Hyprland `bind = ...,
-/// exec, owf-ctl ...` invocation can rely on.
-pub fn send(req: Request) -> Result<()> {
-    let resp = proto::send(&req)?;
-    println!("{}", serde_json::to_string(&resp)?);
-    if !resp.ok {
-        std::process::exit(1);
-    }
-    Ok(())
 }
 
 /// Carries the progress-reporting state from one `progress_line` call to the
@@ -424,21 +379,6 @@ pub fn purge_logs() -> Result<()> {
             println!("{} does not exist -- nothing to remove", path.display())
         }
     }
-    Ok(())
-}
-
-/// The settings window's binary, expected on `PATH` the same way this one is.
-const SETTINGS_BINARY: &str = "openwhisprflow-settings";
-
-/// Starts the settings window and returns immediately.
-///
-/// Deliberately not waited on: this is invoked from a shell or a keybinding,
-/// and blocking until the user closes the window would leave a terminal (or a
-/// compositor exec) hanging for as long as they take to change a setting.
-pub fn open_settings() -> Result<()> {
-    std::process::Command::new(SETTINGS_BINARY).spawn().with_context(|| {
-        format!("cannot start `{SETTINGS_BINARY}` -- is it built and on your PATH?")
-    })?;
     Ok(())
 }
 
