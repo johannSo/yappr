@@ -127,15 +127,23 @@ body {
   }
 }
 
-/* -- State accents -- */
+/* -- State accents --
+
+   Measured against rendered screenshots (not just the declared hex/rgba
+   values -- see the M2 legibility fix report), text stays the pill's base
+   #f4f4f6 throughout. .pill--busy was the one accent that measured below
+   WCAG AA (4.5:1) at its true steady-state render (3.47:1); .pill--error
+   already cleared AA (5.94:1) but only barely, so both were darkened/
+   opacified for a comfortable margin (6.50:1 / 5.28:1) rather than a
+   razor's-edge pass. */
 
 .pill--error {
-  background: rgba(190, 30, 30, 0.94);
+  background: rgba(176, 24, 24, 0.97);
   border-color: rgba(252, 165, 165, 0.4);
 }
 
 .pill--busy {
-  background: rgba(196, 120, 0, 0.94);
+  background: rgba(150, 90, 0, 0.97);
   border-color: rgba(253, 224, 71, 0.42);
 }
 
