@@ -23,6 +23,12 @@ body {
 }
 
 .pill-wrap {
+  /* The window is `alwaysOnTop`/`closable:false` (tauri.conf.json) and this
+     wrapper spans the whole 280x72 window -- without this, the pill sits
+     over whatever's beneath it and eats clicks meant for that window the
+     entire time it's visible, on top of already being unclosable. Nothing
+     in this UI is ever supposed to be clicked (fix 4). */
+  pointer-events: none;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -30,6 +36,7 @@ body {
   height: 100%;
   padding: 8px;
   box-sizing: border-box;
+  position: relative;
 }
 
 .pill {
@@ -56,6 +63,24 @@ body {
   letter-spacing: 0.1px;
   white-space: nowrap;
   animation: pill-in 140ms ease-out;
+  pointer-events: none;
+}
+
+/* -- Spec 15: normalization-degraded badge, a small persistent dot rather
+   than text -- it sits alongside whatever the state pill above is already
+   showing, not in place of it, so it has to stay out of the way of the
+   pill's own label/preview text. */
+
+.badge--degraded {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #f5a524;
+  border: 1.5px solid rgba(22, 22, 26, 0.86);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.1);
 }
 
 @keyframes pill-in {

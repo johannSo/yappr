@@ -18,7 +18,12 @@ type OverlayEvent =
   | { event: "injecting" }
   | { event: "done"; preview: string }
   | { event: "error"; reason: string }
-  | { event: "busy_rejected" };
+  | { event: "busy_rejected" }
+  // Spec 15 (M2 Task 3): normalization availability, independent of the
+  // pipeline's own state -- rendered as a small persistent badge alongside
+  // whatever the state-driven pill is already showing, never in place of it.
+  | { event: "normalize_degraded"; reason: string }
+  | { event: "normalize_recovered" };
 
 // How many of the most recent `recording` levels to keep for the bar
 // meter. At the spec's ~50ms cadence this is roughly 1.4s of history --
@@ -71,8 +76,20 @@ function levelToHeightPercent(level: number): number {
 
 export default function Overlay() {
   const [view, setView] = useState<ViewState>({ kind: "hidden" });
+  // Independent of `view`: spec 15's normalization-availability badge is not
+  // a pipeline state, and must not replace whatever `view` is already
+  // showing (see the `OverlayEvent` union's comment).
+  const [degraded, setDegraded] = useState<string | null>(null);
   const levelsRef = useRef<number[]>([]);
   const hideTimer = useRef<number | undefined>(undefined);
+  // Whether the window is currently shown-and-positioned. `recording` events
+  // arrive at spec 7.1's ~50ms cadence (~20/s) for the whole duration of a
+  // dictation; calling `showAndPosition` -- a `win.show()` IPC round trip
+  // plus `position_overlay`, itself documented as a Wayland no-op today --
+  // on every single one of them bought nothing (the window was already
+  // shown and positioned) for real IPC cost. `showAndPosition` is the "show
+  // it" primitive; `showOnce` below is "show it, only if it isn't already".
+  const visible = useRef(false);
 
   useEffect(() => {
     const win = getCurrentWindow();
@@ -86,68 +103,116 @@ export default function Overlay() {
       }
     };
 
+    const showOnce = () => {
+      if (visible.current) return;
+      visible.current = true;
+      showAndPosition(win);
+    };
+
+    const hide = () => {
+      visible.current = false;
+      setView({ kind: "hidden" });
+      win.hide().catch(() => {});
+    };
+
     const scheduleHide = (ms: number) => {
-      hideTimer.current = window.setTimeout(() => {
-        setView({ kind: "hidden" });
-        win.hide().catch(() => {});
-      }, ms);
+      hideTimer.current = window.setTimeout(hide, ms);
     };
 
     const unlistenPromise = listen<OverlayEvent>("overlay-event", ({ payload }) => {
-      clearHideTimer();
-
+      // Fix 1/4: `clearHideTimer()` used to run here, unconditionally,
+      // before the switch below -- so *every* event, including a plain
+      // `idle`, cancelled whatever flash timer `done`/`error`/`busy_rejected`
+      // had just armed, before a single frame painted. It is now called only
+      // from the branches below that actually need it: the ones that set a
+      // new `view` (a stale timer left ticking would otherwise fire mid-way
+      // through that new state and wrongly hide the window), and explicitly
+      // *not* from `idle` -- a redundant `Idle` racing in behind a terminal
+      // event (or one that slips past the daemon-side fix in `owf-daemon.rs`)
+      // must not be able to cut a flash short. It is also not called from
+      // the two `normalize_*` branches or the `default` case, neither of
+      // which touch `view` at all.
       switch (payload.event) {
         case "warming":
+          clearHideTimer();
           levelsRef.current = [];
           setView({ kind: "warming" });
-          showAndPosition(win);
+          showOnce();
           break;
 
         case "idle":
-          levelsRef.current = [];
-          setView({ kind: "hidden" });
-          win.hide().catch(() => {});
+          // Only act when nothing is currently flashing: a pending timer
+          // means `done`/`error`/`busy_rejected` already decided when this
+          // window hides next, and a redundant `idle` must not override that
+          // (fix 1).
+          if (hideTimer.current === undefined) {
+            levelsRef.current = [];
+            hide();
+          }
           break;
 
         case "recording": {
+          clearHideTimer();
           const levels = [...levelsRef.current, payload.level].slice(-RECORDING_HISTORY);
           levelsRef.current = levels;
           setView({ kind: "recording", levels, elapsedMs: payload.elapsed_ms });
-          showAndPosition(win);
+          showOnce();
           break;
         }
 
         case "transcribing":
+          clearHideTimer();
           setView({ kind: "transcribing" });
-          showAndPosition(win);
+          showOnce();
           break;
 
         case "normalizing":
+          clearHideTimer();
           setView({ kind: "normalizing" });
-          showAndPosition(win);
+          showOnce();
           break;
 
         case "injecting":
+          clearHideTimer();
           setView({ kind: "injecting" });
-          showAndPosition(win);
+          showOnce();
           break;
 
         case "done":
+          clearHideTimer();
           setView({ kind: "done", preview: truncate(payload.preview, PREVIEW_MAX_CHARS) });
-          showAndPosition(win);
+          showOnce();
           scheduleHide(DONE_FLASH_MS);
           break;
 
         case "error":
+          clearHideTimer();
           setView({ kind: "error", reason: payload.reason });
-          showAndPosition(win);
+          showOnce();
           scheduleHide(ERROR_FLASH_MS);
           break;
 
         case "busy_rejected":
+          clearHideTimer();
           setView({ kind: "busy" });
-          showAndPosition(win);
+          showOnce();
           scheduleHide(BUSY_FLASH_MS);
+          break;
+
+        case "normalize_degraded":
+          setDegraded(payload.reason);
+          break;
+
+        case "normalize_recovered":
+          setDegraded(null);
+          break;
+
+        default:
+          // Forward-compatible (fix 4): an event this build doesn't know
+          // about yet must be a no-op, never fall through to cancelling a
+          // pending timer or otherwise touching `view` -- a build that
+          // predates a new variant must not risk a stuck, unclosable pill
+          // over one it can't render.
           break;
       }
     });
@@ -169,6 +234,12 @@ export default function Overlay() {
       <div className={`pill pill--${view.kind}`} role="status" aria-live="polite">
         <PillContent view={view} />
       </div>
+      {/* Spec 15: a persistent badge alongside whatever the state-driven
+          pill above is already showing, not a replacement for it -- see the
+          `OverlayEvent` union's comment. */}
+      {degraded !== null && (
+        <span className="badge badge--degraded" role="status" title={degraded} aria-label={degraded} />
+      )}
     </div>
   );
 }
