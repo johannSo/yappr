@@ -15,6 +15,14 @@ pub enum Request {
     Cancel,
     Status,
     Reload,
+    /// Press-to-start / press-to-stop. Resolved against the server's current
+    /// state, never against a client-side memory of the last press -- the
+    /// client is a fresh process every time and has no memory to consult.
+    Toggle,
+    /// Shut the whole app down. The tray's Beenden sends the same request.
+    Quit,
+    /// Show and focus the settings window.
+    ShowSettings,
     /// Turns this connection into a long-lived `OverlayEvent` stream (spec
     /// 12) instead of the usual one-request-one-response exchange: after
     /// this line, the daemon writes one NDJSON `OverlayEvent` per line,
@@ -224,6 +232,12 @@ mod tests {
         assert_eq!(serde_json::to_string(&Request::Cancel).unwrap(), r#"{"cmd":"cancel"}"#);
         assert_eq!(serde_json::to_string(&Request::Status).unwrap(), r#"{"cmd":"status"}"#);
         assert_eq!(serde_json::to_string(&Request::Reload).unwrap(), r#"{"cmd":"reload"}"#);
+        assert_eq!(serde_json::to_string(&Request::Toggle).unwrap(), r#"{"cmd":"toggle"}"#);
+        assert_eq!(serde_json::to_string(&Request::Quit).unwrap(), r#"{"cmd":"quit"}"#);
+        assert_eq!(
+            serde_json::to_string(&Request::ShowSettings).unwrap(),
+            r#"{"cmd":"show-settings"}"#
+        );
         assert_eq!(
             serde_json::to_string(&Request::Subscribe).unwrap(),
             r#"{"cmd":"subscribe"}"#
@@ -253,6 +267,9 @@ mod tests {
             Request::Cancel,
             Request::Status,
             Request::Reload,
+            Request::Toggle,
+            Request::Quit,
+            Request::ShowSettings,
             Request::Subscribe,
             Request::GetConfig,
             Request::ListInputDevices,

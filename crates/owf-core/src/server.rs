@@ -1355,6 +1355,13 @@ fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
         // event stream instead of one `Response` (see `handle`'s doc
         // comment). Kept only so this match stays exhaustive.
         Request::Subscribe => Response::err("subscribe must be negotiated by the connection handler"),
+
+        // Implemented by Task 7.
+        Request::Toggle => Response::err("not implemented yet"),
+        // Implemented by Task 10.
+        Request::Quit => Response::err("not implemented yet"),
+        // Implemented by Task 10.
+        Request::ShowSettings => Response::err("not implemented yet"),
     }
 }
 

@@ -5,6 +5,7 @@
 //! `--replay <path>` (`replay.rs`), and forwards whatever it receives to
 //! the frontend as a Tauri event. All rendering decisions live in `src/`.
 
+pub mod cli;
 mod connection;
 mod replay;
 
