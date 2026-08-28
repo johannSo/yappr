@@ -287,6 +287,47 @@ impl Default for InjectConfig {
     }
 }
 
+/// Spec 13's `[overlay]` section. Load-bearing on its own just by existing:
+/// before this type existed, `Config`'s `#[serde(deny_unknown_fields)]` had
+/// no `overlay` field to match against, so a user who copied the spec's own
+/// documented `[overlay]` block into their config got a hard `Config::load()`
+/// failure and the daemon refused to start (F5). Wiring these fields to the
+/// overlay's actual position/size is separate, future work -- Wayland's
+/// `xdg_shell` has no client-settable window position (see `hypr.rs`'s doc
+/// comment), so `position` isn't even actionable from the daemon today; only
+/// `width`/`height` describe values `tauri.conf.json` already hardcodes. What
+/// matters here is that the section parses instead of bricking startup.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OverlayConfig {
+    #[serde(default = "d_overlay_position")]
+    pub position: String,
+    #[serde(default = "d_overlay_width")]
+    pub width: u32,
+    #[serde(default = "d_overlay_height")]
+    pub height: u32,
+}
+
+fn d_overlay_position() -> String {
+    "bottom-center".into()
+}
+fn d_overlay_width() -> u32 {
+    280
+}
+fn d_overlay_height() -> u32 {
+    72
+}
+
+impl Default for OverlayConfig {
+    fn default() -> Self {
+        Self {
+            position: d_overlay_position(),
+            width: d_overlay_width(),
+            height: d_overlay_height(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugConfig {
@@ -324,6 +365,8 @@ pub struct Config {
     pub guardrail: GuardrailConfig,
     #[serde(default)]
     pub inject: InjectConfig,
+    #[serde(default)]
+    pub overlay: OverlayConfig,
     #[serde(default)]
     pub style_default: StyleAxes,
     #[serde(default)]
@@ -378,6 +421,12 @@ impl Config {
         }
         if self.normalize.threads == 0 {
             bail!("normalize.threads must be at least 1");
+        }
+        if self.overlay.width == 0 {
+            bail!("overlay.width must be greater than 0");
+        }
+        if self.overlay.height == 0 {
+            bail!("overlay.height must be greater than 0");
         }
         for (name, v) in [
             ("guardrail.min_overlap_english", self.guardrail.min_overlap_english),
@@ -463,6 +512,11 @@ backend = "wtype"
 trailing_space = true
 keystroke_delay_ms = 2
 
+[overlay]
+position = "bottom-center"  # only "bottom-center" is currently supported
+width = 280
+height = 72
+
 [style_default]
 styling = "semi-casual"    # casual | semi-casual | semi-formal | formal
 structure = "prose"        # prose | lists
@@ -506,6 +560,9 @@ mod tests {
         assert_eq!(c.guardrail.ngram_size, 6);
         assert_eq!(c.guardrail.ngram_max_repeats, 3);
         assert!(c.inject.trailing_space);
+        assert_eq!(c.overlay.position, "bottom-center");
+        assert_eq!(c.overlay.width, 280);
+        assert_eq!(c.overlay.height, 72);
         assert_eq!(c.style_default.styling, Styling::SemiCasual);
         assert_eq!(c.style_default.structure, Structure::Prose);
         assert_eq!(c.style_default.context, Context::General);
@@ -551,6 +608,34 @@ mod tests {
         );
     }
 
+    /// F5: before `OverlayConfig` existed, `Config`'s `deny_unknown_fields`
+    /// had no `overlay` field to match against, so pasting spec 13's own
+    /// documented `[overlay]` block into a config file was a hard
+    /// `Config::load()` failure -- the daemon refused to start over a
+    /// section its own spec tells the user to add. Pinned to the exact
+    /// block spec 13 documents, not a paraphrase of it.
+    #[test]
+    fn spec_13s_documented_overlay_block_loads() {
+        let c = Config::from_str(
+            r#"
+            [overlay]
+            position = "bottom-center"
+            width = 280
+            height = 72
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.overlay.position, "bottom-center");
+        assert_eq!(c.overlay.width, 280);
+        assert_eq!(c.overlay.height, 72);
+    }
+
+    #[test]
+    fn unknown_overlay_key_is_a_load_error() {
+        let err = Config::from_str("[overlay]\nfoo = 1\n").unwrap_err();
+        assert!(err.to_string().contains("foo"), "got: {err}");
+    }
+
     #[test]
     fn unknown_key_is_a_load_error() {
         let err = Config::from_str("[audio]\nmax_secondz = 5\n").unwrap_err();
@@ -571,6 +656,8 @@ mod tests {
             "[asr]\nnum_threads = 0\n",
             "[normalize]\nport = 0\n",
             "[normalize]\nthreads = 0\n",
+            "[overlay]\nwidth = 0\n",
+            "[overlay]\nheight = 0\n",
             "[debug]\ndir = \"\"\n",
             "[debug]\ndir = \"   \"\n",
         ] {
