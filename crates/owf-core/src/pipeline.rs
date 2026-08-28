@@ -189,6 +189,16 @@ impl Pipeline {
         self.injector = injector;
     }
 
+    /// Swaps in a freshly (re)connected normalizer -- e.g. after the
+    /// supervised `llama-server` restarts on a new port (spec 15's backoff
+    /// restart; see `owf-daemon.rs`'s `supervise_llama_once`). Unlike
+    /// `update_reloadable`, this touches only `self.normalizer`: `cfg` and
+    /// `injector` are untouched, and this is meant to be called from a
+    /// background supervisor thread, not just `owf-ctl reload`.
+    pub fn set_normalizer(&mut self, normalizer: Box<dyn Normalizer>) {
+        self.normalizer = normalizer;
+    }
+
     /// Runs a complete utterance. `Ok(None)` means there was nothing to say
     /// and nothing was injected.
     ///

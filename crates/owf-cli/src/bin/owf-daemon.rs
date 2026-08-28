@@ -8,7 +8,7 @@
 use anyhow::{Context, Result};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use owf_core::asr::SherpaTranscriber;
 use owf_core::capture::{CaptureStats, Recorder};
-use owf_core::config::{AudioConfig, Config, DebugConfig};
+use owf_core::config::{AudioConfig, Config, DebugConfig, NormalizeConfig};
 use owf_core::inject;
 use owf_core::lang::WhatlangDetector;
 use owf_core::llama::LlamaServer;
@@ -41,6 +41,16 @@ const RECORDING: u8 = 2;
 const TRANSCRIBING: u8 = 3;
 const NORMALIZING: u8 = 4;
 const INJECTING: u8 = 5;
+// Task 3, Work Item 3: a fatal, unrecoverable warm-up failure (ASR/VAD
+// failed to load -- the *only* way `warm_up` still returns `Err`, since a
+// `llama-server` failure is already absorbed into `UnavailableNormalizer`
+// and never propagates). Before this state existed, a fatal warm-up failure
+// left `daemon.state` at `WARMING` forever: a subscriber connected at the
+// moment of failure saw the one-shot `OverlayEvent::Error`, but anyone
+// connecting *afterward* got `snapshot_event(WARMING)` -- a permanent
+// spinner instead of the error pill spec 12 requires. `FAILED` is a real,
+// steady state `state_of`/`snapshot_event` can report to a late joiner.
+const FAILED: u8 = 6;
 
 fn is_busy(v: u8) -> bool {
     matches!(v, TRANSCRIBING | NORMALIZING | INJECTING)
@@ -53,6 +63,7 @@ fn state_of(v: u8) -> State {
         TRANSCRIBING => State::Transcribing,
         NORMALIZING => State::Normalizing,
         INJECTING => State::Injecting,
+        FAILED => State::Error,
         _ => State::Idle,
     }
 }
@@ -70,6 +81,11 @@ fn snapshot_event(v: u8) -> OverlayEvent {
         TRANSCRIBING => OverlayEvent::Transcribing,
         NORMALIZING => OverlayEvent::Normalizing,
         INJECTING => OverlayEvent::Injecting,
+        // A generic fallback reason: `serve_subscriber` overrides this with
+        // the real stored `daemon.fatal_error` when one is available, which
+        // it always is by the time `FAILED` is ever observable. Kept here
+        // too so this function stays a total, sensible mapping on its own.
+        FAILED => OverlayEvent::Error { reason: "daemon failed to start; see logs".to_string() },
         _ => OverlayEvent::Idle,
     }
 }
@@ -120,7 +136,10 @@ struct Daemon {
     /// than leaking it with `mem::forget`, keeps `LlamaServer::drop` reachable
     /// for the lifetime of the daemon instead of permanently severing it.
     /// `None` for the whole run when `[normalize].enabled = false` (R9): no
-    /// child is ever spawned in that case.
+    /// child is ever spawned in that case, and also transiently `None`
+    /// whenever `spawn_housekeeping`'s supervision loop (Task 3) has just
+    /// killed an unhealthy/exited child and hasn't yet installed its
+    /// replacement.
     llama: Mutex<Option<LlamaServer>>,
     window_class: Mutex<Option<String>>,
     max_seconds: u32,
@@ -130,14 +149,85 @@ struct Daemon {
     /// that already stopped (or was cancelled) could fire against a *later*
     /// recording and truncate it early. See concurrency note 3.
     recording_epoch: AtomicU64,
-    /// One `Sender` per currently-connected `Request::Subscribe` client; see
-    /// `broadcast_to` and `serve_subscriber`. A plain `Vec` behind a `Mutex`
-    /// is enough: `send` never blocks (`mpsc` channels are unbounded), so
-    /// broadcasting can never stall the caller on a slow or dead subscriber,
-    /// and a subscriber whose `Receiver` has been dropped (its thread
-    /// exited, because its connection closed) is pruned the next time
-    /// something is broadcast.
-    subscribers: Mutex<Vec<mpsc::Sender<OverlayEvent>>>,
+    /// One entry per currently-connected `Request::Subscribe` client; see
+    /// `broadcast_to`, `register_subscriber`, and `serve_subscriber`.
+    subscribers: Mutex<Vec<Subscriber>>,
+    /// Set once at startup from `[normalize].enabled` and never changed
+    /// afterward (reload does not currently rebuild the normalizer -- plan
+    /// Task 7). Distinguishes "normalization was never turned on" (`status`
+    /// reports `normalize_available: None`) from "it's turned on but
+    /// currently down" (`Some(false)`) -- see `Response::normalize_available`.
+    normalize_enabled: bool,
+    /// The supervisor's (Task 3) best-known answer to "is normalization
+    /// usable right now" -- an `AtomicBool` rather than something requiring
+    /// a lock so `dispatch`'s `Status` handler can read it without blocking
+    /// on, or being blocked by, a health probe in progress. Meaningless
+    /// (stays `false` forever) when `normalize_enabled` is `false`.
+    normalize_available: AtomicBool,
+    /// Set on a fatal warm-up failure (ASR/VAD failed to load) so a
+    /// subscriber connecting after the fact -- not just one connected at the
+    /// moment it happened -- can still learn *why* the daemon is stuck in
+    /// `FAILED` (Task 3, Work Item 3). `None` for the entire run otherwise.
+    fatal_error: Mutex<Option<String>>,
+    /// The background thread reaping dead subscribers and (when enabled)
+    /// supervising `llama-server` -- see `spawn_housekeeping`. `None` until
+    /// `main` installs it, and again after `shutdown` stops it.
+    housekeeping: Mutex<Option<HousekeepingHandle>>,
+}
+
+/// A single registered `Request::Subscribe` connection: the channel
+/// `broadcast_to` sends events through, plus a liveness flag
+/// `serve_subscriber` clears (via `ClearAliveOnDrop`) the moment its thread
+/// exits, for any reason: a clean write failure, or its own liveness poll
+/// noticing the peer is gone (see `socket_peer_gone`).
+///
+/// This is what lets `reap_dead_subscribers` prune a dead entry even when
+/// nothing has ever been broadcast since it died (Task 3, Work Item 2):
+/// before this, a dead subscriber's thread and `Sender` were reaped only as
+/// an incidental side effect of the *next* broadcast, which may never come
+/// while the daemon sits `Idle`.
+struct Subscriber {
+    tx: mpsc::Sender<OverlayEvent>,
+    alive: Arc<AtomicBool>,
+}
+
+/// Caps how many `Request::Subscribe` connections may be registered at
+/// once (Task 3, Work Item 2). The intended consumer is a single overlay
+/// that reconnects with backoff and autostarts with the session (spec 12);
+/// this is generous headroom for that one overlay plus a couple of manual
+/// `owf-ctl subscribe` debugging sessions, while still bounding an overlay
+/// stuck crash-looping against an idle daemon to a handful of parked
+/// threads rather than an unbounded pile.
+const MAX_SUBSCRIBERS: usize = 8;
+
+/// Registers a new subscriber into an already-locked subscriber list,
+/// evicting the oldest registered one first if already at `MAX_SUBSCRIBERS`.
+/// Dropping the evicted entry's `Sender` ends that subscriber's `rx.recv()`
+/// loop (see `serve_subscriber`), closing its connection.
+///
+/// Opportunistically prunes already-dead entries first, so a pile of
+/// merely-not-yet-reaped subscribers doesn't evict a still-live one ahead of
+/// a truly stale one.
+///
+/// Takes an already-locked `&mut Vec<Subscriber>` (rather than locking a
+/// `&Mutex` itself) so `serve_subscriber` can register the new subscriber
+/// and read `daemon.state` inside the *same* critical section -- see that
+/// function's doc comment for why that's what closes Work Item 3's
+/// connect-time race.
+fn register_subscriber(subs: &mut Vec<Subscriber>, tx: mpsc::Sender<OverlayEvent>, alive: Arc<AtomicBool>) {
+    subs.retain(|s| s.alive.load(Ordering::SeqCst));
+    while subs.len() >= MAX_SUBSCRIBERS {
+        subs.remove(0);
+    }
+    subs.push(Subscriber { tx, alive });
+}
+
+/// Drops every subscriber whose thread has already exited, without needing
+/// to broadcast anything -- see `Subscriber`'s doc comment for why this
+/// exists alongside `broadcast_to`'s own incidental pruning. Called from
+/// `spawn_housekeeping`'s periodic tick.
+fn reap_dead_subscribers(subscribers: &Mutex<Vec<Subscriber>>) {
+    lock_ignoring_poison(subscribers).retain(|s| s.alive.load(Ordering::SeqCst));
 }
 
 /// Sends `event` to every registered subscriber, dropping any whose
@@ -149,9 +239,9 @@ struct Daemon {
 /// not a whole `Daemon`) and this module's tests can use it without
 /// constructing a full `Daemon` -- which would need a real `Recorder`, and
 /// thus live audio hardware, just to exist.
-fn broadcast_to(subscribers: &Mutex<Vec<mpsc::Sender<OverlayEvent>>>, event: OverlayEvent) {
+fn broadcast_to(subscribers: &Mutex<Vec<Subscriber>>, event: OverlayEvent) {
     let mut subs = lock_ignoring_poison(subscribers);
-    subs.retain(|tx| tx.send(event.clone()).is_ok());
+    subs.retain(|s| s.tx.send(event.clone()).is_ok());
 }
 
 impl Daemon {
@@ -289,6 +379,11 @@ fn main() -> Result<()> {
         }
     };
 
+    // Cloned before `cfg` is moved into the warm-up thread's closure below;
+    // `None` when `[normalize].enabled = false` (R9), which is also exactly
+    // when `spawn_housekeeping`'s llama-supervision half must stay inert.
+    let normalize_cfg: Option<NormalizeConfig> = cfg.normalize.enabled.then(|| cfg.normalize.clone());
+
     let daemon = Arc::new(Daemon {
         state: AtomicU8::new(WARMING),
         recorder: Mutex::new(recorder),
@@ -299,6 +394,10 @@ fn main() -> Result<()> {
         max_seconds: cfg.audio.max_seconds,
         recording_epoch: AtomicU64::new(0),
         subscribers: Mutex::new(Vec::new()),
+        normalize_enabled: cfg.normalize.enabled,
+        normalize_available: AtomicBool::new(false),
+        fatal_error: Mutex::new(None),
+        housekeeping: Mutex::new(None),
     });
 
     // Warm up off the accept loop so `status` answers immediately.
@@ -306,17 +405,49 @@ fn main() -> Result<()> {
         let daemon = Arc::clone(&daemon);
         std::thread::spawn(move || match warm_up(cfg, &daemon) {
             Ok((pipeline, server)) => {
+                let available = server.is_some();
                 *lock_ignoring_poison(&daemon.pipeline) = Some(pipeline);
                 *lock_ignoring_poison(&daemon.llama) = server;
+                // Populated immediately (accuracy for `status` from the
+                // moment warm-up resolves), independent of when
+                // `spawn_housekeeping`'s own loop next wakes up and
+                // re-confirms the same thing to decide whether a
+                // `NormalizeDegraded`/`NormalizeRecovered` broadcast is due.
+                daemon.normalize_available.store(available, Ordering::SeqCst);
                 daemon.state.store(IDLE, Ordering::SeqCst);
                 daemon.broadcast(OverlayEvent::Idle);
                 tracing::info!("ready");
             }
             Err(e) => {
-                tracing::error!(error = ?e, "warm-up failed; daemon stays in warming");
-                daemon.broadcast(OverlayEvent::Error { reason: format!("warm-up failed: {e}") });
+                // The only way `warm_up` still returns `Err`: ASR/VAD failed
+                // to load. A `llama-server` failure never reaches here (see
+                // `warm_up`'s doc comment) -- it's absorbed into
+                // `UnavailableNormalizer` and the daemon still comes up
+                // `Idle`. This is a permanent, fatal failure (Task 3, Work
+                // Item 3): `FAILED` plus the stored reason is what lets a
+                // subscriber connecting *after* this moment still learn the
+                // daemon is broken, instead of `snapshot_event(WARMING)`'s
+                // permanent spinner.
+                let reason = format!("warm-up failed: {e}");
+                tracing::error!(error = ?e, "warm-up failed; daemon marked failed");
+                *lock_ignoring_poison(&daemon.fatal_error) = Some(reason.clone());
+                daemon.state.store(FAILED, Ordering::SeqCst);
+                daemon.broadcast(OverlayEvent::Error { reason });
             }
         });
+    }
+
+    // Reaps dead subscribers (Task 3, Work Item 2) and, when normalization
+    // is enabled, supervises the `llama-server` child (Task 3, Work Item 1 /
+    // spec 15, 5.1). Spawned unconditionally and immediately -- not gated on
+    // warm-up finishing -- so subscriber hygiene starts from the very first
+    // connection; the llama-specific half stays inert until warm-up has
+    // settled `daemon.llama` (see `spawn_housekeeping`'s own `WARMING`
+    // check), which is what stops it from ever racing warm-up's own initial
+    // spawn into starting a second `llama-server`.
+    {
+        let handle = spawn_housekeeping(Arc::clone(&daemon), normalize_cfg);
+        *lock_ignoring_poison(&daemon.housekeeping) = Some(handle);
     }
 
     // Explicit shutdown on a terminating signal -- see `shutdown`'s doc
@@ -405,7 +536,7 @@ fn warm_up(cfg: Config, daemon: &Arc<Daemon>) -> Result<(Pipeline, Option<LlamaS
     let models = paths::models_dir();
 
     let (server, base_url) = if cfg.normalize.enabled {
-        match spawn_and_wait_healthy(&cfg.normalize) {
+        match spawn_and_wait_healthy(&cfg.normalize, STARTUP_HEALTH_TIMEOUT) {
             Ok(server) => {
                 let base_url = server.base_url();
                 (Some(server), base_url)
@@ -465,12 +596,20 @@ fn warm_up(cfg: Config, daemon: &Arc<Daemon>) -> Result<(Pipeline, Option<LlamaS
     Ok((pipeline, server))
 }
 
+/// Startup's health-wait budget: a cold model load can genuinely take this
+/// long on first run (disk read plus ggml init), so `warm_up`'s one-time
+/// initial spawn gets the full 120 s. A background *restart* is different --
+/// see `RESTART_HEALTH_TIMEOUT`.
+const STARTUP_HEALTH_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Spawns `llama-server` and waits for it to report healthy, as one
 /// `Result` -- the seam `warm_up` above matches on to fall back to
-/// [`UnavailableNormalizer`] instead of failing outright (C1).
-fn spawn_and_wait_healthy(cfg: &owf_core::config::NormalizeConfig) -> Result<LlamaServer> {
+/// [`UnavailableNormalizer`] instead of failing outright (C1), and
+/// `supervise_llama_once` (Task 3) uses the same way with a shorter
+/// `timeout` for a background restart attempt.
+fn spawn_and_wait_healthy(cfg: &NormalizeConfig, timeout: Duration) -> Result<LlamaServer> {
     let mut server = LlamaServer::spawn(cfg)?;
-    server.wait_healthy(Duration::from_secs(120))?;
+    server.wait_healthy(timeout)?;
     Ok(server)
 }
 
@@ -508,11 +647,32 @@ fn shutdown(daemon: &Daemon) {
         return;
     }
     tracing::info!("shutting down");
+    // Stopped *before* `kill_llama`, and joined (not just signalled): once
+    // this returns, the housekeeping thread has fully exited and will never
+    // touch `daemon.llama` again, so `kill_llama` immediately afterward
+    // cannot race a fresh restart into double-spawning, deadlocking, or
+    // leaving an orphan (Task 3's shutdown-vs-backoff-wait requirement). A
+    // backoff *wait* is interrupted immediately (see
+    // `HousekeepingHandle::stop`); the only way this blocks at all is an
+    // in-flight restart attempt actually running, bounded by
+    // `RESTART_HEALTH_TIMEOUT`.
+    stop_housekeeping(&daemon.housekeeping);
     kill_llama(&daemon.llama);
     if let Some(r) = lock_ignoring_poison(&daemon.recorder).as_ref() {
         let _ = r.stop();
     }
     remove_runtime_files();
+}
+
+/// Stops the housekeeping thread, if one was ever installed. Split out for
+/// the same reason `kill_llama` is: testable directly with a scratch
+/// `Mutex<Option<HousekeepingHandle>>` instead of a full `Daemon`.
+/// `Option::take` leaves `None` behind, so a second call is a no-op -- half
+/// of `shutdown`'s idempotence, matching `kill_llama`'s own.
+fn stop_housekeeping(housekeeping: &Mutex<Option<HousekeepingHandle>>) {
+    if let Some(handle) = lock_ignoring_poison(housekeeping).take() {
+        handle.stop();
+    }
 }
 
 /// Kills and reaps the supervised `llama-server` child, if any is running.
@@ -538,6 +698,193 @@ fn remove_runtime_files() {
     let _ = std::fs::remove_file(paths::runtime_socket());
     let _ = std::fs::remove_file(paths::runtime_lock());
     let _ = std::fs::remove_file(paths::runtime_port());
+}
+
+// -- llama-server supervision (Task 3 / spec 15, 5.1) and subscriber
+// housekeeping (Task 3, Work Item 2) ----------------------------------------
+
+/// Spec 5.1's poll cadence for a currently-healthy child.
+const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(10);
+/// Spec 15's backoff: restart attempts start here and double after each
+/// failure, capped below.
+const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// How often the housekeeping loop wakes purely to reap dead subscribers
+/// when there is no `llama-server` to supervise at all
+/// (`[normalize].enabled = false`) -- matches `HEALTH_POLL_INTERVAL` so a
+/// disabled normalizer doesn't change subscriber-cleanup latency.
+const SUBSCRIBER_REAP_INTERVAL: Duration = Duration::from_secs(10);
+/// A restart attempt's health-wait budget -- shorter than `warm_up`'s 120 s
+/// `STARTUP_HEALTH_TIMEOUT` (see that constant's doc comment): a background
+/// retry behind exponential backoff should fail fast and let backoff retry
+/// rather than tying up this thread -- and, via `HousekeepingHandle::stop`,
+/// a shutdown racing it -- for up to two minutes per attempt.
+const RESTART_HEALTH_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Spec 15/5.1's backoff: doubles from `INITIAL_BACKOFF`, capped at
+/// `MAX_BACKOFF`. A free, pure function so "backoff grows and caps" is
+/// provable without any real sleeping.
+fn next_backoff(current: Duration) -> Duration {
+    current.saturating_mul(2).min(MAX_BACKOFF)
+}
+
+struct HousekeepingHandle {
+    stop_tx: mpsc::Sender<()>,
+    join: std::thread::JoinHandle<()>,
+}
+
+impl HousekeepingHandle {
+    /// Signals the loop to stop and waits for it to actually exit.
+    ///
+    /// A backoff *wait* is interrupted immediately: the loop sleeps via
+    /// `stop_rx.recv_timeout`, which this wakes the instant `stop_tx` sends,
+    /// well before the wait would otherwise time out on its own -- it is
+    /// this, not the eventual `std::process::exit` in `main`'s signal
+    /// handler, that makes "shutdown during a backoff wait terminates
+    /// promptly" true, and provable in a test that never calls
+    /// `std::process::exit`. The only way `join` blocks for any real time is
+    /// an in-flight restart attempt actually running, bounded by
+    /// `RESTART_HEALTH_TIMEOUT`.
+    fn stop(self) {
+        let _ = self.stop_tx.send(());
+        let _ = self.join.join();
+    }
+}
+
+/// One llama-server supervision cycle: does nothing at all -- never touches
+/// `llama` -- if the current occupant already answers `/health`; otherwise
+/// kills whatever's there (this is what reaps a zombie, the incident this
+/// exists to prevent) and tries a replacement via `respawn`. On a successful
+/// replacement, also swaps a fresh `S1MiniClient` into `pipeline`'s
+/// normalizer, and either way updates `normalize_available` and broadcasts
+/// `NormalizeDegraded`/`NormalizeRecovered` exactly on the transitions
+/// (never on every poll or every failed retry). Returns the resulting
+/// availability.
+///
+/// A free function taking exactly the pieces of `Daemon` it needs, rather
+/// than `&Daemon`, for the same reason `kill_llama`/`process_utterance` do:
+/// it's unit-testable with a scratch `Mutex<Option<LlamaServer>>` and a stub
+/// child (`LlamaServer::from_child`) instead of a full `Daemon`, which would
+/// need live audio hardware to construct. `respawn` is likewise injected --
+/// production wraps `spawn_and_wait_healthy`; tests hand back a stub child
+/// so this never touches a real `llama-server`.
+///
+/// Never holds `pipeline`'s mutex for longer than the plain field assignment
+/// `Pipeline::set_normalizer` performs -- an utterance in flight is never
+/// blocked behind a health poll.
+fn supervise_llama_once(
+    llama: &Mutex<Option<LlamaServer>>,
+    pipeline: &Mutex<Option<Pipeline>>,
+    normalize_available: &AtomicBool,
+    subscribers: &Mutex<Vec<Subscriber>>,
+    last_known_available: bool,
+    normalize_timeout_ms: u64,
+    respawn: &mut dyn FnMut() -> Result<LlamaServer>,
+) -> bool {
+    let currently_healthy = {
+        let guard = lock_ignoring_poison(llama);
+        guard.as_ref().map(LlamaServer::is_healthy).unwrap_or(false)
+    };
+
+    let healthy_now = if currently_healthy {
+        true
+    } else {
+        // Missing or unhealthy: kill whatever's there and try a
+        // replacement. `Option::take` dropping the old value (if any) is
+        // what runs `LlamaServer::drop` -- kill, then wait (reap) -- before
+        // a replacement is even attempted.
+        drop(lock_ignoring_poison(llama).take());
+        match respawn() {
+            Ok(server) => {
+                let base_url = server.base_url();
+                *lock_ignoring_poison(llama) = Some(server);
+                if let Some(p) = lock_ignoring_poison(pipeline).as_mut() {
+                    p.set_normalizer(Box::new(S1MiniClient::new(base_url, normalize_timeout_ms)));
+                }
+                tracing::info!("llama-server restarted");
+                true
+            }
+            Err(e) => {
+                tracing::warn!(error = ?e, "llama-server restart attempt failed; backing off");
+                false
+            }
+        }
+    };
+
+    normalize_available.store(healthy_now, Ordering::SeqCst);
+    if healthy_now && !last_known_available {
+        broadcast_to(subscribers, OverlayEvent::NormalizeRecovered);
+    } else if !healthy_now && last_known_available {
+        broadcast_to(
+            subscribers,
+            OverlayEvent::NormalizeDegraded { reason: "llama-server is down or unhealthy".to_string() },
+        );
+    }
+    healthy_now
+}
+
+/// Reaps dead subscribers on a periodic tick (Task 3, Work Item 2) and, when
+/// `normalize_cfg` is `Some`, supervises the `llama-server` child on the
+/// same tick (Task 3, Work Item 1 / spec 15, 5.1): restarts a missing or
+/// unhealthy child with exponential backoff, polls a healthy one every 10 s,
+/// and never touches a child that's already healthy.
+///
+/// Spawned unconditionally and immediately from `main` -- not gated on
+/// `warm_up` finishing -- so subscriber reaping starts right away; the
+/// llama-specific half stays inert (see the `WARMING` check below) until
+/// `warm_up` has settled `daemon.llama`/`daemon.normalize_available`, which
+/// is what stops this loop from ever racing `warm_up`'s own initial spawn
+/// into starting a second `llama-server`.
+fn spawn_housekeeping(daemon: Arc<Daemon>, normalize_cfg: Option<NormalizeConfig>) -> HousekeepingHandle {
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    let join = std::thread::spawn(move || {
+        let mut backoff = INITIAL_BACKOFF;
+        // Optimistic baseline: assume healthy until this loop's own first
+        // real check (once warm-up has settled) says otherwise, so a daemon
+        // that starts up fine never gets a spurious "recovered" broadcast on
+        // its very first check -- only an actual true -> false -> true round
+        // trip counts as a degrade-then-recover. A daemon whose *initial*
+        // spawn already failed is handled correctly too: this loop's first
+        // real check finds it unhealthy, `last_known_available` (still
+        // `true` here) makes `supervise_llama_once` broadcast
+        // `NormalizeDegraded` exactly once, matching reality.
+        let mut last_known_available = true;
+        loop {
+            let wait = match &normalize_cfg {
+                None => SUBSCRIBER_REAP_INTERVAL,
+                Some(_) if last_known_available => HEALTH_POLL_INTERVAL,
+                Some(_) => backoff,
+            };
+            match stop_rx.recv_timeout(wait) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+
+            reap_dead_subscribers(&daemon.subscribers);
+
+            let Some(cfg) = &normalize_cfg else { continue };
+            if daemon.state.load(Ordering::SeqCst) == WARMING {
+                // warm_up hasn't settled `daemon.llama` yet -- acting now
+                // could spawn a second llama-server racing warm_up's own.
+                continue;
+            }
+
+            let cfg_for_respawn = cfg.clone();
+            let mut respawn = move || spawn_and_wait_healthy(&cfg_for_respawn, RESTART_HEALTH_TIMEOUT);
+            let healthy_now = supervise_llama_once(
+                &daemon.llama,
+                &daemon.pipeline,
+                &daemon.normalize_available,
+                &daemon.subscribers,
+                last_known_available,
+                cfg.timeout_ms,
+                &mut respawn,
+            );
+            backoff = if healthy_now { INITIAL_BACKOFF } else { next_backoff(backoff) };
+            last_known_available = healthy_now;
+        }
+    });
+    HousekeepingHandle { stop_tx, join }
 }
 
 fn handle(daemon: Arc<Daemon>, stream: UnixStream) {
@@ -598,44 +945,143 @@ fn handle(daemon: Arc<Daemon>, stream: UnixStream) {
     let _ = writeln!(w, "{}", serde_json::to_string(&resp).unwrap_or_default());
 }
 
+/// How often a subscriber's own thread checks whether its socket peer is
+/// still there, when no `OverlayEvent` has arrived to write in the
+/// meantime. This is what lets a disconnected subscriber be detected (and
+/// its `Subscriber::alive` flag cleared) even while the daemon sits `Idle`
+/// broadcasting nothing at all (Task 3, Work Item 2) -- periodically
+/// re-broadcasting the current snapshot instead would work for detection
+/// too, but would also re-arm the overlay's `Done`/`Error`/`BusyRejected`
+/// flash timers (or cut a flash short by replacing it with a stale `Idle`)
+/// every time it fired, which is not acceptable collateral damage for a
+/// pure housekeeping mechanism. A local, already-established Unix socket
+/// makes this cheap: a 1 ms non-blocking peek, not a real wait.
+const SUBSCRIBER_LIVENESS_POLL: Duration = Duration::from_millis(500);
+
 /// Serves one `Request::Subscribe` connection for as long as it stays open:
-/// an immediate snapshot of the daemon's current state, then every
-/// subsequent `OverlayEvent` the daemon broadcasts, one NDJSON line each.
+/// an immediate snapshot of the daemon's current state (plus a
+/// `NormalizeDegraded` replay if normalization is currently down -- a late
+/// joiner must be able to learn that too, not just a client that happened to
+/// be connected at the moment it went down), then every subsequent
+/// `OverlayEvent` the daemon broadcasts, one NDJSON line each.
+///
+/// Registers this subscriber's `Sender` and reads the state snapshot in one
+/// critical section, under `daemon.subscribers`'s own lock -- `broadcast_to`
+/// takes that same lock before it iterates, so no transition's broadcast can
+/// land in the gap between "read the snapshot" and "start receiving
+/// broadcasts" and be missed until some later broadcast (Task 3, Work Item
+/// 3's connect-time race). Either `broadcast_to`'s whole critical section
+/// completes before this one starts (so this snapshot's `daemon.state.load`
+/// already reflects it), or after (so it's delivered live once `rx` is
+/// registered).
 ///
 /// Always runs on its own thread (spawned from `handle`, never inline in the
 /// accept loop) -- see the comment at that call site for why that's what
 /// keeps the accept loop's single-threaded invariant intact.
 fn serve_subscriber(daemon: Arc<Daemon>, stream: UnixStream) {
     let mut w = stream;
-    let snapshot = snapshot_event(daemon.state.load(Ordering::SeqCst));
-    if write_event(&mut w, &snapshot).is_err() {
-        return; // gone already; nothing left to register.
-    }
-
     let (tx, rx) = mpsc::channel();
-    lock_ignoring_poison(&daemon.subscribers).push(tx);
+    let alive = Arc::new(AtomicBool::new(true));
 
-    // Blocks here between events. That costs this thread's stack and
-    // nothing else: it holds no lock the rest of the daemon needs, and
-    // `Daemon::broadcast`'s `Sender::send` never blocks *its* caller waiting
-    // for this end to catch up (`mpsc` channels are unbounded).
-    while let Ok(event) = rx.recv() {
-        if write_event(&mut w, &event).is_err() {
-            // The client disconnected, or `write_timeout` (set by `handle`
-            // before handing off this connection) tripped on a client too
-            // slow to keep up. Either way: drop the connection and let this
-            // thread end. `tx`'s counterpart in `daemon.subscribers` gets
-            // pruned automatically the next time something is broadcast
-            // (`Sender::send` starts failing once `rx` -- dropped right
-            // here -- is gone), so no separate cleanup is needed.
+    // Clears `alive` on *every* exit from this function -- a write failure,
+    // the liveness poll noticing the peer is gone, or the early return below
+    // -- so `reap_dead_subscribers`/`register_subscriber`'s opportunistic
+    // prune can find this entry even though nothing was ever broadcast after
+    // it died.
+    struct ClearAliveOnDrop(Arc<AtomicBool>);
+    impl Drop for ClearAliveOnDrop {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+    let _clear_alive = ClearAliveOnDrop(Arc::clone(&alive));
+
+    let (state_now, degraded) = {
+        let mut subs = lock_ignoring_poison(&daemon.subscribers);
+        register_subscriber(&mut subs, tx, alive);
+        (
+            daemon.state.load(Ordering::SeqCst),
+            daemon.normalize_enabled && !daemon.normalize_available.load(Ordering::SeqCst),
+        )
+    };
+
+    let mut snapshot = snapshot_event(state_now);
+    if state_now == FAILED {
+        if let Some(reason) = lock_ignoring_poison(&daemon.fatal_error).clone() {
+            snapshot = OverlayEvent::Error { reason };
+        }
+    }
+    if write_event(&mut w, &snapshot).is_err() {
+        return;
+    }
+    if degraded {
+        let badge = OverlayEvent::NormalizeDegraded {
+            reason: "llama-server is down or unhealthy".to_string(),
+        };
+        if write_event(&mut w, &badge).is_err() {
             return;
         }
     }
-    // `rx.recv()` returned `Err`: this subscriber's `Sender` (the one pushed
-    // into `daemon.subscribers` above) is gone. Not expected in practice --
-    // `daemon.subscribers` outlives every subscriber thread for the life of
-    // the process -- but handled rather than unwrapped so this loop still
-    // terminates cleanly if that ever stops being true.
+
+    // Blocks here between events, waking early to check the socket only
+    // when nothing has arrived within `SUBSCRIBER_LIVENESS_POLL`. That costs
+    // this thread's stack and a rare, cheap syscall, and nothing else: it
+    // holds no lock the rest of the daemon needs, and `Daemon::broadcast`'s
+    // `Sender::send` never blocks *its* caller waiting for this end to catch
+    // up (`mpsc` channels are unbounded).
+    loop {
+        match rx.recv_timeout(SUBSCRIBER_LIVENESS_POLL) {
+            Ok(event) => {
+                if write_event(&mut w, &event).is_err() {
+                    // The client disconnected, or `write_timeout` (set by
+                    // `handle` before handing off this connection) tripped
+                    // on a client too slow to keep up. Either way: drop the
+                    // connection and let this thread end.
+                    return;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if socket_peer_gone(&mut w) {
+                    return;
+                }
+            }
+            // This subscriber's `Sender` (the one registered above) is
+            // gone. Not expected in practice -- `daemon.subscribers`
+            // outlives every subscriber thread for the life of the process
+            // -- but handled rather than unwrapped so this loop still
+            // terminates cleanly if that ever stops being true.
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
+/// A best-effort check for "has the peer closed this connection." `peek`
+/// would be the non-consuming way to do this, but `UnixStream::peek` is
+/// still gated behind the unstable `unix_socket_peek` feature on this
+/// toolchain (verified: `cargo build` rejects it with E0658, tracking issue
+/// rust-lang/rust#76923) -- so this reads instead. That's harmless here: a
+/// `Subscribe` connection is send-only from the daemon's side after the
+/// initial request line, so the client is never expected to send anything
+/// for this to consume. `Ok(0)` is an orderly shutdown (the overlay process
+/// exited or closed the socket); `Ok(n>0)` would mean the client sent
+/// something anyway, treated as "still there" rather than misread as dead; a
+/// timed-out read (no data waiting within the 1 ms budget) means "no data,
+/// but still connected."
+fn socket_peer_gone(stream: &mut UnixStream) -> bool {
+    let mut buf = [0u8; 1];
+    // `set_read_timeout` panics on `Duration::ZERO` ("must not be zero"), so
+    // this uses the smallest practical non-zero timeout rather than 0 --
+    // 1 ms is still effectively instantaneous for a local, already-
+    // established Unix socket with nothing in its receive buffer.
+    if stream.set_read_timeout(Some(Duration::from_millis(1))).is_err() {
+        return false; // can't tell; assume still alive rather than false-evict.
+    }
+    match stream.read(&mut buf) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => false,
+        Err(_) => true, // any other I/O error: treat the connection as gone.
+    }
 }
 
 fn write_event(w: &mut UnixStream, event: &OverlayEvent) -> std::io::Result<()> {
@@ -656,10 +1102,20 @@ fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
         Request::Status => {
             let mut r = Response::ok(state_of(current));
             r.warm = Some(current != WARMING);
+            // Task 3: "status must stop lying" -- only meaningful (and only
+            // reported) when normalization was ever turned on; see
+            // `Daemon::normalize_enabled`'s doc comment.
+            if daemon.normalize_enabled {
+                r.normalize_available = Some(daemon.normalize_available.load(Ordering::SeqCst));
+            }
+            if current == FAILED {
+                r.err = lock_ignoring_poison(&daemon.fatal_error).clone();
+            }
             r
         }
         Request::PttStart => match current {
             WARMING => Response::err("warming"),
+            FAILED => Response::err("daemon failed to start; see logs"),
             RECORDING => Response::ok(State::Recording), // idempotent
             s if is_busy(s) => {
                 // Spec 6.1: `ptt-start` while Transcribing/Normalizing/
@@ -876,7 +1332,7 @@ fn start_recording(daemon: &Arc<Daemon>) -> Response {
 /// other legitimate writer for this guard to race or clobber.
 struct IdleOnExit<'a> {
     state: &'a AtomicU8,
-    subscribers: &'a Mutex<Vec<mpsc::Sender<OverlayEvent>>>,
+    subscribers: &'a Mutex<Vec<Subscriber>>,
 }
 
 impl Drop for IdleOnExit<'_> {
@@ -937,7 +1393,7 @@ fn preview_of(text: &str) -> String {
 /// reason `IdleOnExit` takes one directly instead of a whole `Daemon`.
 fn process_utterance(
     pipeline: &Mutex<Option<Pipeline>>,
-    subscribers: &Mutex<Vec<mpsc::Sender<OverlayEvent>>>,
+    subscribers: &Mutex<Vec<Subscriber>>,
     samples: &[f32],
     window_class: Option<&str>,
     capture: Option<CaptureStats>,
@@ -1050,9 +1506,9 @@ mod tests {
             Box::new(MockInjector::default()),
         )));
         let state = AtomicU8::new(TRANSCRIBING);
-        let subscribers: Mutex<Vec<mpsc::Sender<OverlayEvent>>> = Mutex::new(Vec::new());
+        let subscribers: Mutex<Vec<Subscriber>> = Mutex::new(Vec::new());
         let (tx, rx) = mpsc::channel();
-        subscribers.lock().unwrap().push(tx);
+        subscribers.lock().unwrap().push(Subscriber { tx, alive: Arc::new(AtomicBool::new(true)) });
         let samples = vec![0.1f32; 16_000];
 
         let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -1254,14 +1710,14 @@ mod tests {
     /// subscriber alongside it must be unaffected.
     #[test]
     fn broadcast_to_prunes_a_disconnected_subscriber_without_blocking_live_ones() {
-        let subscribers: Mutex<Vec<mpsc::Sender<OverlayEvent>>> = Mutex::new(Vec::new());
+        let subscribers: Mutex<Vec<Subscriber>> = Mutex::new(Vec::new());
 
         let (dead_tx, dead_rx) = mpsc::channel();
-        subscribers.lock().unwrap().push(dead_tx);
+        subscribers.lock().unwrap().push(Subscriber { tx: dead_tx, alive: Arc::new(AtomicBool::new(true)) });
         drop(dead_rx); // simulates the subscriber's thread having exited
 
         let (live_tx, live_rx) = mpsc::channel();
-        subscribers.lock().unwrap().push(live_tx);
+        subscribers.lock().unwrap().push(Subscriber { tx: live_tx, alive: Arc::new(AtomicBool::new(true)) });
 
         broadcast_to(&subscribers, OverlayEvent::Idle);
 
@@ -1275,7 +1731,7 @@ mod tests {
 
     #[test]
     fn broadcast_to_an_empty_subscriber_list_is_a_no_op() {
-        let subscribers: Mutex<Vec<mpsc::Sender<OverlayEvent>>> = Mutex::new(Vec::new());
+        let subscribers: Mutex<Vec<Subscriber>> = Mutex::new(Vec::new());
         broadcast_to(&subscribers, OverlayEvent::BusyRejected); // must not panic
         assert!(subscribers.lock().unwrap().is_empty());
     }
@@ -1294,6 +1750,10 @@ mod tests {
             max_seconds: 120,
             recording_epoch: AtomicU64::new(0),
             subscribers: Mutex::new(Vec::new()),
+            normalize_enabled: false,
+            normalize_available: AtomicBool::new(false),
+            fatal_error: Mutex::new(None),
+            housekeeping: Mutex::new(None),
         })
     }
 
@@ -1373,5 +1833,450 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- Task 3, Work Item 3: FAILED state and the connect-time race ------
+
+    #[test]
+    fn state_of_and_snapshot_event_report_failed_as_a_real_error_state() {
+        assert_eq!(state_of(FAILED), State::Error);
+        assert_eq!(
+            snapshot_event(FAILED),
+            OverlayEvent::Error { reason: "daemon failed to start; see logs".to_string() }
+        );
+    }
+
+    /// `dispatch` itself, not just the pure `state_of`/`snapshot_event`
+    /// mappings: `status` against a `FAILED` daemon must report
+    /// `state: "error"` plus the real stored reason (not just a generic
+    /// one), and `ptt-start` must be rejected rather than trying to record
+    /// with no pipeline ever built.
+    #[test]
+    fn dispatch_reports_and_rejects_correctly_against_a_failed_daemon() {
+        let daemon = fake_daemon(FAILED);
+        *lock_ignoring_poison(&daemon.fatal_error) = Some("no ggml compute backend".to_string());
+
+        let status = dispatch(&daemon, Request::Status);
+        assert!(status.ok);
+        assert_eq!(status.state, Some(State::Error));
+        assert_eq!(status.err.as_deref(), Some("no ggml compute backend"));
+
+        let ptt_start = dispatch(&daemon, Request::PttStart);
+        assert!(!ptt_start.ok, "ptt-start must be rejected against a daemon with no working pipeline");
+    }
+
+    /// The specific gap Work Item 3 names: a fatal warm-up failure used to
+    /// leave `daemon.state` at `WARMING` forever, so a subscriber connecting
+    /// *after* the failure (not just one connected at the moment it
+    /// happened) saw a permanent spinner instead of the error pill spec 12
+    /// requires. This drives the real `handle`/`serve_subscriber` path over
+    /// a socket against a daemon already in `FAILED` with a stored reason.
+    #[test]
+    fn a_late_subscriber_learns_about_a_fatal_warm_up_failure_instead_of_spinning_forever() {
+        let dir = std::env::temp_dir()
+            .join(format!("owf-daemon-test-subscribe-failed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock_path = dir.join("test.sock");
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = UnixListener::bind(&sock_path).unwrap();
+
+        let daemon = fake_daemon(FAILED);
+        *lock_ignoring_poison(&daemon.fatal_error) = Some("no ggml compute backend".to_string());
+
+        let accept_daemon = Arc::clone(&daemon);
+        let accept_listener = listener.try_clone().unwrap();
+        let accept_thread = std::thread::spawn(move || {
+            for s in accept_listener.incoming().take(1).flatten() {
+                handle(Arc::clone(&accept_daemon), s);
+            }
+        });
+
+        let mut stream = UnixStream::connect(&sock_path).unwrap();
+        writeln!(stream, "{}", serde_json::to_string(&Request::Subscribe).unwrap()).unwrap();
+        stream.flush().unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let event: OverlayEvent = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(
+            event,
+            OverlayEvent::Error { reason: "no ggml compute backend".to_string() },
+            "a subscriber connecting after the failure must see the real reason, not a spinner"
+        );
+
+        accept_thread.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Work Item 3's connect-time race: registering the subscriber and
+    /// reading the snapshot happen inside one critical section on
+    /// `daemon.subscribers`'s lock, the same lock `broadcast_to` takes
+    /// before it iterates -- so a transition broadcast from another thread,
+    /// fired concurrently with a new subscriber connecting, is never lost:
+    /// the new subscriber either sees it in the snapshot already, or
+    /// receives it live once registered. Driven many times with real
+    /// threads (not asserted analytically) since this is exactly the kind
+    /// of race that only shows up under real scheduling.
+    #[test]
+    fn a_transition_racing_a_new_subscriber_is_never_lost() {
+        let dir = std::env::temp_dir()
+            .join(format!("owf-daemon-test-subscribe-race-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock_path = dir.join("test.sock");
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = UnixListener::bind(&sock_path).unwrap();
+
+        let daemon = fake_daemon(IDLE);
+        let accept_daemon = Arc::clone(&daemon);
+        let accept_listener = listener.try_clone().unwrap();
+        let accept_thread = std::thread::spawn(move || {
+            for s in accept_listener.incoming().take(1).flatten() {
+                handle(Arc::clone(&accept_daemon), s);
+            }
+        });
+
+        // Race a broadcast against the connect: neither strictly happens
+        // before the other from this test's point of view.
+        let racer_daemon = Arc::clone(&daemon);
+        let racer = std::thread::spawn(move || {
+            racer_daemon.state.store(RECORDING, Ordering::SeqCst);
+            racer_daemon.broadcast(OverlayEvent::Recording { level: 0.1, elapsed_ms: 5 });
+        });
+
+        let mut stream = UnixStream::connect(&sock_path).unwrap();
+        writeln!(stream, "{}", serde_json::to_string(&Request::Subscribe).unwrap()).unwrap();
+        stream.flush().unwrap();
+        racer.join().unwrap();
+
+        let mut reader = BufReader::new(stream);
+        let mut first = String::new();
+        reader.read_line(&mut first).unwrap();
+        let first_event: OverlayEvent = serde_json::from_str(first.trim()).unwrap();
+
+        // Whichever way the race landed, the subscriber must see the
+        // `Recording` transition somewhere in its stream -- either as the
+        // snapshot itself, or as the very next line if the snapshot still
+        // caught `Idle`.
+        let saw_recording = matches!(first_event, OverlayEvent::Recording { .. }) || {
+            let mut second = String::new();
+            reader.get_ref().set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            reader.read_line(&mut second).is_ok()
+                && matches!(
+                    serde_json::from_str::<OverlayEvent>(second.trim()),
+                    Ok(OverlayEvent::Recording { .. })
+                )
+        };
+        assert!(saw_recording, "the Recording transition must never be lost, got first={first_event:?}");
+
+        accept_thread.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- Task 3, Work Item 2: subscriber cap, eviction, and reaping -------
+
+    #[test]
+    fn register_subscriber_evicts_the_oldest_once_at_the_cap() {
+        let mut subs: Vec<Subscriber> = Vec::new();
+        let mut receivers = Vec::new();
+        for _ in 0..MAX_SUBSCRIBERS {
+            let (tx, rx) = mpsc::channel();
+            register_subscriber(&mut subs, tx, Arc::new(AtomicBool::new(true)));
+            receivers.push(rx);
+        }
+        assert_eq!(subs.len(), MAX_SUBSCRIBERS);
+
+        let (new_tx, new_rx) = mpsc::channel();
+        register_subscriber(&mut subs, new_tx, Arc::new(AtomicBool::new(true)));
+
+        assert_eq!(subs.len(), MAX_SUBSCRIBERS, "must stay capped, not grow unbounded");
+        assert!(
+            receivers[0].recv().is_err(),
+            "the oldest subscriber must be evicted (its Sender dropped) to make room"
+        );
+
+        let subs = Mutex::new(subs);
+        broadcast_to(&subs, OverlayEvent::Idle);
+        assert_eq!(new_rx.try_recv(), Ok(OverlayEvent::Idle), "the newest subscriber must still be registered");
+    }
+
+    #[test]
+    fn reap_dead_subscribers_prunes_dead_entries_without_sending_anything() {
+        let subs: Mutex<Vec<Subscriber>> = Mutex::new(Vec::new());
+        let (dead_tx, dead_rx) = mpsc::channel();
+        // Simulates the dead subscriber's own thread having already cleared
+        // its liveness flag on exit (`ClearAliveOnDrop`).
+        subs.lock().unwrap().push(Subscriber { tx: dead_tx, alive: Arc::new(AtomicBool::new(false)) });
+
+        let (live_tx, live_rx) = mpsc::channel();
+        subs.lock().unwrap().push(Subscriber { tx: live_tx, alive: Arc::new(AtomicBool::new(true)) });
+
+        reap_dead_subscribers(&subs);
+
+        assert_eq!(subs.lock().unwrap().len(), 1, "only the dead entry should be pruned");
+        assert!(dead_rx.try_recv().is_err(), "reaping must not send anything at all");
+        assert!(live_rx.try_recv().is_err(), "reaping must not send anything to the live subscriber either");
+    }
+
+    #[test]
+    fn socket_peer_gone_detects_an_orderly_shutdown_but_not_an_open_idle_connection() {
+        let (mut a, b) = UnixStream::pair().unwrap();
+        assert!(!socket_peer_gone(&mut a), "a freshly connected, idle peer must not look gone");
+        drop(b);
+        assert!(socket_peer_gone(&mut a), "a closed peer must be detected");
+    }
+
+    /// The end-to-end version of Work Item 2's fix: a subscriber that
+    /// disconnects while the daemon sits `Idle` -- broadcasting nothing at
+    /// all -- must still be reaped, via its own liveness poll
+    /// (`socket_peer_gone`) rather than needing any broadcast to happen.
+    /// Before this fix, only a broadcast's incidental pruning ever removed a
+    /// dead subscriber (see the older, broadcast-driven test above), which
+    /// is exactly the gap review flagged: "never comes while the daemon
+    /// sits idle."
+    #[test]
+    fn a_disconnected_subscriber_is_reaped_without_any_broadcast_while_idle() {
+        let dir = std::env::temp_dir()
+            .join(format!("owf-daemon-test-subscribe-reap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock_path = dir.join("test.sock");
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let daemon = fake_daemon(IDLE);
+
+        let accept_daemon = Arc::clone(&daemon);
+        let accept_listener = listener.try_clone().unwrap();
+        let accept_thread = std::thread::spawn(move || {
+            for s in accept_listener.incoming().take(1).flatten() {
+                handle(Arc::clone(&accept_daemon), s);
+            }
+        });
+
+        {
+            let mut stream = UnixStream::connect(&sock_path).unwrap();
+            writeln!(stream, "{}", serde_json::to_string(&Request::Subscribe).unwrap()).unwrap();
+            stream.flush().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            // `stream` and its clone drop here: the client hangs up, and
+            // nothing is ever broadcast afterward.
+        }
+        accept_thread.join().unwrap();
+
+        // Mirrors `spawn_housekeeping`'s periodic tick, which is what
+        // actually removes a dead entry from `daemon.subscribers` in
+        // production -- the subscriber's own thread only clears its
+        // `alive` flag (via `socket_peer_gone`); something else has to act
+        // on that flag to shrink the list. Bounded poll: the flag itself
+        // should flip within one `SUBSCRIBER_LIVENESS_POLL` (500ms) of the
+        // disconnect, well inside this budget.
+        let mut tries = 0;
+        loop {
+            reap_dead_subscribers(&daemon.subscribers);
+            if lock_ignoring_poison(&daemon.subscribers).is_empty() || tries >= 200 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            tries += 1;
+        }
+        assert!(
+            lock_ignoring_poison(&daemon.subscribers).is_empty(),
+            "a disconnected subscriber must be reaped even though nothing was ever broadcast"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- Task 3, Work Item 1: llama-server supervision (spec 15, 5.1) -----
+
+    #[test]
+    fn next_backoff_doubles_and_caps_at_thirty_seconds() {
+        let mut b = INITIAL_BACKOFF;
+        for want in [2u64, 4, 8, 16, 30, 30, 30] {
+            b = next_backoff(b);
+            assert_eq!(b, Duration::from_secs(want));
+        }
+    }
+
+    /// A tiny, always-200-OK HTTP responder for a `LlamaServer::from_child`
+    /// stub's `/health` -- `LlamaServer::is_healthy` makes a real HTTP
+    /// request, so proving "a healthy child is never restarted" needs
+    /// something real listening, not just a bound port. The stub *process*
+    /// (`sleep 300`) is still never a real `llama-server`; only the HTTP
+    /// response is faked, entirely within this test.
+    struct FakeHealthServer {
+        port: u16,
+        _thread: std::thread::JoinHandle<()>,
+    }
+
+    impl FakeHealthServer {
+        fn start() -> Self {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let thread = std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { break };
+                    let mut buf = [0u8; 512];
+                    let _ = std::io::Read::read(&mut stream, &mut buf);
+                    let _ = std::io::Write::write_all(
+                        &mut stream,
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n",
+                    );
+                }
+            });
+            Self { port, _thread: thread }
+        }
+    }
+
+    /// Proves "a healthy child must never be restarted": `respawn` panics if
+    /// ever called, so any restart attempt at all fails this test loudly.
+    #[test]
+    fn supervise_llama_once_never_touches_an_already_healthy_child() {
+        let health_server = FakeHealthServer::start();
+        let child = std::process::Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .expect("spawning a stub child (`sleep 300`) for this test");
+        let llama = Mutex::new(Some(LlamaServer::from_child(child, health_server.port)));
+        let pipeline: Mutex<Option<Pipeline>> = Mutex::new(None);
+        let normalize_available = AtomicBool::new(true);
+        let subscribers: Mutex<Vec<Subscriber>> = Mutex::new(Vec::new());
+        let mut respawn = || -> Result<LlamaServer> {
+            panic!("must not be called: a healthy child must never be restarted");
+        };
+
+        let healthy = supervise_llama_once(
+            &llama,
+            &pipeline,
+            &normalize_available,
+            &subscribers,
+            true,
+            6000,
+            &mut respawn,
+        );
+
+        assert!(healthy);
+        assert!(normalize_available.load(Ordering::SeqCst));
+        // Cleans up the stub child (kill + reap) via `LlamaServer::drop`.
+        drop(lock_ignoring_poison(&llama).take());
+    }
+
+    /// Proves the incident this whole feature exists to prevent: a dead (or
+    /// zombie) child is reaped and replaced. `false` exits immediately and
+    /// is never bound to any real HTTP server, so `is_healthy` sees it as
+    /// down without needing a fake server at all.
+    #[test]
+    fn supervise_llama_once_reaps_a_dead_child_and_installs_a_healthy_replacement() {
+        let dead_child = std::process::Command::new("false")
+            .spawn()
+            .expect("spawning a stub child (`false`) for this test");
+        let dead_pid = dead_child.id();
+        std::thread::sleep(Duration::from_millis(100)); // let it actually exit
+        let llama = Mutex::new(Some(LlamaServer::from_child(dead_child, 0)));
+        let pipeline: Mutex<Option<Pipeline>> = Mutex::new(None);
+        let normalize_available = AtomicBool::new(false);
+        let subscribers: Mutex<Vec<Subscriber>> = Mutex::new(Vec::new());
+        let (tx, rx) = mpsc::channel();
+        subscribers.lock().unwrap().push(Subscriber { tx, alive: Arc::new(AtomicBool::new(true)) });
+
+        let mut respawn_calls = 0u32;
+        let mut respawn = || -> Result<LlamaServer> {
+            respawn_calls += 1;
+            let stub = std::process::Command::new("sleep")
+                .arg("300")
+                .spawn()
+                .expect("spawning a replacement stub child for this test");
+            Ok(LlamaServer::from_child(stub, 0))
+        };
+
+        let healthy = supervise_llama_once(
+            &llama,
+            &pipeline,
+            &normalize_available,
+            &subscribers,
+            false,
+            6000,
+            &mut respawn,
+        );
+
+        assert!(healthy, "a successful respawn must report healthy");
+        assert_eq!(respawn_calls, 1, "a dead child must trigger exactly one restart attempt");
+        assert!(normalize_available.load(Ordering::SeqCst));
+        assert_eq!(rx.try_recv(), Ok(OverlayEvent::NormalizeRecovered));
+        assert!(
+            !std::path::Path::new(&format!("/proc/{dead_pid}")).exists(),
+            "the dead child must be reaped (no zombie left behind), not just abandoned"
+        );
+
+        // Cleans up the replacement stub child via `LlamaServer::drop`.
+        drop(lock_ignoring_poison(&llama).take());
+    }
+
+    /// The other half of the same fix: a restart attempt that also fails
+    /// must broadcast `NormalizeDegraded` exactly once (on the transition),
+    /// report unavailable, and leave `llama` empty rather than storing
+    /// anything -- there is nothing healthy to store.
+    #[test]
+    fn supervise_llama_once_reports_degraded_when_a_restart_attempt_also_fails() {
+        let llama: Mutex<Option<LlamaServer>> = Mutex::new(None);
+        let pipeline: Mutex<Option<Pipeline>> = Mutex::new(None);
+        let normalize_available = AtomicBool::new(true);
+        let subscribers: Mutex<Vec<Subscriber>> = Mutex::new(Vec::new());
+        let (tx, rx) = mpsc::channel();
+        subscribers.lock().unwrap().push(Subscriber { tx, alive: Arc::new(AtomicBool::new(true)) });
+
+        let mut respawn = || -> Result<LlamaServer> { anyhow::bail!("no ggml compute backend") };
+
+        let healthy = supervise_llama_once(
+            &llama,
+            &pipeline,
+            &normalize_available,
+            &subscribers,
+            true,
+            6000,
+            &mut respawn,
+        );
+
+        assert!(!healthy);
+        assert!(!normalize_available.load(Ordering::SeqCst));
+        assert!(lock_ignoring_poison(&llama).is_none());
+        assert_eq!(
+            rx.try_recv(),
+            Ok(OverlayEvent::NormalizeDegraded { reason: "llama-server is down or unhealthy".to_string() })
+        );
+    }
+
+    /// Task 3's shutdown-vs-backoff requirement, proven with the real
+    /// threaded loop (`spawn_housekeeping`/`HousekeepingHandle`): a bogus
+    /// `llama_server_path` makes every restart attempt fail near-instantly
+    /// (an `ENOENT` on `Command::spawn`, never a real `llama-server` --
+    /// satisfying the hard constraint against ever touching a real one),
+    /// growing backoff past its 1s initial value. `stop()` called while the
+    /// loop is asleep inside a *later* backoff wait must return promptly --
+    /// nowhere near that wait's real duration -- proving it woke via the
+    /// stop signal, not by timing out and attempting one more spawn first.
+    #[test]
+    fn shutdown_during_a_backoff_wait_terminates_promptly_without_spawning() {
+        let daemon = fake_daemon(IDLE);
+        let normalize_cfg = Some(NormalizeConfig {
+            llama_server_path: "/nonexistent/owf-test-llama-server-binary".to_string(),
+            ..NormalizeConfig::default()
+        });
+
+        let handle = spawn_housekeeping(Arc::clone(&daemon), normalize_cfg);
+
+        // Past the first (1s) backoff wait, so the loop is now asleep inside
+        // its *second* wait (2s) -- genuinely "during a backoff wait", not
+        // just before the first one has even started.
+        std::thread::sleep(Duration::from_millis(1200));
+
+        let t0 = Instant::now();
+        handle.stop();
+        let elapsed = t0.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "stop() should return almost immediately, not wait out the backoff; took {elapsed:?}"
+        );
     }
 }

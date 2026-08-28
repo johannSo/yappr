@@ -41,6 +41,16 @@ pub enum OverlayEvent {
     Done { preview: String },
     Error { reason: String },
     BusyRejected,
+    /// Spec 15 (M2 Task 3): normalization has stopped being available. Not a
+    /// `State` transition -- meant as a persistent badge alongside whatever
+    /// else is showing. Rendering the badge itself is future work; today
+    /// `connection.rs`'s existing "drop and keep listening" handling means
+    /// an overlay build that predates this variant simply ignores it rather
+    /// than crashing, so adding it here is forward-compatible either way.
+    NormalizeDegraded { reason: String },
+    /// Emitted once normalization becomes available again after a
+    /// `NormalizeDegraded`.
+    NormalizeRecovered,
 }
 
 /// The exact NDJSON line `owf_core::proto::Request::Subscribe` serialises
@@ -65,6 +75,8 @@ mod tests {
             OverlayEvent::Done { preview: "Hello there".to_string() },
             OverlayEvent::Error { reason: "no speech detected".to_string() },
             OverlayEvent::BusyRejected,
+            OverlayEvent::NormalizeDegraded { reason: "llama-server is down".to_string() },
+            OverlayEvent::NormalizeRecovered,
         ];
         for event in events {
             let s = serde_json::to_string(&event).unwrap();
@@ -111,6 +123,15 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&OverlayEvent::BusyRejected).unwrap(),
             r#"{"event":"busy_rejected"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&OverlayEvent::NormalizeDegraded { reason: "boom".to_string() })
+                .unwrap(),
+            r#"{"event":"normalize_degraded","reason":"boom"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&OverlayEvent::NormalizeRecovered).unwrap(),
+            r#"{"event":"normalize_recovered"}"#
         );
     }
 

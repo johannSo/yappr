@@ -32,6 +32,13 @@ pub enum State {
     Transcribing,
     Normalizing,
     Injecting,
+    /// A fatal, unrecoverable warm-up failure (ASR/VAD failed to load) --
+    /// distinct from the transient `OverlayEvent::Error` flash. This is a
+    /// steady state a late-connecting subscriber's snapshot must be able to
+    /// report instead of a permanent `Warming` spinner (spec 12; see
+    /// `owf-daemon.rs`'s `FAILED` and `serve_subscriber`). Additive: every
+    /// existing variant's wire form is unchanged.
+    Error,
 }
 
 /// One line of the NDJSON stream a `Request::Subscribe` connection turns
@@ -62,6 +69,18 @@ pub enum OverlayEvent {
     Done { preview: String },
     Error { reason: String },
     BusyRejected,
+    /// Spec 15: normalization has stopped being available -- the supervised
+    /// `llama-server` died, was wedged, or never came up. This is not a
+    /// `State` transition: the pipeline itself is unaffected (raw text plus
+    /// the rule-based fallback keeps working per spec 15's error matrix), so
+    /// the overlay is expected to render this as a persistent badge
+    /// alongside whatever `State`-driven view is already showing, not
+    /// replace it. `reason` is a short, log-line-style explanation. See
+    /// `owf-daemon.rs`'s `spawn_housekeeping`/`supervise_llama_once`.
+    NormalizeDegraded { reason: String },
+    /// Emitted once normalization becomes available again after a
+    /// `NormalizeDegraded`.
+    NormalizeRecovered,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,15 +94,24 @@ pub struct Response {
     pub warm: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_ms: Option<serde_json::Value>,
+    /// Whether normalization is currently available -- populated only by the
+    /// `Status` handler (mirroring how `warm` already works), and only when
+    /// `[normalize].enabled = true`: `None` there means "not applicable"
+    /// (normalization was never turned on), not "unknown". This is Task 3's
+    /// "status must stop lying": before it existed, `status` kept reporting
+    /// a daemon as fully fine while its supervised `llama-server` was dead,
+    /// with no field anywhere reflecting the gap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub normalize_available: Option<bool>,
 }
 
 impl Response {
     pub fn ok(state: State) -> Self {
-        Self { ok: true, state: Some(state), err: None, warm: None, last_ms: None }
+        Self { ok: true, state: Some(state), err: None, warm: None, last_ms: None, normalize_available: None }
     }
 
     pub fn err(msg: impl Into<String>) -> Self {
-        Self { ok: false, state: None, err: Some(msg.into()), warm: None, last_ms: None }
+        Self { ok: false, state: None, err: Some(msg.into()), warm: None, last_ms: None, normalize_available: None }
     }
 }
 
@@ -153,6 +181,7 @@ mod tests {
         assert_eq!(serde_json::to_string(&State::Normalizing).unwrap(), r#""normalizing""#);
         assert_eq!(serde_json::to_string(&State::Injecting).unwrap(), r#""injecting""#);
         assert_eq!(serde_json::to_string(&State::Idle).unwrap(), r#""idle""#);
+        assert_eq!(serde_json::to_string(&State::Error).unwrap(), r#""error""#);
     }
 
     #[test]
@@ -187,6 +216,8 @@ mod tests {
             OverlayEvent::Done { preview: "Hello there".to_string() },
             OverlayEvent::Error { reason: "no speech detected".to_string() },
             OverlayEvent::BusyRejected,
+            OverlayEvent::NormalizeDegraded { reason: "llama-server is down".to_string() },
+            OverlayEvent::NormalizeRecovered,
         ];
         for event in events {
             let s = serde_json::to_string(&event).unwrap();
@@ -233,5 +264,29 @@ mod tests {
             serde_json::to_string(&OverlayEvent::BusyRejected).unwrap(),
             r#"{"event":"busy_rejected"}"#
         );
+        assert_eq!(
+            serde_json::to_string(&OverlayEvent::NormalizeDegraded { reason: "boom".to_string() })
+                .unwrap(),
+            r#"{"event":"normalize_degraded","reason":"boom"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&OverlayEvent::NormalizeRecovered).unwrap(),
+            r#"{"event":"normalize_recovered"}"#
+        );
+    }
+
+    /// Task 3: `status` must stop lying about normalization availability --
+    /// the field is additive (`skip_serializing_if`) so an old client that
+    /// never looks for it is unaffected, and it must not appear at all
+    /// unless something actually populates it.
+    #[test]
+    fn normalize_available_is_absent_by_default_and_present_when_set() {
+        let mut r = Response::ok(State::Idle);
+        let v: serde_json::Value = serde_json::to_value(&r).unwrap();
+        assert!(v.get("normalize_available").is_none());
+
+        r.normalize_available = Some(false);
+        let v: serde_json::Value = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["normalize_available"], serde_json::json!(false));
     }
 }

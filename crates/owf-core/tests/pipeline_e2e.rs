@@ -589,6 +589,39 @@ fn update_reloadable_applies_a_new_guardrail_and_a_new_injector() {
     );
 }
 
+/// Task 3 (llama-server supervision): after a backoff restart reconnects to
+/// a fresh `llama-server` on a (possibly different) port, the daemon's
+/// supervisor swaps in a new normalizer via `set_normalizer` without
+/// rebuilding the rest of the pipeline. This proves the swap actually
+/// changes which normalizer later utterances go through -- unlike
+/// `update_reloadable`, `cfg`/`injector` must be untouched by the call.
+#[test]
+fn set_normalizer_swaps_the_normalizer_used_by_the_next_utterance() {
+    let old_injector = std::sync::Arc::new(MockInjector::default());
+    let mut p = Pipeline::new(
+        Config::from_str("").unwrap(),
+        Box::new(FixedAsr("send the invoice on friday".into())),
+        Box::new(WholeBuffer),
+        Box::new(AlwaysEnglish),
+        Box::new(BrokenNormalizer),
+        Box::new(FwdInjector(old_injector.clone())),
+    );
+
+    let before = p.process(&samples(), None).unwrap().expect("some outcome");
+    assert!(!before.normalized, "the broken normalizer must degrade to raw text");
+
+    p.set_normalizer(Box::new(FixedNormalizer("Send the invoice on Friday!".into())));
+
+    let after = p.process(&samples(), None).unwrap().expect("some outcome");
+    assert!(after.normalized, "the freshly swapped-in normalizer must actually be used");
+    assert_eq!(after.text, "Send the invoice on Friday! ");
+    assert_eq!(
+        old_injector.injected(),
+        vec![before.text, after.text],
+        "the injector must be untouched by set_normalizer -- both utterances went through it"
+    );
+}
+
 /// M2 Task 1: a subscriber (here, a plain `Vec` behind a `Mutex` standing in
 /// for the daemon's socket fan-out -- `owf-daemon.rs`'s own tests cover the
 /// actual `Request::Subscribe` wiring) must see `Normalizing` before

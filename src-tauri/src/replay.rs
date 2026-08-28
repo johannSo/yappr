@@ -28,6 +28,13 @@ fn hold_for(event: &OverlayEvent) -> Duration {
         | OverlayEvent::Transcribing
         | OverlayEvent::Normalizing
         | OverlayEvent::Injecting => Duration::from_millis(1_800),
+        // M2 Task 3: a persistent badge, not a full-screen state -- no
+        // rendering exists for these yet (that's future UI work), so this
+        // replay path just needs *a* reasonable, non-flashing hold rather
+        // than the `Recording`/`BusyRejected` short-flash timings above.
+        OverlayEvent::NormalizeDegraded { .. } | OverlayEvent::NormalizeRecovered => {
+            Duration::from_millis(1_800)
+        }
     }
 }
 
