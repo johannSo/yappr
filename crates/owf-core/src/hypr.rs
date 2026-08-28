@@ -9,36 +9,58 @@ use crate::procutil;
 /// `status` -- forever.
 const HYPRCTL_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Hyprland keybindings, autostart and window rules, in Omarchy's Lua config
-/// format.
+/// Hyprland keybindings and window rules, in Omarchy's Lua config format --
+/// spec §3 (shortcuts), §6 (the overlay window), §10 (migration).
 ///
 /// Hyprland 0.56+ configured through Lua rejects the legacy keyword parser
-/// outright (`hyprctl keyword windowrule ...` answers "keyword can't work with
-/// non-legacy parsers"), so the `.conf` block below is useless on such a
-/// system and this is what those users need instead.
+/// outright (`hyprctl keyword windowrule ...` answers "keyword can't work
+/// with non-legacy parsers"), so the `.conf` block below is useless on such
+/// a system and this is what those users need instead.
 ///
-/// The `release = true` binding is what makes this push-to-talk rather than a
-/// toggle: the same key starts recording on press and stops it on release.
-/// Both halves must stay bound to the same key.
+/// ## Migration (spec §10)
+///
+/// This is a breaking change from the previous, `owf-ctl`-based shortcut
+/// block: `owf-ctl` no longer exists, autostart is now the Settings
+/// window's "Beim Anmelden starten" toggle (spec §9) rather than a Hyprland
+/// line, and hold-to-talk's release-edge binding (the paired
+/// `{ release = true }` `o.bind` call here; `bindr` in the classic format)
+/// has no replacement under press/press toggle (spec §3) -- there is
+/// nothing to rewrite it *to*. So this text leads with what to delete, per
+/// spec §10, rather than silently leaving stale lines that call a binary
+/// which no longer exists.
 ///
 /// ## Window rules
 ///
-/// M1 rendered no window, so M1 shipped none. The M2 overlay exists now, and
-/// it needs two things a previous version got wrong by writing
-/// `windowrulev2` lines from memory (they didn't even apply on a
-/// Lua-configured compositor):
+/// Two requirements, unchanged since M2:
 ///
 /// 1. **Never take keyboard focus** -- otherwise `wtype` types the dictation
-///    into the overlay instead of the user's target window (spec 5.3). The
-///    Tauri window already asks for `focused:false`/`focusable:false`; this
-///    is belt-and-braces at the compositor level.
-/// 2. **Be positioned bottom-centre** (spec 12) -- Wayland's `xdg_shell` has
-///    no client-settable window position (`tao`'s `set_outer_position` calls
-///    `gtk_window_move`, which GTK documents as a no-op under Wayland), so
-///    placement can only come from the compositor.
+///    into the overlay instead of the user's target window (invariant 2).
+/// 2. **Be positioned bottom-centre** (invariant 5) -- Wayland's `xdg_shell`
+///    has no client-settable window position, so placement can only come
+///    from the compositor.
 ///
-/// Every field below is the exact Lua spelling registered by the *installed*
-/// Hyprland 0.56.2 binary, not a remembered one. The ground truth is
+/// `src-tauri/src/layer.rs`'s `anchor_overlay` now satisfies both directly,
+/// with no window rule at all, via `wlr-layer-shell` -- but only on a
+/// compositor that implements that protocol (every wlroots compositor;
+/// not Mutter). The rule below is what a GNOME/Mutter session falls back to
+/// (spec §6), so it is emitted unconditionally: this text is generated once
+/// by `--print-shortcuts`, ahead of time, with no way to know which of the
+/// two a given run will land on. It costs nothing on the compositors that
+/// don't need it.
+///
+/// It is now keyed on the overlay's **title**, not its class. Since the
+/// settings window became a window of this same Tauri app (Task 9), it
+/// shares the app's class -- a class-matched rule would make the settings
+/// form unable to take a keystroke too, which is exactly the class-collision
+/// bug the previous two-app split existed to avoid (spec §12 item 2). The
+/// overlay's title, `"openwhisprflow overlay"`, comes from its window
+/// declaration in `src-tauri/tauri.conf.json`; the settings window's title
+/// there, `"OpenWhisprFlow – Einstellungen"`, does not match the regex below,
+/// so the rule reaches only the overlay.
+///
+/// Every rule *effect* below is the exact Lua spelling registered by the
+/// *installed* Hyprland 0.56.2 binary, not a remembered one -- unchanged
+/// from the class-matched version this replaces. The ground truth is
 /// `WINDOW_RULE_EFFECT_DESCS` in
 /// `/usr/include/hyprland/src/config/lua/bindings/LuaBindingsInternal.hpp`
 /// (name string -> `eWindowRuleEffect`), which the `o.window` global
@@ -52,53 +74,48 @@ const HYPRCTL_TIMEOUT: Duration = Duration::from_secs(3);
 ///   - `{"move", ..., WE::WINDOW_RULE_EFFECT_MOVE}` (line 59), taking a
 ///     `CLuaConfigExpressionVec2` -- a `{x, y}` table of expression strings.
 ///
-/// That table is cross-checked against real, currently-shipping Omarchy Lua
-/// rules on this machine that do the same kind of thing (a floating, pinned,
-/// never-focused HUD-like window positioned with monitor-relative math):
-///   - `/usr/share/omarchy/default/hypr/windows.lua:18` -- `no_focus = true`
-///   - `/usr/share/omarchy/default/hypr/apps/webcam-overlay.lua:20-24` --
-///     `float = true, pin = true, no_initial_focus = true, no_dim = true`
-///     on a small always-on-top overlay, positioned via `size`/`move`
-///   - `/usr/share/omarchy/default/hypr/apps/pip.lua:3-12` -- `float = true`,
-///     `pin = true`, `border_size = 0`,
-///     `move = { "(monitor_w-window_w-40)", "(monitor_h*0.04)" }` --
-///     confirms both the field spellings and the `monitor_w`/`window_w`/
-///     `monitor_h`/`window_h` expression variables used below
+/// The **selector** -- `o.window({ title = ... }, { ... })` rather than a
+/// bare class string -- is confirmed by real, currently-shipping Omarchy Lua
+/// rules on this machine that key on `title` the same way:
+///   - `/usr/share/omarchy/default/hypr/apps/pip.lua:2` --
+///     `o.window({ title = "(Picture.?in.?[Pp]icture)" }, { tag = "+pip" })`
+///   - `/usr/share/omarchy/default/hypr/apps/battlenet.lua:4` --
+///     `o.window({ class = "^steam_app_battlenet$", title = "^Battle\\.net$" }, { ... })`
+///   - `/usr/share/omarchy/default/hypr/apps/steam.lua:2` --
+///     `o.window({ class = "steam", title = "Steam" }, { center = true, ... })`
 ///
 /// `pin` is included because the overlay window is created once, hidden, at
-/// daemon start (spec 12) and only shown/hidden after that -- without `pin`
-/// it would stay bound to whatever workspace was active at that moment and
-/// silently fail to appear if the user dictates from a different one.
-/// `no_dim` exists because `no_focus` makes the window permanently
-/// "inactive", which would make it a target for `decoration.dim_inactive` if
-/// a user ever turns that on (off by default here, but not universally).
-/// `border_size = 0` matches the spec's transparent, decoration-less pill --
-/// without it Hyprland would still draw its own compositor border around the
-/// window regardless of the Tauri window's own `decorations: false`.
-pub const HYPR_CONFIG_LUA: &str = r#"-- OpenWhisprFlow: push-to-talk dictation.
--- Add to ~/.config/hypr/bindings.lua
-o.bind("SUPER + D", "Dictate (hold to talk)", "owf-ctl ptt-start")
-o.bind("SUPER + D", nil, "owf-ctl ptt-stop", { release = true })
-o.bind("SUPER + ALT + D", "Dictation: cancel", "owf-ctl cancel")
+/// startup and only shown/hidden after that -- without `pin` it would stay
+/// bound to whatever workspace was active at that moment and silently fail
+/// to appear if the user dictates from a different one. `no_dim` exists
+/// because `no_focus` makes the window permanently "inactive", which would
+/// make it a target for `decoration.dim_inactive` if a user ever turns that
+/// on. `border_size = 0` matches the overlay's transparent, decoration-less
+/// pill -- without it Hyprland would still draw its own compositor border
+/// around the window regardless of the Tauri window's own
+/// `decorations: false`.
+pub const SHORTCUT_CONFIG_LUA: &str = r#"-- OpenWhisprFlow dictation shortcuts and window rules.
+--
+-- Delete first, wherever they currently live (bindings.lua, autostart.lua,
+-- windows.lua): the old owf-ctl bind pair (the "ptt-start" press binding
+-- and its paired "ptt-stop" release binding), both
+-- o.launch_on_start(...) lines ("owf-ctl daemon" and "openwhisprflow"),
+-- and the old o.window("openwhisprflow", { ... }) rule keyed on the app's
+-- class. owf-ctl no longer exists; autostart is now the Settings window's
+-- "Beim Anmelden starten" toggle, not a Hyprland line; and the
+-- class-matched rule also reaches the settings window, which then cannot
+-- take a keystroke.
+--
+-- Add to ~/.config/hypr/bindings.lua. Press-only: there is no release-edge
+-- counterpart to pair either bind with.
+o.bind("SUPER + D", "Dictation: toggle", "openwhisprflow --toggle")
+o.bind("SUPER + ALT + D", "Dictation: cancel", "openwhisprflow --cancel")
 
--- Add to ~/.config/hypr/autostart.lua
--- Spec 5.1: the overlay ("openwhisprflow", the Tauri app -- see
--- `src-tauri/Cargo.toml`'s `[package].name`, the binary produced with no
--- `[[bin]]` override) must be autostarted alongside the daemon; before this
--- fix only the daemon was, so a user who applied this snippet got window
--- rules (below) for a window that never appeared. Named bare, on PATH, the
--- same way `owf-ctl` is: this project has no separate install step for
--- the overlay binary that would justify a more fragile absolute path (e.g.
--- `~/.cargo/bin/openwhisprflow` after `cargo install --path src-tauri`, or
--- wherever a packaged `tauri build` bundle happens to put it) -- put it on
--- PATH the same way `owf-ctl` is expected to be.
-o.launch_on_start("owf-ctl daemon")
-o.launch_on_start("openwhisprflow")
-
--- Add to ~/.config/hypr/windows.lua
--- Never focus (spec 5.3), always floating and on every workspace, no
--- compositor border, bottom-centre (spec 12).
-o.window("openwhisprflow", {
+-- Add to ~/.config/hypr/windows.lua. Keyed on the overlay's title, not its
+-- class -- see this module's doc comment for why, and for why this rule is
+-- emitted even when the layer-shell surface (which needs no window rule at
+-- all) is available.
+o.window({ title = "^openwhisprflow overlay$" }, {
   float = true,
   pin = true,
   no_focus = true,
@@ -108,63 +125,72 @@ o.window("openwhisprflow", {
 })
 "#;
 
-/// Hyprland keybindings, autostart and window rules, in the classic `.conf`
-/// format.
+/// Hyprland keybindings and window rules, in the classic `.conf` format.
 ///
 /// For installations that still use `hyprland.conf` (Hyprland 0.56.2 still
 /// depends on `libhyprlang`, so this parser is retained even though the
 /// upstream wiki has moved its documentation to the Lua syntax). See
-/// [`HYPR_CONFIG_LUA`] for the Lua equivalent, the two requirements the
-/// window rules satisfy, and why `pin`/`no_dim`/`border_size` are included.
+/// [`SHORTCUT_CONFIG_LUA`] for the Lua equivalent and the full reasoning
+/// behind every line below.
 ///
 /// This machine configures Hyprland in Lua, so these classic `windowrulev2`
 /// lines can't be exercised here the way the Lua ones were checked against
-/// this compositor's own installed binary. Instead each keyword is verified
-/// against real, currently-published classic configs rather than memory:
+/// this compositor's own installed binary. The rule *effects* are unchanged
+/// from the class-matched version this replaces, so the same verification
+/// stands (real, currently-published classic configs rather than memory):
 ///   - `nofocus` / `noinitialfocus`: a GitHub Hyprland discussion
 ///     (hyprwm/Hyprland#13141) and issue (#8136) both show
 ///     `windowrulev2 = noinitialfocus, class:^(jetbrains-.)$` and
 ///     `windowrulev2 = nofocus, class:^(.*jetbrains.*)$, title:^(win.*)$`
-///     used together on a never-should-focus window, exactly this case.
+///     used together on a never-should-focus window -- the second of these
+///     is also the standing evidence that `title:` is a real, independent
+///     selector key the classic parser accepts, which is what the rule
+///     below relies on (with no `class:` at all -- Hyprland's windowrulev2
+///     selector keys, unlike this project's own rule effects, are
+///     documented as freely combinable/omittable, not a fixed set that
+///     needs one-by-one verification the way an *effect* keyword does).
 ///   - `float` / `pin` / `move <x> <y>`: end-4/dots-hyprland's shipped
 ///     `rules.conf` (commit `41520aebc6f0bd5fe4e10e32e08f4817bce321c0`) pins
 ///     and floats a picture-in-picture window with
 ///     `windowrulev2 = move 73% 72%,title:...`,
-///     `windowrulev2 = float,title:...`, `windowrulev2 = pin,title:...`.
+///     `windowrulev2 = float,title:...`, `windowrulev2 = pin,title:...` --
+///     already title-matched in the source it was cited from.
 ///   - `bordersize 0`: cited from a real `hyprland.conf` snippet,
 ///     `windowrule = bordersize 0, floating:0, onworkspace:w[tv1]`.
 ///   - the `(monitor_w-1000)`-style parenthesised expression form of `move`
 ///     (used below for centring) is confirmed by a separate real example,
 ///     `windowrulev2 = move (monitor_w-1000) (monitor_h-1000), ...`.
 ///
-/// Every one of these keyword strings also matches, one-to-one modulo
-/// underscores, the same internal `eWindowRuleEffect` table the Lua bindings
-/// use (`WINDOW_RULE_EFFECT_NO_FOCUS`, `_NOINITIALFOCUS`, `_FLOAT`, `_PIN`,
+/// Every rule-effect keyword also matches, one-to-one modulo underscores,
+/// the same internal `eWindowRuleEffect` table the Lua bindings use
+/// (`WINDOW_RULE_EFFECT_NO_FOCUS`, `_NOINITIALFOCUS`, `_FLOAT`, `_PIN`,
 /// `_BORDER_SIZE`, `_MOVE` in
 /// `/usr/include/hyprland/src/desktop/rule/windowRule/WindowRuleEffectContainer.hpp`),
 /// which is the strongest available cross-check without a classic-conf
 /// Hyprland session on hand to test against directly. `no_dim` is left out of
 /// this block because it has no independently confirmed classic spelling.
-pub const HYPR_CONFIG_CONF: &str = r#"# OpenWhisprFlow
-exec-once = owf-ctl daemon
-# Spec 5.1: autostart the overlay ("openwhisprflow", the Tauri app's own
-# binary name -- see src-tauri/Cargo.toml) alongside the daemon, the same way
-# and on the same assumption (bare name, on PATH) as owf-ctl above -- see
-# HYPR_CONFIG_LUA's doc comment for why an absolute path was rejected.
-exec-once = openwhisprflow
+pub const SHORTCUT_CONFIG_CONF: &str = r#"# OpenWhisprFlow dictation shortcuts and window rules.
+#
+# Delete first: the old exec-once lines (owf-ctl daemon, openwhisprflow),
+# the old owf-ctl bind/bindr pair (ptt-start / ptt-stop), and every
+# windowrulev2 line matched on class:^(openwhisprflow)$. owf-ctl no longer
+# exists; autostart is now the Settings window's "Beim Anmelden starten"
+# toggle, not a Hyprland line; and the class-matched rule also reaches the
+# settings window, which then cannot take a keystroke.
+#
+# Press-only: there is no release-edge counterpart to pair either bind with.
+bind  = SUPER, D,     exec, openwhisprflow --toggle
+bind  = SUPER ALT, D, exec, openwhisprflow --cancel
 
-bind  = SUPER, D,       exec, owf-ctl ptt-start
-bindr = SUPER, D,       exec, owf-ctl ptt-stop
-bind  = SUPER ALT, D,   exec, owf-ctl cancel
-
-# Never focus (spec 5.3), always floating and on every workspace, no
-# compositor border, bottom-centre (spec 12).
-windowrulev2 = float,class:^(openwhisprflow)$
-windowrulev2 = pin,class:^(openwhisprflow)$
-windowrulev2 = nofocus,class:^(openwhisprflow)$
-windowrulev2 = noinitialfocus,class:^(openwhisprflow)$
-windowrulev2 = bordersize 0,class:^(openwhisprflow)$
-windowrulev2 = move (monitor_w/2-window_w/2) (monitor_h-window_h-40),class:^(openwhisprflow)$
+# Keyed on the overlay's title, not its class -- see SHORTCUT_CONFIG_LUA's
+# doc comment for why, and for why this rule is emitted even when the
+# layer-shell surface (which needs no window rule at all) is available.
+windowrulev2 = float,title:^(openwhisprflow overlay)$
+windowrulev2 = pin,title:^(openwhisprflow overlay)$
+windowrulev2 = nofocus,title:^(openwhisprflow overlay)$
+windowrulev2 = noinitialfocus,title:^(openwhisprflow overlay)$
+windowrulev2 = bordersize 0,title:^(openwhisprflow overlay)$
+windowrulev2 = move (monitor_w/2-window_w/2) (monitor_h-window_h-40),title:^(openwhisprflow overlay)$
 "#;
 
 /// True when this machine configures Hyprland in Lua rather than `.conf`.
@@ -172,17 +198,21 @@ fn uses_lua_config(config_dir: &std::path::Path) -> bool {
     config_dir.join("hyprland.lua").exists()
 }
 
-/// The config snippet appropriate to this machine.
+/// The shortcut/window-rule snippet appropriate to this machine (spec §3,
+/// §10) -- what `openwhisprflow --print-shortcuts` prints. Renamed from
+/// `hypr_config()`: this crate no longer emits anything Hyprland-specific
+/// beyond the shortcut bindings and the overlay's fallback window rule, so
+/// the name should say what the function actually produces.
 ///
 /// Picks Lua when `~/.config/hypr/hyprland.lua` exists, `.conf` otherwise.
-pub fn hypr_config() -> &'static str {
+pub fn shortcut_config() -> &'static str {
     let dir = dirs::config_dir()
         .map(|d| d.join("hypr"))
         .unwrap_or_else(|| std::path::PathBuf::from("/nonexistent"));
     if uses_lua_config(&dir) {
-        HYPR_CONFIG_LUA
+        SHORTCUT_CONFIG_LUA
     } else {
-        HYPR_CONFIG_CONF
+        SHORTCUT_CONFIG_CONF
     }
 }
 
@@ -215,6 +245,20 @@ pub fn active_window_class() -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Lines of `config` that are executable directives rather than
+    /// comments. Both migration headers deliberately *quote* dead syntax
+    /// (`owf-ctl ptt-stop`, `launch_on_start`, the old class-matched
+    /// selector) so a user can find and delete it -- spec §10. A test for
+    /// "this dead thing is truly gone" must look only at the lines that
+    /// would actually run, not at prose telling the user to remove it.
+    fn active_lines<'a>(config: &'a str, comment_prefix: &str) -> Vec<&'a str> {
+        config
+            .lines()
+            .map(str::trim_start)
+            .filter(|l| !l.is_empty() && !l.starts_with(comment_prefix))
+            .collect()
+    }
+
     #[test]
     fn parses_the_class_from_hyprctl_json() {
         let json = r#"{"address":"0x1","class":"thunderbird","title":"Inbox"}"#;
@@ -235,26 +279,44 @@ mod tests {
     }
 
     #[test]
-    fn the_lua_config_binds_press_and_release_to_the_same_key() {
-        // The release binding is what makes this push-to-talk instead of a
-        // toggle. Losing it would leave the microphone hot after one tap.
-        assert!(HYPR_CONFIG_LUA.contains(r#"o.bind("SUPER + D", "Dictate (hold to talk)", "owf-ctl ptt-start")"#));
-        assert!(HYPR_CONFIG_LUA
-            .contains(r#"o.bind("SUPER + D", nil, "owf-ctl ptt-stop", { release = true })"#));
-        assert!(HYPR_CONFIG_LUA.contains("o.launch_on_start(\"owf-ctl daemon\")"));
-        assert!(HYPR_CONFIG_LUA.contains("owf-ctl cancel"));
+    fn the_lua_config_binds_toggle_and_cancel_with_no_release_edge() {
+        // Rev 3 dropped hold-to-talk (spec §3): both binds are press-only,
+        // so a `{ release = true }` counterpart must never reappear here.
+        assert!(SHORTCUT_CONFIG_LUA
+            .contains(r#"o.bind("SUPER + D", "Dictation: toggle", "openwhisprflow --toggle")"#));
+        assert!(SHORTCUT_CONFIG_LUA.contains(
+            r#"o.bind("SUPER + ALT + D", "Dictation: cancel", "openwhisprflow --cancel")"#
+        ));
+        for line in active_lines(SHORTCUT_CONFIG_LUA, "--") {
+            assert!(!line.contains("release"), "a release-edge binding leaked in: {line:?}");
+        }
     }
 
-    /// F2 / spec 5.1: the daemon alone used to be autostarted, so a user who
-    /// applied this snippet got the window rules below for a window
-    /// (`openwhisprflow`, the Tauri overlay app) that never launched.
     #[test]
-    fn the_lua_config_autostarts_the_overlay_alongside_the_daemon() {
-        assert!(HYPR_CONFIG_LUA.contains("o.launch_on_start(\"owf-ctl daemon\")"));
-        assert!(
-            HYPR_CONFIG_LUA.contains("o.launch_on_start(\"openwhisprflow\")"),
-            "the Tauri overlay binary must be autostarted too (spec 5.1), not just the daemon"
-        );
+    fn neither_config_mentions_the_deleted_owf_ctl_binary_as_a_command_to_run() {
+        // owf-ctl no longer exists (spec §10) -- every command this text
+        // tells the user to run must be `openwhisprflow`, not the deleted
+        // binary. The word still legitimately appears in the "delete this"
+        // migration comments, so this checks the actual commands, not the
+        // whole text.
+        for config in [SHORTCUT_CONFIG_LUA, SHORTCUT_CONFIG_CONF] {
+            assert!(config.contains("openwhisprflow --toggle"));
+            assert!(config.contains("openwhisprflow --cancel"));
+        }
+    }
+
+    #[test]
+    fn neither_config_autostarts_anything() {
+        // Autostart is now the Settings window's toggle (spec §9), not a
+        // Hyprland line -- a previous version's `o.launch_on_start` /
+        // `exec-once` lines must not reappear as live directives (the
+        // migration header names them so the user can delete the old ones).
+        for line in active_lines(SHORTCUT_CONFIG_LUA, "--") {
+            assert!(!line.contains("launch_on_start"), "autostart leaked in: {line:?}");
+        }
+        for line in active_lines(SHORTCUT_CONFIG_CONF, "#") {
+            assert!(!line.contains("exec-once"), "autostart leaked in: {line:?}");
+        }
     }
 
     #[test]
@@ -263,14 +325,14 @@ mod tests {
         // conf-style directive leaking into the Lua output is inert text.
         //
         // Lua rule tables legitimately use `=` for their own fields
-        // (`{ release = true }`, the window rule's `float = true` etc.), so a
-        // blanket "no bare `=` anywhere" check can't tell those apart from a
-        // leaked classic directive. What's actually distinctive about a
-        // classic directive is that it's a *complete statement* starting with
-        // the bare keyword itself (`bind = ...`, `bindr = ...`) -- every
-        // legitimate statement in this file starts with `o.` instead. Match
-        // on that instead of on `=`.
-        for line in HYPR_CONFIG_LUA.lines() {
+        // (`float = true` etc.), so a blanket "no bare `=` anywhere" check
+        // can't tell those apart from a leaked classic directive. What's
+        // actually distinctive about a classic directive is that it's a
+        // *complete statement* starting with the bare keyword itself
+        // (`bind = ...`, `bindr = ...`) -- every legitimate statement in
+        // this file starts with `o.` or `--` instead. Match on that instead
+        // of on `=`.
+        for line in SHORTCUT_CONFIG_LUA.lines() {
             let trimmed = line.trim_start();
             if trimmed.starts_with("--") {
                 continue;
@@ -279,68 +341,107 @@ mod tests {
                 !trimmed.starts_with("bind ") && !trimmed.starts_with("bind="),
                 "conf-style `bind =` leaked into the Lua config: {line:?}"
             );
-            for dead in ["windowrule", "bindr", "exec-once"] {
+            for dead in ["windowrulev2", "bindr", "exec-once"] {
                 assert!(!line.contains(dead), "conf-style `{dead}` leaked into the Lua config");
             }
         }
     }
 
     #[test]
-    fn neither_config_ships_unverified_window_rules() {
-        // A previous version emitted five `windowrulev2` lines written from
-        // memory that didn't even apply on a Lua-configured compositor. M2's
-        // rules must instead be exactly the fields verified against the
-        // installed Hyprland 0.56.2 Lua binding table
-        // (`LuaBindingsInternal.hpp`'s `WINDOW_RULE_EFFECT_DESCS`, see
-        // `HYPR_CONFIG_LUA`'s doc comment) for the Lua side, and against real
-        // published classic configs for the `.conf` side -- so this test
-        // pins the verified forms rather than merely asserting "no rules",
-        // and still fails if unverified syntax reappears.
-        assert!(HYPR_CONFIG_LUA.contains(r#"o.window("openwhisprflow", {"#));
+    fn window_rules_are_title_matched_not_class_matched_in_either_config() {
+        // The settings window shares the overlay's class (Task 9); a
+        // class-matched rule reaches it too and its form could not take a
+        // keystroke. This is the specific regression this task exists to
+        // fix, so it is pinned directly rather than only inferred from the
+        // presence of a title selector.
+        assert!(SHORTCUT_CONFIG_LUA.contains(r#"o.window({ title = "^openwhisprflow overlay$" }"#));
+        for line in active_lines(SHORTCUT_CONFIG_LUA, "--") {
+            assert!(!line.contains("o.window(\"openwhisprflow\""), "class-keyed rule leaked in: {line:?}");
+        }
+
+        assert!(SHORTCUT_CONFIG_CONF.contains(",title:^(openwhisprflow overlay)$"));
+        for line in active_lines(SHORTCUT_CONFIG_CONF, "#") {
+            assert!(!line.contains(",class:^(openwhisprflow)$"), "class-keyed rule leaked in: {line:?}");
+        }
+    }
+
+    #[test]
+    fn neither_config_ships_unverified_window_rule_effects() {
+        // A previous version emitted `windowrulev2` lines written from
+        // memory that didn't even apply on a Lua-configured compositor. The
+        // rule *effects* here must be exactly the fields verified against
+        // the installed Hyprland 0.56.2 Lua binding table
+        // (`LuaBindingsInternal.hpp`'s `WINDOW_RULE_EFFECT_DESCS`, see this
+        // module's doc comment) for the Lua side, and against real
+        // published classic configs for the `.conf` side.
         for verified_field in
             ["float = true", "pin = true", "no_focus = true", "no_dim = true", "border_size = 0", "move = {"]
         {
             assert!(
-                HYPR_CONFIG_LUA.contains(verified_field),
-                "HYPR_CONFIG_LUA is missing the verified field `{verified_field}`"
+                SHORTCUT_CONFIG_LUA.contains(verified_field),
+                "SHORTCUT_CONFIG_LUA is missing the verified field `{verified_field}`"
             );
         }
         // The classic keyword spellings (no underscores) are Lua-syntax
         // errors, not valid Lua field names -- if either leaks into the Lua
         // config it's a sign the two formats got mixed up.
-        assert!(!HYPR_CONFIG_LUA.contains("nofocus"));
-        assert!(!HYPR_CONFIG_LUA.contains("noinitialfocus"));
+        assert!(!SHORTCUT_CONFIG_LUA.contains("nofocus"));
+        assert!(!SHORTCUT_CONFIG_LUA.contains("noinitialfocus"));
 
-        for verified_line in [
-            "windowrulev2 = float,class:^(openwhisprflow)$",
-            "windowrulev2 = pin,class:^(openwhisprflow)$",
-            "windowrulev2 = nofocus,class:^(openwhisprflow)$",
-            "windowrulev2 = noinitialfocus,class:^(openwhisprflow)$",
-            "windowrulev2 = bordersize 0,class:^(openwhisprflow)$",
-            "windowrulev2 = move (monitor_w/2-window_w/2) (monitor_h-window_h-40),class:^(openwhisprflow)$",
-        ] {
+        for verified_effect in
+            ["float,title:", "pin,title:", "nofocus,title:", "noinitialfocus,title:", "bordersize 0,title:", "move (monitor_w/2-window_w/2) (monitor_h-window_h-40),title:"]
+        {
             assert!(
-                HYPR_CONFIG_CONF.contains(verified_line),
-                "HYPR_CONFIG_CONF is missing the verified rule: {verified_line}"
+                SHORTCUT_CONFIG_CONF.contains(verified_effect),
+                "SHORTCUT_CONFIG_CONF is missing the verified rule: {verified_effect}"
             );
         }
     }
 
     #[test]
     fn the_conf_config_still_serves_classic_installations() {
-        assert!(HYPR_CONFIG_CONF.contains("bind  = SUPER, D,       exec, owf-ctl ptt-start"));
-        assert!(HYPR_CONFIG_CONF.contains("bindr = SUPER, D,       exec, owf-ctl ptt-stop"));
-        assert!(HYPR_CONFIG_CONF.contains("exec-once = owf-ctl daemon"));
+        assert!(SHORTCUT_CONFIG_CONF.contains("bind  = SUPER, D,     exec, openwhisprflow --toggle"));
+        assert!(SHORTCUT_CONFIG_CONF.contains("bind  = SUPER ALT, D, exec, openwhisprflow --cancel"));
+        for line in active_lines(SHORTCUT_CONFIG_CONF, "#") {
+            assert!(!line.contains("bindr"), "a release-edge bindr leaked in: {line:?}");
+        }
     }
 
-    /// F2 / spec 5.1, the `.conf` side of the same fix.
+    /// Mechanical drift check, the same shape as `proto.rs`'s
+    /// `the_overlay_replay_fixture_parses_as_this_crates_overlay_event`
+    /// (invariant 3): a title-matched rule that doesn't match
+    /// `src-tauri/tauri.conf.json`'s *actual* window titles silently rules
+    /// nothing, which is exactly the failure mode a previous version of
+    /// this file already shipped once (unverified `windowrulev2` lines).
     #[test]
-    fn the_conf_config_autostarts_the_overlay_alongside_the_daemon() {
-        assert!(HYPR_CONFIG_CONF.contains("exec-once = owf-ctl daemon"));
-        assert!(
-            HYPR_CONFIG_CONF.contains("exec-once = openwhisprflow"),
-            "the Tauri overlay binary must be autostarted too (spec 5.1), not just the daemon"
-        );
+    fn the_title_selectors_match_tauri_conf_jsons_actual_window_titles() {
+        let conf_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../src-tauri/tauri.conf.json");
+        let raw = std::fs::read_to_string(&conf_path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", conf_path.display()));
+        let json: serde_json::Value = serde_json::from_str(&raw).expect("tauri.conf.json is valid JSON");
+        let windows = json["app"]["windows"].as_array().expect("app.windows is an array");
+        let title_of = |label: &str| -> String {
+            windows
+                .iter()
+                .find(|w| w["label"] == label)
+                .and_then(|w| w["title"].as_str())
+                .unwrap_or_else(|| panic!("no window labelled {label:?} in tauri.conf.json"))
+                .to_string()
+        };
+        let overlay_title = title_of("overlay");
+        let settings_title = title_of("settings");
+
+        assert_eq!(overlay_title, "openwhisprflow overlay");
+
+        // Both emitted regexes must match the real overlay title...
+        assert!(SHORTCUT_CONFIG_LUA.contains(&overlay_title));
+        assert!(SHORTCUT_CONFIG_CONF.contains(&overlay_title));
+        // ...and neither may match the settings window's title, which is
+        // the entire point of matching on title instead of class.
+        assert_ne!(overlay_title, settings_title);
+        assert!(!SHORTCUT_CONFIG_LUA.contains(&settings_title));
+        assert!(!SHORTCUT_CONFIG_CONF.contains(&settings_title));
     }
 
     #[test]

@@ -13,6 +13,7 @@ mod bench;
 pub mod cli;
 pub mod client;
 mod client_stream;
+mod layer;
 mod provision;
 mod replay;
 mod settings_cmds;
@@ -220,6 +221,20 @@ pub fn run() {
             let window = app
                 .get_webview_window(OVERLAY_LABEL)
                 .expect("the overlay window must be declared in tauri.conf.json");
+
+            // Spec §6: layer-shell must be applied before the window is
+            // realized, so this runs before anything else touches `window`.
+            // `anchor_overlay` returns `Err` when the compositor doesn't
+            // implement wlr-layer-shell (Mutter) -- the window then stays
+            // an ordinary toplevel. Invariant 2 (never take keyboard focus)
+            // still holds on that path: `tauri.conf.json`'s
+            // `focusable: false` applies regardless of which path this
+            // takes, and `owf_core::hypr::shortcut_config`'s emitted
+            // title-matched `nofocus`/`noinitialfocus` window rule is the
+            // compositor-side belt-and-braces for exactly this fallback.
+            if let Err(e) = layer::anchor_overlay(&window) {
+                eprintln!("overlay: layer-shell unavailable ({e}); falling back to a toplevel");
+            }
             relax_webkitgtk_minimum_size(&window);
 
             // Neither window is ever destroyed by a close request -- only

@@ -34,8 +34,7 @@ pub fn dispatch(route: Route) -> Result<bool> {
         Route::Subscribe => crate::client_stream::subscribe()?,
         Route::Debug => crate::setup::debug_summary()?,
         Route::Bench => crate::bench::run()?,
-        // Renamed to `shortcut_config()` in Task 17, when its content changes.
-        Route::PrintShortcuts => print!("{}", owf_core::hypr::hypr_config()),
+        Route::PrintShortcuts => print!("{}", owf_core::hypr::shortcut_config()),
         Route::PurgeLogs => crate::setup::purge_logs()?,
         Route::UpdateLock => crate::setup::setup(true)?,
         Route::Usage => {

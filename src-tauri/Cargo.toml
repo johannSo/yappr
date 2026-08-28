@@ -48,6 +48,18 @@ ksni = "0.2"
 # node, just direct access to one already-present crate.
 [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
 gtk = "0.18"
+# `layer.rs`'s `anchor_overlay` -- spec §6. The only published gtk3
+# `wlr-layer-shell` binding (marked "UNMAINTAINED" on crates.io, but its
+# generated surface is exactly what `anchor_overlay` uses: the `LayerShell`
+# trait, `Edge`/`Layer`/`KeyboardMode`, `init_layer_shell`/`set_layer`/
+# `set_anchor`/`set_layer_shell_margin`/`set_keyboard_mode`/`is_supported` --
+# verified against 0.8.2's own generated source, not memory or its README).
+# Default features are empty; `v0_6` unlocks `set_keyboard_mode` and (via
+# `v0_5`, which it implies) `is_supported`, both load-bearing here --
+# `is_supported` is the live runtime check `anchor_overlay` uses to decide
+# whether to attempt layer-shell at all, and `set_keyboard_mode` is
+# invariant 2's enforcement on that path.
+gtk-layer-shell = { version = "0.8", features = ["v0_6"] }
 
 [features]
 # This feature is used for production builds, or when a plain `cargo
