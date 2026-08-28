@@ -6,21 +6,26 @@
 //! than losing the utterance. See spec 15.
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Instant, SystemTime};
 
 use crate::asr::Transcriber;
+use crate::capture::CaptureStats;
 use crate::config::Config;
+use crate::debug;
 use crate::guardrail::{self, RejectReason, Verdict};
-use crate::inject::{inject_with_fallback, TextInjector};
+use crate::inject::{self, ClipboardInjector, TextInjector};
 use crate::lang::{Lang, LanguageDetector};
 use crate::normalize::Normalizer;
 use crate::paths;
+use crate::proto::OverlayEvent;
 use crate::style;
 use crate::vad::Trimmer;
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
 pub struct Timings {
     pub vad_ms: u128,
     pub asr_ms: u128,
@@ -49,11 +54,25 @@ pub struct Pipeline {
     detector: Box<dyn LanguageDetector>,
     normalizer: Box<dyn Normalizer>,
     injector: Box<dyn TextInjector>,
+    /// The fallback `inject_with_recovery` falls through to when `injector`
+    /// fails, if overridden by `with_fallback_injector`. Defaults to the
+    /// real `ClipboardInjector` in `new`, matching `inject_with_fallback`'s
+    /// production behaviour.
+    fallback_injector: Box<dyn TextInjector>,
     /// Where guardrail rejections are appended, if overridden by
     /// `with_rejections_path`. `None` (the default from `new`) means the
     /// real M3 tuning dataset, `paths::rejections_file()` -- see
     /// `rejections_path` and `log_rejection_to`.
     rejections_path: Option<PathBuf>,
+    /// Where the injection-failure recovery file (spec 10.4's `unsent.txt`)
+    /// is written, if overridden by `with_recovery_dir`. `None` (the default
+    /// from `new`) means the real `paths::state_dir()`.
+    recovery_dir: Option<PathBuf>,
+    /// Reports `OverlayEvent::Normalizing`/`OverlayEvent::Injecting` as
+    /// `process_with_capture` enters each stage, if set by
+    /// `with_stage_events`. `None` (the default from `new`) costs one `if
+    /// let` check per stage and nothing else.
+    stage_events: Option<Arc<dyn Fn(OverlayEvent) + Send + Sync>>,
 }
 
 impl Pipeline {
@@ -65,7 +84,18 @@ impl Pipeline {
         normalizer: Box<dyn Normalizer>,
         injector: Box<dyn TextInjector>,
     ) -> Self {
-        Self { cfg, asr, trimmer, detector, normalizer, injector, rejections_path: None }
+        Self {
+            cfg,
+            asr,
+            trimmer,
+            detector,
+            normalizer,
+            injector,
+            fallback_injector: Box::new(ClipboardInjector),
+            rejections_path: None,
+            recovery_dir: None,
+            stage_events: None,
+        }
     }
 
     /// Points guardrail-rejection logging at `path` instead of the real M3
@@ -87,6 +117,56 @@ impl Pipeline {
         self.rejections_path.clone().unwrap_or_else(paths::rejections_file)
     }
 
+    /// Substitutes the fallback injector that `inject_with_recovery` falls
+    /// through to when the primary injector fails, instead of the real
+    /// `ClipboardInjector` (which shells out to `wl-copy`).
+    ///
+    /// Additive, same rationale as `with_rejections_path`: production always
+    /// takes the `new`-time default. Only tests need this -- specifically,
+    /// to force *both* injectors to fail deterministically and prove the
+    /// debug record still gets written when that happens, without touching
+    /// the real clipboard.
+    pub fn with_fallback_injector(mut self, fallback: Box<dyn TextInjector>) -> Self {
+        self.fallback_injector = fallback;
+        self
+    }
+
+    /// Points the injection-failure recovery file (spec 10.4's `unsent.txt`)
+    /// at `dir` instead of the real `paths::state_dir()`.
+    ///
+    /// Additive, same rationale as `with_rejections_path`: a test that
+    /// deliberately fails both injectors must not write to the real user
+    /// state directory.
+    pub fn with_recovery_dir(mut self, dir: PathBuf) -> Self {
+        self.recovery_dir = Some(dir);
+        self
+    }
+
+    /// Where the injection-failure recovery file is written:
+    /// `paths::state_dir()` unless overridden by `with_recovery_dir`.
+    fn recovery_dir(&self) -> PathBuf {
+        self.recovery_dir.clone().unwrap_or_else(paths::state_dir)
+    }
+
+    /// Reports `OverlayEvent::Normalizing`/`OverlayEvent::Injecting` to
+    /// `sink` as `process_with_capture` enters each stage (spec 12).
+    ///
+    /// Additive, same rationale as `with_rejections_path`: `new`'s six
+    /// positional arguments are `owf-daemon.rs`'s locked-in call site, and
+    /// only the daemon (to drive the overlay's state broadcast) and this
+    /// crate's own tests (to prove event ordering) ever need this.
+    ///
+    /// A callback rather than a channel: `Pipeline` has no business knowing
+    /// whether the far end is a socket fan-out, a test's `Vec`, or nothing
+    /// at all. `Transcribing` is deliberately not reported here -- by the
+    /// time `process_with_capture` is called, the daemon already knows it's
+    /// transcribing (it's the caller), so there is nothing for `Pipeline`
+    /// itself to add.
+    pub fn with_stage_events(mut self, sink: Arc<dyn Fn(OverlayEvent) + Send + Sync>) -> Self {
+        self.stage_events = Some(sink);
+        self
+    }
+
     pub fn config(&self) -> &Config {
         &self.cfg
     }
@@ -102,90 +182,294 @@ impl Pipeline {
     /// existing. `asr`, the VAD/ASR models, and the `llama-server` connection
     /// underneath `self.normalizer` are untouched: those require a restart
     /// (see `owf-daemon.rs`'s `Reload` handler), exactly as the comment this
-    /// replaces already said -- the bug was applying that restriction to
-    /// *everything* in `Config`, including the fields that need no restart.
-    pub fn update_reloadable(&mut self, cfg: Config, injector: Box<dyn TextInjector>) {
+    /// replaces already said.
+    ///
+    /// R15: that restriction used to be applied inconsistently. Every other
+    /// `[normalize]` field (`port`, `llama_server_path`, `context_size`, ...)
+    /// really does need a restart and this function already left them alone
+    /// by never reading them again -- but `cfg` was still swapped in
+    /// *wholesale*, so `[normalize].enabled` silently changed anyway even
+    /// though `self.normalizer` (the object that flag actually gates) is not
+    /// rebuilt here. `false` -> `true` on reload used to leave the
+    /// `UnavailableNormalizer` stub `owf-daemon.rs`'s `warm_up` builds when
+    /// normalization starts disabled in place, now called on every
+    /// utterance; it errors, and the pipeline quietly falls back to raw text
+    /// forever -- the exact "reports success, changes nothing" bug fix I5
+    /// already removed from `reload` once, recreated one field at a time.
+    /// This rejects the reload outright instead of pretending it worked,
+    /// leaving `self` completely untouched (`cfg`/`injector` both, not just
+    /// the one that changed) so a caller can't end up with half a reload
+    /// applied.
+    ///
+    /// Rebuilding the normalizer instead -- spawning a fresh `llama-server`
+    /// and connecting an `S1MiniClient` to it, the way `owf-daemon.rs`'s
+    /// Task 3 supervisor already does in `supervise_llama_once` -- was
+    /// considered and rejected here: that supervisor runs on its own
+    /// background thread precisely so a slow health-wait (15 s for a
+    /// restart, 120 s for a cold start, per `RESTART_HEALTH_TIMEOUT`/
+    /// `STARTUP_HEALTH_TIMEOUT`) never blocks anything else. `Reload`, like
+    /// every other socket command, is dispatched synchronously on the
+    /// daemon's single accept-loop thread (see `owf-daemon.rs`'s `main`) --
+    /// rebuilding here would freeze `status`/`ptt-start`/every other
+    /// in-flight command for the entire model-load, a worse regression than
+    /// asking for a restart. Doing it properly would mean teaching `Reload`
+    /// to hand the slow part off to a background thread and answer
+    /// asynchronously, which is a real redesign, not a small fix.
+    pub fn update_reloadable(
+        &mut self,
+        cfg: Config,
+        injector: Box<dyn TextInjector>,
+    ) -> Result<(), String> {
+        if cfg.normalize.enabled != self.cfg.normalize.enabled {
+            return Err(format!(
+                "reload cannot change [normalize].enabled from {} to {} without rebuilding \
+                 llama-server -- restart owf-daemon instead",
+                self.cfg.normalize.enabled, cfg.normalize.enabled
+            ));
+        }
         self.cfg = cfg;
         self.injector = injector;
+        Ok(())
+    }
+
+    /// Swaps in a freshly (re)connected normalizer -- e.g. after the
+    /// supervised `llama-server` restarts on a new port (spec 15's backoff
+    /// restart; see `owf-daemon.rs`'s `supervise_llama_once`). Unlike
+    /// `update_reloadable`, this touches only `self.normalizer`: `cfg` and
+    /// `injector` are untouched, and this is meant to be called from a
+    /// background supervisor thread, not just `owf-ctl reload`.
+    pub fn set_normalizer(&mut self, normalizer: Box<dyn Normalizer>) {
+        self.normalizer = normalizer;
     }
 
     /// Runs a complete utterance. `Ok(None)` means there was nothing to say
     /// and nothing was injected.
+    ///
+    /// A thin wrapper around [`Pipeline::process_with_capture`] for the many
+    /// callers (every test in this crate, plus any future caller that has no
+    /// `CaptureStats` to hand) that don't have -- or don't care about --
+    /// capture-side debug info. Real production use goes through
+    /// `process_with_capture` instead, via `owf-daemon.rs`'s
+    /// `process_utterance`.
     pub fn process(&self, samples: &[f32], window_class: Option<&str>) -> Result<Option<Outcome>> {
-        let mut timings = Timings::default();
+        self.process_with_capture(samples, window_class, None)
+    }
+
+    /// Like [`Pipeline::process`], but additionally takes the capture-side
+    /// facts behind `samples` (device, native rate, samples actually
+    /// delivered, stream error count, ...) so that, when `[debug].enabled`,
+    /// the per-utterance debug record's `capture` section can be populated.
+    ///
+    /// `capture` is `None` whenever the caller has no `CaptureStats` for
+    /// this buffer (every test in this crate, and `process`'s own callers);
+    /// the debug record is still written in that case, just without a
+    /// `capture` section -- see `debug::DebugRecord::capture`.
+    pub fn process_with_capture(
+        &self,
+        samples: &[f32],
+        window_class: Option<&str>,
+        capture: Option<CaptureStats>,
+    ) -> Result<Option<Outcome>> {
+        // `ctx` is `None` when `[debug].enabled` is false -- the common case
+        // -- so that recording an utterance costs this function nothing
+        // beyond the one bool check: no timestamp formatted, no path
+        // expanded, no record built or written. See `DebugRecordGuard` for
+        // why the write itself is unconditional (structural) rather than
+        // called out at each return point.
+        let ctx = self.cfg.debug.enabled.then(|| {
+            (debug::timestamp_for_filename(SystemTime::now()), debug::expand_tilde(&self.cfg.debug.dir))
+        });
+        let mut dbg = DebugRecordGuard {
+            ctx,
+            save_audio: self.cfg.debug.save_audio,
+            capture: capture.as_ref(),
+            raw: samples,
+            trim: None,
+            vad: debug::VadDebug::not_found(),
+            asr_raw: None,
+            lang: None,
+            normalize: None,
+            guardrail: None,
+            inject: None,
+            timings: Timings::default(),
+        };
 
         let t = Instant::now();
         let Some((start, end)) = self.trimmer.trim(samples, self.cfg.audio.vad_padding_ms) else {
             tracing::info!("no speech detected");
-            return Ok(None);
+            return Ok(None); // dbg drops here: writes a "no speech" record.
         };
-        timings.vad_ms = t.elapsed().as_millis();
+        dbg.timings.vad_ms = t.elapsed().as_millis();
+        dbg.trim = Some((start, end));
+        dbg.vad = debug::VadDebug::span(start, end);
 
         let t = Instant::now();
-        let raw = self.asr.transcribe(&samples[start..end])?;
-        timings.asr_ms = t.elapsed().as_millis();
+        let raw = self.asr.transcribe(&samples[start..end])?; // dbg drops here on error: writes a record with the VAD span but no transcript -- the gap this fix closes.
+        dbg.timings.asr_ms = t.elapsed().as_millis();
+        if dbg.ctx.is_some() {
+            dbg.asr_raw = Some(raw.clone());
+        }
         if raw.trim().is_empty() {
             tracing::info!("empty transcript");
-            return Ok(None);
+            return Ok(None); // dbg drops here: writes a record with the (empty) transcript.
         }
 
         let lang = self.detector.detect(&raw);
+        dbg.lang = Some(lang);
         let axes = style::resolve(&self.cfg, window_class);
         let control = style::control_line(&axes);
 
         let mut normalized = false;
         let mut reject_reason: Option<String> = None;
         let mut text = guardrail::rule_based_fallback(&raw);
+        let mut normalize_debug = debug::NormalizeDebug {
+            control: control.clone(),
+            ran: false,
+            cleaned: None,
+            error: None,
+        };
+        let mut guardrail_debug: Option<debug::GuardrailDebug> = None;
 
         if self.cfg.normalize.enabled {
+            if let Some(sink) = &self.stage_events {
+                sink(OverlayEvent::Normalizing);
+            }
             // Scoped tightly around just the normalizer call: `evaluate` and
             // `log_rejection` are cheap and unrelated to normalizer latency,
             // which is exactly what M3 threshold tuning wants out of this
             // number.
             let t = Instant::now();
             let normalize_result = self.normalizer.normalize(&control, &raw);
-            timings.normalize_ms = t.elapsed().as_millis();
+            dbg.timings.normalize_ms = t.elapsed().as_millis();
+            normalize_debug.ran = true;
 
             match normalize_result {
-                Ok(cleaned) => match guardrail::evaluate(&raw, &cleaned, lang, &self.cfg.guardrail)
-                {
-                    Verdict::Accept => {
-                        text = cleaned;
-                        normalized = true;
+                Ok(cleaned) => {
+                    normalize_debug.cleaned = Some(cleaned.clone());
+                    match guardrail::evaluate(&raw, &cleaned, lang, &self.cfg.guardrail) {
+                        Verdict::Accept => {
+                            guardrail_debug = Some(debug::GuardrailDebug::accept());
+                            text = cleaned;
+                            normalized = true;
+                        }
+                        Verdict::Reject(reason) => {
+                            guardrail_debug =
+                                Some(debug::GuardrailDebug::reject(&raw, &cleaned, &reason));
+                            reject_reason = Some(reason.code().to_string());
+                            log_rejection_to(&self.rejections_path(), &raw, &cleaned, &reason, lang, &control);
+                        }
                     }
-                    Verdict::Reject(reason) => {
-                        reject_reason = Some(reason.code().to_string());
-                        log_rejection_to(&self.rejections_path(), &raw, &cleaned, &reason, lang, &control);
-                    }
-                },
+                }
                 Err(e) => {
                     // A failed cleanup must never cost the transcript, and it
                     // is not a guardrail rejection: `reject_reason` stays
                     // `None` here. Pinned by
                     // `a_dead_normalizer_still_produces_text` in
                     // tests/pipeline_e2e.rs.
+                    normalize_debug.error = Some(e.to_string());
                     tracing::warn!(error = %e, "normalization failed; using raw transcript");
                 }
             }
         }
+        // Recorded now (a plain move -- `normalize_debug`/`guardrail_debug`
+        // aren't read again) so that if injection below fails, the record
+        // `dbg` writes on drop still carries the raw transcript, the
+        // normalization result, and the guardrail verdict -- precisely the
+        // three things you'd most want when *both* injectors have failed.
+        dbg.normalize = Some(normalize_debug);
+        dbg.guardrail = guardrail_debug;
 
         if self.cfg.inject.trailing_space {
             text.push(' ');
         }
 
+        if let Some(sink) = &self.stage_events {
+            sink(OverlayEvent::Injecting);
+        }
         let t = Instant::now();
-        let backend = inject_with_fallback(self.injector.as_ref(), &text)?;
-        timings.inject_ms = t.elapsed().as_millis();
+        let backend = inject::inject_with_recovery(
+            self.injector.as_ref(),
+            self.fallback_injector.as_ref(),
+            &text,
+            &self.recovery_dir(),
+        )?; // dbg drops here if both injectors fail: writes a record with everything up to (not including) injection -- the gap review flagged.
+        dbg.timings.inject_ms = t.elapsed().as_millis();
+        dbg.inject = Some(debug::InjectDebug { backend: backend.to_string(), final_text: text.clone() });
 
         tracing::info!(
-            ?timings,
+            timings = ?dbg.timings,
             normalized,
             ?reject_reason,
             backend,
             "utterance complete"
         );
 
-        Ok(Some(Outcome { text, raw, normalized, reject_reason, backend, timings }))
+        Ok(Some(Outcome { text, raw, normalized, reject_reason, backend, timings: dbg.timings }))
+        // dbg drops here on the happy path too: writes the complete record.
+        // One writer, reached from every exit -- see `DebugRecordGuard`.
+    }
+}
+
+/// Accumulates the pieces of a per-utterance debug record as
+/// [`Pipeline::process_with_capture`] learns them, and writes exactly one
+/// record -- via `Drop` -- no matter which of that function's returns is
+/// taken.
+///
+/// This replaces writing the record at each individual return point, which
+/// is only as complete as whoever remembers to add a new call site next to
+/// every future fallible call. Two of `process_with_capture`'s early
+/// returns skipped the write entirely before this fix (ASR erroring, and
+/// both injectors failing) -- both found by review, not by a failing test
+/// someone had already written. Tying the write to `Drop` instead closes the
+/// whole *class* of that bug rather than patching the two known instances:
+/// `?` desugars to an early `return`, and a `return` drops every local still
+/// in scope, so any fallible call inserted anywhere in the function body from
+/// now on -- before or after today's two -- still runs through this same,
+/// single writer as the stack unwinds. There is no third call site to add,
+/// and no fourth one to forget later.
+struct DebugRecordGuard<'a> {
+    /// `None` when `[debug].enabled` is false: `Drop::drop` becomes a no-op,
+    /// preserving `process_with_capture`'s "costs nothing beyond one bool
+    /// check" invariant for the common case.
+    ctx: Option<(String, PathBuf)>,
+    save_audio: bool,
+    capture: Option<&'a CaptureStats>,
+    raw: &'a [f32],
+    trim: Option<(usize, usize)>,
+    vad: debug::VadDebug,
+    asr_raw: Option<String>,
+    lang: Option<Lang>,
+    normalize: Option<debug::NormalizeDebug>,
+    guardrail: Option<debug::GuardrailDebug>,
+    inject: Option<debug::InjectDebug>,
+    timings: Timings,
+}
+
+impl Drop for DebugRecordGuard<'_> {
+    fn drop(&mut self) {
+        // `record_utterance` itself logs-and-swallows every I/O failure
+        // (see its own doc comment): a debug write must never be able to
+        // panic out of a `Drop` impl, let alone propagate into the pipeline.
+        let Some((ts, dir)) = self.ctx.take() else { return };
+        let trimmed = self.trim.map(|(s, e)| &self.raw[s..e]);
+        let asr_raw = self.asr_raw.take();
+        debug::record_utterance(
+            &dir,
+            &ts,
+            self.save_audio,
+            debug::DebugInput {
+                capture: self.capture,
+                raw: self.raw,
+                trimmed,
+                vad: self.vad.clone(),
+                asr_raw: asr_raw.as_deref(),
+                lang: self.lang,
+                normalize: self.normalize.take(),
+                guardrail: self.guardrail.take(),
+                inject: self.inject.take(),
+                timings: self.timings,
+            },
+        );
     }
 }
 
@@ -260,7 +544,11 @@ fn rfc3339_now() -> String {
 /// one call site -- this is the entire extent of the calendar math
 /// `rejections.jsonl` needs. Takes a plain integer specifically so it's
 /// testable without touching the wall clock.
-fn rfc3339_utc(secs_since_epoch: u64) -> String {
+///
+/// `pub(crate)` (not private) so `crate::debug::timestamp_for_filename` can
+/// reuse this same calendar math for its filesystem-safe timestamps instead
+/// of adding a second date/time formatter to the crate.
+pub(crate) fn rfc3339_utc(secs_since_epoch: u64) -> String {
     let days = (secs_since_epoch / 86_400) as i64;
     let rem = secs_since_epoch % 86_400;
     let (hour, minute, second) = (rem / 3600, (rem % 3600) / 60, rem % 60);

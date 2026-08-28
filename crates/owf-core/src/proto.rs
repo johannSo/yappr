@@ -13,6 +13,14 @@ pub enum Request {
     Cancel,
     Status,
     Reload,
+    /// Turns this connection into a long-lived `OverlayEvent` stream (spec
+    /// 12) instead of the usual one-request-one-response exchange: after
+    /// this line, the daemon writes one NDJSON `OverlayEvent` per line,
+    /// starting with a snapshot of whatever state it's in right now, for as
+    /// long as the connection stays open. There is no `Response` for this
+    /// request -- see `owf-daemon.rs`'s `handle`, which special-cases it
+    /// before ever reaching `dispatch`.
+    Subscribe,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,6 +32,55 @@ pub enum State {
     Transcribing,
     Normalizing,
     Injecting,
+    /// A fatal, unrecoverable warm-up failure (ASR/VAD failed to load) --
+    /// distinct from the transient `OverlayEvent::Error` flash. This is a
+    /// steady state a late-connecting subscriber's snapshot must be able to
+    /// report instead of a permanent `Warming` spinner (spec 12; see
+    /// `owf-daemon.rs`'s `FAILED` and `serve_subscriber`). Additive: every
+    /// existing variant's wire form is unchanged.
+    Error,
+}
+
+/// One line of the NDJSON stream a `Request::Subscribe` connection turns
+/// into (spec 12): every state the overlay needs to render, plus the two
+/// terminal outcomes (`Done`, `Error`) and the busy-rejection flash that
+/// aren't `State` transitions at all. `owf-daemon.rs` is the sole producer;
+/// the overlay (and `owf-ctl subscribe`) are the consumers.
+///
+/// `#[serde(tag = "event", ...)]` makes each variant a self-describing JSON
+/// object -- e.g. `{"event":"recording","level":0.02,"elapsed_ms":140}` --
+/// so a bare `serde_json::to_string` plus a trailing newline is already
+/// valid NDJSON with no wrapping needed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum OverlayEvent {
+    Warming,
+    Idle,
+    /// Spec 7.1: emitted at roughly 50 ms cadence while recording, not per
+    /// audio callback. `level` is the RMS of the most recent capture window;
+    /// `elapsed_ms` is time since this recording started.
+    Recording { level: f32, elapsed_ms: u64 },
+    Transcribing,
+    Normalizing,
+    Injecting,
+    /// The first ~60 characters of what was actually injected (spec 12's
+    /// 800 ms preview flash). Truncation to that length is the overlay's
+    /// job, not the wire format's.
+    Done { preview: String },
+    Error { reason: String },
+    BusyRejected,
+    /// Spec 15: normalization has stopped being available -- the supervised
+    /// `llama-server` died, was wedged, or never came up. This is not a
+    /// `State` transition: the pipeline itself is unaffected (raw text plus
+    /// the rule-based fallback keeps working per spec 15's error matrix), so
+    /// the overlay is expected to render this as a persistent badge
+    /// alongside whatever `State`-driven view is already showing, not
+    /// replace it. `reason` is a short, log-line-style explanation. See
+    /// `owf-daemon.rs`'s `spawn_housekeeping`/`supervise_llama_once`.
+    NormalizeDegraded { reason: String },
+    /// Emitted once normalization becomes available again after a
+    /// `NormalizeDegraded`.
+    NormalizeRecovered,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,15 +94,24 @@ pub struct Response {
     pub warm: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_ms: Option<serde_json::Value>,
+    /// Whether normalization is currently available -- populated only by the
+    /// `Status` handler (mirroring how `warm` already works), and only when
+    /// `[normalize].enabled = true`: `None` there means "not applicable"
+    /// (normalization was never turned on), not "unknown". This is Task 3's
+    /// "status must stop lying": before it existed, `status` kept reporting
+    /// a daemon as fully fine while its supervised `llama-server` was dead,
+    /// with no field anywhere reflecting the gap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub normalize_available: Option<bool>,
 }
 
 impl Response {
     pub fn ok(state: State) -> Self {
-        Self { ok: true, state: Some(state), err: None, warm: None, last_ms: None }
+        Self { ok: true, state: Some(state), err: None, warm: None, last_ms: None, normalize_available: None }
     }
 
     pub fn err(msg: impl Into<String>) -> Self {
-        Self { ok: false, state: None, err: Some(msg.into()), warm: None, last_ms: None }
+        Self { ok: false, state: None, err: Some(msg.into()), warm: None, last_ms: None, normalize_available: None }
     }
 }
 
@@ -81,11 +147,22 @@ mod tests {
         assert_eq!(serde_json::to_string(&Request::Cancel).unwrap(), r#"{"cmd":"cancel"}"#);
         assert_eq!(serde_json::to_string(&Request::Status).unwrap(), r#"{"cmd":"status"}"#);
         assert_eq!(serde_json::to_string(&Request::Reload).unwrap(), r#"{"cmd":"reload"}"#);
+        assert_eq!(
+            serde_json::to_string(&Request::Subscribe).unwrap(),
+            r#"{"cmd":"subscribe"}"#
+        );
     }
 
     #[test]
     fn requests_round_trip() {
-        for r in [Request::PttStart, Request::PttStop, Request::Cancel, Request::Status, Request::Reload] {
+        for r in [
+            Request::PttStart,
+            Request::PttStop,
+            Request::Cancel,
+            Request::Status,
+            Request::Reload,
+            Request::Subscribe,
+        ] {
             let s = serde_json::to_string(&r).unwrap();
             assert_eq!(serde_json::from_str::<Request>(&s).unwrap(), r);
         }
@@ -104,6 +181,7 @@ mod tests {
         assert_eq!(serde_json::to_string(&State::Normalizing).unwrap(), r#""normalizing""#);
         assert_eq!(serde_json::to_string(&State::Injecting).unwrap(), r#""injecting""#);
         assert_eq!(serde_json::to_string(&State::Idle).unwrap(), r#""idle""#);
+        assert_eq!(serde_json::to_string(&State::Error).unwrap(), r#""error""#);
     }
 
     #[test]
@@ -120,5 +198,146 @@ mod tests {
         let v: serde_json::Value = serde_json::to_value(&r).unwrap();
         assert_eq!(v["ok"], serde_json::json!(true));
         assert_eq!(v["state"], serde_json::json!("recording"));
+    }
+
+    /// Every `OverlayEvent` variant round-trips through serde -- the overlay
+    /// frontend and `owf-ctl subscribe` are both written against this exact
+    /// wire form, so a variant that fails to round-trip here would silently
+    /// break both.
+    #[test]
+    fn every_overlay_event_round_trips_through_json() {
+        let events = [
+            OverlayEvent::Warming,
+            OverlayEvent::Idle,
+            OverlayEvent::Recording { level: 0.42, elapsed_ms: 1_234 },
+            OverlayEvent::Transcribing,
+            OverlayEvent::Normalizing,
+            OverlayEvent::Injecting,
+            OverlayEvent::Done { preview: "Hello there".to_string() },
+            OverlayEvent::Error { reason: "no speech detected".to_string() },
+            OverlayEvent::BusyRejected,
+            OverlayEvent::NormalizeDegraded { reason: "llama-server is down".to_string() },
+            OverlayEvent::NormalizeRecovered,
+        ];
+        for event in events {
+            let s = serde_json::to_string(&event).unwrap();
+            assert_eq!(
+                serde_json::from_str::<OverlayEvent>(&s).unwrap(),
+                event,
+                "round trip failed for {s}"
+            );
+        }
+    }
+
+    /// Pins the exact wire form each variant produces -- the overlay
+    /// frontend (a separate, not-yet-written codebase) will be implemented
+    /// against this shape, so an accidental rename here must fail loudly.
+    #[test]
+    fn overlay_events_serialise_to_the_documented_wire_form() {
+        assert_eq!(serde_json::to_string(&OverlayEvent::Warming).unwrap(), r#"{"event":"warming"}"#);
+        assert_eq!(serde_json::to_string(&OverlayEvent::Idle).unwrap(), r#"{"event":"idle"}"#);
+        assert_eq!(
+            serde_json::to_string(&OverlayEvent::Recording { level: 0.5, elapsed_ms: 100 }).unwrap(),
+            r#"{"event":"recording","level":0.5,"elapsed_ms":100}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&OverlayEvent::Transcribing).unwrap(),
+            r#"{"event":"transcribing"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&OverlayEvent::Normalizing).unwrap(),
+            r#"{"event":"normalizing"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&OverlayEvent::Injecting).unwrap(),
+            r#"{"event":"injecting"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&OverlayEvent::Done { preview: "hi".to_string() }).unwrap(),
+            r#"{"event":"done","preview":"hi"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&OverlayEvent::Error { reason: "boom".to_string() }).unwrap(),
+            r#"{"event":"error","reason":"boom"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&OverlayEvent::BusyRejected).unwrap(),
+            r#"{"event":"busy_rejected"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&OverlayEvent::NormalizeDegraded { reason: "boom".to_string() })
+                .unwrap(),
+            r#"{"event":"normalize_degraded","reason":"boom"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&OverlayEvent::NormalizeRecovered).unwrap(),
+            r#"{"event":"normalize_recovered"}"#
+        );
+    }
+
+    /// Task 3: `status` must stop lying about normalization availability --
+    /// the field is additive (`skip_serializing_if`) so an old client that
+    /// never looks for it is unaffected, and it must not appear at all
+    /// unless something actually populates it.
+    #[test]
+    fn normalize_available_is_absent_by_default_and_present_when_set() {
+        let mut r = Response::ok(State::Idle);
+        let v: serde_json::Value = serde_json::to_value(&r).unwrap();
+        assert!(v.get("normalize_available").is_none());
+
+        r.normalize_available = Some(false);
+        let v: serde_json::Value = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["normalize_available"], serde_json::json!(false));
+    }
+
+    /// `src-tauri/src/wire.rs` deliberately hand-duplicates this enum's wire
+    /// format rather than depending on `owf-core` (see that module's doc
+    /// comment for why), which means the two can silently drift: a variant
+    /// added or reshaped here with no matching change there would only be
+    /// caught by someone remembering to update `wire.rs`'s own hand-written
+    /// pinned-string test by hand. This turns that manual promise into a
+    /// mechanical one from this side: every line of the checked-in overlay
+    /// replay fixture -- itself asserted elsewhere
+    /// (`src-tauri/src/replay.rs`'s `checked_in_fixture_covers_every_event_kind`)
+    /// to cover every `wire::OverlayEvent` variant -- must also parse as
+    /// this crate's own `OverlayEvent`. If the two wire formats ever
+    /// disagree, one of these two tests fails.
+    #[test]
+    fn the_overlay_replay_fixture_parses_as_this_crates_overlay_event() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../src-tauri/fixtures/replay-full.ndjson");
+        let contents = std::fs::read_to_string(&fixture)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", fixture.display()));
+
+        let mut events = Vec::new();
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let event: OverlayEvent = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("parsing fixture line {line:?}: {e}"));
+            events.push(event);
+        }
+
+        assert!(!events.is_empty(), "fixture must contain events");
+        for variant in [
+            "warming",
+            "idle",
+            "transcribing",
+            "normalizing",
+            "injecting",
+            "done",
+            "error",
+            "busy_rejected",
+            "normalize_degraded",
+            "normalize_recovered",
+        ] {
+            assert!(
+                events.iter().any(|e| serde_json::to_value(e).unwrap()["event"] == variant),
+                "fixture is missing a {variant} line"
+            );
+        }
+        assert!(events.iter().any(|e| matches!(e, OverlayEvent::Recording { .. })));
     }
 }

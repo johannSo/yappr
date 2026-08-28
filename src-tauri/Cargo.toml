@@ -23,3 +23,27 @@ tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# Linux-only, and only for one call: WebKitGTK's WebView widget enforces an
+# internal minimum natural size (~200 logical px tall) that GTK's box
+# layout will not shrink below, no matter what `tauri.conf.json`'s
+# width/height/minHeight say -- confirmed empirically (see lib.rs's
+# `relax_webkitgtk_minimum_size`). The fix is
+# `gtk_widget_set_size_request(webview, -1, -1)` on the raw widget, which
+# only `PlatformWebview::inner()` exposes. Pinned to the same version wry
+# already resolves in Cargo.lock, so this adds no new dependency graph
+# node, just direct access to one already-present crate.
+[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
+gtk = "0.18"
+
+[features]
+# This feature is used for production builds, or when a plain `cargo
+# build`/`cargo build --release` (rather than the Tauri CLI's `tauri
+# build`) should embed `frontendDist` instead of pointing at `devUrl`'s
+# dev server. Deliberately NOT a default feature: `tauri::generate_context!`
+# resolves `dev: cfg!(not(feature = "custom-protocol"))`, so leaving it off
+# by default is what lets `bun run tauri dev` keep talking to the live Vite
+# server on port 1420. Standalone production builds of the overlay binary
+# must pass `--features custom-protocol` explicitly, e.g.:
+#   cargo build --release -p openwhisprflow --features custom-protocol
+custom-protocol = ["tauri/custom-protocol"]
+

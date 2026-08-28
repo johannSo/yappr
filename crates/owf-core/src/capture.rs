@@ -1,8 +1,9 @@
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use crate::asr::SAMPLE_RATE;
 use crate::config::AudioConfig;
@@ -18,11 +19,86 @@ fn downmix(interleaved: &[f32], channels: usize) -> Vec<f32> {
         .collect()
 }
 
-fn rms(samples: &[f32]) -> f32 {
+pub(crate) fn rms(samples: &[f32]) -> f32 {
     if samples.is_empty() {
         return 0.0;
     }
     (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
+}
+
+/// Largest absolute sample value, regardless of sign. `0.0` for an empty
+/// slice, matching `rms`'s convention for the same case.
+pub(crate) fn peak(samples: &[f32]) -> f32 {
+    samples.iter().fold(0.0f32, |m, &s| m.max(s.abs()))
+}
+
+/// Native (interleaved, pre-downmix) samples a recording of `duration`
+/// *should* have produced at `native_rate` Hz across `channels` channels, if
+/// nothing were ever dropped.
+///
+/// This is the "5 s held at 48 kHz stereo should deliver ~480,000 samples"
+/// arithmetic the capture-debug record is built around -- see
+/// `capture_ratio` for what actually got delivered gets compared against it.
+pub fn expected_native_samples(duration: Duration, native_rate: u32, channels: usize) -> usize {
+    (duration.as_secs_f64() * native_rate as f64 * channels as f64).round() as usize
+}
+
+/// Fraction of `expected` native samples that were actually captured.
+///
+/// `1.0` when nothing was expected (a zero-duration recording) rather than
+/// dividing by zero -- there is nothing to have dropped. Deliberately
+/// unclamped above 1.0: a ratio above one is itself a real (if different)
+/// diagnostic signal, not an error to hide.
+pub fn capture_ratio(captured: usize, expected: usize) -> f64 {
+    if expected == 0 {
+        1.0
+    } else {
+        captured as f64 / expected as f64
+    }
+}
+
+/// Snapshot of one recording's raw capture-side facts -- everything the
+/// debug record's `capture` section needs that isn't derivable from the
+/// resampled sample buffer itself. See `crate::debug::CaptureDebug`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CaptureStats {
+    pub device: String,
+    pub native_sample_rate: u32,
+    pub channels: usize,
+    /// Interleaved samples actually handed to the callback across the whole
+    /// recording, regardless of whether they fit in the capacity-bounded
+    /// buffer `Command::Start` allocates.
+    pub native_samples_captured: usize,
+    /// Count of `cpal` stream error-callback invocations (ALSA Xruns and the
+    /// like) during the recording.
+    pub stream_errors: usize,
+    /// Wall-clock time between `start` actually building the stream and
+    /// `stop` tearing it down.
+    pub duration: Duration,
+}
+
+impl Default for CaptureStats {
+    /// The "nothing was ever recorded" case: `Recorder::stop()` returns this
+    /// when called while not recording, mirroring the empty-samples default
+    /// it has always returned in that situation.
+    fn default() -> Self {
+        Self {
+            device: String::new(),
+            native_sample_rate: 0,
+            channels: 0,
+            native_samples_captured: 0,
+            stream_errors: 0,
+            duration: Duration::ZERO,
+        }
+    }
+}
+
+/// What `Recorder::stop()` yields: the 16 kHz mono samples plus the raw
+/// capture-side facts behind them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StopOutcome {
+    pub samples: Vec<f32>,
+    pub capture: CaptureStats,
 }
 
 /// Offline resample of a complete mono buffer to 16 kHz.
@@ -80,7 +156,7 @@ enum Command {
         reply: mpsc::Sender<Result<(), String>>,
     },
     Stop {
-        reply: mpsc::Sender<Result<Vec<f32>, String>>,
+        reply: mpsc::Sender<Result<StopOutcome, String>>,
     },
 }
 
@@ -88,9 +164,33 @@ enum Command {
 /// at startup so `start`/`stop` don't repeat device enumeration.
 struct DeviceSetup {
     device: cpal::Device,
+    /// `device.to_string()`, cached once rather than recomputed on every
+    /// `stop()` -- it feeds straight into `CaptureStats::device`.
+    name: String,
     channels: usize,
     rate: u32,
     max_samples_native: usize,
+}
+
+/// Whether the device can actually open an f32 input stream at `rate`.
+///
+/// Builds a throwaway stream and drops it. This is the only reliable test:
+/// the rate ranges cpal reports are advisory, and ALSA refuses combinations
+/// that fall inside them.
+fn can_build_at(device: &cpal::Device, channels: usize, rate: u32) -> bool {
+    let config = cpal::StreamConfig {
+        channels: channels as u16,
+        sample_rate: rate,
+        buffer_size: cpal::BufferSize::Default,
+    };
+    device
+        .build_input_stream(
+            config,
+            |_: &[f32], _: &cpal::InputCallbackInfo| {},
+            |_| {},
+            None,
+        )
+        .is_ok()
 }
 
 fn setup_device(cfg: &AudioConfig) -> Result<DeviceSetup> {
@@ -103,24 +203,35 @@ fn setup_device(cfg: &AudioConfig) -> Result<DeviceSetup> {
             .with_context(|| format!("input device not found: {}", cfg.device))?
     };
 
-    // Prefer 16 kHz directly; PipeWire resamples transparently.
+    // Prefer 16 kHz so the resampler can be skipped -- but VERIFY it by
+    // building a throwaway stream rather than trusting the advertised range.
+    //
+    // `supported_input_configs()` reports a min..max span, and a rate inside
+    // that span is NOT necessarily buildable with this device's channel count
+    // and sample format. PipeWire accepts 16 kHz transparently because it
+    // resamples for us; real ALSA hardware rejects it at `build_input_stream`
+    // with "The requested stream configuration is not supported by the
+    // device." Trusting the range meant we never fell back, so the resampler
+    // below was unreachable and capture failed outright on such hardware.
     let supported = device.default_input_config().context("default input config")?;
-    let rate = if device
-        .supported_input_configs()
-        .context("supported input configs")?
-        .any(|r| r.min_sample_rate() <= SAMPLE_RATE as u32 && r.max_sample_rate() >= SAMPLE_RATE as u32)
-    {
+    let channels = supported.channels() as usize;
+    let rate = if can_build_at(&device, channels, SAMPLE_RATE as u32) {
         SAMPLE_RATE as u32
     } else {
+        tracing::info!(
+            native_rate = supported.sample_rate(),
+            "device refused 16 kHz; capturing native and resampling"
+        );
         supported.sample_rate()
     };
-    let channels = supported.channels() as usize;
 
     tracing::info!(rate, channels, device = %device, "input device selected");
+    let name = device.to_string();
 
     Ok(DeviceSetup {
         max_samples_native: rate as usize * channels * cfg.max_seconds as usize,
         device,
+        name,
         channels,
         rate,
     })
@@ -150,7 +261,12 @@ fn audio_thread_main(
     }
 
     let buffer: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
+    // Reset on every `Start` (see below) so each recording's counts are its
+    // own, not a running total across the whole daemon lifetime.
+    let delivered = Arc::new(AtomicUsize::new(0));
+    let errors = Arc::new(AtomicUsize::new(0));
     let mut stream: Option<cpal::Stream> = None;
+    let mut started_at: Option<Instant> = None;
 
     while let Ok(cmd) = commands.recv() {
         match cmd {
@@ -164,7 +280,11 @@ fn audio_thread_main(
                     buf.clear();
                     buf.reserve(setup.max_samples_native);
                 }
+                delivered.store(0, Ordering::SeqCst);
+                errors.store(0, Ordering::SeqCst);
                 let buf_for_cb = Arc::clone(&buffer);
+                let delivered_for_cb = Arc::clone(&delivered);
+                let errors_for_cb = Arc::clone(&errors);
                 let cap = setup.max_samples_native;
                 let stream_config = cpal::StreamConfig {
                     channels: setup.channels as u16,
@@ -176,13 +296,26 @@ fn audio_thread_main(
                     stream_config,
                     move |data: &[f32], _: &cpal::InputCallbackInfo| {
                         on_level(rms(data));
+                        // Counts every sample the callback actually
+                        // delivered -- including any beyond `cap`, which the
+                        // buffer below silently drops on the floor. This is
+                        // the diagnostic this whole facility exists for: the
+                        // hardware/ALSA side can be dropping samples (Xruns)
+                        // well before this buffer's own capacity is ever a
+                        // factor, and `native_samples_captured` needs to
+                        // reflect what cpal actually handed us, not what we
+                        // chose to keep.
+                        delivered_for_cb.fetch_add(data.len(), Ordering::Relaxed);
                         let mut buf = buf_for_cb.lock().unwrap();
                         if buf.len() < cap {
                             let room = cap - buf.len();
                             buf.extend_from_slice(&data[..data.len().min(room)]);
                         }
                     },
-                    |err| tracing::error!(?err, "input stream error"),
+                    move |err| {
+                        errors_for_cb.fetch_add(1, Ordering::Relaxed);
+                        tracing::error!(?err, "input stream error");
+                    },
                     None,
                 );
 
@@ -190,6 +323,7 @@ fn audio_thread_main(
                 match outcome {
                     Ok(s) => {
                         stream = Some(s);
+                        started_at = Some(Instant::now());
                         recording.store(true, Ordering::SeqCst);
                         let _ = reply.send(Ok(()));
                     }
@@ -203,9 +337,24 @@ fn audio_thread_main(
                 // whole point of this design: it never has to be Send.
                 stream.take();
                 recording.store(false, Ordering::SeqCst);
+                let duration = started_at.take().map(|t| t.elapsed()).unwrap_or_default();
+                let native_samples_captured = delivered.load(Ordering::SeqCst);
+                let stream_errors = errors.load(Ordering::SeqCst);
                 let raw = std::mem::take(&mut *buffer.lock().unwrap());
                 let mono = downmix(&raw, setup.channels);
-                let result = resample_to_16k(&mono, setup.rate).map_err(|e| e.to_string());
+                let result = resample_to_16k(&mono, setup.rate)
+                    .map(|samples| StopOutcome {
+                        samples,
+                        capture: CaptureStats {
+                            device: setup.name.clone(),
+                            native_sample_rate: setup.rate,
+                            channels: setup.channels,
+                            native_samples_captured,
+                            stream_errors,
+                            duration,
+                        },
+                    })
+                    .map_err(|e| e.to_string());
                 let _ = reply.send(result);
             }
         }
@@ -272,10 +421,13 @@ impl Recorder {
             .map_err(|e| anyhow!(e))
     }
 
-    /// Stops capture and returns 16 kHz mono samples.
-    pub fn stop(&self) -> Result<Vec<f32>> {
+    /// Stops capture and returns 16 kHz mono samples plus the raw
+    /// capture-side stats behind them (device, native rate/channels,
+    /// samples actually delivered, and stream error count) -- see
+    /// [`StopOutcome`].
+    pub fn stop(&self) -> Result<StopOutcome> {
         if !self.is_recording() {
-            return Ok(Vec::new());
+            return Ok(StopOutcome { samples: Vec::new(), capture: CaptureStats::default() });
         }
         let (reply_tx, reply_rx) = mpsc::channel();
         self.send(Command::Stop { reply: reply_tx })?;
@@ -354,5 +506,62 @@ mod tests {
         let input = vec![0.25f32; 1_000];
         let out = resample_to_16k(&input, 16_000).unwrap();
         assert_eq!(out, input);
+    }
+
+    #[test]
+    fn peak_of_silence_is_zero() {
+        assert_eq!(peak(&[0.0; 128]), 0.0);
+    }
+
+    #[test]
+    fn peak_finds_the_largest_magnitude_regardless_of_sign() {
+        assert_eq!(peak(&[0.1, -0.9, 0.4, 0.2]), 0.9);
+        assert_eq!(peak(&[-0.7, 0.3]), 0.7);
+    }
+
+    #[test]
+    fn peak_of_an_empty_slice_is_zero() {
+        assert_eq!(peak(&[]), 0.0);
+    }
+
+    #[test]
+    fn expected_native_samples_matches_the_reported_bug_scenario() {
+        // Spec: 5 s held at 48 kHz stereo should deliver ~480,000 samples.
+        let expected = expected_native_samples(Duration::from_secs(5), 48_000, 2);
+        assert_eq!(expected, 480_000);
+    }
+
+    #[test]
+    fn expected_native_samples_rounds_fractional_durations() {
+        // 0.1 s at 16 kHz mono = 1600 samples exactly.
+        assert_eq!(expected_native_samples(Duration::from_millis(100), 16_000, 1), 1_600);
+    }
+
+    #[test]
+    fn expected_native_samples_of_a_zero_duration_is_zero() {
+        assert_eq!(expected_native_samples(Duration::ZERO, 48_000, 2), 0);
+    }
+
+    #[test]
+    fn capture_ratio_is_captured_over_expected() {
+        assert_eq!(capture_ratio(240_000, 480_000), 0.5);
+        assert_eq!(capture_ratio(480_000, 480_000), 1.0);
+    }
+
+    #[test]
+    fn capture_ratio_of_a_degenerate_zero_expected_is_one() {
+        // A zero-duration recording expects zero samples; treat that as
+        // "nothing was dropped" rather than dividing by zero.
+        assert_eq!(capture_ratio(0, 0), 1.0);
+        assert_eq!(capture_ratio(5, 0), 1.0);
+    }
+
+    #[test]
+    fn capture_ratio_can_exceed_one_without_panicking() {
+        // Timing jitter between the wall-clock duration and the callback's
+        // actual delivery can legitimately push this a little over 1.0; it
+        // must not be clamped away, since an unexpectedly high ratio is its
+        // own diagnostic signal.
+        assert!((capture_ratio(481_000, 480_000) - 1.0020833333333334).abs() < 1e-9);
     }
 }

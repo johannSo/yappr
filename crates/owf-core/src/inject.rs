@@ -217,7 +217,14 @@ pub fn inject_with_fallback(
 /// the recovery-file directory are both parameters, so tests can substitute
 /// a failing fallback and a scratch directory without touching real system
 /// state or the public signature `inject_with_fallback` is required to keep.
-fn inject_with_recovery(
+///
+/// `pub(crate)` rather than private: `pipeline::Pipeline` calls this directly
+/// with its own configurable fallback injector and recovery directory (see
+/// `Pipeline::with_fallback_injector` / `with_recovery_dir`), so that a test
+/// can force *both* injectors to fail deterministically -- `inject_with_fallback`
+/// alone can't do that, since it hard-codes the real `ClipboardInjector` and
+/// `paths::state_dir()`.
+pub(crate) fn inject_with_recovery(
     primary: &dyn TextInjector,
     fallback: &dyn TextInjector,
     text: &str,

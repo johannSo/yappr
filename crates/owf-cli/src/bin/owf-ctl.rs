@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use owf_core::proto::{self, Request};
 
 fn main() -> Result<()> {
@@ -12,20 +12,156 @@ fn main() -> Result<()> {
         ["cancel"] => send(Request::Cancel),
         ["status"] => send(Request::Status),
         ["reload"] => send(Request::Reload),
+        ["subscribe"] => subscribe(),
+        ["debug"] => debug_summary(),
         ["setup"] => setup(false),
         ["setup", "--update-lock"] => setup(true),
         ["setup", "--print-hypr"] => {
             print!("{}", owf_core::hypr::hypr_config());
             Ok(())
         }
+        ["setup", "--purge-logs"] => purge_logs(),
         _ => {
             eprintln!(
-                "usage: owf-ctl <ptt-start|ptt-stop|cancel|status|reload>\n\
-                 \x20      owf-ctl setup [--update-lock|--print-hypr]"
+                "usage: owf-ctl <ptt-start|ptt-stop|cancel|status|reload|subscribe|debug>\n\
+                 \x20      owf-ctl setup [--update-lock|--print-hypr|--purge-logs]"
             );
             std::process::exit(2);
         }
     }
+}
+
+/// Connects to the daemon, sends `Request::Subscribe`, and prints every
+/// `OverlayEvent` NDJSON line it receives until the daemon closes the
+/// connection -- the same wire path the overlay itself will use (spec 12).
+/// A plain pass-through rather than parsing each line into an `OverlayEvent`
+/// and re-serializing it: the daemon's own wire format *is* the thing being
+/// sanity-checked here, so printing anything other than exactly what came
+/// off the socket would hide a wire-format bug rather than surface it.
+///
+/// This only ever reads from the daemon; it never sends `ptt-start` or any
+/// other command, so running it opens no microphone.
+fn subscribe() -> Result<()> {
+    use std::io::{BufRead, BufReader, Write as _};
+    use std::os::unix::net::UnixStream;
+
+    let sock = owf_core::paths::runtime_socket();
+    let stream = UnixStream::connect(&sock).with_context(|| {
+        format!("cannot reach the daemon at {} — is owf-daemon running?", sock.display())
+    })?;
+    let mut writer = stream.try_clone().context("cloning socket for writing")?;
+    writeln!(writer, "{}", serde_json::to_string(&Request::Subscribe)?)?;
+    writer.flush()?;
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line).context("reading from the daemon")?;
+        if n == 0 {
+            break; // the daemon closed the connection.
+        }
+        print!("{line}");
+        std::io::stdout().flush().ok();
+    }
+    Ok(())
+}
+
+/// Prints a short summary of the most recently written debug record --
+/// see `owf_core::debug` and `[debug]` in config.toml. Reads straight off
+/// disk (not through the daemon): the debug facility writes independently
+/// of `owf-ctl`, so there is nothing to ask the daemon for.
+fn debug_summary() -> Result<()> {
+    let cfg = owf_core::config::Config::load().context("loading config")?;
+    if !cfg.debug.enabled {
+        eprintln!("[debug].enabled is false in config.toml -- no records are being written");
+        std::process::exit(1);
+    }
+
+    let dir = owf_core::debug::expand_tilde(&cfg.debug.dir);
+    let logs_dir = dir.join("logs");
+    let json_path = owf_core::debug::latest_record_path(&logs_dir)
+        .with_context(|| format!("no debug records found under {}", logs_dir.display()))?;
+    let contents = std::fs::read_to_string(&json_path)
+        .with_context(|| format!("reading {}", json_path.display()))?;
+    let record: owf_core::debug::DebugRecord = serde_json::from_str(&contents)
+        .with_context(|| format!("parsing {}", json_path.display()))?;
+
+    print_debug_summary(&record, &json_path, &dir);
+    Ok(())
+}
+
+fn print_debug_summary(
+    record: &owf_core::debug::DebugRecord,
+    json_path: &Path,
+    dir: &Path,
+) {
+    println!("most recent utterance: {}", record.ts);
+
+    if let Some(c) = &record.capture {
+        println!(
+            "  capture: {} native samples / {} expected (ratio {:.3}, {} stream error(s))",
+            c.native_samples_captured, c.native_samples_expected, c.capture_ratio, c.stream_errors
+        );
+        println!(
+            "           device={:?} native_rate={} channels={} mono_16k_samples={}",
+            c.device, c.native_sample_rate, c.channels, c.mono_16k_samples
+        );
+    } else {
+        println!("  capture: (no capture stats recorded for this utterance)");
+    }
+
+    println!(
+        "  raw audio:     rms={:.4} peak={:.4}",
+        record.audio.raw.rms, record.audio.raw.peak
+    );
+    match &record.audio.trimmed {
+        Some(t) => println!("  trimmed audio: rms={:.4} peak={:.4}", t.rms, t.peak),
+        None => println!("  trimmed audio: (none -- no speech found)"),
+    }
+
+    match (record.vad.start_secs, record.vad.end_secs) {
+        (Some(s), Some(e)) => println!(
+            "  vad span: {}..{} samples ({:.3}s .. {:.3}s)",
+            record.vad.start_sample.unwrap_or(0),
+            record.vad.end_sample.unwrap_or(0),
+            s,
+            e
+        ),
+        _ => println!("  vad span: no speech found"),
+    }
+
+    match &record.asr_raw {
+        Some(raw) => println!("  raw transcript: {raw:?}"),
+        None => println!("  raw transcript: (none)"),
+    }
+
+    match &record.inject {
+        Some(i) => println!("  final text ({}): {:?}", i.backend, i.final_text),
+        None => println!("  final text: (nothing was injected)"),
+    }
+
+    if let Some(g) = &record.guardrail {
+        println!(
+            "  guardrail: {} reason={:?} overlap={:?} word_ratio={:?}",
+            g.verdict, g.reason, g.overlap, g.word_ratio
+        );
+    }
+
+    println!("  files:");
+    println!("    json:        {}", json_path.display());
+    let raw_wav = dir.join("audio").join(format!("{}-raw.wav", record.ts));
+    let trimmed_wav = dir.join("audio").join(format!("{}-trimmed.wav", record.ts));
+    println!(
+        "    raw wav:     {}{}",
+        raw_wav.display(),
+        if raw_wav.exists() { "" } else { " (missing -- save_audio was off?)" }
+    );
+    println!(
+        "    trimmed wav: {}{}",
+        trimmed_wav.display(),
+        if trimmed_wav.exists() { "" } else { " (missing)" }
+    );
 }
 
 /// Sends one request to the daemon and prints its response line verbatim.
@@ -258,6 +394,53 @@ fn setup(update_lock: bool) -> Result<()> {
     Ok(())
 }
 
+/// What [`purge_logs_at`] actually did, so [`purge_logs`] can report it
+/// precisely and tests can assert on the outcome directly instead of
+/// scraping printed text.
+enum PurgeOutcome {
+    Removed,
+    AlreadyAbsent,
+}
+
+/// Deletes exactly `path` and reports which of those two things happened,
+/// treating an already-absent file as success rather than an error --
+/// running `--purge-logs` twice in a row (or on a fresh install that has
+/// never rejected anything) must not fail.
+///
+/// Split out from `purge_logs` so this destructive operation is testable
+/// against a scratch path instead of the real
+/// `~/.local/state/openwhisprflow/rejections.jsonl`.
+fn purge_logs_at(path: &Path) -> Result<PurgeOutcome> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(PurgeOutcome::Removed),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(PurgeOutcome::AlreadyAbsent),
+        Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+    }
+}
+
+/// Spec 5.1/9.3: `owf-ctl setup --purge-logs` is the only documented way to
+/// clear the guardrail-rejection dataset (`rejections.jsonl`) -- a
+/// local-only file of raw/cleaned transcript pairs (spec 9.3) that is never
+/// transmitted anywhere, but is still real user dictation content sitting on
+/// disk, so clearing it needs an explicit, deliberate command rather than
+/// happening as a side effect of `setup` or `reload`.
+///
+/// Deletes exactly that one file -- nothing else under
+/// `~/.local/state/openwhisprflow/` (the daemon's own `openwhisprflow.log`,
+/// in particular, is untouched) -- and, being destructive, always says
+/// exactly what it did: the path it removed, or that there was nothing to
+/// remove.
+fn purge_logs() -> Result<()> {
+    let path = owf_core::paths::rejections_file();
+    match purge_logs_at(&path)? {
+        PurgeOutcome::Removed => println!("removed {} -- rejection dataset cleared", path.display()),
+        PurgeOutcome::AlreadyAbsent => {
+            println!("{} does not exist -- nothing to remove", path.display())
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,5 +559,50 @@ mod tests {
         let line = line.expect("crossing the threshold must report even without a total");
         assert!(line.contains("MB"));
         assert!(!line.contains('%'));
+    }
+
+    #[test]
+    fn purge_logs_at_removes_an_existing_file() {
+        let dir = scratch_dir("purge-existing");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rejections.jsonl");
+        std::fs::write(&path, b"{\"ts\":\"...\"}\n").unwrap();
+
+        let outcome = purge_logs_at(&path).unwrap();
+
+        assert!(matches!(outcome, PurgeOutcome::Removed));
+        assert!(!path.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn purge_logs_at_treats_an_already_absent_file_as_success() {
+        // Running `--purge-logs` twice in a row, or on a fresh install that
+        // has never rejected anything, must not be an error.
+        let dir = scratch_dir("purge-absent");
+        let path = dir.join("rejections.jsonl"); // dir doesn't even exist yet
+
+        let outcome = purge_logs_at(&path).unwrap();
+
+        assert!(matches!(outcome, PurgeOutcome::AlreadyAbsent));
+    }
+
+    #[test]
+    fn purge_logs_at_touches_only_the_path_it_is_given() {
+        // Spec 5.1/9.3 names exactly one file (`rejections.jsonl`) as what
+        // `--purge-logs` clears -- proves it doesn't reach for anything else
+        // that might live alongside it, like the daemon's own log file.
+        let dir = scratch_dir("purge-scoped");
+        std::fs::create_dir_all(&dir).unwrap();
+        let rejections = dir.join("rejections.jsonl");
+        let daemon_log = dir.join("openwhisprflow.log");
+        std::fs::write(&rejections, b"{}\n").unwrap();
+        std::fs::write(&daemon_log, b"log line\n").unwrap();
+
+        purge_logs_at(&rejections).unwrap();
+
+        assert!(!rejections.exists());
+        assert!(daemon_log.exists(), "purge_logs_at must not touch any other file");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

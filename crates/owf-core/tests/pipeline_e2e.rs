@@ -1,15 +1,27 @@
 use owf_core::asr::Transcriber;
+use owf_core::capture::CaptureStats;
 use owf_core::config::Config;
 use owf_core::inject::MockInjector;
 use owf_core::lang::{Lang, LanguageDetector};
 use owf_core::normalize::Normalizer;
 use owf_core::pipeline::Pipeline;
+use owf_core::proto::OverlayEvent;
 use owf_core::vad::Trimmer;
 
 struct FixedAsr(String);
 impl Transcriber for FixedAsr {
     fn transcribe(&self, _: &[f32]) -> anyhow::Result<String> {
         Ok(self.0.clone())
+    }
+}
+
+/// Always errors, never producing a transcript -- used to prove the debug
+/// record is still written when `self.asr.transcribe(...)?` is the return
+/// path (`debug_record_is_written_when_asr_errors`).
+struct FailingAsr;
+impl Transcriber for FailingAsr {
+    fn transcribe(&self, _: &[f32]) -> anyhow::Result<String> {
+        anyhow::bail!("asr exploded")
     }
 }
 
@@ -103,6 +115,236 @@ fn scratch_rejections_path(tag: &str) -> std::path::PathBuf {
     std::env::temp_dir()
         .join(format!("owf-core-test-pipeline-e2e-{tag}-{}-{n}", std::process::id()))
         .join("rejections.jsonl")
+}
+
+/// A fresh, collision-free scratch directory for a single test's
+/// `[debug].dir`. Same pattern as `scratch_rejections_path` above.
+fn scratch_debug_dir(tag: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("owf-core-test-pipeline-e2e-debug-{tag}-{}-{n}", std::process::id()))
+}
+
+fn debug_config(dir: &std::path::Path, save_audio: bool) -> Config {
+    Config::from_str(&format!(
+        "[debug]\nenabled = true\ndir = \"{}\"\nsave_audio = {save_audio}\n",
+        dir.display(),
+    ))
+    .unwrap()
+}
+
+fn capture_stats_fixture() -> CaptureStats {
+    CaptureStats {
+        device: "HDA Intel PCH, ALC3271 Analog".to_string(),
+        native_sample_rate: 48_000,
+        channels: 2,
+        native_samples_captured: 240_000,
+        stream_errors: 3,
+        duration: std::time::Duration::from_secs(5),
+    }
+}
+
+/// The single highest-value diagnostic this whole facility exists for: with
+/// `[debug].enabled = true` and real `CaptureStats` handed in via
+/// `process_with_capture`, the JSON record's `capture` section carries the
+/// captured/expected native sample counts, their ratio, and the stream
+/// error count -- exactly what distinguishes "ALSA dropped audio" from
+/// "VAD over-trimmed" as the cause of a single-word transcript.
+#[test]
+fn debug_capture_records_capture_ratio_and_stream_errors_when_enabled() {
+    let dir = scratch_debug_dir("capture-ratio");
+    let p = Pipeline::new(
+        debug_config(&dir, true),
+        Box::new(FixedAsr("um so the meeting is at uh four thirty on tuesday".into())),
+        Box::new(WholeBuffer),
+        Box::new(AlwaysEnglish),
+        Box::new(FixedNormalizer("So the meeting is at 4:30 on Tuesday.".into())),
+        Box::new(MockInjector::default()),
+    );
+
+    let out = p
+        .process_with_capture(&samples(), None, Some(capture_stats_fixture()))
+        .unwrap()
+        .expect("some outcome");
+    assert!(out.normalized);
+
+    let logs_dir = dir.join("logs");
+    let json_path = owf_core::debug::latest_record_path(&logs_dir).unwrap();
+    let record: owf_core::debug::DebugRecord =
+        serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
+
+    let capture = record.capture.expect("capture section must be present");
+    assert_eq!(capture.native_samples_captured, 240_000);
+    assert_eq!(capture.native_samples_expected, 480_000); // 5s * 48kHz * 2ch
+    assert!((capture.capture_ratio - 0.5).abs() < 1e-9);
+    assert_eq!(capture.stream_errors, 3);
+    assert_eq!(capture.device, "HDA Intel PCH, ALC3271 Analog");
+
+    assert_eq!(record.asr_raw.as_deref(), Some("um so the meeting is at uh four thirty on tuesday"));
+    assert_eq!(record.lang.as_deref(), Some("English"));
+    assert!(record.audio.trimmed.is_some());
+    let guardrail = record.guardrail.expect("guardrail should have run");
+    assert_eq!(guardrail.verdict, "accept");
+    let inject = record.inject.expect("inject should have run");
+    assert_eq!(inject.backend, "mock");
+    assert_eq!(inject.final_text, out.text);
+
+    assert!(dir.join("audio").join(format!("{}-raw.wav", record.ts)).exists());
+    assert!(dir.join("audio").join(format!("{}-trimmed.wav", record.ts)).exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn debug_capture_omits_the_capture_section_when_process_is_called_without_stats() {
+    let dir = scratch_debug_dir("no-capture-stats");
+    let p = Pipeline::new(
+        debug_config(&dir, false),
+        Box::new(FixedAsr("send the invoice on friday".into())),
+        Box::new(WholeBuffer),
+        Box::new(AlwaysEnglish),
+        Box::new(FixedNormalizer("Send the invoice on Friday.".into())),
+        Box::new(MockInjector::default()),
+    );
+
+    // The plain two-arg `process` (what every other test in this file
+    // calls) has no `CaptureStats` to offer -- the record must still be
+    // written, just without a `capture` section.
+    p.process(&samples(), None).unwrap();
+
+    let logs_dir = dir.join("logs");
+    let json_path = owf_core::debug::latest_record_path(&logs_dir).unwrap();
+    let record: owf_core::debug::DebugRecord =
+        serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
+    assert!(record.capture.is_none());
+
+    // save_audio was false: no WAVs, only the JSON record.
+    assert!(!dir.join("audio").join(format!("{}-raw.wav", record.ts)).exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn debug_capture_records_no_speech_utterances_too() {
+    let dir = scratch_debug_dir("no-speech");
+    let p = Pipeline::new(
+        debug_config(&dir, true),
+        Box::new(FixedAsr("should never be reached".into())),
+        Box::new(NoSpeechTrimmer),
+        Box::new(AlwaysEnglish),
+        Box::new(FixedNormalizer("nope".into())),
+        Box::new(MockInjector::default()),
+    );
+
+    assert!(p.process(&samples(), None).unwrap().is_none());
+
+    let logs_dir = dir.join("logs");
+    let json_path = owf_core::debug::latest_record_path(&logs_dir).unwrap();
+    let record: owf_core::debug::DebugRecord =
+        serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
+    assert!(!record.vad.found);
+    assert!(record.asr_raw.is_none());
+    // The raw buffer is still worth having even when VAD found nothing --
+    // that's exactly the buffer to inspect for "did VAD over-trim?".
+    assert!(dir.join("audio").join(format!("{}-raw.wav", record.ts)).exists());
+    assert!(!dir.join("audio").join(format!("{}-trimmed.wav", record.ts)).exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn debug_capture_is_a_no_op_when_disabled() {
+    let dir = scratch_debug_dir("disabled");
+    // enabled = false (the default), pointed at a scratch dir that must
+    // never be created.
+    let cfg = Config::from_str(&format!("[debug]\ndir = \"{}\"\n", dir.display())).unwrap();
+    let p = Pipeline::new(
+        cfg,
+        Box::new(FixedAsr("send the invoice on friday".into())),
+        Box::new(WholeBuffer),
+        Box::new(AlwaysEnglish),
+        Box::new(FixedNormalizer("Send the invoice on Friday.".into())),
+        Box::new(MockInjector::default()),
+    );
+
+    p.process(&samples(), None).unwrap();
+
+    assert!(!dir.exists(), "no debug directory should be created when [debug].enabled = false");
+}
+
+/// Structural fix: `self.asr.transcribe(...)?` used to skip the debug write
+/// entirely on error, even with `[debug].enabled = true`. VAD had already
+/// run by then, so the record must still capture that much.
+#[test]
+fn debug_record_is_written_when_asr_errors() {
+    let dir = scratch_debug_dir("asr-error");
+    let p = Pipeline::new(
+        debug_config(&dir, false),
+        Box::new(FailingAsr),
+        Box::new(WholeBuffer),
+        Box::new(AlwaysEnglish),
+        Box::new(FixedNormalizer("unused".into())),
+        Box::new(MockInjector::default()),
+    );
+
+    let err = p.process(&samples(), None).unwrap_err();
+    assert!(err.to_string().contains("asr exploded"), "got {err}");
+
+    let logs_dir = dir.join("logs");
+    let json_path = owf_core::debug::latest_record_path(&logs_dir)
+        .expect("a debug record must be written even when ASR errors");
+    let record: owf_core::debug::DebugRecord =
+        serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
+    assert!(record.vad.found, "VAD had already run before ASR errored");
+    assert!(record.asr_raw.is_none(), "ASR never produced a transcript");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Structural fix, second instance: `inject_with_fallback(...)?` used to skip
+/// the debug write when *both* the primary and clipboard-fallback injectors
+/// failed -- found by review, not disclosed by the implementer. By then the
+/// raw transcript, the normalization result, and the guardrail verdict are
+/// all already computed; this is exactly the utterance you'd most want a
+/// record for.
+///
+/// Uses `with_fallback_injector`/`with_recovery_dir` (added alongside this
+/// fix) so the test can force the fallback path deterministically instead of
+/// depending on whether the real `wl-copy` happens to be installed, and
+/// without writing to the real `paths::state_dir()`.
+#[test]
+fn debug_record_is_written_when_both_injectors_fail() {
+    let dir = scratch_debug_dir("both-injectors-fail");
+    let recovery_dir = scratch_debug_dir("both-injectors-fail-recovery");
+    let p = Pipeline::new(
+        debug_config(&dir, false),
+        Box::new(FixedAsr("send the invoice on friday".into())),
+        Box::new(WholeBuffer),
+        Box::new(AlwaysEnglish),
+        Box::new(FixedNormalizer("Send the invoice on Friday.".into())),
+        Box::new(MockInjector::failing()),
+    )
+    .with_fallback_injector(Box::new(MockInjector::failing()))
+    .with_recovery_dir(recovery_dir.clone());
+
+    let err = p.process(&samples(), None).unwrap_err();
+    assert!(err.to_string().contains("unsent.txt"), "got {err}");
+
+    let logs_dir = dir.join("logs");
+    let json_path = owf_core::debug::latest_record_path(&logs_dir)
+        .expect("a debug record must be written even when both injectors fail");
+    let record: owf_core::debug::DebugRecord =
+        serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
+    assert_eq!(record.asr_raw.as_deref(), Some("send the invoice on friday"));
+    let normalize = record.normalize.expect("normalization should have already run");
+    assert_eq!(normalize.cleaned.as_deref(), Some("Send the invoice on Friday."));
+    let guardrail = record.guardrail.expect("the guardrail should have already reached a verdict");
+    assert_eq!(guardrail.verdict, "accept");
+    assert!(record.inject.is_none(), "injection never completed");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&recovery_dir);
 }
 
 #[test]
@@ -335,7 +577,8 @@ fn update_reloadable_applies_a_new_guardrail_and_a_new_injector() {
     let permissive =
         Config::from_str("[guardrail]\nmin_word_ratio = 0.0\nmin_overlap_english = 0.0\n").unwrap();
     let new_injector = std::sync::Arc::new(MockInjector::default());
-    p.update_reloadable(permissive, Box::new(FwdInjector(new_injector.clone())));
+    p.update_reloadable(permissive, Box::new(FwdInjector(new_injector.clone())))
+        .expect("this reload does not touch [normalize].enabled and must be accepted");
 
     let after = p.process(&samples(), None).unwrap().expect("some outcome");
     assert!(after.normalized, "the reloaded, permissive guardrail should accept this cleanup");
@@ -345,4 +588,170 @@ fn update_reloadable_applies_a_new_guardrail_and_a_new_injector() {
         vec![after.text],
         "the reloaded injector must receive the post-reload utterance"
     );
+}
+
+/// R15: `[normalize].enabled` gates which `self.normalizer` is live, but
+/// `update_reloadable` never rebuilds `self.normalizer` -- only
+/// `set_normalizer` (Task 3's supervisor) does. Silently accepting a
+/// changed `enabled` here would flip the flag while leaving the *old*
+/// normalizer in place: disabled -> enabled would start calling a
+/// normalizer that was never built for real use (in production, the
+/// `UnavailableNormalizer` stub `warm_up` installs when normalization
+/// starts disabled), which errors on every utterance and quietly falls back
+/// to raw text forever while `reload` reports success -- the same "reports
+/// success, changes nothing" bug fix I5 already removed from `reload` once.
+/// Proves the reload is refused outright, and that refusing it leaves the
+/// pipeline's config and injector completely untouched, not just the one
+/// field that would have been wrong.
+#[test]
+fn update_reloadable_refuses_to_change_normalize_enabled() {
+    let disabled = Config::from_str("[normalize]\nenabled = false\n").unwrap();
+    let old_injector = std::sync::Arc::new(MockInjector::default());
+    let mut p = Pipeline::new(
+        disabled,
+        Box::new(FixedAsr("send the invoice on friday".into())),
+        Box::new(WholeBuffer),
+        Box::new(AlwaysEnglish),
+        Box::new(PanickingNormalizer),
+        Box::new(FwdInjector(old_injector.clone())),
+    );
+
+    let enabled = Config::from_str("[normalize]\nenabled = true\n").unwrap();
+    let new_injector = std::sync::Arc::new(MockInjector::default());
+    let result = p.update_reloadable(enabled, Box::new(FwdInjector(new_injector.clone())));
+
+    let msg = result.expect_err("flipping [normalize].enabled must be refused");
+    assert!(msg.contains("normalize"), "the error should name the offending setting: {msg}");
+    assert!(msg.to_lowercase().contains("restart"), "the error should say a restart is needed: {msg}");
+
+    // Rejected wholesale, not partially applied: the *old* config and
+    // injector must still be in effect, including the untouched
+    // `enabled = false` that keeps `PanickingNormalizer` correctly
+    // unreachable.
+    let out = p.process(&samples(), None).unwrap().expect("some outcome");
+    assert!(!out.normalized, "normalization must still be disabled after a refused reload");
+    assert_eq!(old_injector.injected(), vec![out.text]);
+    assert!(new_injector.injected().is_empty(), "the rejected reload's injector must never be used");
+}
+
+/// Task 3 (llama-server supervision): after a backoff restart reconnects to
+/// a fresh `llama-server` on a (possibly different) port, the daemon's
+/// supervisor swaps in a new normalizer via `set_normalizer` without
+/// rebuilding the rest of the pipeline. This proves the swap actually
+/// changes which normalizer later utterances go through -- unlike
+/// `update_reloadable`, `cfg`/`injector` must be untouched by the call.
+#[test]
+fn set_normalizer_swaps_the_normalizer_used_by_the_next_utterance() {
+    let old_injector = std::sync::Arc::new(MockInjector::default());
+    let mut p = Pipeline::new(
+        Config::from_str("").unwrap(),
+        Box::new(FixedAsr("send the invoice on friday".into())),
+        Box::new(WholeBuffer),
+        Box::new(AlwaysEnglish),
+        Box::new(BrokenNormalizer),
+        Box::new(FwdInjector(old_injector.clone())),
+    );
+
+    let before = p.process(&samples(), None).unwrap().expect("some outcome");
+    assert!(!before.normalized, "the broken normalizer must degrade to raw text");
+
+    p.set_normalizer(Box::new(FixedNormalizer("Send the invoice on Friday!".into())));
+
+    let after = p.process(&samples(), None).unwrap().expect("some outcome");
+    assert!(after.normalized, "the freshly swapped-in normalizer must actually be used");
+    assert_eq!(after.text, "Send the invoice on Friday! ");
+    assert_eq!(
+        old_injector.injected(),
+        vec![before.text, after.text],
+        "the injector must be untouched by set_normalizer -- both utterances went through it"
+    );
+}
+
+/// M2 Task 1: a subscriber (here, a plain `Vec` behind a `Mutex` standing in
+/// for the daemon's socket fan-out -- `owf-daemon.rs`'s own tests cover the
+/// actual `Request::Subscribe` wiring) must see `Normalizing` before
+/// `Injecting`, in that order, for a synthetic utterance driven through the
+/// existing fake `Transcriber`/`Normalizer`/`Trimmer`/`MockInjector`.
+#[test]
+fn stage_events_fire_normalizing_then_injecting_in_order() {
+    let seen: std::sync::Arc<std::sync::Mutex<Vec<OverlayEvent>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_for_sink = seen.clone();
+
+    let p = Pipeline::new(
+        Config::from_str("").unwrap(),
+        Box::new(FixedAsr("send the invoice on friday".into())),
+        Box::new(WholeBuffer),
+        Box::new(AlwaysEnglish),
+        Box::new(FixedNormalizer("Send the invoice on Friday.".into())),
+        Box::new(MockInjector::default()),
+    )
+    .with_stage_events(std::sync::Arc::new(move |ev| {
+        seen_for_sink.lock().unwrap().push(ev);
+    }));
+
+    p.process(&samples(), None).unwrap().expect("some outcome");
+
+    assert_eq!(
+        seen.lock().unwrap().as_slice(),
+        [OverlayEvent::Normalizing, OverlayEvent::Injecting],
+        "Normalizing must be reported before Injecting, in pipeline order"
+    );
+}
+
+/// When normalization is disabled, `Pipeline` never enters that stage at
+/// all -- the subscriber must see only `Injecting`, not a `Normalizing`
+/// event for a stage nothing actually ran.
+#[test]
+fn stage_events_omit_normalizing_when_normalization_is_disabled() {
+    let seen: std::sync::Arc<std::sync::Mutex<Vec<OverlayEvent>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_for_sink = seen.clone();
+
+    let p = Pipeline::new(
+        Config::from_str("[normalize]\nenabled = false\n").unwrap(),
+        Box::new(FixedAsr("send the invoice on friday".into())),
+        Box::new(WholeBuffer),
+        Box::new(AlwaysEnglish),
+        Box::new(PanickingNormalizer),
+        Box::new(MockInjector::default()),
+    )
+    .with_stage_events(std::sync::Arc::new(move |ev| {
+        seen_for_sink.lock().unwrap().push(ev);
+    }));
+
+    p.process(&samples(), None).unwrap().expect("some outcome");
+
+    assert_eq!(seen.lock().unwrap().as_slice(), [OverlayEvent::Injecting]);
+}
+
+/// `with_stage_events`'s sink is a plain, infallible `Fn(OverlayEvent)`:
+/// `Pipeline` never inspects a return value and never depends on the sink
+/// doing anything in particular. That's what lets the daemon's real sink
+/// (`Daemon::broadcast`, via `broadcast_to`) silently drop a disconnected
+/// subscriber -- by design, see `owf-daemon.rs`'s own tests -- without that
+/// choice ever being able to reach back into the utterance itself. This
+/// just pins the call count/outcome so a future change can't quietly make
+/// the pipeline's result depend on the sink.
+#[test]
+fn the_stage_events_sink_cannot_influence_the_pipeline_outcome() {
+    struct CountingSink(std::sync::atomic::AtomicUsize);
+    let calls = std::sync::Arc::new(CountingSink(std::sync::atomic::AtomicUsize::new(0)));
+    let calls_for_sink = calls.clone();
+
+    let p = Pipeline::new(
+        Config::from_str("").unwrap(),
+        Box::new(FixedAsr("send the invoice on friday".into())),
+        Box::new(WholeBuffer),
+        Box::new(AlwaysEnglish),
+        Box::new(FixedNormalizer("Send the invoice on Friday.".into())),
+        Box::new(MockInjector::default()),
+    )
+    .with_stage_events(std::sync::Arc::new(move |_ev| {
+        calls_for_sink.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }));
+
+    let out = p.process(&samples(), None).unwrap().expect("some outcome");
+    assert!(out.normalized);
+    assert_eq!(calls.0.load(std::sync::atomic::Ordering::SeqCst), 2, "Normalizing + Injecting");
 }
