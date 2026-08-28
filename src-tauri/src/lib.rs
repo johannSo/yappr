@@ -1,21 +1,25 @@
 //! The OpenWhisprFlow overlay: a small always-on-top window that renders
-//! the dictation pipeline's state (spec 12). This crate holds no pipeline
-//! logic -- it is a thin client of the daemon's `Subscribe` event stream
-//! (`connection.rs`), or of a checked-in NDJSON fixture when driven with
-//! `--replay <path>` (`replay.rs`), and forwards whatever it receives to
-//! the frontend as a Tauri event. All rendering decisions live in `src/`.
+//! the dictation pipeline's state (spec 12). As of this app hosting the
+//! server itself, this crate no longer talks to a daemon over a socket for
+//! its own events -- `setup()` below starts `owf_core::server` in-process
+//! and forwards its broadcasts to the frontend directly as a Tauri event.
+//! (`--replay <path>` (`replay.rs`) still drives the overlay from a
+//! checked-in NDJSON fixture instead, with neither a pipeline nor a
+//! socket.) All rendering decisions live in `src/`.
+
+use std::sync::Arc;
 
 mod bench;
 pub mod cli;
 pub mod client;
 mod client_stream;
-mod connection;
 mod replay;
 mod setup;
 
 use tauri::{Emitter, Manager, PhysicalPosition};
 
 use owf_core::proto::OverlayEvent;
+use owf_core::server::EventSink;
 
 /// Must match the window `label` in `tauri.conf.json`.
 const OVERLAY_LABEL: &str = "overlay";
@@ -73,6 +77,21 @@ fn position_overlay(window: tauri::WebviewWindow) {
     position_bottom_center(&window);
 }
 
+/// Forwards every broadcast from the in-process `owf_core::server::Daemon`
+/// to the frontend as a Tauri event -- the overlay's `src/Overlay.tsx`
+/// already listens for `"overlay-event"`; it used to arrive there via
+/// `connection.rs`'s socket client, and now arrives the same way but
+/// without a socket in between.
+struct TauriSink(tauri::AppHandle);
+
+impl EventSink for TauriSink {
+    fn emit(&self, event: &OverlayEvent) {
+        if let Err(e) = self.0.emit("overlay-event", event) {
+            eprintln!("overlay: failed to emit event to the frontend: {e}");
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let replay_path = replay_arg();
@@ -86,23 +105,28 @@ pub fn run() {
                 .expect("the overlay window must be declared in tauri.conf.json");
             relax_webkitgtk_minimum_size(&window);
 
-            let handle = app.handle().clone();
-            let emit = move |event: OverlayEvent| {
-                if let Err(e) = handle.emit("overlay-event", &event) {
-                    eprintln!("overlay: failed to emit event to the frontend: {e}");
-                }
-            };
-
             // Never on the Tauri event-loop thread: a not-yet-warm daemon,
             // or a slow/looping replay file, must not delay first paint or
             // freeze window management.
             match replay_path.clone() {
                 Some(path) => {
+                    let handle = app.handle().clone();
+                    let emit = move |event: OverlayEvent| {
+                        if let Err(e) = handle.emit("overlay-event", &event) {
+                            eprintln!("overlay: failed to emit event to the frontend: {e}");
+                        }
+                    };
                     eprintln!("overlay: replaying {} (not connecting to the daemon)", path.display());
                     std::thread::spawn(move || replay::run(&path, emit));
                 }
                 None => {
-                    std::thread::spawn(move || connection::run(emit));
+                    let (daemon, listener) =
+                        owf_core::server::start(Arc::new(TauriSink(app.handle().clone())))?;
+                    app.manage(daemon.clone());
+                    // Never on the Tauri event-loop thread -- the accept
+                    // loop blocks, and a blocked event loop is a frozen
+                    // window and an unclickable tray.
+                    std::thread::spawn(move || owf_core::server::serve(daemon, listener));
                 }
             }
 

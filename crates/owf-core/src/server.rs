@@ -149,7 +149,14 @@ fn lock_ignoring_poison<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-struct Daemon {
+/// A sink for events the server produces. The standalone daemon had exactly
+/// one consumer (socket subscribers); the app has two, because the overlay is
+/// now in-process and gets its events through Tauri rather than a socket.
+pub trait EventSink: Send + Sync + 'static {
+    fn emit(&self, event: &OverlayEvent);
+}
+
+pub struct Daemon {
     state: AtomicU8,
     /// `None` until a `Recorder` has been successfully constructed -- either
     /// eagerly at startup, or lazily on the first `ptt-start` after a
@@ -217,6 +224,16 @@ struct Daemon {
     /// pipeline-error utterance has no `Outcome` to take timings from and
     /// leaves whatever was last recorded in place rather than clearing it.
     last_timings: Mutex<Option<Timings>>,
+    /// The in-process consumer of every broadcast. The standalone daemon had
+    /// none; the app's overlay is no longer a socket client, so it is one.
+    sink: Arc<dyn EventSink>,
+    /// The single-instance guard (see `start`'s doc comment): an exclusive,
+    /// non-blocking `flock` on a runtime file. Held for the life of the
+    /// daemon only because this `File` lives here -- `start` used to keep it
+    /// in a local that dropped, and released the lock, the moment `start`
+    /// returned, letting a second `openwhisprflow` race this one for the
+    /// socket. Never read; it exists only so `Drop` doesn't run early.
+    _runtime_lock: std::fs::File,
 }
 
 /// A single registered `Request::Subscribe` connection: the channel
@@ -290,7 +307,11 @@ fn broadcast_to(subscribers: &Mutex<Vec<Subscriber>>, event: OverlayEvent) {
 
 impl Daemon {
     fn broadcast(&self, event: OverlayEvent) {
-        broadcast_to(&self.subscribers, event);
+        broadcast_to(&self.subscribers, event.clone());
+        // The in-process consumer: unlike socket subscribers, always exactly
+        // one, and never absent, so this must run unconditionally rather
+        // than being folded into `broadcast_to`'s empty-list fast path.
+        self.sink.emit(&event);
     }
 }
 
@@ -365,9 +386,25 @@ fn open_debug_log_file(debug: &DebugConfig) -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new().create(true).append(true).open(logs_dir.join("daemon.log"))
 }
 
-pub fn run() -> Result<()> {
+/// Everything `run()` used to do except the accept loop: acquires the
+/// single-instance lock, loads config, sets up tracing, binds and secures
+/// the socket, builds the `Daemon`, and spawns the warm-up, housekeeping,
+/// and signal-handling threads. Returns the constructed `Daemon` and the
+/// bound `UnixListener` so a host that owns its own event loop (the Tauri
+/// app) can call this during its `setup()` and then run [`serve`] on a
+/// thread of its own, instead of blocking the caller the way `run` does.
+///
+/// `sink` is the in-process consumer of every broadcast alongside socket
+/// subscribers -- see [`EventSink`]. The standalone daemon (`run`, below)
+/// passes a sink that discards every event, since it has no in-process
+/// consumer of its own.
+pub fn start(sink: Arc<dyn EventSink>) -> Result<(Arc<Daemon>, UnixListener)> {
     // Single-instance guard: an exclusive, non-blocking lock on a runtime
-    // file, held for the life of the process via `lock` staying in scope.
+    // file. The `File` is stored in `Daemon::_runtime_lock` so the lock is
+    // held for the life of the *daemon*, not just this function -- a local
+    // here would drop, and release the exclusive flock with it, the moment
+    // `start` returns, letting a second `openwhisprflow` race this one for
+    // the socket.
     let lock_path = paths::runtime_lock();
     if let Some(parent) = lock_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -443,6 +480,8 @@ pub fn run() -> Result<()> {
         fatal_error: Mutex::new(None),
         housekeeping: Mutex::new(None),
         last_timings: Mutex::new(None),
+        sink,
+        _runtime_lock: lock,
     });
 
     // Warm up off the accept loop so `status` answers immediately.
@@ -516,12 +555,33 @@ pub fn run() -> Result<()> {
     }
 
     tracing::info!(socket = %sock_path.display(), "listening");
+    Ok((daemon, listener))
+}
+
+/// The accept loop `run()` used to end with, moved out so a host that owns
+/// its own event loop can run this on a thread of its own instead. Blocks
+/// forever (or until the process is torn down by `shutdown`, e.g. on a
+/// terminating signal): **never call this on the Tauri event-loop thread** --
+/// a blocked event loop is a frozen window and an unclickable tray.
+pub fn serve(daemon: Arc<Daemon>, listener: UnixListener) {
     for stream in listener.incoming() {
         match stream {
             Ok(s) => handle(Arc::clone(&daemon), s),
             Err(e) => tracing::warn!(error = ?e, "accept failed"),
         }
     }
+}
+
+/// The standalone daemon binary's entry point: `start` plus `serve` with no
+/// in-process event consumer, run on the calling thread (`owf-ctl daemon`
+/// blocks here for the life of the process, same as before this was split).
+pub fn run() -> Result<()> {
+    struct NoExtraSink;
+    impl EventSink for NoExtraSink {
+        fn emit(&self, _: &OverlayEvent) {}
+    }
+    let (daemon, listener) = start(Arc::new(NoExtraSink))?;
+    serve(daemon, listener);
     Ok(())
 }
 
@@ -2244,7 +2304,73 @@ mod tests {
             fatal_error: Mutex::new(None),
             housekeeping: Mutex::new(None),
             last_timings: Mutex::new(None),
+            sink: Arc::new(DropSink),
+            _runtime_lock: fake_runtime_lock(),
         })
+    }
+
+    /// What `fake_daemon_at`/`fake_daemon_with_normalize` pass for `sink`:
+    /// broadcast now has an in-process consumer as well as socket
+    /// subscribers, and the vast majority of tests in this module care about
+    /// neither, so this keeps their construction unchanged.
+    struct DropSink;
+    impl EventSink for DropSink {
+        fn emit(&self, _: &OverlayEvent) {}
+    }
+
+    /// A `File` for `Daemon::_runtime_lock` in tests. No fake daemon here
+    /// ever binds the real socket or competes with a real one for it, so the
+    /// file just needs to exist -- nothing ever calls `try_lock_exclusive`
+    /// on it the way `start` does.
+    fn fake_runtime_lock() -> std::fs::File {
+        let path = std::env::temp_dir().join("owf-core-tests-fake-runtime-lock");
+        std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(path).unwrap()
+    }
+
+    /// `fake_daemon_at` and `fake_daemon_with_normalize` keep their
+    /// signatures and pass a sink that drops events, so no existing test
+    /// changes. Only the test asserting on the second consumer needs this.
+    fn fake_daemon_with_sink(initial_state: u8, sink: Arc<dyn EventSink>) -> Arc<Daemon> {
+        Arc::new(Daemon {
+            state: AtomicU8::new(initial_state),
+            recorder: Mutex::new(None),
+            audio_cfg: Mutex::new(AudioConfig::default()),
+            pipeline: Mutex::new(None),
+            llama: Mutex::new(None),
+            window_class: Mutex::new(None),
+            config_path: PathBuf::from("/nonexistent/owf-test/config.toml"),
+            recording_epoch: AtomicU64::new(0),
+            subscribers: Mutex::new(Vec::new()),
+            normalize_enabled: false,
+            normalize_available: AtomicBool::new(false),
+            fatal_error: Mutex::new(None),
+            housekeeping: Mutex::new(None),
+            last_timings: Mutex::new(None),
+            sink,
+            _runtime_lock: fake_runtime_lock(),
+        })
+    }
+
+    /// The overlay stopped being a socket client, so `broadcast` has two
+    /// consumers now. A future edit that returns early for one of them (a
+    /// no-subscribers fast path, say) would silently blind the overlay while
+    /// every socket test still passed.
+    #[test]
+    fn broadcast_reaches_the_in_process_sink_even_with_no_socket_subscribers() {
+        #[derive(Default)]
+        struct Recorder(Mutex<Vec<OverlayEvent>>);
+        impl EventSink for Recorder {
+            fn emit(&self, e: &OverlayEvent) {
+                self.0.lock().unwrap().push(e.clone());
+            }
+        }
+        let sink = Arc::new(Recorder::default());
+        let daemon = fake_daemon_with_sink(IDLE, sink.clone());
+        assert!(lock_ignoring_poison(&daemon.subscribers).is_empty());
+
+        daemon.broadcast(OverlayEvent::Transcribing);
+
+        assert_eq!(sink.0.lock().unwrap().as_slice(), &[OverlayEvent::Transcribing]);
     }
 
     fn scratch_config(tag: &str) -> PathBuf {
