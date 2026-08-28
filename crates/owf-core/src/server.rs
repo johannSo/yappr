@@ -17,18 +17,18 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use owf_core::asr::SherpaTranscriber;
-use owf_core::capture::{CaptureStats, Recorder};
-use owf_core::config::{AudioConfig, Config, DebugConfig, NormalizeConfig};
-use owf_core::config_write;
-use owf_core::inject;
-use owf_core::lang::WhatlangDetector;
-use owf_core::llama::LlamaServer;
-use owf_core::normalize::{Normalizer, S1MiniClient};
-use owf_core::paths;
-use owf_core::pipeline::{Pipeline, Timings};
-use owf_core::proto::{OverlayEvent, Request, Response, State};
-use owf_core::vad::SileroTrimmer;
+use crate::asr::SherpaTranscriber;
+use crate::capture::{CaptureStats, Recorder};
+use crate::config::{AudioConfig, Config, DebugConfig, NormalizeConfig};
+use crate::config_write;
+use crate::inject;
+use crate::lang::WhatlangDetector;
+use crate::llama::LlamaServer;
+use crate::normalize::{Normalizer, S1MiniClient};
+use crate::paths;
+use crate::pipeline::{Pipeline, Timings};
+use crate::proto::{OverlayEvent, Request, Response, State};
+use crate::vad::SileroTrimmer;
 
 const WARMING: u8 = 0;
 const IDLE: u8 = 1;
@@ -360,7 +360,7 @@ fn init_tracing(debug: &DebugConfig) {
 /// Opens `<debug.dir>/logs/daemon.log` for append, creating the directory
 /// tree if needed.
 fn open_debug_log_file(debug: &DebugConfig) -> std::io::Result<std::fs::File> {
-    let logs_dir = owf_core::debug::expand_tilde(&debug.dir).join("logs");
+    let logs_dir = crate::debug::expand_tilde(&debug.dir).join("logs");
     std::fs::create_dir_all(&logs_dir)?;
     std::fs::OpenOptions::new().create(true).append(true).open(logs_dir.join("daemon.log"))
 }
@@ -1288,7 +1288,7 @@ fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
         },
 
         Request::ListInputDevices => {
-            match owf_core::capture::list_input_devices(DEVICE_LIST_TIMEOUT) {
+            match crate::capture::list_input_devices(DEVICE_LIST_TIMEOUT) {
                 Ok(devices) => {
                     let mut r = Response::ok(state_of(current));
                     r.devices = Some(devices);
@@ -1447,7 +1447,7 @@ fn start_recording(daemon: &Arc<Daemon>) -> Response {
     // Capturing the window class here, now that the mic is already open,
     // is still deliberate (spec 11): it is the window that was focused when
     // the user *started* talking, not whatever has focus once they finish.
-    *lock_ignoring_poison(&daemon.window_class) = owf_core::hypr::active_window_class();
+    *lock_ignoring_poison(&daemon.window_class) = crate::hypr::active_window_class();
 
     // Bump the epoch *before* flipping the state, not after: they are two
     // independent atomics, and the safety-valve timer below reads the epoch
@@ -1654,12 +1654,12 @@ fn process_utterance(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use owf_core::asr::Transcriber;
-    use owf_core::config::Config;
-    use owf_core::inject::MockInjector;
-    use owf_core::lang::{Lang, LanguageDetector};
-    use owf_core::normalize::Normalizer;
-    use owf_core::vad::Trimmer;
+    use crate::asr::Transcriber;
+    use crate::config::Config;
+    use crate::inject::MockInjector;
+    use crate::lang::{Lang, LanguageDetector};
+    use crate::normalize::Normalizer;
+    use crate::vad::Trimmer;
     use std::panic::AssertUnwindSafe;
 
     struct WholeBuffer;

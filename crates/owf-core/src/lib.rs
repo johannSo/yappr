@@ -15,6 +15,7 @@ pub mod paths;
 pub mod pipeline;
 pub(crate) mod procutil;
 pub mod proto;
+pub mod server;
 pub mod style;
 pub mod vad;
 pub mod vocab;

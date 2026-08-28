@@ -15,6 +15,7 @@ toml.workspace = true
 # Cargo.lock as a transitive dependency of `toml`, so this adds no graph node.
 toml_edit = "0.25"
 tracing.workspace = true
+tracing-subscriber.workspace = true
 dirs.workspace = true
 regex.workspace = true
 ureq.workspace = true
@@ -29,6 +30,10 @@ whatlang = "0.18"
 strsim = "0.11"
 cpal = "0.18"
 rubato = "5.0"
+# Synchronous, self-pipe-based signal handling for the daemon's SIGTERM/
+# SIGINT/SIGHUP shutdown path (fix 2) -- no async runtime, matching the rest
+# of `server.rs`.
+signal-hook = "0.3"
 
 [dev-dependencies]
 hound = "3.5"

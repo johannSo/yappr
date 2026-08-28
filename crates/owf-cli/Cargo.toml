@@ -8,13 +8,7 @@ owf-core = { path = "../owf-core" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
 hound = "3.5"
-# Synchronous, self-pipe-based signal handling for the daemon's SIGTERM/
-# SIGINT/SIGHUP shutdown path (fix 2) -- no async runtime, matching the rest
-# of this binary.
-signal-hook = "0.3"
 
 [lib]
 name = "owf_cli"

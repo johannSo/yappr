@@ -1,10 +1,12 @@
 //! One command, three jobs.
 //!
 //! `owf-daemon`, `owf-ctl` and `owf-bench` used to be three binaries built
-//! from three files under `src/bin/`. They are one binary now, and the three
-//! files moved here unchanged: [`daemon`], [`ctl`] and [`bench`]. What the
-//! merge had to preserve is the push-to-talk keybinding, which the compositor
-//! runs on every key press and release --
+//! from three files under `src/bin/`. They are one binary now: [`ctl`] and
+//! [`bench`] moved here unchanged. The daemon moved one hop further, into
+//! `owf_core::server`, so a later Tauri app can host it in-process without
+//! this crate's binary in between. What the merge had to preserve is the
+//! push-to-talk keybinding, which the compositor runs on every key press
+//! and release --
 //! `o.bind("SUPER + D", ..., "owf-ctl ptt-start")` and its `release = true`
 //! twin. Keeping `owf-ctl` as the command name is what makes those keep
 //! working with no change to anyone's Hyprland config; the daemon and the
@@ -16,7 +18,6 @@
 
 pub mod bench;
 pub mod ctl;
-pub mod daemon;
 
 use owf_core::proto::Request;
 
@@ -78,7 +79,7 @@ pub fn route(args: &[&str]) -> Route {
 
 pub fn dispatch(route: Route) -> anyhow::Result<()> {
     match route {
-        Route::Daemon => daemon::run(),
+        Route::Daemon => owf_core::server::run(),
         Route::Bench => bench::run(),
         Route::Send(req) => ctl::send(req),
         Route::Subscribe => ctl::subscribe(),
