@@ -1,8 +1,9 @@
 # Checked-in NDJSON OverlayEvent fixture for `openwhisprflow --replay`.
 # Exercises every wire::OverlayEvent variant (M2 Task 5 acceptance
-# evidence) across three scenarios: a full successful dictation, a
-# no-speech error, and a busy rejection. Lines starting with '#' and blank
-# lines are ignored by the replay loader.
+# evidence) across four scenarios: a full successful dictation, a
+# no-speech error, a busy rejection, and llama-server degrading then
+# recovering. Lines starting with '#' and blank lines are ignored by the
+# replay loader.
 #
 # The recording burst below has a realistic ~50ms cadence (spec 7.1) and
 # varying levels so the overlay's live bars actually move rather than
@@ -51,3 +52,10 @@
 # --- Scenario 3: a second ptt-start while the pipeline is busy ---
 {"event":"busy_rejected"}
 {"event":"idle"}
+
+# --- Scenario 4: llama-server (S1-mini) goes down, then recovers (spec 15) ---
+# Not a State transition -- a persistent badge alongside whatever else is
+# showing (here, plain idle), which is why it's its own scenario rather than
+# folded into scenario 1's dictation.
+{"event":"normalize_degraded","reason":"llama-server is down or unhealthy"}
+{"event":"normalize_recovered"}

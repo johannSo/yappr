@@ -157,6 +157,17 @@ mod tests {
         assert!(has(&|e| matches!(e, OverlayEvent::Done { .. })), "missing done");
         assert!(has(&|e| matches!(e, OverlayEvent::Error { .. })), "missing error");
         assert!(has(&|e| matches!(e, OverlayEvent::BusyRejected)), "missing busy_rejected");
+        // Added this milestone (M2 Task 3 / spec 15) and previously absent
+        // from both the fixture and this coverage check -- the exact "stale
+        // fixture, mechanical guard missing" gap the guard exists to catch.
+        assert!(
+            has(&|e| matches!(e, OverlayEvent::NormalizeDegraded { .. })),
+            "missing normalize_degraded"
+        );
+        assert!(
+            has(&|e| matches!(e, OverlayEvent::NormalizeRecovered)),
+            "missing normalize_recovered"
+        );
 
         // The recording burst should have more than a couple of samples
         // and varying levels, or it wouldn't be "realistic" per the

@@ -289,4 +289,55 @@ mod tests {
         let v: serde_json::Value = serde_json::to_value(&r).unwrap();
         assert_eq!(v["normalize_available"], serde_json::json!(false));
     }
+
+    /// `src-tauri/src/wire.rs` deliberately hand-duplicates this enum's wire
+    /// format rather than depending on `owf-core` (see that module's doc
+    /// comment for why), which means the two can silently drift: a variant
+    /// added or reshaped here with no matching change there would only be
+    /// caught by someone remembering to update `wire.rs`'s own hand-written
+    /// pinned-string test by hand. This turns that manual promise into a
+    /// mechanical one from this side: every line of the checked-in overlay
+    /// replay fixture -- itself asserted elsewhere
+    /// (`src-tauri/src/replay.rs`'s `checked_in_fixture_covers_every_event_kind`)
+    /// to cover every `wire::OverlayEvent` variant -- must also parse as
+    /// this crate's own `OverlayEvent`. If the two wire formats ever
+    /// disagree, one of these two tests fails.
+    #[test]
+    fn the_overlay_replay_fixture_parses_as_this_crates_overlay_event() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../src-tauri/fixtures/replay-full.ndjson");
+        let contents = std::fs::read_to_string(&fixture)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", fixture.display()));
+
+        let mut events = Vec::new();
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let event: OverlayEvent = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("parsing fixture line {line:?}: {e}"));
+            events.push(event);
+        }
+
+        assert!(!events.is_empty(), "fixture must contain events");
+        for variant in [
+            "warming",
+            "idle",
+            "transcribing",
+            "normalizing",
+            "injecting",
+            "done",
+            "error",
+            "busy_rejected",
+            "normalize_degraded",
+            "normalize_recovered",
+        ] {
+            assert!(
+                events.iter().any(|e| serde_json::to_value(e).unwrap()["event"] == variant),
+                "fixture is missing a {variant} line"
+            );
+        }
+        assert!(events.iter().any(|e| matches!(e, OverlayEvent::Recording { .. })));
+    }
 }
