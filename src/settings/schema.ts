@@ -119,6 +119,12 @@ export const LABELS: Record<string, string> = {
   "overlay.position": "Position",
   "overlay.width": "Breite",
   "overlay.height": "Höhe",
+  // Not a `config.toml` key — see `Settings.tsx`'s `AutostartCard` and
+  // `settings_cmds.rs`'s module doc for why this is filesystem state
+  // (`~/.config/autostart/openwhisprflow.desktop` existing or not) rather
+  // than a section here. The path `"autostart.enabled"` exists only so this
+  // row can borrow the same `LABELS`/`HELP` lookup every config row uses.
+  "autostart.enabled": "Beim Anmelden starten",
 };
 
 /// Rendered after the input rather than inside the label, so a row reads
@@ -202,6 +208,8 @@ export const HELP: Record<string, string> = {
     "Wird eingelesen, steuert aber nichts — unter Wayland kann ein Fenster seine eigene Position nicht setzen.",
   "overlay.width": "Wird eingelesen, steuert aber nichts.",
   "overlay.height": "Wird eingelesen, steuert aber nichts.",
+  "autostart.enabled":
+    "Legt ~/.config/autostart/openwhisprflow.desktop an; systemd startet OpenWhisprFlow davon bei der nächsten Anmeldung automatisch. Aus heißt: die Datei existiert nicht, und nichts startet von selbst.",
 };
 
 export const ENUMS: Record<string, string[]> = {

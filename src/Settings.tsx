@@ -3,8 +3,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { AnimatePresence, MotionConfig, motion } from "motion/react";
 import { Icon } from "./settings/icons";
-import { Commit, Device, Field, ResetButton, TableEditor } from "./settings/controls";
+import { Commit, Device, Field, ResetButton, Row, TableEditor, Toggle } from "./settings/controls";
 import {
+  HELP,
   Json,
   RESTART_SECTIONS,
   SECTION_NOTES,
@@ -12,6 +13,7 @@ import {
   Section,
   categorize,
   jsonEqual,
+  labelFor,
   orderedFields,
   paneTitleOf,
   search,
@@ -580,6 +582,15 @@ export default function Settings() {
                       onSection={(value, commit) => updateSection(section, value, commit)}
                     />
                   ))}
+                  {/* Same reasoning as the Setup pane above: filesystem
+                      state, not a `config.toml` section (see
+                      `AutostartCard`'s own doc comment), so it renders
+                      alongside `shown.map` rather than through it. Appended
+                      after the config-backed sections rather than before —
+                      Allgemein's other rows (Mikrofon, Texteingabe) are
+                      about how one dictation behaves, this is about the app
+                      itself. */}
+                  {!searching && current.id === "allgemein" && <AutostartCard />}
                 </motion.div>
               )}
             </div>
@@ -636,6 +647,81 @@ function SaveCapsule({ state }: { state: SaveState }) {
         )}
       </AnimatePresence>
     </div>
+  );
+}
+
+/// "Beim Anmelden starten" (spec §9, task 16). Deliberately **not** rendered
+/// through `SectionCard`/`config[section]` the way every other row in this
+/// window is: the thing being toggled is whether
+/// `~/.config/autostart/openwhisprflow.desktop` exists, which is filesystem
+/// state that can change behind this app's back (the user clearing that
+/// directory by hand, another autostart manager). Mirroring that into a
+/// `config.toml` key would be a second copy of the same fact, free to
+/// disagree with the file the moment either changes without the other — see
+/// `settings_cmds.rs`'s module doc for the full reasoning.
+///
+/// So this card asks the filesystem directly (`autostart_status`) rather
+/// than reading anything out of `config`, and every toggle press
+/// (`set_autostart`) writes or removes the real file immediately — there is
+/// no debounce here the way `NumberInput` needs one, because a toggle, like
+/// every other boolean row in this window, is a finished decision the
+/// moment it changes.
+function AutostartCard() {
+  const [enabled, setEnabled] = useState<boolean | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const refresh = useCallback(() => {
+    invoke("autostart_status")
+      .then((res) => setEnabled((res as { enabled: boolean }).enabled))
+      .catch((e) => setError(String(e)));
+  }, []);
+
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
+
+  const onChange = useCallback(
+    (next: boolean) => {
+      // Guards the same race `disabled={enabled === null}` dims on screen:
+      // without it, a click that lands before the first `autostart_status`
+      // reply resolves would toggle from an unknown baseline and could
+      // "revert" to `null` on failure instead of to whatever is real.
+      if (enabled === null) return;
+      // Optimistic, then reverted on failure — exactly `flush`'s rule for
+      // every other setting in this window (CLAUDE.md invariant 9): the
+      // backend validates/writes before this is trusted, so a rejection
+      // must not leave the toggle showing something the disk disagrees with.
+      const previous = enabled;
+      setEnabled(next);
+      setError(null);
+      invoke("set_autostart", { enabled: next }).catch((e) => {
+        setEnabled(previous);
+        setError(String(e));
+      });
+    },
+    [enabled],
+  );
+
+  return (
+    <section className="group">
+      <div className="group-head">
+        <h2>Autostart</h2>
+      </div>
+      <div className="card">
+        <Row
+          label={labelFor("autostart.enabled", "enabled")}
+          help={HELP["autostart.enabled"]}
+          disabled={enabled === null}
+          control={<Toggle value={enabled ?? false} onChange={(v) => onChange(v as boolean)} />}
+        />
+      </div>
+      {error && (
+        <div className="banner error">
+          <Icon name="warn" className="icon-sm" />
+          <span>{error}</span>
+        </div>
+      )}
+    </section>
   );
 }
 

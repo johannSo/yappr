@@ -46,6 +46,21 @@ pub fn runtime_port() -> PathBuf {
     xdg_runtime().join("openwhisprflow.port")
 }
 
+/// The XDG autostart entry (design doc §9, task 16). Deliberately **not**
+/// built on [`config_dir`]: `~/.config/autostart/` is a directory shared by
+/// every autostart-capable app on the system (on this machine it already
+/// holds, among others, `Handy.desktop` and `claude-desktop.desktop`), not a
+/// subdirectory namespaced under this app the way `config_file()`'s parent
+/// is. `xdg-autostart-generator` turns whatever `.desktop` files live here
+/// into systemd user units automatically -- this project authors no unit of
+/// its own.
+pub fn autostart_desktop_file() -> PathBuf {
+    dirs::config_dir()
+        .expect("no config dir")
+        .join("autostart")
+        .join("openwhisprflow.desktop")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -55,6 +70,18 @@ mod tests {
         assert!(config_file().ends_with("openwhisprflow/config.toml"));
         assert!(models_dir().ends_with("openwhisprflow/models"));
         assert!(rejections_file().ends_with("openwhisprflow/rejections.jsonl"));
+    }
+
+    /// `~/.config/autostart/` is a shared directory, not this app's own
+    /// namespaced subdirectory -- unlike every other path in this file, it
+    /// must sit as a sibling of [`config_dir`], not inside it. Computing the
+    /// path is safe to test directly (it is a pure function of
+    /// `dirs::config_dir()`); nothing here reads, writes, or creates it.
+    #[test]
+    fn the_autostart_entry_lives_beside_this_apps_config_dir_not_inside_it() {
+        let p = autostart_desktop_file();
+        assert!(p.ends_with("autostart/openwhisprflow.desktop"));
+        assert!(!p.starts_with(config_dir()));
     }
 
     #[test]

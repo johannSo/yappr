@@ -1,11 +1,31 @@
-//! The settings window's three commands.
+//! The settings window's commands: the original three config/device calls,
+//! plus (task 16) the pair backing the "Beim Anmelden starten" toggle.
 //!
-//! They were socket calls in `settings-tauri`; they are direct calls now. The
-//! command names and the JSON they return are byte-identical on purpose:
-//! `src/settings/` and `Settings.tsx` are unchanged by this move, and CLAUDE.md
-//! invariant 9's autosave contract -- validate before writing, atomic rename,
-//! a rejected save keeps the value on screen -- is `config_write`'s, not the
-//! transport's.
+//! The first three were socket calls in `settings-tauri`; they are direct
+//! calls now. The command names and the JSON they return are byte-identical
+//! on purpose: `src/settings/` and `Settings.tsx` are unchanged by this move,
+//! and CLAUDE.md invariant 9's autosave contract -- validate before writing,
+//! atomic rename, a rejected save keeps the value on screen -- is
+//! `config_write`'s, not the transport's.
+//!
+//! ## Why autostart is not a `config.toml` key
+//!
+//! Every other setting in this window is a key the daemon reads out of
+//! `Config` and validates with `#[serde(deny_unknown_fields)]`. Autostart
+//! doesn't fit that shape: the thing being toggled is *whether a file
+//! exists* (`owf_core::paths::autostart_desktop_file()`), and that file can
+//! be deleted or edited by something entirely outside this app -- the user
+//! clearing `~/.config/autostart/` by hand, a distro migration, another
+//! autostart manager. A `config.toml` key mirroring that ("autostart.enabled
+//! = true") would be a second, independent copy of the same fact, free to
+//! disagree with the filesystem the moment either one changes without the
+//! other -- and there would be no event that tells this app to re-sync them.
+//!
+//! So there is no key. [`autostart_status`] answers by checking the file's
+//! existence directly, every time it's asked, and [`set_autostart`] is the
+//! only thing that ever writes or removes it. The filesystem is not
+//! mirrored into config; it *is* the state, which is the only way for a
+//! toggle here to be incapable of lying about it.
 //!
 //! Two things a socket call didn't have to worry about, that a Tauri command
 //! does:
@@ -87,6 +107,75 @@ pub async fn list_input_devices(
     call(&server, Request::ListInputDevices).await
 }
 
+/// The `.desktop` entry `set_autostart_at` writes when enabling autostart --
+/// mirrors the minimal working shape already on this machine at
+/// `~/.config/autostart/Handy.desktop` (no `Hidden`, no `OnlyShowIn`/
+/// `NotShowIn`, which is what lets `xdg-autostart-generator` pick it up
+/// unconditionally). `Exec=openwhisprflow` names the binary bare, matching
+/// how `crates/owf-core/src/hypr.rs` invokes it in the Hyprland config it
+/// emits (`exec-once = openwhisprflow`) -- both rely on a `PATH` install
+/// rather than an absolute path baked in.
+const AUTOSTART_DESKTOP_ENTRY: &str = "\
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=OpenWhisprFlow
+Comment=Startet das Diktat-Overlay im Hintergrund
+Exec=openwhisprflow
+StartupNotify=false
+Terminal=false
+";
+
+/// Writes or removes the autostart `.desktop` entry at `path` (spec §9;
+/// off by default, so this is only ever reached by an explicit toggle).
+///
+/// Idempotent in both directions: `enabled: true` is a plain overwrite of a
+/// fixed single path, so writing it twice leaves exactly one file, not two;
+/// `enabled: false` treats a second removal's `NotFound` as success rather
+/// than an error, so disabling twice -- or disabling a toggle that was
+/// already off -- never fails.
+///
+/// Takes `path` as a parameter rather than resolving
+/// `owf_core::paths::autostart_desktop_file()` itself, purely so this is
+/// testable against a scratch directory: see this module's tests, none of
+/// which ever construct the real path. Only [`set_autostart`] below does.
+fn set_autostart_at(path: &std::path::Path, enabled: bool) -> std::io::Result<()> {
+    if enabled {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, AUTOSTART_DESKTOP_ENTRY)
+    } else {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// Whether OpenWhisprFlow currently starts itself at login -- read straight
+/// off the filesystem (see the module doc's "why not a config key"), so a
+/// file removed behind this app's back is reported truthfully instead of
+/// from stale state. A single `Path::exists()` stat; no `spawn_blocking`
+/// needed for that, unlike [`call`]'s `dispatch` or `list_input_devices`.
+#[tauri::command]
+pub fn autostart_status() -> serde_json::Value {
+    let enabled = owf_core::paths::autostart_desktop_file().exists();
+    serde_json::json!({ "enabled": enabled })
+}
+
+/// Turns "Beim Anmelden starten" on or off by writing or removing the real
+/// autostart entry. Same reasoning as [`autostart_status`] on why this is a
+/// plain synchronous command: a single small write or remove, not the kind
+/// of work `settings_cmds.rs`'s module doc reserves `spawn_blocking` for.
+#[tauri::command]
+pub fn set_autostart(enabled: bool) -> Result<(), String> {
+    set_autostart_at(&owf_core::paths::autostart_desktop_file(), enabled).map_err(|e| {
+        format!("Autostart-Eintrag konnte nicht geschrieben werden: {e}")
+    })
+}
+
 /// Every settings command funnels through here: pulls the `Arc<Daemon>` out
 /// of `Server` (or reports [`NO_DAEMON`]), then runs the blocking `dispatch`
 /// call on a dedicated blocking thread -- never inline on the async worker
@@ -119,6 +208,81 @@ fn to_json(resp: Response) -> Result<serde_json::Value, String> {
 mod tests {
     use super::*;
     use owf_core::proto::State as WireState;
+
+    /// A fresh, collision-free scratch directory for a single test. Not a
+    /// dependency: `tempfile` isn't in `[dev-dependencies]` here either (see
+    /// the identical helper in `owf-core`'s `inject.rs` and `owf-cli`'s --
+    /// now this crate's -- `setup.rs` tests). Load-bearing for this file in
+    /// particular: this is what keeps every autostart test off the real
+    /// `~/.config/autostart/`, which on this machine holds five files this
+    /// project must never touch, one of them another dictation app's own
+    /// autostart entry.
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("owf-settings-cmds-test-{tag}-{}-{n}", std::process::id()))
+    }
+
+    /// Writing the file is what enables autostart; removing it is what
+    /// disables it. Both directions must be idempotent -- a user who toggles
+    /// twice must not end up with two entries or a stale one. Runs entirely
+    /// inside a scratch directory (never the real autostart directory) --
+    /// see [`set_autostart_at`]'s doc comment for why the path is a
+    /// parameter rather than resolved internally.
+    #[test]
+    fn the_autostart_desktop_file_is_written_and_removed_idempotently() {
+        let dir = scratch_dir("autostart");
+        let p = dir.join("openwhisprflow.desktop");
+
+        set_autostart_at(&p, true).unwrap();
+        set_autostart_at(&p, true).unwrap();
+        assert!(p.exists());
+        assert!(std::fs::read_to_string(&p).unwrap().contains("Exec=openwhisprflow"));
+
+        set_autostart_at(&p, false).unwrap();
+        set_autostart_at(&p, false).unwrap();
+        assert!(!p.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Disabling something that was never enabled -- the directory itself
+    /// doesn't even exist yet -- must be a no-op, not an error: a fresh
+    /// install's very first `set_config`-equivalent call for this toggle is
+    /// exactly this shape (default off, nothing on disk).
+    #[test]
+    fn disabling_autostart_when_nothing_was_ever_enabled_is_not_an_error() {
+        let dir = scratch_dir("autostart-never-enabled");
+        let p = dir.join("openwhisprflow.desktop");
+        assert!(!dir.exists());
+
+        set_autostart_at(&p, false).unwrap();
+        assert!(!p.exists());
+    }
+
+    /// Pins the fields `xdg-autostart-generator` cares about, checked
+    /// against `~/.config/autostart/Handy.desktop`'s known-working shape on
+    /// this machine: a bare `Type=Application`/`Exec=`, and critically
+    /// *no* `Hidden=true` or `OnlyShowIn`/`NotShowIn` -- any of those would
+    /// make the generator skip the file rather than turn it into a systemd
+    /// user unit.
+    #[test]
+    fn the_written_entry_has_the_shape_xdg_autostart_generator_requires() {
+        let dir = scratch_dir("autostart-shape");
+        let p = dir.join("openwhisprflow.desktop");
+
+        set_autostart_at(&p, true).unwrap();
+        let content = std::fs::read_to_string(&p).unwrap();
+        assert!(content.starts_with("[Desktop Entry]"));
+        assert!(content.contains("Type=Application"));
+        assert!(content.contains("Exec=openwhisprflow"));
+        assert!(!content.contains("Hidden"));
+        assert!(!content.contains("OnlyShowIn"));
+        assert!(!content.contains("NotShowIn"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The exact scenario Task 9 exists to close off: `--replay` mode
     /// manages `Server(None)` (see `lib.rs`'s `setup()`), and a settings

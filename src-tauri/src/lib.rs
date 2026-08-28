@@ -151,6 +151,8 @@ pub fn run() {
             settings_cmds::get_config,
             settings_cmds::set_config,
             settings_cmds::list_input_devices,
+            settings_cmds::autostart_status,
+            settings_cmds::set_autostart,
             provision::setup_status,
             provision::run_setup
         ])
