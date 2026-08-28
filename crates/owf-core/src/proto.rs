@@ -41,6 +41,9 @@ pub enum Request {
     SetConfig { config: serde_json::Value },
     /// The input devices `cpal` can see, for the device dropdown.
     ListInputDevices,
+    /// Tray-driven. Pausing leaves the shortcut bound and the app running; it
+    /// only makes `Toggle` refuse, so no microphone is opened.
+    SetPaused { paused: bool },
 }
 
 /// One row of the settings GUI's microphone dropdown.
@@ -67,6 +70,14 @@ pub enum State {
     /// `owf-daemon.rs`'s `FAILED` and `serve_subscriber`). Additive: every
     /// existing variant's wire form is unchanged.
     Error,
+    /// Task 13: `Request::SetPaused { paused: true }`, accepted only from
+    /// `Idle` -- see `owf-daemon.rs`'s `SetPaused` handler, a
+    /// compare-and-exchange rather than a store, so pausing can never seize
+    /// a state an utterance is already using. `Toggle`/`PttStart` refuse in
+    /// this state exactly as they do in `Warming`/`Error`, opening no
+    /// microphone, until `Request::SetPaused { paused: false }` returns the
+    /// daemon to `Idle`.
+    Paused,
 }
 
 /// One line of the NDJSON stream a `Request::Subscribe` connection turns
@@ -84,6 +95,12 @@ pub enum State {
 pub enum OverlayEvent {
     Warming,
     Idle,
+    /// Task 13: mirrors `State::Paused` -- the daemon is paused via the
+    /// tray's "Diktat pausieren" and will accept no `ptt-start`/`toggle`
+    /// until it is unchecked. Sent as the initial snapshot to a subscriber
+    /// connecting while paused (`snapshot_event`), and broadcast the moment
+    /// `Request::SetPaused` actually takes effect.
+    Paused,
     /// `ptt-start` has been accepted but the microphone is not delivering
     /// samples yet: `ensure_recorder` may still have to build the recorder,
     /// and even after `Recorder::start` returns, ALSA/PipeWire hands over the
@@ -251,6 +268,10 @@ mod tests {
             r#"{"cmd":"list-input-devices"}"#
         );
         assert_eq!(
+            serde_json::to_string(&Request::SetPaused { paused: true }).unwrap(),
+            r#"{"cmd":"set-paused","paused":true}"#
+        );
+        assert_eq!(
             serde_json::to_string(&Request::SetConfig {
                 config: serde_json::json!({"audio": {"device": "default"}})
             })
@@ -274,6 +295,8 @@ mod tests {
             Request::GetConfig,
             Request::ListInputDevices,
             Request::SetConfig { config: serde_json::json!({"asr": {"num_threads": 2}}) },
+            Request::SetPaused { paused: true },
+            Request::SetPaused { paused: false },
         ] {
             let s = serde_json::to_string(&r).unwrap();
             assert_eq!(serde_json::from_str::<Request>(&s).unwrap(), r);
@@ -306,6 +329,7 @@ mod tests {
         assert_eq!(serde_json::to_string(&State::Injecting).unwrap(), r#""injecting""#);
         assert_eq!(serde_json::to_string(&State::Idle).unwrap(), r#""idle""#);
         assert_eq!(serde_json::to_string(&State::Error).unwrap(), r#""error""#);
+        assert_eq!(serde_json::to_string(&State::Paused).unwrap(), r#""paused""#);
     }
 
     #[test]
@@ -348,6 +372,7 @@ mod tests {
         let events = [
             OverlayEvent::Warming,
             OverlayEvent::Idle,
+            OverlayEvent::Paused,
             OverlayEvent::Recording { level: 0.42, elapsed_ms: 1_234 },
             OverlayEvent::Transcribing,
             OverlayEvent::Normalizing,
@@ -375,6 +400,7 @@ mod tests {
     fn overlay_events_serialise_to_the_documented_wire_form() {
         assert_eq!(serde_json::to_string(&OverlayEvent::Warming).unwrap(), r#"{"event":"warming"}"#);
         assert_eq!(serde_json::to_string(&OverlayEvent::Idle).unwrap(), r#"{"event":"idle"}"#);
+        assert_eq!(serde_json::to_string(&OverlayEvent::Paused).unwrap(), r#"{"event":"paused"}"#);
         assert_eq!(serde_json::to_string(&OverlayEvent::Opening).unwrap(), r#"{"event":"opening"}"#);
         assert_eq!(
             serde_json::to_string(&OverlayEvent::Recording { level: 0.5, elapsed_ms: 100 }).unwrap(),
@@ -464,6 +490,7 @@ mod tests {
         for variant in [
             "warming",
             "idle",
+            "paused",
             "opening",
             "transcribing",
             "normalizing",

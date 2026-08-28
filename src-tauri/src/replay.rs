@@ -30,6 +30,7 @@ fn hold_for(event: &OverlayEvent) -> Duration {
         OverlayEvent::Opening => Duration::from_millis(120),
         OverlayEvent::Warming
         | OverlayEvent::Idle
+        | OverlayEvent::Paused
         | OverlayEvent::Transcribing
         | OverlayEvent::Normalizing
         | OverlayEvent::Injecting => Duration::from_millis(1_800),
@@ -155,6 +156,10 @@ mod tests {
         let has = |pred: &dyn Fn(&OverlayEvent) -> bool| events.iter().any(pred);
         assert!(has(&|e| matches!(e, OverlayEvent::Warming)), "missing warming");
         assert!(has(&|e| matches!(e, OverlayEvent::Idle)), "missing idle");
+        // Task 13: added this milestone, same "stale fixture, mechanical
+        // guard missing" gap the NormalizeDegraded/NormalizeRecovered
+        // assertions below were added to close.
+        assert!(has(&|e| matches!(e, OverlayEvent::Paused)), "missing paused");
         assert!(has(&|e| matches!(e, OverlayEvent::Opening)), "missing opening");
         assert!(has(&|e| matches!(e, OverlayEvent::Recording { .. })), "missing recording");
         assert!(has(&|e| matches!(e, OverlayEvent::Transcribing)), "missing transcribing");

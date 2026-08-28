@@ -112,14 +112,17 @@
 //! self-deadlock: frozen icon, dead menu, dead Beenden, recoverable only by
 //! killing the process from outside.
 //!
-//! Not reachable today: `Request::Quit` spawns its wait-then-shutdown work
-//! on a fresh thread and broadcasts nothing on the calling one, and
-//! `show_settings_window` broadcasts nothing at all. But it is a real trap
-//! for the next `dispatch` call a tray callback adds -- "Diktat pausieren"
-//! is exactly such a case -- so every `dispatch` call reachable from a tray
-//! callback runs on its own freshly spawned thread ([`OwfTray::quit`] is
-//! the current example), never inline in the callback, on principle rather
-//! than because today's one call happens to be safe.
+//! Not reachable via `Request::Quit` or `show_settings_window`: `Quit`
+//! spawns its wait-then-shutdown work on a fresh thread and broadcasts
+//! nothing on the calling one, and `show_settings_window` broadcasts
+//! nothing at all. `Request::SetPaused` ("Diktat pausieren", Task 13) is the
+//! trap made real: its handler (`server.rs`) really does call
+//! `daemon.broadcast` synchronously on whatever thread calls `dispatch`. So
+//! every `dispatch` call reachable from a tray callback runs on its own
+//! freshly spawned thread ([`OwfTray::quit`] and [`OwfTray::toggle_paused`]
+//! are the two examples), never inline in the callback -- for `toggle_paused`
+//! this is not just defensive: without the thread hop, checking "Diktat
+//! pausieren" would deadlock the ksni thread on the very first click.
 
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -136,6 +139,12 @@ pub fn icon_name(state: State) -> &'static str {
         Idle => "audio-input-microphone-symbolic",
         Recording => "media-record-symbolic",
         Transcribing | Normalizing | Injecting => "content-loading-symbolic",
+        // Task 13: deliberately its own icon, not `Idle`'s -- a paused
+        // daemon must be as visually distinct as a recording one (this
+        // match's whole point, per this function's own doc comment), or the
+        // one indicator left under press/press toggle would tell the user
+        // dictation is ready when the shortcut in fact opens no microphone.
+        Paused => "media-playback-pause-symbolic",
         Error => "dialog-error-symbolic",
     }
 }
@@ -151,6 +160,7 @@ fn status_label(state: State) -> &'static str {
         Transcribing => "Transkribiert …",
         Normalizing => "Verbessert Text …",
         Injecting => "Fügt Text ein …",
+        Paused => "Pausiert",
         Error => "Fehler",
     }
 }
@@ -181,6 +191,11 @@ pub(crate) fn state_from_event(event: &OverlayEvent) -> Option<State> {
         OverlayEvent::Normalizing => Some(State::Normalizing),
         OverlayEvent::Injecting => Some(State::Injecting),
         OverlayEvent::Done { .. } => Some(State::Idle),
+        // Task 13: unambiguous from the event alone, unlike `Error` below --
+        // `Paused` is broadcast on exactly one path (`server.rs`'s
+        // `SetPaused` handler) and means exactly one thing, so there is no
+        // second signal to resolve it against.
+        OverlayEvent::Paused => Some(State::Paused),
         OverlayEvent::Error { .. }
         | OverlayEvent::BusyRejected
         | OverlayEvent::NormalizeDegraded { .. }
@@ -263,6 +278,35 @@ impl OwfTray {
             }
         }
     }
+
+    /// "Diktat pausieren": a click always means "flip whatever this
+    /// checkbox currently shows", so it dispatches `Request::SetPaused` with
+    /// the opposite of `self.state == State::Paused` -- never a fixed
+    /// `true`/`false`. `None` under `--replay`, the same reasoning as
+    /// [`OwfTray::quit`]: there is no daemon there, so there is nothing to
+    /// pause and nothing invariant 1 protects either.
+    ///
+    /// Dispatched on a freshly spawned thread, never inline here -- see this
+    /// module's doc comment ("Tray callbacks must not call `dispatch`
+    /// inline"). Unlike `Request::Quit`, `Request::SetPaused`'s handler
+    /// (`server.rs`) really does broadcast synchronously on the thread that
+    /// calls it -- that is exactly the shape the doc comment warns about,
+    /// which is why this hop is load-bearing here, not just cheap insurance.
+    /// The handler is also a compare-and-exchange from `IDLE` only, so a
+    /// click that lands mid-utterance is silently dropped rather than
+    /// seizing a busy state: the checkbox just won't show checked, and the
+    /// user presses it again once the daemon settles back to idle on its
+    /// own.
+    fn toggle_paused(&self) {
+        let paused = !matches!(self.state, State::Paused);
+        if let Some(server) = self.app.try_state::<crate::settings_cmds::Server>() {
+            if let Some(daemon) = server.0.clone() {
+                std::thread::spawn(move || {
+                    dispatch(&daemon, Request::SetPaused { paused });
+                });
+            }
+        }
+    }
 }
 
 impl ksni::Tray for OwfTray {
@@ -285,13 +329,25 @@ impl ksni::Tray for OwfTray {
     }
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
-        use ksni::menu::StandardItem;
+        use ksni::menu::{CheckmarkItem, StandardItem};
         vec![
             StandardItem { label: status_label(self.state).into(), enabled: false, ..Default::default() }
                 .into(),
             StandardItem {
                 label: "Einstellungen".into(),
                 activate: Box::new(|this: &mut Self| crate::show_settings_window(&this.app)),
+                ..Default::default()
+            }
+            .into(),
+            // Task 13: checked exactly when the daemon's real state is
+            // `Paused` -- never an optimistic guess set at click time -- so
+            // a click that the daemon actually refused (mid-utterance) is
+            // visibly a click that did nothing, not a checkbox lying about
+            // what the shortcut will do next.
+            CheckmarkItem {
+                label: "Diktat pausieren".into(),
+                checked: matches!(self.state, State::Paused),
+                activate: Box::new(|this: &mut Self| this.toggle_paused()),
                 ..Default::default()
             }
             .into(),
@@ -379,11 +435,16 @@ mod tests {
     #[test]
     fn every_state_maps_to_an_icon_and_recording_is_never_idle() {
         use State::*;
-        let all = [Warming, Idle, Recording, Transcribing, Normalizing, Injecting, Error];
+        let all = [Warming, Idle, Recording, Transcribing, Normalizing, Injecting, Paused, Error];
         let names: Vec<_> = all.iter().map(|s| icon_name(*s)).collect();
         assert!(names.iter().all(|n| !n.is_empty()));
         assert_ne!(icon_name(Recording), icon_name(Idle));
         assert_ne!(icon_name(Recording), icon_name(Transcribing));
+        // Task 13: a paused daemon is the other state where the shortcut
+        // opens no microphone at all -- it must not be mistaken for `Idle`,
+        // which promises the opposite.
+        assert_ne!(icon_name(Paused), icon_name(Idle));
+        assert_ne!(icon_name(Paused), icon_name(Recording));
     }
 
     /// The context menu's status line must never be blank, for any state
@@ -391,7 +452,7 @@ mod tests {
     #[test]
     fn every_state_has_a_non_empty_status_label() {
         use State::*;
-        for s in [Warming, Idle, Recording, Transcribing, Normalizing, Injecting, Error] {
+        for s in [Warming, Idle, Recording, Transcribing, Normalizing, Injecting, Paused, Error] {
             assert!(!status_label(s).is_empty());
         }
     }
@@ -442,6 +503,14 @@ mod tests {
         assert_eq!(state_from_event(&OverlayEvent::NormalizeRecovered), None);
     }
 
+    /// Task 13: unlike `Error`, `Paused` is unambiguous from the event alone
+    /// -- broadcast on exactly one path (`server.rs`'s `SetPaused` handler)
+    /// -- so it resolves without ever asking `Request::Status`.
+    #[test]
+    fn state_from_event_maps_paused_to_paused() {
+        assert_eq!(state_from_event(&OverlayEvent::Paused), Some(State::Paused));
+    }
+
     // -- `icon_state_for` (review round 2: the call pattern that was
     // actually broken, extracted so it is testable at all) -----------------
 
@@ -455,6 +524,12 @@ mod tests {
     #[test]
     fn icon_state_for_maps_opening_to_recording_regardless_of_status() {
         assert_eq!(icon_state_for(&OverlayEvent::Opening, None), Some(State::Recording));
+    }
+
+    #[test]
+    fn icon_state_for_maps_paused_to_paused_regardless_of_status() {
+        assert_eq!(icon_state_for(&OverlayEvent::Paused, None), Some(State::Paused));
+        assert_eq!(icon_state_for(&OverlayEvent::Paused, Some(State::Recording)), Some(State::Paused));
     }
 
     /// The one case this whole review round exists for: a warm-up failure

@@ -5,14 +5,22 @@ import { getCurrentWindow, type Window as TauriWindow } from "@tauri-apps/api/wi
 import { AnimatePresence, MotionConfig, motion, type Transition } from "motion/react";
 import "./Overlay.css";
 
-// Wire shape emitted by the Rust backend (`src-tauri/src/wire.rs`), which
-// itself mirrors `owf_core::proto::OverlayEvent` (crates/owf-core/src/proto.rs).
-// This is the *only* place the frontend knows about the pipeline: it never
-// decides state transitions, timing budgets, or retries -- it renders
-// whatever it's told (spec 12).
+// Wire shape emitted by the Rust backend: a hand-maintained mirror of
+// `owf_core::proto::OverlayEvent` (crates/owf-core/src/proto.rs), forwarded
+// here as a Tauri event by `TauriSink::emit` (src-tauri/src/lib.rs) -- the
+// in-process daemon serialises its own enum straight to JSON, with no
+// intermediate `wire.rs` copy any more (invariant 3: this union is now the
+// *only* other hand-maintained copy, plus the checked-in replay fixture
+// `src-tauri/fixtures/replay-full.ndjson`). This is the *only* place the
+// frontend knows about the pipeline: it never decides state transitions,
+// timing budgets, or retries -- it renders whatever it's told (spec 12).
 type OverlayEvent =
   | { event: "warming" }
   | { event: "idle" }
+  // Task 13: the tray's "Diktat pausieren" is checked. No rendering exists
+  // for this yet (future UI work); the `default` case below is what keeps
+  // an unhandled event a safe no-op rather than a stuck capsule.
+  | { event: "paused" }
   // ptt-start accepted, but the mic has not produced a sample yet (~55 ms
   // through PipeWire here). Rendered as "wait" so the user does not start
   // talking into a microphone that is not capturing; the next `recording`

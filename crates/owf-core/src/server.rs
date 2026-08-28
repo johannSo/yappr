@@ -54,6 +54,13 @@ const INJECTING: u8 = 5;
 // spinner instead of the error pill spec 12 requires. `FAILED` is a real,
 // steady state `state_of`/`snapshot_event` can report to a late joiner.
 const FAILED: u8 = 6;
+// Task 13: tray-driven, via `Request::SetPaused`. Deliberately not one of
+// `is_busy`'s three values -- pausing is not "processing an utterance", it's
+// "refuse to start a new one" -- and reached only by a compare-and-exchange
+// from `IDLE`, never a store, so a pause request arriving mid-utterance
+// (RECORDING included, not just the three `is_busy` names) defers to it
+// instead of seizing it (invariant 1).
+const PAUSED: u8 = 7;
 
 fn is_busy(v: u8) -> bool {
     matches!(v, TRANSCRIBING | NORMALIZING | INJECTING)
@@ -91,6 +98,7 @@ fn state_of(v: u8) -> State {
         NORMALIZING => State::Normalizing,
         INJECTING => State::Injecting,
         FAILED => State::Error,
+        PAUSED => State::Paused,
         _ => State::Idle,
     }
 }
@@ -108,6 +116,7 @@ fn snapshot_event(v: u8) -> OverlayEvent {
         TRANSCRIBING => OverlayEvent::Transcribing,
         NORMALIZING => OverlayEvent::Normalizing,
         INJECTING => OverlayEvent::Injecting,
+        PAUSED => OverlayEvent::Paused,
         // A generic fallback reason: `serve_subscriber` overrides this with
         // the real stored `daemon.fatal_error` when one is available, which
         // it always is by the time `FAILED` is ever observable. Kept here
@@ -1456,10 +1465,9 @@ fn claim_busy(daemon: &Daemon) -> bool {
 /// to consult.
 ///
 /// Only `RECORDING` maps to `PttStop`; every other state -- the busy
-/// sub-states, `WARMING`, and `FAILED` included -- maps to `PttStart`, whose
-/// own match arms already refuse all of those (see `dispatch` below). A
-/// later task adds `PAUSED` and will extend this function accordingly; it
-/// is deliberately not anticipated here.
+/// sub-states, `WARMING`, `FAILED`, and (Task 13) `PAUSED` included -- maps
+/// to `PttStart`, whose own match arms already refuse all of those (see
+/// `dispatch` below).
 fn toggle_target(state: u8) -> Request {
     match state {
         RECORDING => Request::PttStop,
@@ -1504,6 +1512,11 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
             }
             match current {
                 WARMING => Response::err("warming"),
+                // Task 13: the tray's "Diktat pausieren" is checked. The
+                // shortcut stays bound (this refusal is reachable at all
+                // only because it is), it just opens no microphone until
+                // `Request::SetPaused { paused: false }` returns to `IDLE`.
+                PAUSED => Response::err("paused"),
                 // The real stored reason, not a generic pointer to logs: on a
                 // fresh install with no models yet, this is
                 // `SherpaTranscriber`/`SileroTrimmer`'s own "model paths"
@@ -1569,6 +1582,30 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
                 s if is_busy(s) => Response::err("cannot cancel: transcription already in progress"),
                 s => Response::ok(state_of(s)), // already idle, or still warming
             }
+        }
+        // Task 13: the tray's "Diktat pausieren". A compare-and-exchange,
+        // never an unconditional store: a `SetPaused` arriving mid-utterance
+        // -- RECORDING included, not just the TRANSCRIBING/NORMALIZING/
+        // INJECTING sub-states `is_busy` names -- must defer to it rather
+        // than seize it. Invariant 1 protects text already produced; nothing
+        // else would protect it from a pause that stole a state that isn't
+        // `IDLE`. A CAS that fails here is silently dropped, with no retry
+        // and no queue: a pause requested mid-utterance simply does not take,
+        // and the tray's checkbox -- driven by this broadcast, never an
+        // optimistic guess -- correctly never shows checked for it. The user
+        // presses "Diktat pausieren" again once the daemon is back to `IDLE`.
+        //
+        // Broadcast only on an actual transition (mirroring `Cancel` above),
+        // not on a failed or no-op CAS: `TauriSink::emit` -> `refresh_tray_icon`
+        // is the only thing that ever moves the tray's icon/checkbox (see
+        // `tray.rs`'s "Icon and daemon state"), so a transition nothing
+        // broadcasts is a transition the tray never learns about.
+        Request::SetPaused { paused } => {
+            let (from, to) = if paused { (IDLE, PAUSED) } else { (PAUSED, IDLE) };
+            if daemon.state.compare_exchange(from, to, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                daemon.broadcast(if paused { OverlayEvent::Paused } else { OverlayEvent::Idle });
+            }
+            Response::ok(state_of(daemon.state.load(Ordering::SeqCst)))
         }
         Request::Reload => {
             if current != IDLE {
@@ -2557,6 +2594,7 @@ mod tests {
         assert_eq!(state_of(TRANSCRIBING), State::Transcribing);
         assert_eq!(state_of(NORMALIZING), State::Normalizing);
         assert_eq!(state_of(INJECTING), State::Injecting);
+        assert_eq!(state_of(PAUSED), State::Paused);
     }
 
     #[test]
@@ -2567,6 +2605,7 @@ mod tests {
         assert!(!is_busy(WARMING));
         assert!(!is_busy(IDLE));
         assert!(!is_busy(RECORDING));
+        assert!(!is_busy(PAUSED));
     }
 
     #[test]
@@ -2576,6 +2615,7 @@ mod tests {
         assert_eq!(snapshot_event(TRANSCRIBING), OverlayEvent::Transcribing);
         assert_eq!(snapshot_event(NORMALIZING), OverlayEvent::Normalizing);
         assert_eq!(snapshot_event(INJECTING), OverlayEvent::Injecting);
+        assert_eq!(snapshot_event(PAUSED), OverlayEvent::Paused);
         assert_eq!(
             snapshot_event(RECORDING),
             OverlayEvent::Recording { level: 0.0, elapsed_ms: 0 },
@@ -3690,7 +3730,7 @@ mod tests {
     #[test]
     fn toggle_target_maps_recording_to_ptt_stop_and_every_other_state_to_ptt_start() {
         assert_eq!(toggle_target(RECORDING), Request::PttStop);
-        for other in [WARMING, IDLE, TRANSCRIBING, NORMALIZING, INJECTING, FAILED] {
+        for other in [WARMING, IDLE, TRANSCRIBING, NORMALIZING, INJECTING, FAILED, PAUSED] {
             assert_eq!(toggle_target(other), Request::PttStart, "state {other} must toggle to PttStart");
         }
     }
@@ -3805,6 +3845,134 @@ mod tests {
             RECORDING,
             "a stale safety valve must not touch a session it does not own"
         );
+    }
+
+    // -- Task 13: Pause -----------------------------------------------------
+
+    /// The shortcut stays bound while paused -- it just opens no microphone.
+    /// `Toggle` from `IDLE` normally resolves to `PttStart`; while `PAUSED`
+    /// it must still resolve to `PttStart` (`toggle_target`'s "every other
+    /// state" case) and that `PttStart` must be refused by name, never fall
+    /// through to `start_recording`.
+    #[test]
+    fn toggle_is_refused_while_paused_and_opens_no_microphone() {
+        let d = fake_daemon_with_normalize(IDLE, false);
+        let paused = dispatch(&d, Request::SetPaused { paused: true });
+        assert!(paused.ok);
+        assert_eq!(paused.state, Some(State::Paused));
+        assert_eq!(d.state.load(Ordering::SeqCst), PAUSED);
+
+        let r = dispatch(&d, Request::Toggle);
+        assert!(!r.ok);
+        assert_eq!(r.err.as_deref(), Some("paused"));
+        assert_eq!(d.state.load(Ordering::SeqCst), PAUSED, "toggle must not change the daemon's state");
+    }
+
+    /// The same refusal, reached directly through `PttStart` rather than via
+    /// `Toggle`'s delegation -- `owf-ctl ptt-start` is a real, separate
+    /// client of this arm (the Hyprland keybind's press half under
+    /// press/press toggle uses `Toggle`, but nothing stops a hand-run
+    /// `ptt-start` from reaching it too).
+    #[test]
+    fn ptt_start_is_refused_while_paused_with_a_stated_reason() {
+        let d = fake_daemon(PAUSED);
+        let r = dispatch(&d, Request::PttStart);
+        assert!(!r.ok);
+        assert_eq!(r.err.as_deref(), Some("paused"));
+        assert_eq!(d.state.load(Ordering::SeqCst), PAUSED);
+    }
+
+    /// Invariant 1: pausing is not a way to lose an utterance already in
+    /// flight. The compare-and-exchange only ever fires from `IDLE`, so a
+    /// `SetPaused` reaching the daemon mid-utterance is silently dropped --
+    /// not queued, not retried -- rather than seizing whatever busy
+    /// sub-state it landed on.
+    #[test]
+    fn pausing_never_interrupts_an_utterance_already_in_flight() {
+        for busy in [TRANSCRIBING, NORMALIZING, INJECTING] {
+            let d = fake_daemon_with_normalize(busy, false);
+            let r = dispatch(&d, Request::SetPaused { paused: true });
+            assert!(r.ok, "SetPaused itself is not refused, it just does not take");
+            assert_eq!(
+                d.state.load(Ordering::SeqCst),
+                busy,
+                "pause must defer, never seize, busy state {busy}"
+            );
+        }
+    }
+
+    /// `RECORDING` gets the identical treatment, even though it is
+    /// deliberately outside `is_busy` (see that function's own tests): the
+    /// CAS only ever fires from `IDLE`, so a recording already underway is
+    /// just as protected as a busy sub-state, with no separate check needed.
+    #[test]
+    fn pausing_defers_rather_than_interrupts_a_recording_in_progress() {
+        let d = fake_daemon(RECORDING);
+        let r = dispatch(&d, Request::SetPaused { paused: true });
+        assert!(r.ok);
+        assert_eq!(d.state.load(Ordering::SeqCst), RECORDING, "pause must not stop an open microphone");
+    }
+
+    #[test]
+    fn unpausing_returns_to_idle() {
+        let d = fake_daemon_with_normalize(PAUSED, false);
+        let r = dispatch(&d, Request::SetPaused { paused: false });
+        assert!(r.ok);
+        assert_eq!(r.state, Some(State::Idle));
+        assert_eq!(d.state.load(Ordering::SeqCst), IDLE);
+    }
+
+    /// An unpause request against a daemon that was never paused is a no-op,
+    /// not an error -- there is nothing for the CAS to do, and `SetPaused`
+    /// always reports `ok` (mirroring `PttStop`'s "already idle" branch).
+    #[test]
+    fn unpausing_a_daemon_that_is_not_paused_is_a_harmless_no_op() {
+        let d = fake_daemon(IDLE);
+        let r = dispatch(&d, Request::SetPaused { paused: false });
+        assert!(r.ok);
+        assert_eq!(d.state.load(Ordering::SeqCst), IDLE);
+    }
+
+    /// The tray's icon/checkbox is driven entirely by broadcasts
+    /// (`tray.rs`'s "Icon and daemon state") -- a transition that changed
+    /// `daemon.state` but broadcast nothing would leave the tray showing
+    /// stale state forever. This is the one test in this file that reaches
+    /// past `dispatch`'s return value into the in-process sink to prove the
+    /// transition itself is actually observable.
+    #[test]
+    fn pausing_and_unpausing_each_broadcast_exactly_one_event_to_the_in_process_sink() {
+        let seen: Arc<Mutex<Vec<OverlayEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        struct RecordingSink(Arc<Mutex<Vec<OverlayEvent>>>);
+        impl EventSink for RecordingSink {
+            fn emit(&self, event: &OverlayEvent) {
+                self.0.lock().unwrap().push(event.clone());
+            }
+        }
+        let d = fake_daemon_with_sink(IDLE, Arc::new(RecordingSink(Arc::clone(&seen))));
+
+        dispatch(&d, Request::SetPaused { paused: true });
+        assert_eq!(seen.lock().unwrap().as_slice(), [OverlayEvent::Paused]);
+
+        dispatch(&d, Request::SetPaused { paused: false });
+        assert_eq!(seen.lock().unwrap().as_slice(), [OverlayEvent::Paused, OverlayEvent::Idle]);
+    }
+
+    /// A pause request that does not take (mid-utterance) must not broadcast
+    /// anything either -- there was no transition, so there is nothing for
+    /// the tray to learn about.
+    #[test]
+    fn a_pause_request_that_does_not_take_broadcasts_nothing() {
+        let seen: Arc<Mutex<Vec<OverlayEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        struct RecordingSink(Arc<Mutex<Vec<OverlayEvent>>>);
+        impl EventSink for RecordingSink {
+            fn emit(&self, event: &OverlayEvent) {
+                self.0.lock().unwrap().push(event.clone());
+            }
+        }
+        let d = fake_daemon_with_sink(TRANSCRIBING, Arc::new(RecordingSink(Arc::clone(&seen))));
+
+        dispatch(&d, Request::SetPaused { paused: true });
+        assert!(seen.lock().unwrap().is_empty());
     }
 
     // -- Task 10: Request::Quit / Request::ShowSettings (spec §8) ----------

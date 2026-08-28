@@ -61,3 +61,7 @@
 # folded into scenario 1's dictation.
 {"event":"normalize_degraded","reason":"llama-server is down or unhealthy"}
 {"event":"normalize_recovered"}
+
+# --- Scenario 5: the tray's "Diktat pausieren" is checked, then unchecked (Task 13) ---
+{"event":"paused"}
+{"event":"idle"}
