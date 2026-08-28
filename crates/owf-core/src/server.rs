@@ -1608,8 +1608,17 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
             Response::ok(state_of(daemon.state.load(Ordering::SeqCst)))
         }
         Request::Reload => {
-            if current != IDLE {
-                return Response::err("reload requires idle");
+            // Task 13 review: widened from `!= IDLE` to also accept `PAUSED`.
+            // `PAUSED` is reached only by a CAS from `IDLE` (`SetPaused`
+            // above), so there is never a recorder or pipeline mid-utterance
+            // to protect while paused -- exactly the same absence of risk
+            // `IDLE` itself already has. Before this widening, a user who
+            // paused dictation from the tray could not `owf-ctl reload` (or
+            // save a settings change, see `SetConfig` below) without
+            // unpausing first, for a state that is not busy in any sense
+            // this guard actually cares about.
+            if current != IDLE && current != PAUSED {
+                return Response::err("reload requires idle or paused");
             }
             // I5: this used to parse the config on disk, discard the result,
             // and report bare success -- a user who edited a guardrail
@@ -1675,10 +1684,16 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
         }
 
         Request::SetConfig { config } => {
-            // Same guard as `reload`: swapping the pipeline's config or
-            // dropping the recorder mid-utterance is not something to do.
-            if current != IDLE {
-                return Response::err("changing settings requires idle");
+            // Same guard as `reload`, widened the same way (Task 13 review):
+            // swapping the pipeline's config or dropping the recorder
+            // mid-utterance is not something to do, but `PAUSED` is not
+            // mid-utterance -- it is reached only by a CAS from `IDLE`, so
+            // there is no in-flight recorder or pipeline state here to
+            // protect. Without this, pausing dictation from the tray (one
+            // menu row above Einstellungen) silently broke every settings
+            // autosave until the user unpaused again.
+            if current != IDLE && current != PAUSED {
+                return Response::err("changing settings requires idle or paused");
             }
             let old = match Config::load_from(&daemon.config_path) {
                 Ok(c) => c,
@@ -2986,6 +3001,51 @@ mod tests {
         assert!(!r.ok);
         assert!(r.err.unwrap().contains("idle"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Task 13 review: `PAUSED` is reached only by a CAS from `IDLE`, so
+    /// there is never an in-flight recorder or pipeline state here to
+    /// protect -- the same absence of risk `IDLE` itself already has. Before
+    /// this widening, pausing dictation from the tray silently broke every
+    /// settings autosave (a toggle immediately, a text field 700 ms after
+    /// the last keystroke) until the user unpaused again, which is one menu
+    /// row away from the pause checkbox itself.
+    #[test]
+    fn set_config_is_accepted_while_paused_since_pausing_only_ever_starts_from_idle() {
+        let path = scratch_config("set-paused");
+        let daemon = fake_daemon_at(PAUSED, false, path.clone());
+
+        let r = dispatch(
+            &daemon,
+            Request::SetConfig { config: serde_json::json!({"asr": {"num_threads": 8}}) },
+        );
+
+        assert!(r.ok, "{:?}", r.err);
+        assert_eq!(Config::load_from(&path).unwrap().asr.num_threads, 8);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Pinned separately from `set_config_is_refused_while_the_daemon_is_busy`
+    /// (which uses `RECORDING`) so the widening above stays exactly
+    /// `IDLE`/`PAUSED` and does not silently creep to cover a real `is_busy`
+    /// sub-state too -- swapping the pipeline's config while an utterance is
+    /// actually being transcribed is exactly the case this guard exists to
+    /// prevent.
+    #[test]
+    fn set_config_is_still_refused_while_transcribing_after_widening_the_guard_for_paused() {
+        let path = scratch_config("set-transcribing");
+        let before = std::fs::read_to_string(&path).unwrap();
+        let daemon = fake_daemon_at(TRANSCRIBING, false, path.clone());
+
+        let r = dispatch(
+            &daemon,
+            Request::SetConfig { config: serde_json::json!({"asr": {"num_threads": 8}}) },
+        );
+
+        assert!(!r.ok);
+        assert!(r.err.unwrap().contains("idle"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "the file was modified");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
