@@ -20,6 +20,10 @@ use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// Moved here from `inject.rs` alongside [`notify_send`]: how long a hung
+/// `notify-send` (a stuck or absent notification daemon) is given before
+/// this module kills it.
+const NOTIFY_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Runs `command` to completion, or kills it after `timeout`.
 ///
@@ -73,6 +77,24 @@ fn wait_with_timeout(mut child: Child, timeout: Duration) -> io::Result<Output> 
         }
         std::thread::sleep(POLL_INTERVAL);
     }
+}
+
+/// Fires a desktop notification via the `notify-send` subprocess.
+///
+/// A courtesy, not part of the contract: a missing or failing `notify-send`
+/// (no notification daemon running, binary not installed, etc.) must never
+/// surface as an error, so any failure — spawn or exit status — is silently
+/// discarded.
+///
+/// The one place in this workspace that actually spawns `notify-send`:
+/// `inject.rs`'s clipboard-fallback notice and `client.rs`'s client-failure
+/// notice both call through here rather than each owning its own
+/// invocation, so a future change to the timeout, icon or urgency only has
+/// one call site to make it in.
+pub fn notify_send(summary: &str, body: &str) {
+    let mut cmd = Command::new("notify-send");
+    cmd.arg(summary).arg(body);
+    let _ = run_with_timeout(cmd, NOTIFY_TIMEOUT, None);
 }
 
 #[cfg(test)]

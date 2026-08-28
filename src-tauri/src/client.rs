@@ -52,9 +52,7 @@ pub fn dispatch(route: Route) -> Result<bool> {
 /// and stderr goes nowhere anyone will read.
 pub fn notify_failure(e: &anyhow::Error) {
     let body = format!("{e:#}");
-    let mut cmd = std::process::Command::new("notify-send");
-    cmd.arg("OpenWhisprFlow").arg(&body);
-    let _ = owf_core::procutil::run_with_timeout(cmd, std::time::Duration::from_secs(3), None);
+    owf_core::procutil::notify_send("OpenWhisprFlow", &body);
 }
 
 #[cfg(test)]

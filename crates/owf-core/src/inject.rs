@@ -14,7 +14,6 @@ use crate::procutil;
 /// inside this bound at the default 2 ms/keystroke delay.
 const WTYPE_TIMEOUT: Duration = Duration::from_secs(15);
 const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(5);
-const NOTIFY_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, thiserror::Error)]
 pub enum InjectError {
@@ -162,18 +161,6 @@ pub fn build(cfg: &InjectConfig) -> Box<dyn TextInjector> {
     }
 }
 
-/// Fires a desktop notification via the `notify-send` subprocess.
-///
-/// A courtesy, not part of the contract: a missing or failing `notify-send`
-/// (no notification daemon running, binary not installed, etc.) must never
-/// surface as an error, so any failure — spawn or exit status — is silently
-/// discarded.
-fn notify_send(summary: &str, body: &str) {
-    let mut cmd = Command::new("notify-send");
-    cmd.arg(summary).arg(body);
-    let _ = procutil::run_with_timeout(cmd, NOTIFY_TIMEOUT, None);
-}
-
 /// Appends one timestamped line to `<state_dir>/unsent.txt`.
 ///
 /// This is the last resort when both the primary injector and the clipboard
@@ -236,7 +223,7 @@ pub(crate) fn inject_with_recovery(
             tracing::warn!(error = %primary_err, "primary injector failed; falling back to clipboard");
             match fallback.inject(text) {
                 Ok(()) => {
-                    notify_send(
+                    procutil::notify_send(
                         "OpenWhisprFlow",
                         "Typing failed — transcript copied to clipboard",
                     );
