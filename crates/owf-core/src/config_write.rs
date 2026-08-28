@@ -211,7 +211,7 @@ mod tests {
 
 [audio]
 device = "default"
-max_seconds = 120   # hold-to-talk cap
+max_seconds = 120   # Sicherheitsnetz: beendet eine vergessene Aufnahme
 
 # Cleanup runs on S1-mini.
 [normalize]
@@ -230,7 +230,7 @@ port = 8730
     fn changing_a_value_keeps_the_trailing_comment_on_its_own_line() {
         let out = merge_json_into_toml(ANNOTATED, &json!({"audio": {"max_seconds": 60}})).unwrap();
         assert!(
-            out.contains("max_seconds = 60   # hold-to-talk cap"),
+            out.contains("max_seconds = 60   # Sicherheitsnetz: beendet eine vergessene Aufnahme"),
             "trailing comment lost:\n{out}"
         );
     }

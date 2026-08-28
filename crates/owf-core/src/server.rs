@@ -1652,7 +1652,29 @@ fn start_recording(daemon: &Arc<Daemon>) -> Response {
     // (`should_emit_level`'s `last_emitted` starts `None`), so the bars still
     // appear at the earliest honest moment: when capture is actually live.
 
-    // Safety valve: a stuck key must not leave the microphone hot (spec 6.1).
+    // Safety valve: under hold-to-talk this only ever caught a stuck key
+    // (spec 6.1). Under press/press toggle it is the *sole* terminator of a
+    // recording whose second press never comes -- nothing else will ever
+    // close that microphone -- so it must transcribe what it captured
+    // (invariant 1), not discard it. See `spawn_safety_valve`'s own doc.
+    spawn_safety_valve(daemon, epoch);
+
+    Response::ok(State::Recording)
+}
+
+/// The body of `start_recording`'s safety-valve timer, extracted to a named
+/// function so it can be driven directly in tests -- see the "safety valve"
+/// tests below -- without going through `start_recording`, which would
+/// require a real `Recorder` (`ensure_recorder` calls `Recorder::new`, which
+/// needs live audio hardware). Moved here unchanged: same sleep, same epoch
+/// check, same `claim_busy`/`run_utterance` call: no behaviour change.
+///
+/// `run_utterance` with `daemon.recorder` still `None` -- exactly the case
+/// for every fake daemon in this module's tests -- takes its early `None`
+/// arm and returns without calling any `Recorder` method, the same property
+/// `toggle_stops_and_begins_transcribing_when_recording` already relies on
+/// for `PttStop`'s identical `std::thread::spawn(move || run_utterance(d))`.
+fn spawn_safety_valve(daemon: &Arc<Daemon>, epoch: u64) {
     let d = Arc::clone(daemon);
     let limit = Duration::from_secs(lock_ignoring_poison(&d.audio_cfg).max_seconds as u64);
     std::thread::spawn(move || {
@@ -1665,8 +1687,6 @@ fn start_recording(daemon: &Arc<Daemon>) -> Response {
             run_utterance(d);
         }
     });
-
-    Response::ok(State::Recording)
 }
 
 /// RAII guard that returns the daemon to `IDLE` when `run_utterance` ends,
@@ -3437,5 +3457,63 @@ mod tests {
         assert!(!r.ok);
         assert!(r.err.is_some());
         assert_eq!(failed.state.load(Ordering::SeqCst), FAILED, "and must not change the daemon's state");
+    }
+
+    /// Hold-to-talk had a physical guarantee that recording ends: you let
+    /// go. Toggle has none. This watchdog is now the only thing that closes
+    /// a microphone whose second press never came, and it must *transcribe*
+    /// what it captured rather than discard it (invariant 1).
+    ///
+    /// Driven directly against `spawn_safety_valve`, never through
+    /// `dispatch(&d, Request::Toggle)`/`start_recording`: reaching the valve
+    /// that way would call `ensure_recorder` -> `Recorder::new`, which opens
+    /// a real microphone -- forbidden in this suite. `fake_daemon`'s
+    /// `recorder` slot is `None`, so the `run_utterance` this test exercises
+    /// takes the same hardware-free `None` arm that
+    /// `toggle_stops_and_begins_transcribing_when_recording` already relies
+    /// on for `PttStop`'s identical spawned call.
+    #[test]
+    fn a_recording_with_no_second_press_is_ended_and_transcribed_by_the_safety_valve() {
+        let d = fake_daemon(RECORDING);
+        // The valve reads `audio_cfg`, so shorten it rather than sleeping
+        // out a real 120 s default.
+        lock_ignoring_poison(&d.audio_cfg).max_seconds = 1;
+        let epoch = d.recording_epoch.load(Ordering::SeqCst);
+
+        spawn_safety_valve(&d, epoch);
+        std::thread::sleep(Duration::from_millis(1_500));
+
+        assert_ne!(
+            d.state.load(Ordering::SeqCst),
+            RECORDING,
+            "the microphone is still open after max_seconds"
+        );
+    }
+
+    /// Concurrency note 3, pinned: a safety valve spawned for one recording
+    /// session must not act on a later one. Under hold-to-talk this was a
+    /// narrow race (a stuck-key timer outliving a key that was, in fact,
+    /// released promptly next time); under toggle a forgotten press means
+    /// valve firings and real second presses interleave far more often, so
+    /// this matters more than it used to.
+    #[test]
+    fn a_stale_safety_valve_from_an_earlier_session_does_not_stop_a_later_one() {
+        let d = fake_daemon(RECORDING);
+        lock_ignoring_poison(&d.audio_cfg).max_seconds = 1;
+        let stale_epoch = d.recording_epoch.load(Ordering::SeqCst);
+
+        spawn_safety_valve(&d, stale_epoch);
+        // A later session (a real second press ending this recording and a
+        // fresh one beginning, or simply `start_recording` running again)
+        // bumps the epoch before the stale timer above fires.
+        d.recording_epoch.fetch_add(1, Ordering::SeqCst);
+
+        std::thread::sleep(Duration::from_millis(1_500));
+
+        assert_eq!(
+            d.state.load(Ordering::SeqCst),
+            RECORDING,
+            "a stale safety valve must not touch a session it does not own"
+        );
     }
 }
