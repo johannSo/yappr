@@ -299,6 +299,13 @@ export default function Overlay() {
       }
     });
 
+    // Replays the daemon's current state once this listener is actually
+    // registered -- closes the race where nothing shows during warm-up
+    // (nothing ever broadcasts "warming"; the daemon only stores it) or a
+    // warm-up failure broadcast outruns this listener. A no-op in --replay
+    // mode, where no daemon is managed at all.
+    unlistenPromise.then(() => invoke("overlay_ready").catch(() => {}));
+
     return () => {
       unlistenPromise.then((unlisten) => unlisten());
       clearHideTimer();

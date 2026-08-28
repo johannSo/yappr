@@ -117,6 +117,32 @@ fn snapshot_event(v: u8) -> OverlayEvent {
     }
 }
 
+/// The events a subscriber -- socket or in-process -- must see immediately
+/// upon attaching: `snapshot_event` for `state_now`, replaced by the real
+/// stored fatal reason when `state_now == FAILED` (`fatal_error`), plus a
+/// `NormalizeDegraded` replay when `degraded`. Pure and side-effect-free so
+/// `serve_subscriber` (which must compute `state_now`/`degraded` inside its
+/// own subscriber-registration critical section -- see that function's doc
+/// comment for the connect-time race that guards against) and
+/// `Daemon::connect_snapshot` (the in-process sink has no registration step
+/// to race: see that method's doc comment) can share the exact same mapping
+/// from "state right now" to "events to send" without hand-copying it.
+fn connect_events(state_now: u8, degraded: bool, fatal_error: Option<String>) -> Vec<OverlayEvent> {
+    let mut snapshot = snapshot_event(state_now);
+    if state_now == FAILED {
+        if let Some(reason) = fatal_error {
+            snapshot = OverlayEvent::Error { reason };
+        }
+    }
+    let mut events = vec![snapshot];
+    if degraded {
+        events.push(OverlayEvent::NormalizeDegraded {
+            reason: "llama-server is down or unhealthy".to_string(),
+        });
+    }
+    events
+}
+
 /// Spec 7.1's RMS cadence: `Recording` events are emitted at roughly this
 /// interval, not on every `cpal` audio callback (~10 ms at 48 kHz, ~100/s --
 /// far more than the overlay needs or a Unix-socket fan-out should carry).
@@ -296,22 +322,79 @@ fn reap_dead_subscribers(subscribers: &Mutex<Vec<Subscriber>>) {
 /// write error and exited -- see `serve_subscriber`).
 ///
 /// A free function taking `&Mutex<Vec<...>>` rather than a `&Daemon` method
-/// so `IdleOnExit` (which only ever has the two fields it actually touches,
-/// not a whole `Daemon`) and this module's tests can use it without
+/// so this module's low-level subscriber-list tests can use it without
 /// constructing a full `Daemon` -- which would need a real `Recorder`, and
-/// thus live audio hardware, just to exist.
+/// thus live audio hardware, just to exist. Every *production* broadcast
+/// goes through [`Broadcaster::broadcast`] instead, which calls this and
+/// then the in-process sink: calling this directly from production code,
+/// the way `IdleOnExit`/`process_utterance`/`supervise_llama_once` used to,
+/// is exactly the bug a code review caught after Task 6 first added the
+/// sink -- `Done`, both `Error` variants, the panic-recovery `Idle`, and
+/// `NormalizeDegraded`/`NormalizeRecovered` all reached socket subscribers
+/// but never the app's overlay, because none of those call sites went
+/// through `Daemon::broadcast` at all.
 fn broadcast_to(subscribers: &Mutex<Vec<Subscriber>>, event: OverlayEvent) {
     let mut subs = lock_ignoring_poison(subscribers);
     subs.retain(|s| s.tx.send(event.clone()).is_ok());
 }
 
+/// The two consumers every broadcast must reach, bundled together so a
+/// function that emits an `OverlayEvent` cannot reach the socket-subscriber
+/// half without the in-process sink half, or vice versa -- see
+/// `broadcast_to`'s doc comment for the incident this exists to prevent.
+/// Cheap to construct (one `Arc` clone) and to pass around by value.
+#[derive(Clone)]
+struct Broadcaster<'a> {
+    subscribers: &'a Mutex<Vec<Subscriber>>,
+    sink: Arc<dyn EventSink>,
+}
+
+impl Broadcaster<'_> {
+    fn broadcast(&self, event: OverlayEvent) {
+        broadcast_to(self.subscribers, event.clone());
+        self.sink.emit(&event);
+    }
+}
+
 impl Daemon {
     fn broadcast(&self, event: OverlayEvent) {
-        broadcast_to(&self.subscribers, event.clone());
-        // The in-process consumer: unlike socket subscribers, always exactly
-        // one, and never absent, so this must run unconditionally rather
-        // than being folded into `broadcast_to`'s empty-list fast path.
-        self.sink.emit(&event);
+        self.broadcaster().broadcast(event);
+    }
+
+    /// Borrows the two fields `Broadcaster` bundles. Built fresh on every
+    /// call rather than cached on `Daemon` -- it only ever needs to live as
+    /// long as the caller's own use of it, e.g. for the lifetime of one
+    /// `IdleOnExit` guard.
+    fn broadcaster(&self) -> Broadcaster<'_> {
+        Broadcaster { subscribers: &self.subscribers, sink: Arc::clone(&self.sink) }
+    }
+
+    /// The events an in-process consumer must see right now, as though it
+    /// had just connected -- mirrors what `serve_subscriber` sends a
+    /// freshly connected socket subscriber, via the same [`connect_events`].
+    ///
+    /// Unlike `serve_subscriber`, this needs no critical section: a socket
+    /// subscriber's snapshot must be read atomically with *registering* it
+    /// into `daemon.subscribers` (otherwise a broadcast landing in the gap
+    /// could be missed forever -- see `serve_subscriber`'s doc comment), but
+    /// the in-process sink has no equivalent registration step. It already
+    /// receives every future broadcast unconditionally, from `Daemon`
+    /// construction onward (`Daemon::sink`), so there is nothing to race:
+    /// the caller either sees this snapshot reflect a given transition, or
+    /// receives that transition as a live event moments later, never both
+    /// and never neither.
+    ///
+    /// This is what the app's `overlay_ready` Tauri command calls once the
+    /// webview has registered its own event listener (`src/Overlay.tsx`),
+    /// closing the gap where nothing ever *broadcasts* `Warming` (`start`
+    /// only stores it) and a warm-up failure broadcast from a background
+    /// thread could otherwise outrun that listener's registration.
+    pub fn connect_snapshot(&self) -> Vec<OverlayEvent> {
+        let state_now = self.state.load(Ordering::SeqCst);
+        let degraded = self.normalize_enabled && !self.normalize_available.load(Ordering::SeqCst);
+        let fatal_error =
+            if state_now == FAILED { lock_ignoring_poison(&self.fatal_error).clone() } else { None };
+        connect_events(state_now, degraded, fatal_error)
     }
 }
 
@@ -444,22 +527,17 @@ pub fn start(sink: Arc<dyn EventSink>) -> Result<(Arc<Daemon>, UnixListener)> {
 
     // I7: a capture device that isn't there yet at startup (a USB mic not
     // enumerated in time under Hyprland's `exec-once`) must not take the
-    // whole daemon down with it -- it used to, via this same `?` propagating
-    // out of `main`, which meant the daemon never even bound its socket.
-    // Attempted eagerly here so a startup failure is visible in the logs
-    // immediately, but `ensure_recorder` retries construction on the next
-    // `ptt-start` regardless of whether this attempt succeeded.
-    let recorder = match Recorder::new(&cfg.audio) {
-        Ok(r) => Some(r),
-        Err(e) => {
-            tracing::error!(
-                error = ?e,
-                "no capture device at startup; will retry on the next ptt-start"
-            );
-            None
-        }
-    };
-
+    // whole daemon down with it -- see `warm_up`'s doc comment, where this
+    // attempt now actually happens. `recorder` starts `None` here
+    // unconditionally: `Recorder::new` can block for a long time (cpal
+    // enumerating devices and probing throwaway streams with no timeout --
+    // see CLAUDE.md's cpal gotcha), and this function runs on the caller's
+    // own thread, which for the Tauri app is the `setup()`/event-loop
+    // thread -- a wedge here would mean no window, no tray, and no way to
+    // quit. `ensure_recorder` retries construction lazily on the next
+    // `ptt-start` regardless of whether warm-up's own attempt succeeded, so
+    // nothing is lost by deferring it but the timing of one log line.
+    //
     // Cloned before `cfg` is moved into the warm-up thread's closure below;
     // `None` when `[normalize].enabled = false` (R9), which is also exactly
     // when `spawn_housekeeping`'s llama-supervision half must stay inert.
@@ -467,7 +545,7 @@ pub fn start(sink: Arc<dyn EventSink>) -> Result<(Arc<Daemon>, UnixListener)> {
 
     let daemon = Arc::new(Daemon {
         state: AtomicU8::new(WARMING),
-        recorder: Mutex::new(recorder),
+        recorder: Mutex::new(None),
         audio_cfg: Mutex::new(cfg.audio.clone()),
         pipeline: Mutex::new(None),
         llama: Mutex::new(None),
@@ -637,7 +715,29 @@ fn try_lock_exclusive(f: &std::fs::File) -> bool {
 /// inject raw + rule pass"). Only spawning the ASR/VAD models can still fail
 /// this function: there is no raw-fallback path for a missing ASR the way
 /// there is for a missing normalizer, so failing loudly there is correct.
+///
+/// I7: also makes the first, eager attempt at constructing `daemon.recorder`
+/// here, off whatever thread called `start` -- this used to happen inside
+/// `start` itself, which is harmless for the standalone daemon (its own
+/// thread has nothing else to do) but not for the app, where `start` runs
+/// on the Tauri `setup()`/event-loop thread: `Recorder::new` can block for a
+/// long time (cpal enumerating devices and probing throwaway streams with
+/// no timeout -- see CLAUDE.md's cpal gotcha), and a wedge there means no
+/// window, no tray, and no way to quit. Purely a diagnostic convenience
+/// either way: `ensure_recorder` already retries lazily on the next
+/// `ptt-start` regardless of whether this attempt succeeds, so nothing is
+/// lost by deferring it here but the timing of one log line.
 fn warm_up(cfg: Config, daemon: &Arc<Daemon>) -> Result<(Pipeline, Option<LlamaServer>)> {
+    match Recorder::new(&cfg.audio) {
+        Ok(r) => *lock_ignoring_poison(&daemon.recorder) = Some(r),
+        Err(e) => {
+            tracing::error!(
+                error = ?e,
+                "no capture device at startup; will retry on the next ptt-start"
+            );
+        }
+    }
+
     let models = paths::models_dir();
 
     let (server, base_url) = if cfg.normalize.enabled {
@@ -881,7 +981,7 @@ fn supervise_llama_once(
     llama: &Mutex<Option<LlamaServer>>,
     pipeline: &Mutex<Option<Pipeline>>,
     normalize_available: &AtomicBool,
-    subscribers: &Mutex<Vec<Subscriber>>,
+    broadcaster: Broadcaster<'_>,
     last_known_available: bool,
     normalize_timeout_ms: u64,
     respawn: &mut dyn FnMut() -> Result<LlamaServer>,
@@ -918,12 +1018,11 @@ fn supervise_llama_once(
 
     normalize_available.store(healthy_now, Ordering::SeqCst);
     if healthy_now && !last_known_available {
-        broadcast_to(subscribers, OverlayEvent::NormalizeRecovered);
+        broadcaster.broadcast(OverlayEvent::NormalizeRecovered);
     } else if !healthy_now && last_known_available {
-        broadcast_to(
-            subscribers,
-            OverlayEvent::NormalizeDegraded { reason: "llama-server is down or unhealthy".to_string() },
-        );
+        broadcaster.broadcast(OverlayEvent::NormalizeDegraded {
+            reason: "llama-server is down or unhealthy".to_string(),
+        });
     }
     healthy_now
 }
@@ -991,7 +1090,7 @@ fn spawn_housekeeping(
                 &daemon.llama,
                 &daemon.pipeline,
                 &daemon.normalize_available,
-                &daemon.subscribers,
+                daemon.broadcaster(),
                 last_known_available,
                 cfg.timeout_ms,
                 &mut respawn,
@@ -1121,20 +1220,10 @@ fn serve_subscriber(daemon: Arc<Daemon>, stream: UnixStream) {
         )
     };
 
-    let mut snapshot = snapshot_event(state_now);
-    if state_now == FAILED {
-        if let Some(reason) = lock_ignoring_poison(&daemon.fatal_error).clone() {
-            snapshot = OverlayEvent::Error { reason };
-        }
-    }
-    if write_event(&mut w, &snapshot).is_err() {
-        return;
-    }
-    if degraded {
-        let badge = OverlayEvent::NormalizeDegraded {
-            reason: "llama-server is down or unhealthy".to_string(),
-        };
-        if write_event(&mut w, &badge).is_err() {
+    let fatal_error =
+        if state_now == FAILED { lock_ignoring_poison(&daemon.fatal_error).clone() } else { None };
+    for event in connect_events(state_now, degraded, fatal_error) {
+        if write_event(&mut w, &event).is_err() {
             return;
         }
     }
@@ -1589,13 +1678,13 @@ fn start_recording(daemon: &Arc<Daemon>) -> Response {
 /// other legitimate writer for this guard to race or clobber.
 struct IdleOnExit<'a> {
     state: &'a AtomicU8,
-    subscribers: &'a Mutex<Vec<Subscriber>>,
+    broadcaster: Broadcaster<'a>,
     terminal_sent: Cell<bool>,
 }
 
 impl<'a> IdleOnExit<'a> {
-    fn new(state: &'a AtomicU8, subscribers: &'a Mutex<Vec<Subscriber>>) -> Self {
-        Self { state, subscribers, terminal_sent: Cell::new(false) }
+    fn new(state: &'a AtomicU8, broadcaster: Broadcaster<'a>) -> Self {
+        Self { state, broadcaster, terminal_sent: Cell::new(false) }
     }
 }
 
@@ -1603,13 +1692,13 @@ impl Drop for IdleOnExit<'_> {
     fn drop(&mut self) {
         self.state.store(IDLE, Ordering::SeqCst);
         if !self.terminal_sent.get() {
-            broadcast_to(self.subscribers, OverlayEvent::Idle);
+            self.broadcaster.broadcast(OverlayEvent::Idle);
         }
     }
 }
 
 fn run_utterance(daemon: Arc<Daemon>) {
-    let idle_on_exit = IdleOnExit::new(&daemon.state, &daemon.subscribers);
+    let idle_on_exit = IdleOnExit::new(&daemon.state, daemon.broadcaster());
 
     let stop_result = match lock_ignoring_poison(&daemon.recorder).as_ref() {
         Some(r) => r.stop(),
@@ -1634,7 +1723,7 @@ fn run_utterance(daemon: Arc<Daemon>) {
     let class = lock_ignoring_poison(&daemon.window_class).clone();
     process_utterance(
         &daemon.pipeline,
-        &daemon.subscribers,
+        daemon.broadcaster(),
         &daemon.last_timings,
         &stop.samples,
         class.as_deref(),
@@ -1657,15 +1746,16 @@ fn preview_of(text: &str) -> String {
 }
 
 /// Runs one utterance's already-captured samples through the pipeline, and
-/// broadcasts the outcome (`Done`/`Error`) to every subscriber.
+/// broadcasts the outcome (`Done`/`Error`) to every subscriber and the
+/// in-process sink alike, via `broadcaster`.
 ///
 /// Split out from `run_utterance` so it is testable without a real
 /// `Recorder` (which needs live audio hardware to construct -- see
 /// `capture::Recorder::new`): a test can drive this directly with a scratch
 /// `Mutex<Option<Pipeline>>` and a panicking fake stage to prove
-/// `IdleOnExit` recovers `state` even when this function unwinds. `subscribers`
-/// is likewise a bare `&Mutex<Vec<...>>` rather than `&Daemon`, for the same
-/// reason `IdleOnExit` takes one directly instead of a whole `Daemon`.
+/// `IdleOnExit` recovers `state` even when this function unwinds.
+/// `broadcaster` is likewise built from bare parts rather than a whole
+/// `&Daemon`, for the same reason `IdleOnExit` takes one directly.
 ///
 /// `last_timings` is likewise a bare `&Mutex<Option<Timings>>` -- it is
 /// updated here, from the produced `Outcome`, whenever there is one to take
@@ -1673,7 +1763,7 @@ fn preview_of(text: &str) -> String {
 /// no-speech/error utterance leaves it untouched instead of clearing it).
 fn process_utterance(
     pipeline: &Mutex<Option<Pipeline>>,
-    subscribers: &Mutex<Vec<Subscriber>>,
+    broadcaster: Broadcaster<'_>,
     last_timings: &Mutex<Option<Timings>>,
     samples: &[f32],
     window_class: Option<&str>,
@@ -1694,18 +1784,15 @@ fn process_utterance(
             Ok(Some(out)) => {
                 tracing::info!(chars = out.text.len(), "injected");
                 *lock_ignoring_poison(last_timings) = Some(out.timings);
-                broadcast_to(subscribers, OverlayEvent::Done { preview: preview_of(&out.text) });
+                broadcaster.broadcast(OverlayEvent::Done { preview: preview_of(&out.text) });
             }
             Ok(None) => {
                 tracing::info!("nothing to inject");
-                broadcast_to(
-                    subscribers,
-                    OverlayEvent::Error { reason: "no speech detected".to_string() },
-                );
+                broadcaster.broadcast(OverlayEvent::Error { reason: "no speech detected".to_string() });
             }
             Err(e) => {
                 tracing::error!(error = ?e, "pipeline failed");
-                broadcast_to(subscribers, OverlayEvent::Error { reason: e.to_string() });
+                broadcaster.broadcast(OverlayEvent::Error { reason: e.to_string() });
             }
         }
     } else {
@@ -1714,7 +1801,7 @@ fn process_utterance(
         // populated `pipeline`. Logged rather than unwrapped so a future
         // change to that invariant fails loudly instead of panicking.
         tracing::warn!("utterance finished but the pipeline was not ready");
-        broadcast_to(subscribers, OverlayEvent::Error { reason: "pipeline not ready".to_string() });
+        broadcaster.broadcast(OverlayEvent::Error { reason: "pipeline not ready".to_string() });
     }
 }
 
@@ -1795,8 +1882,9 @@ mod tests {
         let last_timings: Mutex<Option<Timings>> = Mutex::new(None);
 
         let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            let _idle_on_exit = IdleOnExit::new(&state, &subscribers);
-            process_utterance(&pipeline, &subscribers, &last_timings, &samples, None, None);
+            let broadcaster = dropping_broadcaster(&subscribers);
+            let _idle_on_exit = IdleOnExit::new(&state, broadcaster.clone());
+            process_utterance(&pipeline, broadcaster, &last_timings, &samples, None, None);
         }));
 
         assert!(result.is_err(), "the transcriber's panic should have propagated");
@@ -1843,8 +1931,9 @@ mod tests {
         let last_timings: Mutex<Option<Timings>> = Mutex::new(None);
 
         {
-            let idle_on_exit = IdleOnExit::new(&state, &subscribers);
-            process_utterance(&pipeline, &subscribers, &last_timings, &samples, None, None);
+            let broadcaster = dropping_broadcaster(&subscribers);
+            let idle_on_exit = IdleOnExit::new(&state, broadcaster.clone());
+            process_utterance(&pipeline, broadcaster, &last_timings, &samples, None, None);
             idle_on_exit.terminal_sent.set(true);
         }
 
@@ -1895,8 +1984,9 @@ mod tests {
         let last_timings: Mutex<Option<Timings>> = Mutex::new(None);
 
         {
-            let idle_on_exit = IdleOnExit::new(&state, &subscribers);
-            process_utterance(&pipeline, &subscribers, &last_timings, &samples, None, None);
+            let broadcaster = dropping_broadcaster(&subscribers);
+            let idle_on_exit = IdleOnExit::new(&state, broadcaster.clone());
+            process_utterance(&pipeline, broadcaster, &last_timings, &samples, None, None);
             idle_on_exit.terminal_sent.set(true);
         }
 
@@ -1941,11 +2031,53 @@ mod tests {
         let last_timings: Mutex<Option<Timings>> = Mutex::new(None);
         let samples = vec![0.1f32; 16_000];
 
-        process_utterance(&pipeline, &subscribers, &last_timings, &samples, None, None);
+        process_utterance(&pipeline, dropping_broadcaster(&subscribers), &last_timings, &samples, None, None);
 
         assert!(
             last_timings.lock().unwrap().is_some(),
             "a successful utterance must record its per-stage timings"
+        );
+    }
+
+    /// The regression this whole task exists to prevent: before `Broadcaster`
+    /// existed, `process_utterance` called `broadcast_to` directly, so its
+    /// `Done`/`Error` terminal events reached socket subscribers but never
+    /// the app's in-process sink -- every existing test here asserted only
+    /// on a socket subscriber (an `mpsc::Receiver`), so the gap was invisible
+    /// to the whole suite even after `Daemon::broadcast` itself was fixed to
+    /// reach both. This drives `process_utterance` with *no* socket
+    /// subscriber registered at all, so the only way this can pass is if the
+    /// `Done` it produces reaches the sink through `Broadcaster`.
+    #[test]
+    fn a_successful_utterance_reaches_the_in_process_sink_via_process_utterance() {
+        #[derive(Default)]
+        struct Recorder(Mutex<Vec<OverlayEvent>>);
+        impl EventSink for Recorder {
+            fn emit(&self, e: &OverlayEvent) {
+                self.0.lock().unwrap().push(e.clone());
+            }
+        }
+
+        let pipeline = Mutex::new(Some(Pipeline::new(
+            Config::from_str("[normalize]\nenabled = false\n").unwrap(),
+            Box::new(FixedAsr("hello there")),
+            Box::new(WholeBuffer),
+            Box::new(AlwaysEnglish),
+            Box::new(NeverNormalizer),
+            Box::new(MockInjector::default()),
+        )));
+        let subscribers: Mutex<Vec<Subscriber>> = Mutex::new(Vec::new());
+        let sink = Arc::new(Recorder::default());
+        let broadcaster = broadcaster_with(&subscribers, sink.clone());
+        let last_timings: Mutex<Option<Timings>> = Mutex::new(None);
+        let samples = vec![0.1f32; 16_000];
+
+        process_utterance(&pipeline, broadcaster, &last_timings, &samples, None, None);
+
+        let events = sink.0.lock().unwrap();
+        assert!(
+            matches!(events.as_slice(), [OverlayEvent::Done { .. }]),
+            "expected exactly one Done event in the in-process sink, got {events:?}"
         );
     }
 
@@ -2316,6 +2448,25 @@ mod tests {
     struct DropSink;
     impl EventSink for DropSink {
         fn emit(&self, _: &OverlayEvent) {}
+    }
+
+    /// Builds a `Broadcaster` over a bare `subscribers` list for the tests
+    /// that drive `IdleOnExit`/`process_utterance`/`supervise_llama_once`
+    /// directly, without a full `Daemon`, the same way those functions
+    /// already took a bare `&Mutex<Vec<Subscriber>>` before `Broadcaster`
+    /// existed.
+    fn broadcaster_with(subscribers: &Mutex<Vec<Subscriber>>, sink: Arc<dyn EventSink>) -> Broadcaster<'_> {
+        Broadcaster { subscribers, sink }
+    }
+
+    /// The `Broadcaster` most such tests want: they assert on the socket
+    /// subscriber (a plain `mpsc::Receiver`), and care nothing about the
+    /// in-process sink -- that half is proven by
+    /// `broadcast_reaches_the_in_process_sink_even_with_no_socket_subscribers`
+    /// and `a_successful_utterance_reaches_the_in_process_sink_via_process_utterance`
+    /// below.
+    fn dropping_broadcaster(subscribers: &Mutex<Vec<Subscriber>>) -> Broadcaster<'_> {
+        broadcaster_with(subscribers, Arc::new(DropSink))
     }
 
     /// A `File` for `Daemon::_runtime_lock` in tests. No fake daemon here
@@ -2724,6 +2875,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `connect_snapshot` is the in-process mirror of what `serve_subscriber`
+    /// sends a freshly connected socket subscriber (proven over a real
+    /// socket by the two `a_late_subscriber_*` tests above) -- this proves
+    /// the two agree directly, via the public entry point the app's
+    /// `overlay_ready` Tauri command actually calls, covering both the
+    /// degraded badge and the stored fatal-failure reason.
+    #[test]
+    fn connect_snapshot_mirrors_what_a_freshly_connected_subscriber_would_see() {
+        // Same precondition `a_late_subscriber_sees_the_degraded_badge_replayed_on_connect`
+        // relies on: `normalize_available` defaults to `false`.
+        let daemon = fake_daemon_with_normalize(IDLE, true);
+        assert_eq!(
+            daemon.connect_snapshot(),
+            vec![
+                OverlayEvent::Idle,
+                OverlayEvent::NormalizeDegraded { reason: "llama-server is down or unhealthy".to_string() },
+            ]
+        );
+
+        let failed = fake_daemon(FAILED);
+        *lock_ignoring_poison(&failed.fatal_error) = Some("no ggml compute backend".to_string());
+        assert_eq!(
+            failed.connect_snapshot(),
+            vec![OverlayEvent::Error { reason: "no ggml compute backend".to_string() }]
+        );
+    }
+
     /// Work Item 3's connect-time race: registering the subscriber and
     /// reading the snapshot happen inside one critical section on
     /// `daemon.subscribers`'s lock, the same lock `broadcast_to` takes
@@ -2998,7 +3176,7 @@ mod tests {
             &llama,
             &pipeline,
             &normalize_available,
-            &subscribers,
+            dropping_broadcaster(&subscribers),
             true,
             6000,
             &mut respawn,
@@ -3042,7 +3220,7 @@ mod tests {
             &llama,
             &pipeline,
             &normalize_available,
-            &subscribers,
+            dropping_broadcaster(&subscribers),
             false,
             6000,
             &mut respawn,
@@ -3080,7 +3258,7 @@ mod tests {
             &llama,
             &pipeline,
             &normalize_available,
-            &subscribers,
+            dropping_broadcaster(&subscribers),
             true,
             6000,
             &mut respawn,

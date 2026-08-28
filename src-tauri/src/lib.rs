@@ -19,7 +19,7 @@ mod setup;
 use tauri::{Emitter, Manager, PhysicalPosition};
 
 use owf_core::proto::OverlayEvent;
-use owf_core::server::EventSink;
+use owf_core::server::{Daemon, EventSink};
 
 /// Must match the window `label` in `tauri.conf.json`.
 const OVERLAY_LABEL: &str = "overlay";
@@ -92,13 +92,44 @@ impl EventSink for TauriSink {
     }
 }
 
+/// Called once by the frontend, immediately after it starts listening for
+/// `"overlay-event"` (`src/Overlay.tsx`) -- replays whatever state the
+/// daemon is in *right now* as a fresh `"overlay-event"` emission, via
+/// `Daemon::connect_snapshot`. That is the same snapshot
+/// `owf_core::server::serve_subscriber` sends a freshly connected socket
+/// subscriber; the overlay stopped being a socket client, but still needs
+/// the same "what's happening right now" answer on attach.
+///
+/// Without this, nothing shows during the several-second warm-up (nothing
+/// ever *broadcasts* `Warming` -- `owf_core::server::start` only stores it),
+/// and a warm-up failure broadcast from a background thread that happened to
+/// outrun this window's `listen()` registration would be lost to the
+/// overlay forever. Calling this only after `listen()`'s own promise has
+/// resolved (rather than e.g. on page load, which races React's effect-based
+/// registration) is what removes that race by construction: the listener
+/// this replays into already exists by the time it's asked to replay.
+///
+/// A no-op the frontend ignores in `--replay` mode: no `Daemon` is ever
+/// `app.manage`d there (replay drives the overlay from the fixture file
+/// directly), so this command's `State` extraction itself fails before the
+/// body below ever runs, and Tauri reports that as a rejected promise
+/// rather than a panic.
+#[tauri::command]
+fn overlay_ready(app: tauri::AppHandle, daemon: tauri::State<'_, Arc<Daemon>>) {
+    for event in daemon.connect_snapshot() {
+        if let Err(e) = app.emit("overlay-event", &event) {
+            eprintln!("overlay: failed to emit event to the frontend: {e}");
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let replay_path = replay_arg();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![position_overlay])
+        .invoke_handler(tauri::generate_handler![position_overlay, overlay_ready])
         .setup(move |app| {
             let window = app
                 .get_webview_window(OVERLAY_LABEL)
