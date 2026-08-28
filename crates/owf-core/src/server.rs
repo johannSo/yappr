@@ -190,6 +190,20 @@ pub trait EventSink: Send + Sync + 'static {
 
 pub struct Daemon {
     state: AtomicU8,
+    /// Spec §8 step 1's first clause, missed by this task's initial pass:
+    /// "stop accepting new utterances" -- set once, synchronously, by
+    /// `Request::Quit` before it spawns the wait/shutdown thread, and
+    /// checked at the top of `PttStart` and `Toggle` (never cleared; a
+    /// daemon that has been asked to quit never un-quits). Without this, a
+    /// `PttStart`/`Toggle` landing on the very next `accept()` after Beenden
+    /// -- the accept loop is single-threaded, so "next" can be milliseconds
+    /// away -- would be accepted normally and could reach `TRANSCRIBING`
+    /// inside the short window while `shutdown` is stopping housekeeping and
+    /// reaping `llama-server`, destroying a transcript invariant 1 says must
+    /// never be lost. `PttStop` is deliberately not guarded here: it only
+    /// ever finishes a recording that was already accepted before Quit was
+    /// dispatched, not a new one.
+    quitting: AtomicBool,
     /// `None` until a `Recorder` has been successfully constructed -- either
     /// eagerly at startup, or lazily on the first `ptt-start` after a
     /// startup where it wasn't (I7). See `ensure_recorder`.
@@ -563,6 +577,7 @@ pub fn start(sink: Arc<dyn EventSink>) -> Result<(Arc<Daemon>, UnixListener)> {
 
     let daemon = Arc::new(Daemon {
         state: AtomicU8::new(WARMING),
+        quitting: AtomicBool::new(false),
         recorder: Mutex::new(None),
         audio_cfg: Mutex::new(cfg.audio.clone()),
         pipeline: Mutex::new(None),
@@ -985,11 +1000,38 @@ fn wait_for_busy_to_clear(state: &AtomicU8, timeout: Duration, poll: Duration) {
 /// that must immediately follow it in production -- see
 /// `wait_for_busy_to_clear`'s doc comment for why that split matters for
 /// testing.
+///
+/// Deliberately does **not** wait on `RECORDING`, even though it is not
+/// `IDLE` either -- `is_busy` (what this waits on) was already narrower than
+/// "not idle" before this task, and that is correct here too. Invariant 1
+/// protects text ASR has already *produced*; nothing has been transcribed
+/// yet while merely `RECORDING`, so tearing down and discarding that audio
+/// is not the loss invariant 1 forbids. It is also the behaviour a user
+/// clicking Beenden mid-recording is actually asking for -- stop now, not
+/// "finish transcribing what I've said so far first". `Daemon::quitting`
+/// (set by the `Request::Quit` arm before this runs) independently closes
+/// the *other* half of this: no *new* recording can start once quitting is
+/// set, so this never has to choose between waiting on `RECORDING` and
+/// racing a fresh one. Do not "fix" this into waiting on `RECORDING` too --
+/// that would make Beenden hang for however long the user has been
+/// recording, entirely defeating the point of a responsive quit.
 fn wait_for_busy_to_clear_then_shutdown(daemon: &Daemon) {
-    wait_for_busy_to_clear(&daemon.state, QUIT_BUSY_WAIT_TIMEOUT, QUIT_BUSY_POLL_INTERVAL);
+    wait_for_busy_to_clear_then_shutdown_with(daemon, QUIT_BUSY_WAIT_TIMEOUT, QUIT_BUSY_POLL_INTERVAL);
+}
+
+/// `wait_for_busy_to_clear_then_shutdown` with an injectable timeout/poll,
+/// for the same reason `wait_for_busy_to_clear` itself takes them: so a test
+/// can observe both "still busy => shutdown hasn't run yet" and "bound
+/// elapsed => shutdown ran anyway" against a `sleep 300` stub `llama-server`
+/// in milliseconds, rather than waiting out the real ~10 s
+/// `QUIT_BUSY_WAIT_TIMEOUT`. Production (`wait_for_busy_to_clear_then_shutdown`,
+/// above, and thus the `Request::Quit` dispatch arm) always calls this with
+/// the real constants.
+fn wait_for_busy_to_clear_then_shutdown_with(daemon: &Daemon, timeout: Duration, poll: Duration) {
+    wait_for_busy_to_clear(&daemon.state, timeout, poll);
     if is_busy(daemon.state.load(Ordering::SeqCst)) {
         tracing::warn!(
-            timeout = ?QUIT_BUSY_WAIT_TIMEOUT,
+            timeout = ?timeout,
             "quit: still busy after the wait bound; shutting down anyway (spec 8)"
         );
     }
@@ -1442,19 +1484,26 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
             }
             r
         }
-        Request::PttStart => match current {
-            WARMING => Response::err("warming"),
-            FAILED => Response::err("daemon failed to start; see logs"),
-            RECORDING => Response::ok(State::Recording), // idempotent
-            s if is_busy(s) => {
-                // Spec 6.1: `ptt-start` while Transcribing/Normalizing/
-                // Injecting is rejected, and "the overlay flashes" -- this is
-                // that flash's trigger.
-                daemon.broadcast(OverlayEvent::BusyRejected);
-                Response::err("busy")
+        Request::PttStart => {
+            // Spec §8 step 1: stop accepting new utterances once Beenden has
+            // been requested. See `Daemon::quitting`'s doc comment.
+            if daemon.quitting.load(Ordering::SeqCst) {
+                return Response::err("shutting down");
             }
-            _ => start_recording(daemon),
-        },
+            match current {
+                WARMING => Response::err("warming"),
+                FAILED => Response::err("daemon failed to start; see logs"),
+                RECORDING => Response::ok(State::Recording), // idempotent
+                s if is_busy(s) => {
+                    // Spec 6.1: `ptt-start` while Transcribing/Normalizing/
+                    // Injecting is rejected, and "the overlay flashes" -- this is
+                    // that flash's trigger.
+                    daemon.broadcast(OverlayEvent::BusyRejected);
+                    Response::err("busy")
+                }
+                _ => start_recording(daemon),
+            }
+        }
         Request::PttStop => {
             if !claim_busy(daemon) {
                 // Not recording (idle/warming), or already claimed by
@@ -1627,9 +1676,25 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
         // them -- PttStart and PttStop already carry the busy-rejection
         // broadcast, the idempotent restart, and `claim_busy`'s CAS against
         // the safety valve, and Toggle inherits all of it by construction.
+        // The same is true of `Daemon::quitting`'s guard (spec §8 step 1):
+        // for every state but RECORDING, `toggle_target` resolves to
+        // `PttStart`, whose own guard the recursive `dispatch` call below
+        // re-enters and applies. Deliberately not also checked directly
+        // here -- doing so would refuse the RECORDING -> `PttStop` case too,
+        // which (like a direct `PttStop`) only finishes a recording already
+        // accepted before Quit, not a new one, and must stay allowed.
         Request::Toggle => dispatch(daemon, toggle_target(current)),
         Request::Quit => {
-            // Spec §8: run the wait-then-shutdown off this thread so
+            // Spec §8 step 1, first clause: stop accepting new utterances.
+            // Set synchronously, here, before spawning the wait/shutdown
+            // thread below -- not inside that thread -- so a `PttStart`/
+            // `Toggle` landing on the very next `accept()` (the accept loop
+            // is single-threaded; see `handle`'s doc comment) already sees
+            // it. See `Daemon::quitting`'s doc comment for the race this
+            // closes.
+            daemon.quitting.store(true, Ordering::SeqCst);
+
+            // Second clause: run the wait-then-shutdown off this thread so
             // `dispatch` (and thus the client's socket round trip) returns
             // immediately, then exit -- `exit` belongs here, at the one
             // production call site, and nowhere near
@@ -2587,6 +2652,7 @@ mod tests {
         let (runtime_socket_path, runtime_lock_path, runtime_port_path) = fake_runtime_files();
         Arc::new(Daemon {
             state: AtomicU8::new(initial_state),
+            quitting: AtomicBool::new(false),
             recorder: Mutex::new(None),
             audio_cfg: Mutex::new(AudioConfig::default()),
             pipeline: Mutex::new(None),
@@ -2675,6 +2741,7 @@ mod tests {
         let (runtime_socket_path, runtime_lock_path, runtime_port_path) = fake_runtime_files();
         Arc::new(Daemon {
             state: AtomicU8::new(initial_state),
+            quitting: AtomicBool::new(false),
             recorder: Mutex::new(None),
             audio_cfg: Mutex::new(AudioConfig::default()),
             pipeline: Mutex::new(None),
@@ -3667,6 +3734,25 @@ mod tests {
 
     // -- Task 10: Request::Quit / Request::ShowSettings (spec §8) ----------
 
+    /// Serializes the handful of tests in this file that call the *real*
+    /// `shutdown` (as opposed to `kill_llama`/`stop_housekeeping` directly).
+    /// `shutdown` mutates the module-wide `SHUTTING_DOWN` static, which is
+    /// designed for "called at most once per process" -- true in production,
+    /// but not true of a test binary where `cargo test`'s default thread-per-
+    /// test parallelism could otherwise run two such tests at once, letting
+    /// whichever calls `shutdown` second see `SHUTTING_DOWN` already `true`
+    /// and silently skip its cleanup (a spurious, scheduling-order-dependent
+    /// failure, not a real bug). Holding this lock for the test body and
+    /// resetting the flag to `false` first makes each such test observe
+    /// `SHUTTING_DOWN` exactly as if it were the only caller in the process.
+    static SHUTDOWN_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_a_fresh_shutting_down_guard(f: impl FnOnce()) {
+        let _guard = lock_ignoring_poison(&SHUTDOWN_TEST_LOCK);
+        SHUTTING_DOWN.store(false, Ordering::SeqCst);
+        f();
+    }
+
     /// Spec §8: Beenden must leave nothing behind. The llama-server child is
     /// the one that leaks today when the process is killed rather than
     /// dropped. Exercises the real `shutdown` (not just `kill_llama`
@@ -3682,17 +3768,87 @@ mod tests {
     /// really does call `remove_file` on whatever paths it's given.
     #[test]
     fn quit_reaps_the_llama_child_and_removes_the_runtime_files() {
-        let d = fake_daemon_at(IDLE, false, PathBuf::from("/nonexistent/owf-test/config.toml"));
-        let child = std::process::Command::new("sleep")
-            .arg("300")
-            .spawn()
-            .expect("spawning a stub child (`sleep 300`) for this test");
-        let pid = child.id();
-        *lock_ignoring_poison(&d.llama) = Some(LlamaServer::from_child(child, 0));
+        with_a_fresh_shutting_down_guard(|| {
+            let d = fake_daemon_at(IDLE, false, PathBuf::from("/nonexistent/owf-test/config.toml"));
+            let child = std::process::Command::new("sleep")
+                .arg("300")
+                .spawn()
+                .expect("spawning a stub child (`sleep 300`) for this test");
+            let pid = child.id();
+            *lock_ignoring_poison(&d.llama) = Some(LlamaServer::from_child(child, 0));
 
-        shutdown(&d);
+            shutdown(&d);
 
-        assert!(!process_is_alive(pid), "llama-server survived shutdown");
+            assert!(!process_is_alive(pid), "llama-server survived shutdown");
+        });
+    }
+
+    /// Closes the gap a reviewer found in the first pass: `wait_for_busy_to_
+    /// clear` and `shutdown` each had tests, but never their *composition*
+    /// (`wait_for_busy_to_clear_then_shutdown`, what `Request::Quit` actually
+    /// calls) -- so a regression that shuffled the two calls into `shutdown`
+    /// running *before* the wait would have kept every existing test in this
+    /// file green while reintroducing the exact defect this task exists to
+    /// fix. Proves both halves of the real sequencing end to end, using the
+    /// same `sleep 300` stub `LlamaServer::from_child` gives every other
+    /// `shutdown` test in this file: the child must survive while the
+    /// pipeline is still `TRANSCRIBING`, and must be reaped once the state
+    /// clears and `shutdown` finally runs. No `std::process::exit` anywhere
+    /// near this test -- only `wait_for_busy_to_clear_then_shutdown_with`,
+    /// never the `Request::Quit` dispatch arm itself.
+    #[test]
+    fn wait_for_busy_to_clear_then_shutdown_keeps_llama_alive_until_the_state_clears_then_reaps_it() {
+        with_a_fresh_shutting_down_guard(|| {
+            let d = fake_daemon_at(TRANSCRIBING, false, PathBuf::from("/nonexistent/owf-test/config.toml"));
+            let child = std::process::Command::new("sleep")
+                .arg("300")
+                .spawn()
+                .expect("spawning a stub child (`sleep 300`) for this test");
+            let pid = child.id();
+            *lock_ignoring_poison(&d.llama) = Some(LlamaServer::from_child(child, 0));
+
+            let d2 = Arc::clone(&d);
+            let handle = std::thread::spawn(move || {
+                wait_for_busy_to_clear_then_shutdown_with(&d2, Duration::from_secs(10), Duration::from_millis(5));
+            });
+
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(process_is_alive(pid), "shutdown must not run while still TRANSCRIBING");
+
+            d.state.store(IDLE, Ordering::SeqCst);
+            handle.join().expect("wait/shutdown thread panicked");
+
+            assert!(
+                !process_is_alive(pid),
+                "llama-server must be reaped once the state clears and shutdown runs"
+            );
+        });
+    }
+
+    /// The bound half of the same composition: a pipeline wedged forever in
+    /// a busy state must not hang `shutdown` forever either -- past
+    /// `server.rs`'s wait bound, `wait_for_busy_to_clear_then_shutdown` shuts
+    /// down anyway. The state is never cleared here, so a passing assertion
+    /// proves the bound itself, not a state change, is what let `shutdown`
+    /// run.
+    #[test]
+    fn wait_for_busy_to_clear_then_shutdown_gives_up_at_the_bound_and_shuts_down_anyway() {
+        with_a_fresh_shutting_down_guard(|| {
+            let d = fake_daemon_at(TRANSCRIBING, false, PathBuf::from("/nonexistent/owf-test/config.toml"));
+            let child = std::process::Command::new("sleep")
+                .arg("300")
+                .spawn()
+                .expect("spawning a stub child (`sleep 300`) for this test");
+            let pid = child.id();
+            *lock_ignoring_poison(&d.llama) = Some(LlamaServer::from_child(child, 0));
+
+            wait_for_busy_to_clear_then_shutdown_with(&d, Duration::from_millis(60), Duration::from_millis(5));
+
+            assert!(
+                !process_is_alive(pid),
+                "must shut down anyway once the bound elapses, even while still busy"
+            );
+        });
     }
 
     /// The defect fix at the heart of this task: the plan's original `Quit`
@@ -3747,6 +3903,28 @@ mod tests {
             is_busy(state.load(Ordering::SeqCst)),
             "state is still busy: the bound, not a cleared state, is what ended the wait"
         );
+    }
+
+    /// Closes the other gap a reviewer found: spec §8 step 1's first clause
+    /// ("stop accepting new utterances") was never implemented -- only its
+    /// second half ("let one already in flight finish") was. Without
+    /// `Daemon::quitting`, a `PttStart`/`Toggle` landing on the accept loop's
+    /// very next connection after Beenden would be accepted normally and
+    /// could reach `TRANSCRIBING` inside the window while the spawned
+    /// shutdown thread is stopping housekeeping and reaping `llama-server`.
+    /// Drives `dispatch` directly (not through `Request::Quit`, which this
+    /// suite must never call -- see this file's other `#[test]`s' doc
+    /// comments) by setting the flag exactly as that arm now does.
+    #[test]
+    fn ptt_start_and_toggle_are_refused_once_the_quitting_flag_is_set() {
+        let d = fake_daemon(IDLE);
+        d.quitting.store(true, Ordering::SeqCst);
+
+        let ptt_start = dispatch(&d, Request::PttStart);
+        assert!(!ptt_start.ok, "PttStart must be refused once quitting");
+
+        let toggle = dispatch(&d, Request::Toggle);
+        assert!(!toggle.ok, "Toggle must be refused once quitting (it would resolve to PttStart from IDLE)");
     }
 
     /// `Request::ShowSettings` has nothing to validate against daemon state
