@@ -1322,7 +1322,11 @@ fn toggle_target(state: u8) -> Request {
     }
 }
 
-fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
+/// `pub` so `src-tauri/src/settings_cmds.rs` can call it directly: the
+/// settings window's three commands run in-process now, not over the
+/// socket, and this is the same request/response handling the socket path
+/// (`handle`, above) already funnels every other request through.
+pub fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
     let current = daemon.state.load(Ordering::SeqCst);
     match req {
         Request::Status => {

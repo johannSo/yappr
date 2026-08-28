@@ -1,6 +1,0 @@
-{
-  "identifier": "default",
-  "description": "Capability for the settings window",
-  "windows": ["settings"],
-  "permissions": ["core:default"]
-}

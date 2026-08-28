@@ -14,6 +14,7 @@ pub mod cli;
 pub mod client;
 mod client_stream;
 mod replay;
+mod settings_cmds;
 mod setup;
 
 use tauri::{Emitter, Manager, PhysicalPosition};
@@ -129,7 +130,13 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![position_overlay, overlay_ready])
+        .invoke_handler(tauri::generate_handler![
+            position_overlay,
+            overlay_ready,
+            settings_cmds::get_config,
+            settings_cmds::set_config,
+            settings_cmds::list_input_devices
+        ])
         .setup(move |app| {
             let window = app
                 .get_webview_window(OVERLAY_LABEL)
@@ -141,6 +148,11 @@ pub fn run() {
             // freeze window management.
             match replay_path.clone() {
                 Some(path) => {
+                    // No `Daemon` exists in replay mode at all. Managed
+                    // unconditionally (see both arms) so a settings command's
+                    // `State<Server>` extraction never fails here either --
+                    // it reports a German error instead.
+                    app.manage(settings_cmds::Server(None));
                     let handle = app.handle().clone();
                     let emit = move |event: OverlayEvent| {
                         if let Err(e) = handle.emit("overlay-event", &event) {
@@ -154,6 +166,7 @@ pub fn run() {
                     let (daemon, listener) =
                         owf_core::server::start(Arc::new(TauriSink(app.handle().clone())))?;
                     app.manage(daemon.clone());
+                    app.manage(settings_cmds::Server(Some(daemon.clone())));
                     // Never on the Tauri event-loop thread -- the accept
                     // loop blocks, and a blocked event loop is a frozen
                     // window and an unclickable tray.

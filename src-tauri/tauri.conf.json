@@ -33,6 +33,20 @@
         "focusable": false,
         "visible": false,
         "acceptFirstMouse": false
+      },
+      {
+        "label": "settings",
+        "title": "OpenWhisprFlow – Einstellungen",
+        "url": "settings.html",
+        "width": 980,
+        "height": 720,
+        "minWidth": 720,
+        "minHeight": 520,
+        "resizable": true,
+        "decorations": true,
+        "visible": false,
+        "focus": true,
+        "focusable": true
       }
     ],
     "security": {
