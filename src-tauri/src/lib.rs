@@ -20,7 +20,7 @@ mod setup;
 use tauri::{Emitter, Manager, PhysicalPosition};
 
 use owf_core::proto::OverlayEvent;
-use owf_core::server::{Daemon, EventSink};
+use owf_core::server::{shutdown, Daemon, EventSink};
 
 /// Must match the window `label` in `tauri.conf.json`.
 const OVERLAY_LABEL: &str = "overlay";
@@ -91,6 +91,18 @@ impl EventSink for TauriSink {
             eprintln!("overlay: failed to emit event to the frontend: {e}");
         }
     }
+
+    /// `Request::ShowSettings` (spec §8): shows and focuses the settings
+    /// window, which `setup()` below creates hidden. Best-effort -- the
+    /// window is always declared in `tauri.conf.json`, so `get_webview_window`
+    /// returning `None` here would mean that declaration was removed, not a
+    /// transient failure worth surfacing to the caller of `Request::ShowSettings`.
+    fn show_settings(&self) {
+        if let Some(w) = self.0.get_webview_window("settings") {
+            let _ = w.show();
+            let _ = w.set_focus();
+        }
+    }
 }
 
 /// Called once by the frontend, immediately after it starts listening for
@@ -128,7 +140,7 @@ fn overlay_ready(app: tauri::AppHandle, daemon: tauri::State<'_, Arc<Daemon>>) {
 pub fn run() {
     let replay_path = replay_arg();
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             position_overlay,
@@ -142,6 +154,23 @@ pub fn run() {
                 .get_webview_window(OVERLAY_LABEL)
                 .expect("the overlay window must be declared in tauri.conf.json");
             relax_webkitgtk_minimum_size(&window);
+
+            // Spec §8: closing the settings window hides it; it does not
+            // exit the app -- only Beenden/`--quit`/a real app exit does
+            // that (see `run`'s `RunEvent::Exit` handler below). Without
+            // this, Tauri's default `CloseRequested` behaviour destroys the
+            // window outright, and the settings command handlers would then
+            // find no "settings" window left to `show`/`set_focus` on the
+            // next `Request::ShowSettings`.
+            if let Some(settings) = app.get_webview_window("settings") {
+                let w = settings.clone();
+                settings.on_window_event(move |e| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = e {
+                        api.prevent_close();
+                        let _ = w.hide();
+                    }
+                });
+            }
 
             // Never on the Tauri event-loop thread: a not-yet-warm daemon,
             // or a slow/looping replay file, must not delay first paint or
@@ -176,8 +205,40 @@ pub fn run() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    // Task 10 / spec §8: every exit route must converge on
+    // `owf_core::server::shutdown`, not just the signal handler inside
+    // `owf_core::server::start`. Two different mechanisms now guarantee
+    // that, and this hook is only one of them:
+    //
+    // - `Request::Quit` (Beenden, `--quit`, and eventually the tray) already
+    //   calls `shutdown` directly, on its own background thread, before
+    //   its `std::process::exit(0)` -- and `exit` tears the whole process
+    //   down immediately, on every thread, without ever giving Tauri's
+    //   event loop a chance to run this closure. So `RunEvent::Exit` never
+    //   fires on that path, and it doesn't need to: `shutdown` already ran.
+    // - Every *other* way this app's event loop can end -- most notably a
+    //   compositor-issued close of the overlay window falling through
+    //   Tauri's default `ExitRequested` -> `Exit` (the settings window's
+    //   own close is intercepted above and never reaches this at all) --
+    //   has no `Request` to dispatch through, so this closure is the only
+    //   place left for it to reach `shutdown`. `RunEvent::Exit` fires
+    //   exactly once, right before the process actually exits, covering
+    //   all of those at once.
+    //
+    // Either way `shutdown` is idempotent (`SHUTTING_DOWN`), so there is no
+    // harm if some future path ends up calling it from both. `try_state`,
+    // not `state`: in `--replay` mode no `Arc<Daemon>` is ever `app.manage`d,
+    // and this callback must not panic in that mode.
+    app.run(|app_handle, event| {
+        if let tauri::RunEvent::Exit = event {
+            if let Some(daemon) = app_handle.try_state::<Arc<Daemon>>() {
+                shutdown(&daemon);
+            }
+        }
+    });
 }
 
 /// `--replay <path>` switches the overlay from subscribing to the daemon

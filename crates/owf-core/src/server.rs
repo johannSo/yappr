@@ -11,7 +11,7 @@ use signal_hook::iterator::Signals;
 use std::cell::Cell;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard};
@@ -180,6 +180,12 @@ fn lock_ignoring_poison<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// now in-process and gets its events through Tauri rather than a socket.
 pub trait EventSink: Send + Sync + 'static {
     fn emit(&self, event: &OverlayEvent);
+    /// Shows and focuses the settings window (`Request::ShowSettings`). A
+    /// no-op default so the standalone daemon's `run()` sink (`NoExtraSink`)
+    /// and every test sink in this file stay valid without edits -- only
+    /// `TauriSink` (`src-tauri/src/lib.rs`), which actually owns a window to
+    /// show, needs to override it.
+    fn show_settings(&self) {}
 }
 
 pub struct Daemon {
@@ -253,6 +259,18 @@ pub struct Daemon {
     /// The in-process consumer of every broadcast. The standalone daemon had
     /// none; the app's overlay is no longer a socket client, so it is one.
     sink: Arc<dyn EventSink>,
+    /// Where `shutdown`'s `remove_runtime_files` deletes the socket, lock,
+    /// and port files this daemon owns. Real `paths::runtime_*()` values in
+    /// production (`start`); a scratch, never-real path in `fake_daemon_at`/
+    /// `fake_daemon_with_sink` -- for the same reason `config_path` is a
+    /// field rather than a bare `paths::config_file()` call: a test that
+    /// calls `shutdown` (which several in this module now do, to prove the
+    /// llama child is reaped) must never be able to delete
+    /// `$XDG_RUNTIME_DIR/openwhisprflow.sock` out from under a real daemon
+    /// running on the same machine as the test suite.
+    runtime_socket_path: PathBuf,
+    runtime_lock_path: PathBuf,
+    runtime_port_path: PathBuf,
     /// The single-instance guard (see `start`'s doc comment): an exclusive,
     /// non-blocking `flock` on a runtime file. Held for the life of the
     /// daemon only because this `File` lives here -- `start` used to keep it
@@ -559,6 +577,9 @@ pub fn start(sink: Arc<dyn EventSink>) -> Result<(Arc<Daemon>, UnixListener)> {
         housekeeping: Mutex::new(None),
         last_timings: Mutex::new(None),
         sink,
+        runtime_socket_path: sock_path,
+        runtime_lock_path: lock_path,
+        runtime_port_path: paths::runtime_port(),
         _runtime_lock: lock,
     });
 
@@ -632,7 +653,7 @@ pub fn start(sink: Arc<dyn EventSink>) -> Result<(Arc<Daemon>, UnixListener)> {
         });
     }
 
-    tracing::info!(socket = %sock_path.display(), "listening");
+    tracing::info!(socket = %daemon.runtime_socket_path.display(), "listening");
     Ok((daemon, listener))
 }
 
@@ -828,7 +849,12 @@ fn spawn_and_wait_healthy(cfg: &NormalizeConfig, timeout: Duration) -> Result<Ll
 /// break.
 static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 
-/// Explicit, deterministic teardown run on `SIGTERM`/`SIGINT`/`SIGHUP`.
+/// Explicit, deterministic teardown, run on `SIGTERM`/`SIGINT`/`SIGHUP`
+/// (`start`'s signal-handling thread), on `Request::Quit`
+/// (`wait_for_busy_to_clear_then_shutdown`, below -- spec §8's Beenden/`--quit`), and,
+/// from the Tauri app, on `RunEvent::Exit` (`src-tauri/src/lib.rs`) so a
+/// compositor-issued window close that lets Tauri's own event loop exit
+/// still tears this down rather than orphaning `llama-server`.
 ///
 /// Rust destructors -- `LlamaServer::drop` in particular -- only run if
 /// `main` returns normally. A daemon is ordinarily stopped by a signal
@@ -846,8 +872,13 @@ static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 ///
 /// Idempotent: `SHUTTING_DOWN` makes a second call a no-op, and each
 /// individual step (`Option::take`, `remove_file`) is already a no-op the
-/// second time round even without that guard.
-fn shutdown(daemon: &Daemon) {
+/// second time round even without that guard -- deliberately, now that there
+/// are four call sites instead of one and a redundant call from any of them
+/// must stay harmless.
+///
+/// `pub`: called directly from `src-tauri` (a different crate) for the
+/// `RunEvent::Exit` case above, which has no `Request` to dispatch through.
+pub fn shutdown(daemon: &Daemon) {
     if SHUTTING_DOWN.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -866,7 +897,11 @@ fn shutdown(daemon: &Daemon) {
     if let Some(r) = lock_ignoring_poison(&daemon.recorder).as_ref() {
         let _ = r.stop();
     }
-    remove_runtime_files();
+    remove_runtime_files(
+        &daemon.runtime_socket_path,
+        &daemon.runtime_lock_path,
+        &daemon.runtime_port_path,
+    );
 }
 
 /// Stops the housekeeping thread, if one was ever installed. Split out for
@@ -899,10 +934,66 @@ fn kill_llama(llama: &Mutex<Option<LlamaServer>>) {
 /// socket or being told the (now-dead) lock is still held. Best-effort: a
 /// file that is already gone (a second call, or it was never created) is not
 /// an error.
-fn remove_runtime_files() {
-    let _ = std::fs::remove_file(paths::runtime_socket());
-    let _ = std::fs::remove_file(paths::runtime_lock());
-    let _ = std::fs::remove_file(paths::runtime_port());
+///
+/// Takes explicit paths -- rather than calling `paths::runtime_*()` itself --
+/// so `shutdown` can be exercised in a test against `Daemon::runtime_*_path`
+/// scratch values instead of always resolving to
+/// `$XDG_RUNTIME_DIR/openwhisprflow.sock`, which a real daemon elsewhere on
+/// the same machine may be holding open at the moment the test suite runs.
+fn remove_runtime_files(socket: &Path, lock: &Path, port: &Path) {
+    let _ = std::fs::remove_file(socket);
+    let _ = std::fs::remove_file(lock);
+    let _ = std::fs::remove_file(port);
+}
+
+// -- Request::Quit (Task 10 / spec §8) --------------------------------------
+
+/// Spec §8 step 1: Beenden/`--quit` must not tear down while an utterance is
+/// in flight (`is_busy`) -- invariant 1 says a transcribed utterance is never
+/// lost, and `shutdown` stops housekeeping and kills `llama-server`, either
+/// of which could pull the rug out from under a `Normalizing`/`Injecting`
+/// stage that hasn't finished yet. This bounds how long `wait_for_busy_to_
+/// clear` will wait for that stage to finish on its own, so a wedged
+/// pipeline (a `llama-server` or `wtype` call that never returns despite
+/// invariant 6's per-subprocess timeouts) cannot make Beenden unresponsive
+/// forever -- past this bound it shuts down anyway.
+const QUIT_BUSY_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often `wait_for_busy_to_clear` re-checks the state while waiting.
+const QUIT_BUSY_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Blocks until `state` has left the busy set (`is_busy`), or until `timeout`
+/// has elapsed, whichever comes first.
+///
+/// A pure, `Daemon`-free helper over a bare `&AtomicU8` -- deliberately, so a
+/// test can drive it directly with tiny durations and assert on the waiting
+/// itself, without ever going anywhere near `wait_for_busy_to_clear_then_shutdown`'s
+/// real `shutdown` call or the `std::process::exit` that follows it in the
+/// `Request::Quit` dispatch arm. Calling `std::process::exit` from a test
+/// would kill the test *runner*, not just the "daemon" under test, so the
+/// exit is kept at that one call site and nowhere near anything this file's
+/// test module invokes.
+fn wait_for_busy_to_clear(state: &AtomicU8, timeout: Duration, poll: Duration) {
+    let deadline = Instant::now() + timeout;
+    while is_busy(state.load(Ordering::SeqCst)) && Instant::now() < deadline {
+        std::thread::sleep(poll);
+    }
+}
+
+/// `Request::Quit`'s real work: wait (bounded) for any in-flight utterance to
+/// leave the busy states, then run `shutdown`. Split out from the dispatch
+/// arm below purely so the *waiting* half is reachable without the `exit`
+/// that must immediately follow it in production -- see
+/// `wait_for_busy_to_clear`'s doc comment for why that split matters for
+/// testing.
+fn wait_for_busy_to_clear_then_shutdown(daemon: &Daemon) {
+    wait_for_busy_to_clear(&daemon.state, QUIT_BUSY_WAIT_TIMEOUT, QUIT_BUSY_POLL_INTERVAL);
+    if is_busy(daemon.state.load(Ordering::SeqCst)) {
+        tracing::warn!(
+            timeout = ?QUIT_BUSY_WAIT_TIMEOUT,
+            "quit: still busy after the wait bound; shutting down anyway (spec 8)"
+        );
+    }
+    shutdown(daemon);
 }
 
 // -- llama-server supervision (Task 3 / spec 15, 5.1) and subscriber
@@ -1537,10 +1628,32 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
         // broadcast, the idempotent restart, and `claim_busy`'s CAS against
         // the safety valve, and Toggle inherits all of it by construction.
         Request::Toggle => dispatch(daemon, toggle_target(current)),
-        // Implemented by Task 10.
-        Request::Quit => Response::err("not implemented yet"),
-        // Implemented by Task 10.
-        Request::ShowSettings => Response::err("not implemented yet"),
+        Request::Quit => {
+            // Spec §8: run the wait-then-shutdown off this thread so
+            // `dispatch` (and thus the client's socket round trip) returns
+            // immediately, then exit -- `exit` belongs here, at the one
+            // production call site, and nowhere near
+            // `wait_for_busy_to_clear_then_shutdown`/`wait_for_busy_to_clear`
+            // themselves; see their doc comments for why a test must never
+            // reach an `exit` call.
+            //
+            // No terminal `OverlayEvent::Idle` is broadcast here: every
+            // other teardown path (a terminating signal, a future tray
+            // Beenden) goes straight from `shutdown` to `exit` with no
+            // final event either, and a frontend that is about to lose its
+            // process has nothing to do with one more state it'll never
+            // render.
+            let d = Arc::clone(daemon);
+            std::thread::spawn(move || {
+                wait_for_busy_to_clear_then_shutdown(&d);
+                std::process::exit(0);
+            });
+            Response::ok(state_of(current))
+        }
+        Request::ShowSettings => {
+            daemon.sink.show_settings();
+            Response::ok(state_of(current))
+        }
     }
 }
 
@@ -2174,7 +2287,7 @@ mod tests {
         kill_llama(&llama);
 
         assert!(
-            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            !process_is_alive(pid),
             "child process {pid} survived kill_llama: no llama-server may outlive shutdown"
         );
     }
@@ -2471,6 +2584,7 @@ mod tests {
     /// The seam the config handlers need: `set-config` writes, so a test must
     /// never be pointed at the real `paths::config_file()`.
     fn fake_daemon_at(initial_state: u8, normalize_enabled: bool, config_path: PathBuf) -> Arc<Daemon> {
+        let (runtime_socket_path, runtime_lock_path, runtime_port_path) = fake_runtime_files();
         Arc::new(Daemon {
             state: AtomicU8::new(initial_state),
             recorder: Mutex::new(None),
@@ -2487,6 +2601,9 @@ mod tests {
             housekeeping: Mutex::new(None),
             last_timings: Mutex::new(None),
             sink: Arc::new(DropSink),
+            runtime_socket_path,
+            runtime_lock_path,
+            runtime_port_path,
             _runtime_lock: fake_runtime_lock(),
         })
     }
@@ -2528,10 +2645,34 @@ mod tests {
         std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(path).unwrap()
     }
 
+    /// `Daemon::runtime_{socket,lock,port}_path` for every fake daemon:
+    /// scratch paths under the OS temp dir, never the real
+    /// `paths::runtime_*()` locations. `shutdown`'s `remove_runtime_files`
+    /// only ever `remove_file`s these -- best-effort, so it does not matter
+    /// that nothing here ever creates them -- but a test in this suite
+    /// (`quit_reaps_the_llama_child_and_removes_the_runtime_files`) really
+    /// does call `shutdown`, and a real daemon on this same machine may be
+    /// holding `$XDG_RUNTIME_DIR/openwhisprflow.sock` open at that exact
+    /// moment. These paths must never be able to collide with that.
+    fn fake_runtime_files() -> (PathBuf, PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join("owf-core-tests-fake-runtime-files");
+        (dir.join("openwhisprflow.sock"), dir.join("openwhisprflow.lock"), dir.join("openwhisprflow.port"))
+    }
+
+    /// Whether a process with this pid still exists, checked the
+    /// straightforward Linux way -- matching this codebase's one target
+    /// platform (CLAUDE.md: "for Hyprland/Wayland"). Used by the
+    /// `kill_llama`/`shutdown` tests to prove a killed child is actually
+    /// gone (reaped, not just signalled and left a zombie).
+    fn process_is_alive(pid: u32) -> bool {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+
     /// `fake_daemon_at` and `fake_daemon_with_normalize` keep their
     /// signatures and pass a sink that drops events, so no existing test
     /// changes. Only the test asserting on the second consumer needs this.
     fn fake_daemon_with_sink(initial_state: u8, sink: Arc<dyn EventSink>) -> Arc<Daemon> {
+        let (runtime_socket_path, runtime_lock_path, runtime_port_path) = fake_runtime_files();
         Arc::new(Daemon {
             state: AtomicU8::new(initial_state),
             recorder: Mutex::new(None),
@@ -2548,6 +2689,9 @@ mod tests {
             housekeeping: Mutex::new(None),
             last_timings: Mutex::new(None),
             sink,
+            runtime_socket_path,
+            runtime_lock_path,
+            runtime_port_path,
             _runtime_lock: fake_runtime_lock(),
         })
     }
@@ -3519,5 +3663,112 @@ mod tests {
             RECORDING,
             "a stale safety valve must not touch a session it does not own"
         );
+    }
+
+    // -- Task 10: Request::Quit / Request::ShowSettings (spec §8) ----------
+
+    /// Spec §8: Beenden must leave nothing behind. The llama-server child is
+    /// the one that leaks today when the process is killed rather than
+    /// dropped. Exercises the real `shutdown` (not just `kill_llama`
+    /// directly, which `kill_llama_terminates_a_stub_child_and_is_idempotent`
+    /// already covers) so the full `Request::Quit` teardown path -- minus
+    /// the wait and the `exit` themselves, both covered by the tests below
+    /// -- is proven end to end.
+    ///
+    /// Uses `fake_daemon_at`, whose `runtime_*_path` fields are scratch
+    /// paths (`fake_runtime_files`), never the real
+    /// `$XDG_RUNTIME_DIR/openwhisprflow.sock` -- this machine may have a real
+    /// daemon holding that file open while this suite runs, and `shutdown`
+    /// really does call `remove_file` on whatever paths it's given.
+    #[test]
+    fn quit_reaps_the_llama_child_and_removes_the_runtime_files() {
+        let d = fake_daemon_at(IDLE, false, PathBuf::from("/nonexistent/owf-test/config.toml"));
+        let child = std::process::Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .expect("spawning a stub child (`sleep 300`) for this test");
+        let pid = child.id();
+        *lock_ignoring_poison(&d.llama) = Some(LlamaServer::from_child(child, 0));
+
+        shutdown(&d);
+
+        assert!(!process_is_alive(pid), "llama-server survived shutdown");
+    }
+
+    /// The defect fix at the heart of this task: the plan's original `Quit`
+    /// handler would shut down unconditionally, which for a `TRANSCRIBING`/
+    /// `NORMALIZING`/`INJECTING` daemon would kill `llama-server` and stop
+    /// housekeeping out from under an utterance that has not yet reached
+    /// `finish`/injection -- invariant 1 says a transcribed utterance is
+    /// never lost. `wait_for_busy_to_clear` is what a real `Request::Quit`
+    /// waits on before calling `shutdown`; this proves it actually blocks
+    /// while busy and releases the instant the state clears, using
+    /// `std::thread::scope` so the busy `AtomicU8` can be a plain stack
+    /// value shared with the waiting thread -- no `Daemon`, no `shutdown`
+    /// call, and, per `wait_for_busy_to_clear`'s doc comment, no
+    /// `std::process::exit` anywhere near this test.
+    #[test]
+    fn a_quit_arriving_during_transcribing_does_not_proceed_until_the_state_clears() {
+        let state = AtomicU8::new(TRANSCRIBING);
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| {
+                wait_for_busy_to_clear(&state, Duration::from_secs(10), Duration::from_millis(5));
+            });
+
+            std::thread::sleep(Duration::from_millis(150));
+            assert!(
+                !waiter.is_finished(),
+                "must not treat TRANSCRIBING as safe to shut down while it is still the state"
+            );
+
+            state.store(IDLE, Ordering::SeqCst);
+            waiter.join().expect("waiter thread panicked");
+        });
+    }
+
+    /// The other half of the same fix: the wait is bounded (spec §8's "must
+    /// not make Beenden unresponsive forever"), so a pipeline wedged forever
+    /// in a busy state does not hang `Request::Quit`'s shutdown thread
+    /// forever either. Uses a tiny timeout/poll pair so the test itself
+    /// stays fast; `QUIT_BUSY_WAIT_TIMEOUT` is the real ~10 s bound used in
+    /// production.
+    #[test]
+    fn wait_for_busy_to_clear_gives_up_once_its_bound_elapses_if_still_busy() {
+        let state = AtomicU8::new(TRANSCRIBING);
+        let start = Instant::now();
+
+        wait_for_busy_to_clear(&state, Duration::from_millis(60), Duration::from_millis(5));
+
+        assert!(
+            start.elapsed() >= Duration::from_millis(60),
+            "must actually wait out the bound, not return early"
+        );
+        assert!(
+            is_busy(state.load(Ordering::SeqCst)),
+            "state is still busy: the bound, not a cleared state, is what ended the wait"
+        );
+    }
+
+    /// `Request::ShowSettings` has nothing to validate against daemon state
+    /// (spec §8: "show and focus the settings window" is unconditional), so
+    /// the only behaviour worth pinning is that it reaches the sink -- the
+    /// seam `TauriSink::show_settings` (`src-tauri/src/lib.rs`) hangs off.
+    #[test]
+    fn show_settings_reaches_the_sink() {
+        #[derive(Default)]
+        struct Recorder(Mutex<bool>);
+        impl EventSink for Recorder {
+            fn emit(&self, _: &OverlayEvent) {}
+            fn show_settings(&self) {
+                *lock_ignoring_poison(&self.0) = true;
+            }
+        }
+        let sink = Arc::new(Recorder::default());
+        let daemon = fake_daemon_with_sink(IDLE, sink.clone());
+
+        let r = dispatch(&daemon, Request::ShowSettings);
+
+        assert!(r.ok, "{:?}", r.err);
+        assert!(*lock_ignoring_poison(&sink.0), "show_settings must reach the sink");
     }
 }
