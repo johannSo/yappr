@@ -8,6 +8,7 @@
 use anyhow::{Context, Result};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
+use std::cell::Cell;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -455,7 +456,7 @@ fn main() -> Result<()> {
     // check), which is what stops it from ever racing warm-up's own initial
     // spawn into starting a second `llama-server`.
     {
-        let handle = spawn_housekeeping(Arc::clone(&daemon), normalize_cfg);
+        let handle = spawn_housekeeping(Arc::clone(&daemon), normalize_cfg, true);
         *lock_ignoring_poison(&daemon.housekeeping) = Some(handle);
     }
 
@@ -844,7 +845,11 @@ fn supervise_llama_once(
 /// `warm_up` has settled `daemon.llama`/`daemon.normalize_available`, which
 /// is what stops this loop from ever racing `warm_up`'s own initial spawn
 /// into starting a second `llama-server`.
-fn spawn_housekeeping(daemon: Arc<Daemon>, normalize_cfg: Option<NormalizeConfig>) -> HousekeepingHandle {
+fn spawn_housekeeping(
+    daemon: Arc<Daemon>,
+    normalize_cfg: Option<NormalizeConfig>,
+    initial_last_known_available: bool,
+) -> HousekeepingHandle {
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
     let join = std::thread::spawn(move || {
         let mut backoff = INITIAL_BACKOFF;
@@ -857,7 +862,14 @@ fn spawn_housekeeping(daemon: Arc<Daemon>, normalize_cfg: Option<NormalizeConfig
         // real check finds it unhealthy, `last_known_available` (still
         // `true` here) makes `supervise_llama_once` broadcast
         // `NormalizeDegraded` exactly once, matching reality.
-        let mut last_known_available = true;
+        //
+        // Always `true` in production (see `main`'s call site) -- the only
+        // reason this is a parameter at all, rather than a hardcoded `let
+        // mut last_known_available = true;`, is so a test can start it
+        // `false` instead and skip straight past the first, always-10s
+        // `HEALTH_POLL_INTERVAL` wait into a genuine backoff wait (see
+        // `shutdown_during_a_backoff_wait_terminates_promptly_without_spawning`).
+        let mut last_known_available = initial_last_known_available;
         loop {
             let wait = match &normalize_cfg {
                 None => SUBSCRIBER_REAP_INTERVAL,
@@ -1250,6 +1262,20 @@ fn ensure_recorder<T>(slot: &Mutex<Option<T>>, ctor: impl FnOnce() -> Result<T, 
     Ok(())
 }
 
+/// Spec 15 row 1: `start_recording`'s two failure sites (no microphone /
+/// cannot start capture) used to return `Response::err` with no
+/// `OverlayEvent::Error` broadcast at all. The error reached only
+/// `owf-ctl`'s stderr -- which the Hyprland keybind that invokes it discards
+/// -- so a user who pressed SUPER+D with, say, a Bluetooth headset's A2DP
+/// profile routed to `default` (no microphone at all) got nothing: no
+/// recording, no overlay, no clue why. Broadcasting `reason` here before
+/// returning the same `Response::err` makes every way `start_recording` can
+/// fail visible to a subscribed overlay, not just to a discarded CLI stderr.
+fn recording_start_failed(daemon: &Daemon, reason: String) -> Response {
+    daemon.broadcast(OverlayEvent::Error { reason: reason.clone() });
+    Response::err(reason)
+}
+
 fn start_recording(daemon: &Arc<Daemon>) -> Response {
     // I7: construct the recorder (or retry a previous failure) before doing
     // anything else -- and I4: query the window class *after* capture has
@@ -1260,7 +1286,7 @@ fn start_recording(daemon: &Arc<Daemon>) -> Response {
     if let Err(e) = ensure_recorder(&daemon.recorder, || {
         Recorder::new(&daemon.audio_cfg).map_err(|e| e.to_string())
     }) {
-        return Response::err(format!("no microphone: {e}"));
+        return recording_start_failed(daemon, format!("no microphone: {e}"));
     }
 
     // Spec 7.1: the overlay's live bars are driven by RMS at roughly 50 ms
@@ -1286,7 +1312,7 @@ fn start_recording(daemon: &Arc<Daemon>) -> Response {
             }
         });
     if let Err(e) = start_result {
-        return Response::err(format!("cannot start capture: {e}"));
+        return recording_start_failed(daemon, format!("cannot start capture: {e}"));
     }
 
     // Capturing the window class here, now that the mic is already open,
@@ -1340,13 +1366,22 @@ fn start_recording(daemon: &Arc<Daemon>) -> Response {
 /// daemon frozen busy forever, with every later `PttStart`/`PttStop`/
 /// `Cancel` hitting one of the `is_busy` branches.
 ///
-/// Also broadcasts `OverlayEvent::Idle`, for the same reason and on the same
-/// every-exit-path guarantee: a subscriber must see the overlay return to
-/// idle even when the pipeline panicked mid-utterance, not just on the happy
-/// path.
+/// Also broadcasts `OverlayEvent::Idle` -- but only when nothing already told
+/// every subscriber the utterance was over. `Done`/`Error` (spec 12's two
+/// terminal outcomes) already *mean* "returning to idle"; before this fix,
+/// `Drop` broadcast `Idle` unconditionally right behind whichever of those
+/// `process_utterance` had just sent, and the overlay's own
+/// `clearHideTimer()` (see `src/Overlay.tsx`) ran on every event including
+/// that redundant `Idle` -- cancelling the 800 ms `Done` flash or the 2 s
+/// `Error` pill before a single frame painted (fix 1). `terminal_sent` is how
+/// `run_utterance` tells this guard "a terminal event already went out,
+/// don't send another" -- it does not change whether `state` itself returns
+/// to `IDLE`, which stays unconditional on every exit path (including an
+/// unwinding panic, when `terminal_sent` is still `false` and `Idle` is
+/// exactly what a subscriber must see).
 ///
 /// Constructed as the very first thing in `run_utterance`, before anything
-/// fallible, so its `Drop` covers every line after it. The store is
+/// fallible, so its `Drop` covers every line after it. The `state` store is
 /// unconditional, not a CAS: at most one `run_utterance` (or safety-valve)
 /// call is ever in flight at a time -- the RECORDING -> TRANSCRIBING
 /// transition it exits is claimed exactly once per recording, by whichever
@@ -1355,17 +1390,26 @@ fn start_recording(daemon: &Arc<Daemon>) -> Response {
 struct IdleOnExit<'a> {
     state: &'a AtomicU8,
     subscribers: &'a Mutex<Vec<Subscriber>>,
+    terminal_sent: Cell<bool>,
+}
+
+impl<'a> IdleOnExit<'a> {
+    fn new(state: &'a AtomicU8, subscribers: &'a Mutex<Vec<Subscriber>>) -> Self {
+        Self { state, subscribers, terminal_sent: Cell::new(false) }
+    }
 }
 
 impl Drop for IdleOnExit<'_> {
     fn drop(&mut self) {
         self.state.store(IDLE, Ordering::SeqCst);
-        broadcast_to(self.subscribers, OverlayEvent::Idle);
+        if !self.terminal_sent.get() {
+            broadcast_to(self.subscribers, OverlayEvent::Idle);
+        }
     }
 }
 
 fn run_utterance(daemon: Arc<Daemon>) {
-    let _idle_on_exit = IdleOnExit { state: &daemon.state, subscribers: &daemon.subscribers };
+    let idle_on_exit = IdleOnExit::new(&daemon.state, &daemon.subscribers);
 
     let stop_result = match lock_ignoring_poison(&daemon.recorder).as_ref() {
         Some(r) => r.stop(),
@@ -1374,6 +1418,7 @@ fn run_utterance(daemon: Arc<Daemon>) {
         None => {
             tracing::warn!("utterance finished but no recorder was ever constructed");
             daemon.broadcast(OverlayEvent::Error { reason: "no recorder available".to_string() });
+            idle_on_exit.terminal_sent.set(true);
             return;
         }
     };
@@ -1382,6 +1427,7 @@ fn run_utterance(daemon: Arc<Daemon>) {
         Err(e) => {
             tracing::error!(error = ?e, "capture stop failed");
             daemon.broadcast(OverlayEvent::Error { reason: format!("capture stop failed: {e}") });
+            idle_on_exit.terminal_sent.set(true);
             return;
         }
     };
@@ -1394,6 +1440,12 @@ fn run_utterance(daemon: Arc<Daemon>) {
         class.as_deref(),
         Some(stop.capture),
     );
+    // `process_utterance` always broadcasts exactly one terminal event
+    // (`Done` or `Error`) on every path it returns from normally -- the only
+    // way to reach this line without having sent one is for it to have
+    // panicked instead, in which case unwinding skips this store and
+    // `IdleOnExit::drop` correctly still sends `Idle`.
+    idle_on_exit.terminal_sent.set(true);
 }
 
 /// The first ~60 characters of `text` -- spec 12's `Done` preview flash.
@@ -1543,7 +1595,7 @@ mod tests {
         let last_timings: Mutex<Option<Timings>> = Mutex::new(None);
 
         let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            let _idle_on_exit = IdleOnExit { state: &state, subscribers: &subscribers };
+            let _idle_on_exit = IdleOnExit::new(&state, &subscribers);
             process_utterance(&pipeline, &subscribers, &last_timings, &samples, None, None);
         }));
 
@@ -1558,6 +1610,102 @@ mod tests {
             Ok(OverlayEvent::Idle),
             "a subscriber must see the overlay return to idle even when the pipeline panicked"
         );
+    }
+
+    /// Fix 1 (F1): spec 12's `Done` and `Error` rows never rendered, because
+    /// `IdleOnExit::drop` broadcast a redundant `Idle` immediately behind
+    /// whichever one `process_utterance` had just sent, and the overlay's
+    /// `clearHideTimer()` ran on every event -- including that `Idle` --
+    /// cancelling the flash before a frame painted. No test anywhere asserted
+    /// the *sequence* a subscriber receives (every other assertion in this
+    /// file is a single `try_recv()`); this drives one full successful
+    /// utterance through the real `IdleOnExit`/`process_utterance` pair, the
+    /// same way `run_utterance` wires them together (guard constructed
+    /// first, `terminal_sent` marked after `process_utterance` returns, the
+    /// same as the real function), and asserts the whole ordered sequence a
+    /// subscriber actually receives -- including that nothing at all follows
+    /// `Done`.
+    #[test]
+    fn a_successful_utterance_broadcasts_done_with_no_redundant_idle_after_it() {
+        let pipeline = Mutex::new(Some(Pipeline::new(
+            Config::from_str("[normalize]\nenabled = false\n").unwrap(),
+            Box::new(FixedAsr("hello there")),
+            Box::new(WholeBuffer),
+            Box::new(AlwaysEnglish),
+            Box::new(NeverNormalizer),
+            Box::new(MockInjector::default()),
+        )));
+        let state = AtomicU8::new(TRANSCRIBING);
+        let subscribers: Mutex<Vec<Subscriber>> = Mutex::new(Vec::new());
+        let (tx, rx) = mpsc::channel();
+        subscribers.lock().unwrap().push(Subscriber { tx, alive: Arc::new(AtomicBool::new(true)) });
+        let samples = vec![0.1f32; 16_000];
+        let last_timings: Mutex<Option<Timings>> = Mutex::new(None);
+
+        {
+            let idle_on_exit = IdleOnExit::new(&state, &subscribers);
+            process_utterance(&pipeline, &subscribers, &last_timings, &samples, None, None);
+            idle_on_exit.terminal_sent.set(true);
+        }
+
+        assert_eq!(state.load(Ordering::SeqCst), IDLE, "the daemon must still return to idle");
+        // Guardrail capitalization/terminal punctuation plus the default
+        // `inject.trailing_space` (see `pipeline.rs`) turn "hello there"
+        // into "Hello there. " -- this test cares about the *sequence* of
+        // broadcasts, not the exact text transform, so it just matches
+        // whatever `process_utterance` actually produced.
+        let done = rx.try_recv().expect("a subscriber must see Done");
+        assert!(
+            matches!(&done, OverlayEvent::Done { preview } if preview.starts_with("Hello there")),
+            "unexpected Done payload: {done:?}"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no redundant Idle (or anything else) may follow Done -- Done already means \
+             'returning to idle', and a lingering broadcast right behind it is exactly what \
+             cancelled the overlay's 800ms Done flash before a frame painted"
+        );
+    }
+
+    /// The `Error` half of the same fix: `process_utterance`'s "no speech
+    /// detected" path broadcasts `Error`, and that must be the only thing a
+    /// subscriber sees -- no trailing `Idle`.
+    #[test]
+    fn a_no_speech_utterance_broadcasts_error_with_no_redundant_idle_after_it() {
+        struct SilentTrimmer;
+        impl Trimmer for SilentTrimmer {
+            fn trim(&self, _: &[f32], _: u32) -> Option<(usize, usize)> {
+                None
+            }
+        }
+
+        let pipeline = Mutex::new(Some(Pipeline::new(
+            Config::from_str("[normalize]\nenabled = false\n").unwrap(),
+            Box::new(FixedAsr("unused")),
+            Box::new(SilentTrimmer),
+            Box::new(AlwaysEnglish),
+            Box::new(NeverNormalizer),
+            Box::new(MockInjector::default()),
+        )));
+        let state = AtomicU8::new(TRANSCRIBING);
+        let subscribers: Mutex<Vec<Subscriber>> = Mutex::new(Vec::new());
+        let (tx, rx) = mpsc::channel();
+        subscribers.lock().unwrap().push(Subscriber { tx, alive: Arc::new(AtomicBool::new(true)) });
+        let samples = vec![0.1f32; 16_000];
+        let last_timings: Mutex<Option<Timings>> = Mutex::new(None);
+
+        {
+            let idle_on_exit = IdleOnExit::new(&state, &subscribers);
+            process_utterance(&pipeline, &subscribers, &last_timings, &samples, None, None);
+            idle_on_exit.terminal_sent.set(true);
+        }
+
+        assert_eq!(state.load(Ordering::SeqCst), IDLE);
+        assert_eq!(
+            rx.try_recv(),
+            Ok(OverlayEvent::Error { reason: "no speech detected".to_string() }),
+        );
+        assert!(rx.try_recv().is_err(), "no redundant Idle may follow Error either");
     }
 
     /// A transcriber that always succeeds with fixed text -- drives
@@ -1700,6 +1848,34 @@ mod tests {
         assert_eq!(*slot.lock().unwrap(), Some(1));
     }
 
+    /// Fix 3 (F3) / spec 15 row 1: `start_recording`'s two failure sites
+    /// (no microphone, cannot start capture) used to return `Response::err`
+    /// with no `OverlayEvent::Error` broadcast -- invisible to anything but
+    /// `owf-ctl`'s discarded stderr. This is exactly the failure the
+    /// machine's owner hit: a Bluetooth headset in A2DP has no microphone,
+    /// ALSA's `default` routed to it anyway, and SUPER+D did nothing
+    /// visible. Exercises `recording_start_failed` directly (the helper both
+    /// call sites in `start_recording` now go through) rather than calling
+    /// `start_recording` itself, which would need a real `Recorder` --
+    /// opening live audio hardware is off-limits here.
+    #[test]
+    fn recording_start_failed_broadcasts_error_and_returns_the_same_reason() {
+        let daemon = fake_daemon(IDLE);
+        let (tx, rx) = mpsc::channel();
+        daemon.subscribers.lock().unwrap().push(Subscriber { tx, alive: Arc::new(AtomicBool::new(true)) });
+
+        let resp =
+            recording_start_failed(&daemon, "no microphone: no default input device".to_string());
+
+        assert!(!resp.ok);
+        assert_eq!(resp.err.as_deref(), Some("no microphone: no default input device"));
+        assert_eq!(
+            rx.try_recv(),
+            Ok(OverlayEvent::Error { reason: "no microphone: no default input device".to_string() }),
+            "a subscriber must see why nothing happened, not just owf-ctl's discarded stderr"
+        );
+    }
+
     /// I6: proves the socket this daemon binds ends up owner-only, not at
     /// whatever the ambient umask would otherwise leave it -- exercised
     /// against a scratch socket path rather than the real
@@ -1835,6 +2011,17 @@ mod tests {
     /// `llama-server` (both need resources this sandbox doesn't have), just
     /// enough to drive `handle`/`dispatch` for `Status`/`Subscribe`.
     fn fake_daemon(initial_state: u8) -> Arc<Daemon> {
+        fake_daemon_with_normalize(initial_state, false)
+    }
+
+    /// The general form of `fake_daemon`: every other test wants
+    /// `normalize_enabled: false` (the plain `fake_daemon` above), which
+    /// used to be the *only* value any test could get, hardcoded -- making
+    /// `serve_subscriber`'s `NormalizeDegraded`-replay-on-connect path
+    /// (`degraded` in its doc comment) unreachable by any test in this file.
+    /// See `a_late_subscriber_sees_the_degraded_badge_replayed_on_connect`,
+    /// the test that needs `true`.
+    fn fake_daemon_with_normalize(initial_state: u8, normalize_enabled: bool) -> Arc<Daemon> {
         Arc::new(Daemon {
             state: AtomicU8::new(initial_state),
             recorder: Mutex::new(None),
@@ -1845,7 +2032,7 @@ mod tests {
             max_seconds: 120,
             recording_epoch: AtomicU64::new(0),
             subscribers: Mutex::new(Vec::new()),
-            normalize_enabled: false,
+            normalize_enabled,
             normalize_available: AtomicBool::new(false),
             fatal_error: Mutex::new(None),
             housekeeping: Mutex::new(None),
@@ -2004,6 +2191,67 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `serve_subscriber`'s `NormalizeDegraded`-replay-on-connect path (spec
+    /// 15): a late joiner that connects while normalization is *already*
+    /// down must learn that immediately, as a second line right behind the
+    /// state snapshot, not only if it happens to be subscribed at the exact
+    /// moment a future `NormalizeDegraded` broadcast fires. Every other test
+    /// in this file builds its daemon with `fake_daemon`, which hardcodes
+    /// `normalize_enabled: false` -- making this path structurally
+    /// unreachable no matter what any of them asserted. This is the one that
+    /// actually drives it, over a real socket exactly like
+    /// `a_late_subscriber_learns_about_a_fatal_warm_up_failure_instead_of_spinning_forever`
+    /// above.
+    #[test]
+    fn a_late_subscriber_sees_the_degraded_badge_replayed_on_connect() {
+        let dir = std::env::temp_dir()
+            .join(format!("owf-daemon-test-subscribe-degraded-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock_path = dir.join("test.sock");
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = UnixListener::bind(&sock_path).unwrap();
+
+        // `normalize_available` defaults to `false` in `fake_daemon_with_normalize`
+        // -- combined with `normalize_enabled: true`, this is exactly
+        // "normalization is turned on but currently down", the condition
+        // `serve_subscriber` checks to decide whether to replay the badge.
+        let daemon = fake_daemon_with_normalize(IDLE, true);
+
+        let accept_daemon = Arc::clone(&daemon);
+        let accept_listener = listener.try_clone().unwrap();
+        let accept_thread = std::thread::spawn(move || {
+            for s in accept_listener.incoming().take(1).flatten() {
+                handle(Arc::clone(&accept_daemon), s);
+            }
+        });
+
+        let mut stream = UnixStream::connect(&sock_path).unwrap();
+        writeln!(stream, "{}", serde_json::to_string(&Request::Subscribe).unwrap()).unwrap();
+        stream.flush().unwrap();
+        let mut reader = BufReader::new(stream);
+
+        let mut first = String::new();
+        reader.read_line(&mut first).unwrap();
+        assert_eq!(
+            serde_json::from_str::<OverlayEvent>(first.trim()).unwrap(),
+            OverlayEvent::Idle,
+            "the state snapshot comes first, unaffected by normalization's own availability"
+        );
+
+        let mut second = String::new();
+        reader.read_line(&mut second).unwrap();
+        assert_eq!(
+            serde_json::from_str::<OverlayEvent>(second.trim()).unwrap(),
+            OverlayEvent::NormalizeDegraded {
+                reason: "llama-server is down or unhealthy".to_string()
+            },
+            "a late joiner must learn normalization is already down, not just a future subscriber"
+        );
+
+        accept_thread.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Work Item 3's connect-time race: registering the subscriber and
     /// reading the snapshot happen inside one critical section on
     /// `daemon.subscribers`'s lock, the same lock `broadcast_to` takes
@@ -2013,6 +2261,23 @@ mod tests {
     /// receives it live once registered. Driven many times with real
     /// threads (not asserted analytically) since this is exactly the kind
     /// of race that only shows up under real scheduling.
+    ///
+    /// F6: the racy socket subscriber's own assertion below is deliberately
+    /// loose (`matches!`, not payload equality) -- `snapshot_event(RECORDING)`
+    /// always synthesises `{level: 0.0, elapsed_ms: 0}` regardless of whether
+    /// any broadcast ever happened (see its doc comment), so a subscriber
+    /// that loses the race and only ever sees that synthetic snapshot is a
+    /// legitimate, accepted outcome, not evidence of anything broken. That
+    /// synthesis is exactly what let this test pass even with
+    /// `racer_daemon.broadcast(..)` deleted outright: `racer_daemon.state
+    /// .store(RECORDING, ..)` alone is enough to make some interleavings
+    /// produce a first line that `matches!` a `Recording` variant, with the
+    /// real `broadcast` call never having run at all. `control_rx` below
+    /// closes that hole: it is registered, deterministically, *before* the
+    /// racer thread is even spawned, so it is guaranteed to be listening
+    /// when `broadcast_to` runs and must receive the exact real payload --
+    /// deleting the broadcast call now fails this test every time, not just
+    /// on an unlucky interleaving.
     #[test]
     fn a_transition_racing_a_new_subscriber_is_never_lost() {
         let dir = std::env::temp_dir()
@@ -2031,6 +2296,15 @@ mod tests {
             }
         });
 
+        // A deterministic witness, registered before the race even starts:
+        // proves the real broadcast (with its real payload) actually fires,
+        // independent of however the socket subscriber's own race lands.
+        let (control_tx, control_rx) = mpsc::channel();
+        {
+            let mut subs = lock_ignoring_poison(&daemon.subscribers);
+            register_subscriber(&mut subs, control_tx, Arc::new(AtomicBool::new(true)));
+        }
+
         // Race a broadcast against the connect: neither strictly happens
         // before the other from this test's point of view.
         let racer_daemon = Arc::clone(&daemon);
@@ -2044,12 +2318,19 @@ mod tests {
         stream.flush().unwrap();
         racer.join().unwrap();
 
+        assert_eq!(
+            control_rx.recv_timeout(Duration::from_secs(2)),
+            Ok(OverlayEvent::Recording { level: 0.1, elapsed_ms: 5 }),
+            "broadcast_to must actually deliver the real transition payload to an \
+             already-registered subscriber"
+        );
+
         let mut reader = BufReader::new(stream);
         let mut first = String::new();
         reader.read_line(&mut first).unwrap();
         let first_event: OverlayEvent = serde_json::from_str(first.trim()).unwrap();
 
-        // Whichever way the race landed, the subscriber must see the
+        // Whichever way the race landed, the racy subscriber must see the
         // `Recording` transition somewhere in its stream -- either as the
         // snapshot itself, or as the very next line if the snapshot still
         // caught `Idle`.
@@ -2351,6 +2632,19 @@ mod tests {
     /// loop is asleep inside a *later* backoff wait must return promptly --
     /// nowhere near that wait's real duration -- proving it woke via the
     /// stop signal, not by timing out and attempting one more spawn first.
+    ///
+    /// F6: this used to pass `spawn_housekeeping` its production default of
+    /// `initial_last_known_available: true`, which makes the loop's *first*
+    /// wait `HEALTH_POLL_INTERVAL` (10s), not a backoff wait at all -- the
+    /// 1200ms sleep below never got anywhere near even the first real health
+    /// check, let alone a second backoff wait, so this test could never
+    /// actually fail for the reason its name and doc comment claimed
+    /// (deleting the stop-signal wakeup entirely would still have passed,
+    /// since `stop()` returns promptly during the 10s health-poll wait too).
+    /// Passing `false` here starts the loop already "unhealthy", so its
+    /// first wait is genuinely `backoff` (1s, per `INITIAL_BACKOFF`) and its
+    /// second is the doubled 2s this test's timing was always written
+    /// against.
     #[test]
     fn shutdown_during_a_backoff_wait_terminates_promptly_without_spawning() {
         let daemon = fake_daemon(IDLE);
@@ -2359,7 +2653,7 @@ mod tests {
             ..NormalizeConfig::default()
         });
 
-        let handle = spawn_housekeeping(Arc::clone(&daemon), normalize_cfg);
+        let handle = spawn_housekeeping(Arc::clone(&daemon), normalize_cfg, false);
 
         // Past the first (1s) backoff wait, so the loop is now asleep inside
         // its *second* wait (2s) -- genuinely "during a backoff wait", not
