@@ -23,7 +23,7 @@ use owf_core::lang::WhatlangDetector;
 use owf_core::llama::LlamaServer;
 use owf_core::normalize::{Normalizer, S1MiniClient};
 use owf_core::paths;
-use owf_core::pipeline::Pipeline;
+use owf_core::pipeline::{Pipeline, Timings};
 use owf_core::proto::{OverlayEvent, Request, Response, State};
 use owf_core::vad::SileroTrimmer;
 
@@ -173,6 +173,14 @@ struct Daemon {
     /// supervising `llama-server` -- see `spawn_housekeeping`. `None` until
     /// `main` installs it, and again after `shutdown` stops it.
     housekeeping: Mutex<Option<HousekeepingHandle>>,
+    /// The per-stage timing breakdown from the most recent utterance that
+    /// actually produced an `Outcome` (Task 2: `Outcome.timings` used to be
+    /// computed and read by nothing in production). Surfaced by `status` as
+    /// `last_ms` so `owf-ctl status` can report where the time actually went.
+    /// `None` until the first such utterance; a "no speech detected" or
+    /// pipeline-error utterance has no `Outcome` to take timings from and
+    /// leaves whatever was last recorded in place rather than clearing it.
+    last_timings: Mutex<Option<Timings>>,
 }
 
 /// A single registered `Request::Subscribe` connection: the channel
@@ -398,6 +406,7 @@ fn main() -> Result<()> {
         normalize_available: AtomicBool::new(false),
         fatal_error: Mutex::new(None),
         housekeeping: Mutex::new(None),
+        last_timings: Mutex::new(None),
     });
 
     // Warm up off the accept loop so `status` answers immediately.
@@ -1108,6 +1117,14 @@ fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
             if daemon.normalize_enabled {
                 r.normalize_available = Some(daemon.normalize_available.load(Ordering::SeqCst));
             }
+            // Task 2: `last_ms` was declared and never populated. `Timings`
+            // derives `Serialize`, so this is just handing its fields
+            // through as the generic JSON bag `Response::last_ms` already
+            // is; `to_value` on a plain struct of small `u128` millisecond
+            // counts cannot fail in practice.
+            if let Some(t) = *lock_ignoring_poison(&daemon.last_timings) {
+                r.last_ms = serde_json::to_value(t).ok();
+            }
             if current == FAILED {
                 r.err = lock_ignoring_poison(&daemon.fatal_error).clone();
             }
@@ -1367,6 +1384,7 @@ fn run_utterance(daemon: Arc<Daemon>) {
     process_utterance(
         &daemon.pipeline,
         &daemon.subscribers,
+        &daemon.last_timings,
         &stop.samples,
         class.as_deref(),
         Some(stop.capture),
@@ -1391,9 +1409,15 @@ fn preview_of(text: &str) -> String {
 /// `IdleOnExit` recovers `state` even when this function unwinds. `subscribers`
 /// is likewise a bare `&Mutex<Vec<...>>` rather than `&Daemon`, for the same
 /// reason `IdleOnExit` takes one directly instead of a whole `Daemon`.
+///
+/// `last_timings` is likewise a bare `&Mutex<Option<Timings>>` -- it is
+/// updated here, from the produced `Outcome`, whenever there is one to take
+/// timings from (see `Daemon::last_timings`'s doc comment for why a
+/// no-speech/error utterance leaves it untouched instead of clearing it).
 fn process_utterance(
     pipeline: &Mutex<Option<Pipeline>>,
     subscribers: &Mutex<Vec<Subscriber>>,
+    last_timings: &Mutex<Option<Timings>>,
     samples: &[f32],
     window_class: Option<&str>,
     capture: Option<CaptureStats>,
@@ -1412,6 +1436,7 @@ fn process_utterance(
         match p.process_with_capture(samples, window_class, capture) {
             Ok(Some(out)) => {
                 tracing::info!(chars = out.text.len(), "injected");
+                *lock_ignoring_poison(last_timings) = Some(out.timings);
                 broadcast_to(subscribers, OverlayEvent::Done { preview: preview_of(&out.text) });
             }
             Ok(None) => {
@@ -1510,10 +1535,11 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         subscribers.lock().unwrap().push(Subscriber { tx, alive: Arc::new(AtomicBool::new(true)) });
         let samples = vec![0.1f32; 16_000];
+        let last_timings: Mutex<Option<Timings>> = Mutex::new(None);
 
         let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
             let _idle_on_exit = IdleOnExit { state: &state, subscribers: &subscribers };
-            process_utterance(&pipeline, &subscribers, &samples, None, None);
+            process_utterance(&pipeline, &subscribers, &last_timings, &samples, None, None);
         }));
 
         assert!(result.is_err(), "the transcriber's panic should have propagated");
@@ -1527,6 +1553,70 @@ mod tests {
             Ok(OverlayEvent::Idle),
             "a subscriber must see the overlay return to idle even when the pipeline panicked"
         );
+    }
+
+    /// A transcriber that always succeeds with fixed text -- drives
+    /// `process_utterance` down its happy path, unlike `PanickingTranscriber`
+    /// above.
+    struct FixedAsr(&'static str);
+    impl Transcriber for FixedAsr {
+        fn transcribe(&self, _: &[f32]) -> anyhow::Result<String> {
+            Ok(self.0.to_string())
+        }
+    }
+
+    /// Task 2: `Response.last_ms` was declared and never populated, even
+    /// though `Outcome.timings` was computed on every successful utterance
+    /// and simply never read by anything in production. Proves
+    /// `process_utterance` actually stores those timings where `dispatch`'s
+    /// `Request::Status` arm can find them -- see
+    /// `status_reports_last_ms_after_a_successful_utterance` for the other
+    /// half.
+    #[test]
+    fn a_successful_utterance_populates_last_timings() {
+        let pipeline = Mutex::new(Some(Pipeline::new(
+            // Normalization off so `NeverNormalizer` is safe to reuse here
+            // too: nothing about this test cares whether normalization ran.
+            Config::from_str("[normalize]\nenabled = false\n").unwrap(),
+            Box::new(FixedAsr("hello there")),
+            Box::new(WholeBuffer),
+            Box::new(AlwaysEnglish),
+            Box::new(NeverNormalizer),
+            Box::new(MockInjector::default()),
+        )));
+        let subscribers: Mutex<Vec<Subscriber>> = Mutex::new(Vec::new());
+        let last_timings: Mutex<Option<Timings>> = Mutex::new(None);
+        let samples = vec![0.1f32; 16_000];
+
+        process_utterance(&pipeline, &subscribers, &last_timings, &samples, None, None);
+
+        assert!(
+            last_timings.lock().unwrap().is_some(),
+            "a successful utterance must record its per-stage timings"
+        );
+    }
+
+    /// `status`'s own end of the same fix: once an utterance has recorded
+    /// timings, `Request::Status` must surface them as `last_ms`; before any
+    /// utterance has ever completed it must report nothing at all, not even
+    /// the key (`Response::last_ms`'s `skip_serializing_if` promise -- an old
+    /// client that never looks for the field must be unaffected).
+    #[test]
+    fn status_reports_last_ms_after_a_successful_utterance() {
+        let daemon = fake_daemon(IDLE);
+        let before = dispatch(&daemon, Request::Status);
+        assert!(before.last_ms.is_none(), "no utterance has completed yet");
+
+        *daemon.last_timings.lock().unwrap() =
+            Some(Timings { vad_ms: 12, asr_ms: 340, normalize_ms: 0, inject_ms: 5 });
+
+        let after = dispatch(&daemon, Request::Status);
+        let last_ms =
+            after.last_ms.expect("last_ms must be populated once an utterance has completed");
+        assert_eq!(last_ms["vad_ms"], serde_json::json!(12));
+        assert_eq!(last_ms["asr_ms"], serde_json::json!(340));
+        assert_eq!(last_ms["normalize_ms"], serde_json::json!(0));
+        assert_eq!(last_ms["inject_ms"], serde_json::json!(5));
     }
 
     /// Fix 2: proves the mechanism that guarantees no `llama-server` process
@@ -1754,6 +1844,7 @@ mod tests {
             normalize_available: AtomicBool::new(false),
             fatal_error: Mutex::new(None),
             housekeeping: Mutex::new(None),
+            last_timings: Mutex::new(None),
         })
     }
 
