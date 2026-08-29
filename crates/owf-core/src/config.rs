@@ -256,6 +256,13 @@ impl Default for GuardrailConfig {
 #[serde(rename_all = "lowercase")]
 pub enum InjectBackend {
     Wtype,
+    /// Spec 10.3, no longer deferred. Types through `/dev/uinput` rather
+    /// than through the compositor's virtual-keyboard protocol, which is
+    /// what makes it work in the XWayland and Electron surfaces `wtype` is
+    /// known to fail in (spec 17.3) -- at the cost of a running `ydotoold`
+    /// and write access to `/dev/uinput`. Not the default for exactly that
+    /// reason: `wtype` needs no setup at all.
+    Ydotool,
     Clipboard,
 }
 
@@ -598,7 +605,9 @@ ngram_size = 6
 ngram_max_repeats = 3
 
 [inject]
-backend = "wtype"
+backend = "wtype"          # "wtype" | "ydotool" | "clipboard"
+                           # ydotool needs a running ydotoold and write access
+                           # to /dev/uinput; it types where wtype cannot.
 trailing_space = true
 keystroke_delay_ms = 2
 
@@ -797,6 +806,23 @@ mod tests {
         // documented behaviour silently diverge.
         let from_file = Config::from_str(DEFAULT_CONFIG_TOML).unwrap();
         assert_eq!(from_file, Config::default());
+    }
+
+    #[test]
+    fn every_inject_backend_is_spelled_the_way_config_toml_spells_it() {
+        // The GUI dropdown, the `# "wtype" | "ydotool" | "clipboard"` comment
+        // in DEFAULT_CONFIG_TOML and `ENUMS["inject.backend"]` in
+        // `src/settings/schema.ts` all hand-repeat these strings; this pins
+        // what they have to agree with. `deny_unknown_fields` makes a
+        // misspelling a hard startup failure, not a silent fallback.
+        for (spelling, expected) in [
+            ("wtype", InjectBackend::Wtype),
+            ("ydotool", InjectBackend::Ydotool),
+            ("clipboard", InjectBackend::Clipboard),
+        ] {
+            let c = Config::from_str(&format!("[inject]\nbackend = \"{spelling}\"\n")).unwrap();
+            assert_eq!(c.inject.backend, expected, "for {spelling}");
+        }
     }
 
     #[test]

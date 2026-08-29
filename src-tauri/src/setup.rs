@@ -208,6 +208,12 @@ pub(crate) fn check_prerequisites() -> Vec<&'static str> {
         ("llama-server", "S1-mini normalization", "llama-cpp", true),
         ("wtype", "typing into the focused window", "wtype", true),
         ("wl-copy", "clipboard fallback when typing fails", "wl-clipboard", true),
+        // Optional, not fatal: `wtype` is the default injector and needs no
+        // setup, so a machine without `ydotool` is fully working. It only
+        // matters to someone who has switched `inject.backend` to it, and
+        // reporting it as MISSING would put a package in the "install these"
+        // list that almost nobody needs.
+        ("ydotool", "typing via /dev/uinput when inject.backend = \"ydotool\"", "ydotool", false),
         ("hyprctl", "per-application style rules", "hyprland", false),
     ];
 

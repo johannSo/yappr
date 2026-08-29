@@ -13,6 +13,11 @@ use crate::procutil;
 /// utterance typed at a brisk pace is a few thousand characters, comfortably
 /// inside this bound at the default 2 ms/keystroke delay.
 const WTYPE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Twice `WTYPE_TIMEOUT` for the same text, because the two spell "delay"
+/// differently: `wtype -d` waits once per character, `ydotool --key-delay`
+/// waits once per *key event* -- press and release both -- so the same
+/// configured `inject.keystroke_delay_ms` buys ydotool half the throughput.
+const YDOTOOL_TIMEOUT: Duration = Duration::from_secs(30);
 const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]
@@ -71,19 +76,87 @@ impl TextInjector for WtypeInjector {
     }
 
     fn inject(&self, text: &str) -> Result<(), InjectError> {
-        let mut cmd = Command::new("wtype");
-        cmd.args(wtype_argv(text, self.delay_ms));
-        let out = procutil::run_with_timeout(cmd, WTYPE_TIMEOUT, None)
-            .map_err(|e| map_proc_error("wtype", WTYPE_TIMEOUT, e))?;
-        if !out.status.success() {
-            return Err(InjectError::Failed {
-                backend: "wtype",
-                status: out.status.to_string(),
-                stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
-            });
-        }
-        Ok(())
+        run_typer("wtype", wtype_argv(text, self.delay_ms), WTYPE_TIMEOUT)
     }
+}
+
+/// Builds the ydotool argument vector.
+///
+/// `type` is a subcommand and owns its own `getopt_long` parser, so it has to
+/// come before the options rather than after them. `--key-delay` is the same
+/// idea as `wtype -d` but counted per key event rather than per character
+/// (see [`YDOTOOL_TIMEOUT`]), and `--` terminates option parsing so a
+/// transcript beginning with `-` is typed rather than misread as flags --
+/// `getopt_long`'s own guarantee, not something ydotool documents.
+///
+/// Only the three options ydotool's man page actually documents for `type`
+/// are used (`-d/--key-delay`, `-D/--next-delay`, `-f/--file`). In
+/// particular `--escape`, which some builds accept and others do not, is
+/// left alone: an unknown flag would fail every injection outright, and the
+/// escaping it controls is not something spec 10.2 wants invented anyway.
+fn ydotool_argv(text: &str, delay_ms: u32) -> Vec<String> {
+    vec![
+        "type".to_string(),
+        "--key-delay".to_string(),
+        delay_ms.to_string(),
+        "--".to_string(),
+        text.to_string(),
+    ]
+}
+
+/// Spec 10.3's second injector, for the XWayland and Electron surfaces
+/// `wtype` cannot reach (spec 17.3).
+///
+/// Unlike `wtype` this is not self-contained: it talks to a `ydotoold`
+/// daemon over `$YDOTOOL_SOCKET`, and that daemon needs write access to
+/// `/dev/uinput`. When either is missing, `ydotool` exits non-zero and the
+/// clipboard fallback (spec 10.4) carries the transcript instead -- the user
+/// still gets their text, per invariant 1. Setting that up is the user's
+/// call, not the app's (same reason `hypr.rs` prints a config block rather
+/// than applying one).
+pub struct YdotoolInjector {
+    delay_ms: u32,
+}
+
+impl YdotoolInjector {
+    pub fn new(delay_ms: u32) -> Self {
+        Self { delay_ms }
+    }
+}
+
+impl TextInjector for YdotoolInjector {
+    fn name(&self) -> &'static str {
+        "ydotool"
+    }
+
+    fn inject(&self, text: &str) -> Result<(), InjectError> {
+        run_typer("ydotool", ydotool_argv(text, self.delay_ms), YDOTOOL_TIMEOUT)
+    }
+}
+
+/// Runs one argv-driven typing backend under I3's timeout and maps the
+/// outcome onto [`InjectError`].
+///
+/// `backend` is both the error label and the program name -- true of `wtype`
+/// and `ydotool` alike, which differ only in the argv they build and the
+/// budget they are given.
+fn run_typer(
+    backend: &'static str,
+    argv: Vec<String>,
+    timeout: Duration,
+) -> Result<(), InjectError> {
+    let mut cmd = Command::new(backend);
+    cmd.args(argv);
+    let out = procutil::run_with_timeout(cmd, timeout, None)
+        .map_err(|e| map_proc_error(backend, timeout, e))?;
+    if !out.status.success() {
+        return Err(InjectError::Failed {
+            backend,
+            status: out.status.to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        });
+    }
+    Ok(())
 }
 
 pub struct ClipboardInjector;
@@ -157,6 +230,7 @@ impl TextInjector for MockInjector {
 pub fn build(cfg: &InjectConfig) -> Box<dyn TextInjector> {
     match cfg.backend {
         InjectBackend::Wtype => Box::new(WtypeInjector::new(cfg.keystroke_delay_ms)),
+        InjectBackend::Ydotool => Box::new(YdotoolInjector::new(cfg.keystroke_delay_ms)),
         InjectBackend::Clipboard => Box::new(ClipboardInjector),
     }
 }
@@ -283,9 +357,41 @@ mod tests {
     }
 
     #[test]
+    fn ydotool_argv_ends_option_parsing_before_the_text() {
+        // Same hazard as wtype: a transcript beginning with '-' must be
+        // typed, not parsed as flags. `ydotool type` parses with
+        // getopt_long, so `--` terminates option scanning.
+        let argv = ydotool_argv("-- not a flag", 2);
+        let dashdash = argv.iter().position(|a| a == "--").expect("needs a --");
+        assert_eq!(argv.last().unwrap(), "-- not a flag");
+        assert!(dashdash < argv.len() - 1, "-- must precede the text");
+        assert_eq!(argv.first().unwrap(), "type", "type is a subcommand, not a flag");
+        assert!(argv.contains(&"--key-delay".to_string()));
+        assert!(argv.contains(&"2".to_string()));
+    }
+
+    #[test]
+    fn ydotool_argv_passes_the_text_as_a_single_argument() {
+        let argv = ydotool_argv("hello there friend", 2);
+        assert_eq!(argv.iter().filter(|a| a.contains(' ')).count(), 1);
+    }
+
+    #[test]
+    fn ydotool_argv_puts_the_subcommand_before_its_options() {
+        // `ydotool --key-delay 2 type ...` is not a thing: the subcommand
+        // owns the option parser, so it has to come first.
+        let argv = ydotool_argv("hello", 2);
+        let sub = argv.iter().position(|a| a == "type").unwrap();
+        let delay = argv.iter().position(|a| a == "--key-delay").unwrap();
+        assert!(sub < delay, "got: {argv:?}");
+    }
+
+    #[test]
     fn build_selects_the_configured_backend() {
         let mut cfg = InjectConfig::default();
         assert_eq!(build(&cfg).name(), "wtype");
+        cfg.backend = InjectBackend::Ydotool;
+        assert_eq!(build(&cfg).name(), "ydotool");
         cfg.backend = InjectBackend::Clipboard;
         assert_eq!(build(&cfg).name(), "clipboard");
     }

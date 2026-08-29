@@ -422,7 +422,15 @@ consecutive dictations do not run together.
 the documented remedy is to make the clipboard path (§10.4) the default
 injector rather than to invent an escaping scheme.
 
-### 10.3 `YdotoolInjector` (deferred to v2)
+### 10.3 `YdotoolInjector` (implemented — no longer deferred)
+
+**Status update:** implemented as `inject::YdotoolInjector`, selectable as
+`[inject] backend = "ydotool"`. It invokes `ydotool type --key-delay <ms> --
+<text>`; the setup cost catalogued below is unchanged and is documented in
+`README.md` ("Typing with `ydotool`") rather than automated, per the
+never-configure-the-user's-system rule. `wtype` remains the default. The
+original text follows.
+
 
 The original request named `(y)dotool`, and `wtype` was chosen instead for v1
 because it needs no root and is already installed. `wtype` is known to fail in

@@ -180,11 +180,11 @@ export const HELP: Record<string, string> = {
   "guardrail.ngram_max_repeats":
     "Wie oft dieselbe Wortfolge vorkommen darf, bevor die Fassung als Schleife verworfen wird.",
   "inject.backend":
-    "wtype tippt den Text Zeichen für Zeichen ins Fenster. clipboard legt ihn in die Zwischenablage und fügt ihn ein.",
+    "wtype tippt den Text Zeichen für Zeichen ins Fenster. ydotool tippt stattdessen über /dev/uinput und erreicht damit auch Fenster, in denen wtype nichts bewirkt — setzt aber einen laufenden ydotoold voraus. clipboard legt ihn in die Zwischenablage und fügt ihn ein.",
   "inject.trailing_space":
     "Hängt ein Leerzeichen an, damit das nächste Diktat nicht am vorherigen klebt.",
   "inject.keystroke_delay_ms":
-    "Pause zwischen zwei simulierten Tastenanschlägen. Höher setzen, wenn ein Fenster Zeichen verschluckt.",
+    "Pause zwischen zwei simulierten Tastenanschlägen. Höher setzen, wenn ein Fenster Zeichen verschluckt. ydotool zählt sie je Tastenereignis, also zweimal pro Zeichen.",
   "vocabulary.enabled":
     "Korrigiert Fachbegriffe und Namen schon im Erkennungstext, bevor die Nachbearbeitung ihn zu sehen bekommt.",
   "vocabulary.terms":
@@ -213,7 +213,7 @@ export const HELP: Record<string, string> = {
 };
 
 export const ENUMS: Record<string, string[]> = {
-  "inject.backend": ["wtype", "clipboard"],
+  "inject.backend": ["wtype", "ydotool", "clipboard"],
   "style_default.styling": ["casual", "semi-casual", "semi-formal", "formal"],
   "style_default.structure": ["prose", "lists"],
   "style_default.context": ["general", "email"],

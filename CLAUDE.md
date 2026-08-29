@@ -7,7 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Press-to-start, press-to-stop dictation for Hyprland/Wayland. Press `SUPER+D`, speak,
 press `SUPER+D` again; the audio is captured, VAD-trimmed, transcribed (Parakeet TDT via
 `sherpa-onnx`), rewritten by a local S1-mini `llama-server`, checked by a guardrail, and
-typed into the focused window with `wtype`. Fully local at dictation time. `SUPER+ALT+D`
+typed into the focused window with `wtype` (or `ydotool`, if `[inject] backend` selects
+it). Fully local at dictation time. `SUPER+ALT+D`
 cancels a recording in progress; nothing else can end one deliberately — see invariant 11.
 
 OpenWhisprFlow is one binary, `openwhisprflow`, and one process. Running it with no
@@ -34,7 +35,7 @@ bun run tauri dev                         # dev: Vite on :1420 + the Tauri windo
 bun run build                             # frontend only (tsc && vite build -> dist/)
 #   ^ builds BOTH pages: index.html (overlay) and settings.html (settings window).
 
-# Tests (371 passed, 0 failed, 4 #[ignore]d because they need downloaded models)
+# Tests (377 passed, 0 failed, 4 #[ignore]d because they need downloaded models)
 cargo test --workspace
 cargo test --workspace -- --ignored       # needs models already on disk (Settings' Setup pane, or --update-lock)
 cargo test -p owf-core guardrail::        # one module

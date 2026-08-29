@@ -133,12 +133,35 @@ fn build_array(existing: Option<&Item>, items: &[Value]) -> Result<Item> {
 /// Replaces a value while keeping the whitespace and comments attached to it.
 /// Without this, `max_error_ratio = 0.25   # two wrong characters in eight`
 /// loses its explanation the first time the GUI touches it.
+///
+/// A key/value pair carries its comments in *two* places, and both have to be
+/// carried across: the trailing `# ...` on the same line belongs to the value,
+/// while comment lines written on their own line *above* the key belong to the
+/// key. `toml_edit::TableLike::insert` reformats whichever key it lands on
+/// (`Key::fmt()`, which resets the key's decor to its default), so restoring
+/// the value's decor alone left every such comment deleted -- including
+/// `DEFAULT_CONFIG_TOML`'s "# Cleanup runs on S1-mini by Superwhisper.", an
+/// attribution the spec requires, wiped by the user's first toggle of the
+/// `[normalize] enabled` switch printed directly beneath it.
 fn set_preserving_decor(table: &mut dyn toml_edit::TableLike, key: &str, mut new: Item) {
-    let old_decor = table.get(key).and_then(Item::as_value).map(|v| v.decor().clone());
-    if let (Some(decor), Some(value)) = (old_decor, new.as_value_mut()) {
+    let old_value_decor = table.get(key).and_then(Item::as_value).map(|v| v.decor().clone());
+    // Only when the key was already a plain key/value pair. A key that came
+    // from an `[[array.of.tables]]` *header* carries header spacing -- no
+    // trailing space, because a header has no `=` -- and pasting that onto an
+    // inline value renders `replacements= []`.
+    let old_key_decor = table
+        .get(key)
+        .and_then(Item::as_value)
+        .and(table.key(key))
+        .map(|k| (k.leaf_decor().clone(), k.dotted_decor().clone()));
+    if let (Some(decor), Some(value)) = (old_value_decor, new.as_value_mut()) {
         *value.decor_mut() = decor;
     }
     table.insert(key, new);
+    if let (Some((leaf, dotted)), Some(mut k)) = (old_key_decor, table.key_mut(key)) {
+        *k.leaf_decor_mut() = leaf;
+        *k.dotted_decor_mut() = dotted;
+    }
 }
 
 fn scalar_to_toml(value: &Value) -> Result<toml_edit::Value> {
@@ -294,6 +317,54 @@ port = 8730
         assert!(out.contains("replacements = []"), "not written as an empty array:\n{out}");
         let parsed = Config::from_str(&out).unwrap();
         assert!(parsed.vocabulary.replacements.is_empty(), "not cleared:\n{out}");
+    }
+
+    #[test]
+    fn changing_an_inject_setting_keeps_the_comments_documenting_the_section() {
+        // DEFAULT_CONFIG_TOML annotates `backend` with the three spellings it
+        // accepts. Invariant 9: a save that changes one setting must produce a
+        // one-line diff -- it must not strip the annotation the user relies on
+        // to know what else they could have written there.
+        let out = merge_json_into_toml(
+            crate::config::DEFAULT_CONFIG_TOML,
+            // Both decors at once: the choices comment trails `backend` on
+            // its own line, the ydotoold note sits between `backend` and
+            // `trailing_space`, and each is changed here.
+            &json!({"inject": {"backend": "ydotool", "trailing_space": false}}),
+        )
+        .unwrap();
+        assert!(out.contains(r#"backend = "ydotool""#), "not written:\n{out}");
+        assert!(
+            out.contains(r#"# "wtype" | "ydotool" | "clipboard""#),
+            "annotation lost:\n{out}"
+        );
+        assert!(out.contains("# ydotool needs a running ydotoold"), "note lost:\n{out}");
+        assert_eq!(
+            Config::from_str(&out).unwrap().inject.backend,
+            crate::config::InjectBackend::Ydotool
+        );
+    }
+
+    #[test]
+    fn changing_a_value_keeps_the_comment_lines_above_it() {
+        // `set_preserving_decor` used to carry only the *value*'s decor across
+        // -- the trailing `# ...` on the same line. A comment written on its
+        // own line above a key belongs to the *key*'s decor, and `Table::insert`
+        // replaces the whole key/value pair, so every such comment was dropped
+        // the first time the GUI touched the key beneath it. In the shipped
+        // DEFAULT_CONFIG_TOML that included "# Cleanup runs on S1-mini by
+        // Superwhisper." above `normalize.enabled` -- an attribution the
+        // README and spec require, deleted by the user's first toggle.
+        let out = merge_json_into_toml(
+            crate::config::DEFAULT_CONFIG_TOML,
+            &json!({"normalize": {"enabled": false}}),
+        )
+        .unwrap();
+        assert!(out.contains("enabled = false"), "not written:\n{out}");
+        assert!(
+            out.contains("# Cleanup runs on S1-mini by Superwhisper."),
+            "attribution lost:\n{out}"
+        );
     }
 
     #[test]

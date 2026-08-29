@@ -22,7 +22,7 @@ One dictation goes through this pipeline:
 4. **Language ID** — `whatlang` tags the transcript's language, which selects the guardrail's overlap threshold below.
 5. **Normalization** — **S1-mini** by **Superwhisper**, served locally through a supervised `llama-server`, rewrites the raw transcript into cleaned, punctuated prose (or a list, depending on style).
 6. **Guardrail** — a set of cheap, deterministic checks (word-count ratio, token overlap, n-gram loop detection, template-bleed detection) decides whether S1-mini's rewrite is trustworthy. If not, the pipeline falls back to the raw ASR text (or a light rule-based cleanup of it) instead of typing something S1-mini invented. Every rejection is appended to `rejections.jsonl` for later review.
-7. **Injection** — `wtype` types the result into the focused window; if that fails, the text is copied to the clipboard with `wl-copy` instead, and a notification says so.
+7. **Injection** — `wtype` types the result into the focused window; if that fails, the text is copied to the clipboard with `wl-copy` instead, and a notification says so. `[inject] backend = "ydotool"` swaps in `ydotool` for windows `wtype` cannot reach (see below).
 
 `llama-server` is started once, supervised, when the app starts, and stays warm
 for as long as the app runs — normalization only pays a network round-trip to
@@ -74,6 +74,7 @@ end to end** — second press to text appearing.
   ```
 - `wtype` — types the cleaned transcript into the focused window
 - `wl-clipboard` (provides `wl-copy`) — clipboard fallback when typing fails
+- `ydotool` — optional; only if you switch `[inject] backend` to it (see below). Not needed otherwise.
 - Hyprland (`hyprctl`) — optional; used to look up the focused window's class for per-application style rules, and for `wlr-layer-shell` overlay placement. Everything else works without it, including on GNOME, with a plainer (unpositioned) overlay.
 
 ## Install
@@ -113,6 +114,30 @@ running the *old* code, which is the worst possible failure mode:
 rm -f ~/.local/bin/owf-ctl ~/.local/bin/owf-daemon ~/.local/bin/owf-bench \
       ~/.local/bin/openwhisprflow-settings
 ```
+
+`~/.local/bin/openwhisprflow` is deliberately *not* on that list — it is the one
+name the rewrite kept, so deleting it would delete the new build too. It is also
+the most dangerous leftover of the three, because it fails silently rather than
+loudly: the pre-rewrite binary of that name is the overlay-only Tauri app, which
+parses no arguments at all. Run it as `openwhisprflow --toggle` and it never
+touches the socket — it opens *its own* overlay window, subscribes to whatever
+daemon is listening, and draws a second overlay from the same events. Both pills
+show the same waveform and the same timer, because they are the same events; one
+of them is a ghost. Overwrite it, and confirm afterwards that only one binary
+answers to the name:
+
+```bash
+install -m755 target/release/openwhisprflow ~/.local/bin/   # overwrites in place
+which -a openwhisprflow                                     # expect exactly one path
+openwhisprflow --status                                     # expect one line of JSON
+```
+
+That last line is the cheap test: the current binary answers `--status` on stdout
+and exits. A pre-rewrite binary of the same name prints nothing and opens a
+window. If you run the AppImage rather than installing, point `~/.local/bin/openwhisprflow`
+at it (`ln -s`) instead of leaving an older real file there — a shortcut, a
+`.desktop` entry or a shell that resolves the bare name through `PATH` will
+otherwise find the old build and you get the two-overlay symptom above.
 
 Then see [Migrating an existing Hyprland config](#migrating-an-existing-hyprland-config)
 below — this is a breaking change for your shortcuts and window rules too, not
@@ -227,7 +252,7 @@ commented defaults on first run. The main knobs:
 - **`[asr]`** — `num_threads` for Parakeet.
 - **`[normalize]`** — `enabled` (set `false` to skip S1-mini entirely and type rule-based-cleaned raw ASR text), `port`/`timeout_ms`/`llama_server_path`/`context_size`/`threads` for the supervised `llama-server`.
 - **`[guardrail]`** — `min_word_ratio`/`max_word_ratio`, `min_overlap_english`/`min_overlap_other`, `short_input_words` (below this many raw words, the ratio/overlap checks are skipped — see Known limitations), `ngram_size`/`ngram_max_repeats` (loop detection).
-- **`[inject]`** — `backend` (`wtype` or `clipboard`), `trailing_space`, `keystroke_delay_ms`.
+- **`[inject]`** — `backend` (`wtype`, `ydotool` or `clipboard`), `trailing_space`, `keystroke_delay_ms`.
 - **`[style_default]`** and **`[[style_rules]]`** — the default `styling`/`structure`/`context` axes S1-mini is prompted with, and per-application overrides matched by focused window class (regex).
 - **`[debug]`** — `enabled` (off by default), `dir` (default `~/owf`), `save_audio`. When enabled, every utterance writes a WAV of the raw capture and the post-VAD-trim buffer under `<dir>/audio/`, plus a JSON diagnostic record (capture stats — device, native rate, samples captured vs. expected, stream error count — audio RMS/peak, VAD span, ASR/normalize/guardrail/inject results, and timings) under `<dir>/logs/`. The app's own log is also mirrored to `<dir>/logs/daemon.log` (append) while enabled. Run `openwhisprflow --debug` to print a summary of the most recent record and the paths to its files.
 
@@ -237,6 +262,46 @@ and applies every reloadable section to the live pipeline immediately —
 vocabulary, and more. Only `[asr]` and `[normalize]` still need a restart (see
 Settings above); `--reload` refuses outright rather than silently leaving the
 old normalizer in place if you try to change those without one.
+
+### Typing with `ydotool`
+
+`wtype` is the default and needs no setup: it types through the compositor's
+own virtual-keyboard protocol. It is also known to drop or ignore keystrokes in
+some XWayland and Electron windows. `[inject] backend = "ydotool"` types
+through the kernel's `/dev/uinput` instead, which those windows cannot tell
+apart from a real keyboard — at the cost of some setup, which is why it is not
+the default:
+
+```bash
+sudo pacman -S ydotool
+
+# /dev/uinput is root-only by default. Grant the input group write access:
+echo 'KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"' \
+  | sudo tee /etc/udev/rules.d/80-uinput.rules
+sudo usermod -aG input "$USER"          # log out and back in for this to apply
+
+systemctl --user enable --now ydotoold
+```
+
+`ydotool` talks to `ydotoold` over a socket. If your `ydotoold` does not use
+the default path, export `YDOTOOL_SOCKET` in the session environment
+OpenWhisprFlow itself starts in — a value set only in your shell's rc file will
+not reach a tray app started by the session.
+
+Then set the backend in Settings → Allgemein → Texteingabe → Verfahren, or in
+`config.toml`:
+
+```toml
+[inject]
+backend = "ydotool"
+```
+
+If any of that is missing, `ydotool` exits non-zero, and the clipboard fallback
+carries the transcript exactly as it does for a failing `wtype` — you get a
+"typing failed — copied to clipboard" notification rather than a lost dictation.
+Note that `keystroke_delay_ms` means something slightly different here:
+`ydotool` applies it per key event, so a character costs twice the configured
+delay.
 
 ## Known limitations
 

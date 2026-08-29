@@ -2563,6 +2563,9 @@ mod tests {
         for toml in [
             "[guardrail]\nngram_size = 8\n",
             "[inject]\ntrailing_space = false\n",
+            // The row that actually swaps the injector object, not just a
+            // field `process_with_capture` reads out of `cfg`.
+            "[inject]\nbackend = \"ydotool\"\n",
             "[style_default]\nstyling = \"formal\"\n",
             "[vocabulary]\nterms = [\"Hyprland\"]\n",
             "[debug]\nenabled = true\n",

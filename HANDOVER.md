@@ -38,8 +38,12 @@ re-touch it.
 1. **Stop the old processes.**
    ```bash
    pkill -f 'owf-ctl daemon'
-   pkill -f '/openwhisprflow$'
+   pkill -x openwhisprflow          # not -f '/openwhisprflow$'
    ```
+   `-x` on the process name, not `-f` on the command line: a shortcut that runs the bare
+   name through `PATH` gives a command line of `openwhisprflow --toggle`, which the
+   `/openwhisprflow$` pattern does not match — the anchor wants an absolute path and no
+   arguments. That miss is how an old overlay survives a cutover you believe you completed.
    The old daemon's `llama-server` child should exit with it (see CLAUDE.md invariant
    6-adjacent supervision code); check `pgrep llama-server` afterward and kill it directly
    if it didn't.
@@ -52,6 +56,16 @@ re-touch it.
    rm -f ~/.local/bin/owf-ctl ~/.local/bin/owf-daemon ~/.local/bin/owf-bench \
          ~/.local/bin/openwhisprflow-settings
    ```
+   `~/.local/bin/openwhisprflow` is missing from that list on purpose — it is the one name
+   the rewrite kept — but it is the leftover that actually bites, and it did: **observed on
+   this machine on 2026-08-29, two overlays on screen at once.** The pre-rewrite binary of
+   that name parses no arguments, so a `SUPER+D` bound to the bare name resolved through
+   `PATH` to the old build, which opened its own overlay, subscribed to the *new* daemon's
+   socket, and rendered a second pill from the same events — same waveform, same timer, no
+   error anywhere. Overwrite it with `install`, or symlink it at the AppImage, and then run
+   `which -a openwhisprflow` (expect one path) and `openwhisprflow --status` (expect one
+   line of JSON — a stale build prints nothing and opens a window). See README's
+   "Upgrading from an older, multi-binary build".
 
 3. **Edit your three Hyprland files** (this session did not do this for you — see the
    standing rule about never touching your compositor config):
@@ -154,3 +168,31 @@ re-touch it.
 - **Adapted the brief's example test** (see "What I verified myself" above) rather than
   implementing it verbatim, because I could show, on this exact machine, that the verbatim
   version fails for a reason unrelated to the thing it's supposed to check.
+
+---
+
+## Added after this letter: `ydotool` as a third injector
+
+`[inject] backend` now accepts `"ydotool"` alongside `"wtype"` and `"clipboard"`, selectable
+from Settings → Allgemein → Texteingabe → Verfahren. Spec 10.3 planned this and deferred it;
+it is no longer deferred. `wtype` is still the default — it needs no setup, and `ydotool`
+needs a running `ydotoold` plus write access to `/dev/uinput`, which README's "Typing with
+`ydotool`" section documents rather than automates.
+
+- `cargo test --workspace`: **377 passed, 0 failed, 4 ignored** (371 before, plus six new).
+  `cargo clippy --workspace --all-targets`: clean. Frontend `bun run build`: clean.
+- **Found and fixed a pre-existing config-writer bug on the way.** `toml_edit`'s
+  `TableLike::insert` calls `Key::fmt()`, which resets the key's decor, so
+  `set_preserving_decor` — which only carried the *value*'s decor across — deleted every
+  comment written on its own line *above* a setting the first time the GUI saved that
+  setting. In the shipped `DEFAULT_CONFIG_TOML` that included `# Cleanup runs on S1-mini by
+  Superwhisper.`, directly above `[normalize] enabled`: toggling normalization once from the
+  GUI silently removed an attribution the spec requires. Pinned by
+  `changing_a_value_keeps_the_comment_lines_above_it`.
+- **Not verified on hardware:** nobody has typed anything with `ydotool` from this app.
+  `ydotool` is not installed on this machine, so the argv shape (`ydotool type --key-delay
+  <ms> -- <text>`) was checked against ydotool's man page, not against the binary — the same
+  way `wtype`'s `--` handling was originally specified, and spec 10.2's acceptance test
+  (`inject("-- hello -x")` produces exactly `-- hello -x`) has an unrun `ydotool` twin. If it
+  turns out `ydotool type` rejects `--`, the fix is `--file -` on stdin, which its man page
+  also documents; do not invent an escaping scheme.
