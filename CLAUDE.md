@@ -243,8 +243,8 @@ happen to be resident.
     - **Never lock `pipeline` to ask whether the models are loaded.** Not
       merely slow — an outright self-deadlock, on the commonest failure path
       there is. `process_utterance` holds that mutex for the whole `process`
-      call (`server.rs:2603`) and broadcasts `Error` *from inside the guard*:
-      `:2613` for "no speech detected", `:2617` for a pipeline error. On
+      call (`server.rs:2613`) and broadcasts `Error` *from inside the guard*:
+      `:2623` for "no speech detected", `:2627` for a pipeline error. On
       `Error`, and only on `Error`, `TauriSink::refresh_tray_icon` dispatches
       `Request::Status` **synchronously** (`src-tauri/src/lib.rs:162`) to tell
       a fatal startup failure from a transient one. So a `Status` handler that
