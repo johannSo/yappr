@@ -45,7 +45,7 @@ const TRANSCRIBING: u8 = 3;
 const NORMALIZING: u8 = 4;
 const INJECTING: u8 = 5;
 // Task 3, Work Item 3: a fatal, unrecoverable warm-up failure (ASR/VAD
-// failed to load -- the *only* way `warm_up` still returns `Err`, since a
+// failed to load -- the *only* way `load_models` still returns `Err`, since a
 // `llama-server` failure is already absorbed into `UnavailableNormalizer`
 // and never propagates). Before this state existed, a fatal warm-up failure
 // left `daemon.state` at `WARMING` forever: a subscriber connected at the
@@ -451,7 +451,7 @@ impl Daemon {
 ///
 /// Two distinct situations reach this, both correctly modelled the same way:
 /// `[normalize].enabled = false` (no child was ever spawned at all), or
-/// `enabled = true` but `warm_up` couldn't get `llama-server` spawned and
+/// `enabled = true` but `load_models` couldn't get `llama-server` spawned and
 /// healthy (C1) -- a missing ggml compute backend, a missing binary, a port
 /// conflict outside the retry range, or any other startup failure.
 /// `Pipeline::process` already treats a normalizer *error* exactly like a
@@ -459,7 +459,7 @@ impl Daemon {
 /// back to the raw transcript plus the rule-based pass (spec 15). Routing
 /// both "never had one" and "tried and failed" through that same, already-
 /// correct degraded path is what lets the daemon come up `Idle` and useful
-/// in either case, rather than the previous behaviour of `warm_up` returning
+/// in either case, rather than the previous behaviour of `load_models` returning
 /// `Err` on the second case and leaving the daemon stuck in `Warming`
 /// forever.
 struct UnavailableNormalizer(String);
@@ -575,8 +575,8 @@ pub fn start(sink: Arc<dyn EventSink>) -> Result<(Arc<Daemon>, UnixListener)> {
 
     // I7: a capture device that isn't there yet at startup (a USB mic not
     // enumerated in time under Hyprland's `exec-once`) must not take the
-    // whole daemon down with it -- see `warm_up`'s doc comment, where this
-    // attempt now actually happens. `recorder` starts `None` here
+    // whole daemon down with it -- see `warm_up_recorder`'s doc comment, where
+    // this attempt now actually happens. `recorder` starts `None` here
     // unconditionally: `Recorder::new` can block for a long time (cpal
     // enumerating devices and probing throwaway streams with no timeout --
     // see CLAUDE.md's cpal gotcha), and this function runs on the caller's
@@ -617,36 +617,56 @@ pub fn start(sink: Arc<dyn EventSink>) -> Result<(Arc<Daemon>, UnixListener)> {
     // Warm up off the accept loop so `status` answers immediately.
     {
         let daemon = Arc::clone(&daemon);
-        std::thread::spawn(move || match warm_up(cfg, &daemon) {
-            Ok((pipeline, server)) => {
-                let available = server.is_some();
-                *lock_ignoring_poison(&daemon.pipeline) = Some(pipeline);
-                *lock_ignoring_poison(&daemon.llama) = server;
-                // Populated immediately (accuracy for `status` from the
-                // moment warm-up resolves), independent of when
-                // `spawn_housekeeping`'s own loop next wakes up and
-                // re-confirms the same thing to decide whether a
-                // `NormalizeDegraded`/`NormalizeRecovered` broadcast is due.
-                daemon.normalize_available.store(available, Ordering::SeqCst);
+        std::thread::spawn(move || {
+            warm_up_recorder(&cfg, &daemon);
+
+            // The lazy default: startup is finished the moment the recorder
+            // attempt is. Nothing model-shaped is loaded, `models_loaded`
+            // stays false, and the first `ptt-start` is what brings the
+            // models up (`ensure_models_loaded`). `WARMING` still means
+            // "startup has not finished" -- it is simply brief here.
+            if !cfg.models.preload_at_startup {
                 daemon.state.store(IDLE, Ordering::SeqCst);
                 daemon.broadcast(OverlayEvent::Idle);
-                tracing::info!("ready");
+                tracing::info!("ready (models load on demand)");
+                return;
             }
-            Err(e) => {
-                // The only way `warm_up` still returns `Err`: ASR/VAD failed
-                // to load. A `llama-server` failure never reaches here (see
-                // `warm_up`'s doc comment) -- it's absorbed into
-                // `UnavailableNormalizer` and the daemon still comes up
-                // `Idle`. This is a permanent, fatal failure (Task 3, Work
-                // Item 3): `FAILED` plus the stored reason is what lets a
-                // subscriber connecting *after* this moment still learn the
-                // daemon is broken, instead of `snapshot_event(WARMING)`'s
-                // permanent spinner.
-                let reason = format!("warm-up failed: {e}");
-                tracing::error!(error = ?e, "warm-up failed; daemon marked failed");
-                *lock_ignoring_poison(&daemon.fatal_error) = Some(reason.clone());
-                daemon.state.store(FAILED, Ordering::SeqCst);
-                daemon.broadcast(OverlayEvent::Error { reason });
+
+            match load_models(cfg, &daemon) {
+                Ok((pipeline, server)) => {
+                    let available = server.is_some();
+                    *lock_ignoring_poison(&daemon.pipeline) = Some(pipeline);
+                    *lock_ignoring_poison(&daemon.llama) = server;
+                    // Populated immediately (accuracy for `status` from the
+                    // moment warm-up resolves), independent of when
+                    // `spawn_housekeeping`'s own loop next wakes up and
+                    // re-confirms the same thing to decide whether a
+                    // `NormalizeDegraded`/`NormalizeRecovered` broadcast is due.
+                    daemon.normalize_available.store(available, Ordering::SeqCst);
+                    daemon.state.store(IDLE, Ordering::SeqCst);
+                    daemon.broadcast(OverlayEvent::Idle);
+                    tracing::info!("ready");
+                }
+                Err(e) => {
+                    // The only way `load_models` returns `Err`: ASR/VAD failed
+                    // to load. A `llama-server` failure never reaches here (see
+                    // `load_models`'s doc comment) -- it's absorbed into
+                    // `UnavailableNormalizer` and the daemon still comes up
+                    // `Idle`. This is a permanent, fatal failure (Task 3, Work
+                    // Item 3): `FAILED` plus the stored reason is what lets a
+                    // subscriber connecting *after* this moment still learn the
+                    // daemon is broken, instead of `snapshot_event(WARMING)`'s
+                    // permanent spinner.
+                    //
+                    // Reachable only via `preload_at_startup`. The lazy path
+                    // treats the same failure as retryable instead -- see
+                    // `run_utterance`, and spec 2026-08-29 §4.
+                    let reason = format!("warm-up failed: {e}");
+                    tracing::error!(error = ?e, "warm-up failed; daemon marked failed");
+                    *lock_ignoring_poison(&daemon.fatal_error) = Some(reason.clone());
+                    daemon.state.store(FAILED, Ordering::SeqCst);
+                    daemon.broadcast(OverlayEvent::Error { reason });
+                }
             }
         });
     }
@@ -746,8 +766,34 @@ fn try_lock_exclusive(f: &std::fs::File) -> bool {
     }
 }
 
+/// I7's eager first attempt at `daemon.recorder`, split out of `warm_up` so
+/// it still runs at startup even when `[models] preload_at_startup` is off
+/// and no model is loaded at all.
+///
+/// Infallible by design: `ensure_recorder` retries `Recorder::new` lazily on
+/// the next `ptt-start` regardless, so nothing is lost by this attempt
+/// failing but the timing of one log line. It runs at startup, off the Tauri
+/// `setup()` thread, because `Recorder::new` can block for a long time in
+/// `cpal` (see CLAUDE.md's cpal gotcha) and a wedge there means no window, no
+/// tray, and no way to quit.
+fn warm_up_recorder(cfg: &Config, daemon: &Arc<Daemon>) {
+    match Recorder::new(&cfg.audio) {
+        Ok(r) => *lock_ignoring_poison(&daemon.recorder) = Some(r),
+        Err(e) => {
+            tracing::error!(
+                error = ?e,
+                "no capture device at startup; will retry on the next ptt-start"
+            );
+        }
+    }
+}
+
 /// Builds the pipeline and, when normalization is enabled, the supervised
 /// `llama-server` behind it.
+///
+/// Called at startup only when `[models] preload_at_startup` is on; otherwise
+/// called on demand by `ensure_models_loaded`, off the press that needs it.
+/// It therefore must not assume it is running exactly once, or at startup.
 ///
 /// R9: when `cfg.normalize.enabled` is `false`, `llama-server` is never
 /// spawned at all -- not spawned-then-ignored. On this machine the system
@@ -767,29 +813,7 @@ fn try_lock_exclusive(f: &std::fs::File) -> bool {
 /// inject raw + rule pass"). Only spawning the ASR/VAD models can still fail
 /// this function: there is no raw-fallback path for a missing ASR the way
 /// there is for a missing normalizer, so failing loudly there is correct.
-///
-/// I7: also makes the first, eager attempt at constructing `daemon.recorder`
-/// here, off whatever thread called `start` -- this used to happen inside
-/// `start` itself, which is harmless for the standalone daemon (its own
-/// thread has nothing else to do) but not for the app, where `start` runs
-/// on the Tauri `setup()`/event-loop thread: `Recorder::new` can block for a
-/// long time (cpal enumerating devices and probing throwaway streams with
-/// no timeout -- see CLAUDE.md's cpal gotcha), and a wedge there means no
-/// window, no tray, and no way to quit. Purely a diagnostic convenience
-/// either way: `ensure_recorder` already retries lazily on the next
-/// `ptt-start` regardless of whether this attempt succeeds, so nothing is
-/// lost by deferring it here but the timing of one log line.
-fn warm_up(cfg: Config, daemon: &Arc<Daemon>) -> Result<(Pipeline, Option<LlamaServer>)> {
-    match Recorder::new(&cfg.audio) {
-        Ok(r) => *lock_ignoring_poison(&daemon.recorder) = Some(r),
-        Err(e) => {
-            tracing::error!(
-                error = ?e,
-                "no capture device at startup; will retry on the next ptt-start"
-            );
-        }
-    }
-
+fn load_models(cfg: Config, daemon: &Arc<Daemon>) -> Result<(Pipeline, Option<LlamaServer>)> {
     let models = paths::models_dir();
 
     let (server, base_url) = if cfg.normalize.enabled {
@@ -854,13 +878,13 @@ fn warm_up(cfg: Config, daemon: &Arc<Daemon>) -> Result<(Pipeline, Option<LlamaS
 }
 
 /// Startup's health-wait budget: a cold model load can genuinely take this
-/// long on first run (disk read plus ggml init), so `warm_up`'s one-time
+/// long on first run (disk read plus ggml init), so `load_models`'s one-time
 /// initial spawn gets the full 120 s. A background *restart* is different --
 /// see `RESTART_HEALTH_TIMEOUT`.
 const STARTUP_HEALTH_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Spawns `llama-server` and waits for it to report healthy, as one
-/// `Result` -- the seam `warm_up` above matches on to fall back to
+/// `Result` -- the seam `load_models` above matches on to fall back to
 /// [`UnavailableNormalizer`] instead of failing outright (C1), and
 /// `supervise_llama_once` (Task 3) uses the same way with a shorter
 /// `timeout` for a background restart attempt.
@@ -1073,7 +1097,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// (`[normalize].enabled = false`) -- matches `HEALTH_POLL_INTERVAL` so a
 /// disabled normalizer doesn't change subscriber-cleanup latency.
 const SUBSCRIBER_REAP_INTERVAL: Duration = Duration::from_secs(10);
-/// A restart attempt's health-wait budget -- shorter than `warm_up`'s 120 s
+/// A restart attempt's health-wait budget -- shorter than `load_models`'s 120 s
 /// `STARTUP_HEALTH_TIMEOUT` (see that constant's doc comment): a background
 /// retry behind exponential backoff should fail fast and let backoff retry
 /// rather than tying up this thread -- and, via `HousekeepingHandle::stop`,
@@ -1188,10 +1212,10 @@ fn supervise_llama_once(
 /// and never touches a child that's already healthy.
 ///
 /// Spawned unconditionally and immediately from `main` -- not gated on
-/// `warm_up` finishing -- so subscriber reaping starts right away; the
+/// `load_models` finishing -- so subscriber reaping starts right away; the
 /// llama-specific half stays inert (see the `WARMING` check below) until
-/// `warm_up` has settled `daemon.llama`/`daemon.normalize_available`, which
-/// is what stops this loop from ever racing `warm_up`'s own initial spawn
+/// `load_models` has settled `daemon.llama`/`daemon.normalize_available`, which
+/// is what stops this loop from ever racing `load_models`'s own initial spawn
 /// into starting a second `llama-server`.
 fn spawn_housekeeping(
     daemon: Arc<Daemon>,
@@ -1233,8 +1257,8 @@ fn spawn_housekeeping(
 
             let Some(cfg) = &normalize_cfg else { continue };
             if daemon.state.load(Ordering::SeqCst) == WARMING {
-                // warm_up hasn't settled `daemon.llama` yet -- acting now
-                // could spawn a second llama-server racing warm_up's own.
+                // load_models hasn't settled `daemon.llama` yet -- acting now
+                // could spawn a second llama-server racing load_models's own.
                 continue;
             }
 
@@ -3160,7 +3184,7 @@ mod tests {
         assert!(!ptt_start.ok, "ptt-start must be rejected against a daemon with no working pipeline");
     }
 
-    /// Task 15: on a fresh install with no models yet, `warm_up` fails with
+    /// Task 15: on a fresh install with no models yet, `load_models` fails with
     /// `SherpaTranscriber`/`SileroTrimmer`'s own "model paths" error and the
     /// daemon lands in `FAILED` with that exact message stored -- see
     /// `crates/owf-core/src/asr.rs`'s `SherpaTranscriber::new`. `ptt-start`
