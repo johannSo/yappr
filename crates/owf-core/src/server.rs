@@ -1337,6 +1337,34 @@ fn supervise_llama_once(
     healthy_now
 }
 
+/// The floor on an unload-derived housekeeping tick.
+///
+/// When the deadline has passed but the daemon is busy, `unload_models`
+/// declines and the remaining time stays zero -- without this floor the
+/// housekeeping loop would spin at a zero timeout until the utterance
+/// finished. One second is invisible against a timeout measured in minutes.
+const MIN_UNLOAD_TICK: Duration = Duration::from_secs(1);
+
+/// How long until the idle-unload deadline, or `None` when there is no
+/// deadline at all: nothing is loaded, or unloading is disabled.
+///
+/// This is what makes `idle_unload_seconds = 60` mean 60 seconds rather than
+/// "somewhere in 60-70" at the mercy of `HEALTH_POLL_INTERVAL`: the
+/// housekeeping loop takes the smaller of its own wait and this.
+///
+/// Reads `models_loaded`, never the `pipeline` lock -- this runs on the same
+/// thread that reaps dead subscribers, and blocking it behind a
+/// transcription would stall that unrelated work for the whole utterance.
+fn time_until_unload(daemon: &Daemon) -> Option<Duration> {
+    let idle_seconds = lock_ignoring_poison(&daemon.models_cfg).idle_unload_seconds;
+    if idle_seconds == 0 || !daemon.models_loaded.load(Ordering::SeqCst) {
+        return None;
+    }
+    let elapsed = Instant::now().duration_since(*lock_ignoring_poison(&daemon.last_activity));
+    let remaining = Duration::from_secs(idle_seconds as u64).saturating_sub(elapsed);
+    Some(remaining.max(MIN_UNLOAD_TICK))
+}
+
 /// Whether the idle-unload deadline has passed and it is safe to act on it.
 ///
 /// Pure, and therefore directly unit-testable, for the same reason
@@ -1363,6 +1391,28 @@ fn should_unload(
     now.duration_since(last_activity) >= Duration::from_secs(idle_seconds as u64)
 }
 
+/// Whether this housekeeping tick should touch `llama-server` at all.
+///
+/// Pure and unit-testable, for the same reason `should_unload` is. It folds
+/// in the pre-existing `WARMING` check rather than sitting beside it: both
+/// arms answer the same question -- "is there a `llama-server` of ours to
+/// supervise right now" -- and splitting them across a named function and an
+/// inline `if` would leave half the gate untested.
+fn should_supervise_llama(state: u8, models_loaded: bool) -> bool {
+    if state == WARMING {
+        // `warm_up` hasn't settled `daemon.llama` yet -- acting now could
+        // spawn a second llama-server racing warm_up's own.
+        return false;
+    }
+    // Models are unloaded, or a load is still in flight. Either way there is
+    // no child of ours to supervise, and respawning one here would undo every
+    // unload seconds after it happened. `models_loaded` is set only *after* a
+    // load installs the pipeline, so an in-flight `load_models` -- which owns
+    // its own `spawn_and_wait_healthy` child -- is never raced, exactly as
+    // `warm_up`'s initial spawn never was.
+    models_loaded
+}
+
 /// Releases the models, if the deadline still says to. Returns whether it
 /// actually did.
 ///
@@ -1384,23 +1434,6 @@ fn should_unload(
 /// `IDLE` before and is `IDLE` after -- and the tray's icon is driven
 /// entirely by broadcasts (`tray.rs`, "Icon and daemon state"), so an event
 /// here would mean inventing a tray icon for it too.
-// `expect`, not `allow`: the moment Task 6 wires this into the housekeeping
-// tick, `unfulfilled_lint_expectations` fires here and forces this
-// attribute's removal instead of it silently going stale. `cfg_attr(not(test),
-// ...)` rather than a bare `#[expect]`, because this task's own tests already
-// call `unload_models` directly (unlike `ensure_models_loaded`'s equivalent
-// attribute in the previous task, whose tests called the `_with` variant
-// instead and left the outer function genuinely uncalled everywhere) -- a
-// bare `#[expect(dead_code)]` would be unfulfilled, and thus itself a
-// warning, in the `#[cfg(test)]` build where these tests make it live. One
-// attribute covers both otherwise-dead symbols, not just this function:
-// rustc treats an `expect`/`allow`-attributed item as a live root and walks
-// its callees when deciding what else counts as reachable, so this also
-// covers `should_unload`, which has no other caller yet.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired to the housekeeping tick in Task 6; also covers should_unload")
-)]
 fn unload_models(daemon: &Daemon) -> bool {
     let _guard = lock_ignoring_poison(&daemon.load_lock);
 
@@ -1471,6 +1504,11 @@ fn spawn_housekeeping(
                 Some(_) if last_known_available => HEALTH_POLL_INTERVAL,
                 Some(_) => backoff,
             };
+            // Wake for whichever comes first: this loop's own business, or
+            // the idle-unload deadline. Without this, a 60 s timeout would
+            // fire whenever `HEALTH_POLL_INTERVAL` next happened to come
+            // round.
+            let wait = time_until_unload(&daemon).map_or(wait, |d| wait.min(d));
             match stop_rx.recv_timeout(wait) {
                 Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -1478,10 +1516,17 @@ fn spawn_housekeeping(
 
             reap_dead_subscribers(&daemon.subscribers);
 
+            // Cheap when there is nothing to do: `unload_models` re-checks
+            // the deadline itself and returns false. Placed before the llama
+            // supervision below so an unload and the gate that must then skip
+            // supervision happen in the same tick, not one tick apart.
+            unload_models(&daemon);
+
             let Some(cfg) = &normalize_cfg else { continue };
-            if daemon.state.load(Ordering::SeqCst) == WARMING {
-                // load_models hasn't settled `daemon.llama` yet -- acting now
-                // could spawn a second llama-server racing load_models's own.
+            if !should_supervise_llama(
+                daemon.state.load(Ordering::SeqCst),
+                daemon.models_loaded.load(Ordering::SeqCst),
+            ) {
                 continue;
             }
 
@@ -4963,5 +5008,91 @@ mod tests {
 
         assert!(!unload_models(&daemon), "unloaded a pipeline an utterance is using");
         assert!(lock_ignoring_poison(&daemon.pipeline).is_some());
+    }
+
+    #[test]
+    fn there_is_no_unload_deadline_when_nothing_is_loaded() {
+        let daemon = fake_daemon(IDLE);
+        assert_eq!(time_until_unload(&daemon), None);
+    }
+
+    #[test]
+    fn there_is_no_unload_deadline_when_unloading_is_disabled() {
+        let daemon = fake_daemon(IDLE);
+        daemon.models_loaded.store(true, Ordering::SeqCst);
+        lock_ignoring_poison(&daemon.models_cfg).idle_unload_seconds = 0;
+        assert_eq!(time_until_unload(&daemon), None);
+    }
+
+    #[test]
+    fn the_unload_deadline_shrinks_as_the_idle_time_passes() {
+        let daemon = fake_daemon(IDLE);
+        daemon.models_loaded.store(true, Ordering::SeqCst);
+        *lock_ignoring_poison(&daemon.last_activity) = Instant::now() - Duration::from_secs(50);
+
+        let remaining = time_until_unload(&daemon).expect("a deadline");
+
+        // 60 s configured, 50 s elapsed -- about ten left, and never more.
+        assert!(remaining <= Duration::from_secs(10), "got {remaining:?}");
+        assert!(remaining >= Duration::from_secs(9), "got {remaining:?}");
+    }
+
+    #[test]
+    fn a_passed_deadline_never_shrinks_the_tick_below_the_floor() {
+        // Without the floor, a deadline that has passed while the daemon is
+        // busy makes the housekeeping loop spin at zero timeout until the
+        // utterance finishes.
+        let daemon = fake_daemon(TRANSCRIBING);
+        daemon.models_loaded.store(true, Ordering::SeqCst);
+        *lock_ignoring_poison(&daemon.last_activity) = Instant::now() - Duration::from_secs(3600);
+
+        assert_eq!(time_until_unload(&daemon), Some(MIN_UNLOAD_TICK));
+    }
+
+    #[test]
+    fn the_supervisor_is_skipped_entirely_while_the_models_are_unloaded() {
+        // Without this gate the supervisor spawns a fresh 697 MB llama-server
+        // seconds after every unload, forever, and the whole feature is undone.
+        assert!(!should_supervise_llama(IDLE, false), "unloaded: must not supervise");
+        assert!(!should_supervise_llama(PAUSED, false));
+        // A load still in flight owns its own `spawn_and_wait_healthy` child and
+        // has not set `models_loaded` yet, so it is covered by the same arm.
+        assert!(!should_supervise_llama(RECORDING, false));
+    }
+
+    #[test]
+    fn the_supervisor_still_stays_inert_during_warm_up() {
+        // The pre-existing half of this gate, kept: `warm_up` has not settled
+        // `daemon.llama` yet, so acting now could spawn a second llama-server
+        // racing its own.
+        assert!(!should_supervise_llama(WARMING, false));
+        assert!(!should_supervise_llama(WARMING, true));
+    }
+
+    #[test]
+    fn the_supervisor_runs_once_the_models_are_loaded() {
+        for s in [IDLE, PAUSED, RECORDING, TRANSCRIBING, NORMALIZING, INJECTING, FAILED] {
+            assert!(should_supervise_llama(s, true), "state {s} should supervise");
+        }
+    }
+
+    #[test]
+    fn the_housekeeping_tick_answers_while_an_utterance_holds_the_pipeline_lock() {
+        // The second reader `models_loaded` exists for: this runs on the thread
+        // that also reaps dead subscribers, so blocking it behind a
+        // transcription would stall that unrelated work for the whole utterance.
+        let daemon = fake_daemon(TRANSCRIBING);
+        daemon.models_loaded.store(true, Ordering::SeqCst);
+        let held = lock_ignoring_poison(&daemon.pipeline);
+
+        let start = Instant::now();
+        let _ = time_until_unload(&daemon);
+        let _ = should_supervise_llama(
+            daemon.state.load(Ordering::SeqCst),
+            daemon.models_loaded.load(Ordering::SeqCst),
+        );
+
+        assert!(start.elapsed() < Duration::from_millis(100), "the tick blocked on the pipeline lock");
+        drop(held);
     }
 }
