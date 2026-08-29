@@ -629,7 +629,7 @@ vad_padding_ms = 200
 num_threads = 4
 
 [models]
-# Modelle erst beim ersten Tastendruck laden, statt beim Start. Aus heißt:
+# Modelle beim Start laden, statt beim ersten Tastendruck. Aus heißt:
 # das erste Diktat nach dem Start wartet einmalig auf die Modelle.
 preload_at_startup = false
 # Modelle nach dieser Ruhezeit wieder entladen und den Speicher freigeben.

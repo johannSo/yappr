@@ -974,21 +974,37 @@ fn ensure_models_loaded(daemon: &Arc<Daemon>) -> Result<(), String> {
         let cfg = Config::load_from(&daemon.config_path).context("config error")?;
         load_models(cfg, daemon)
     };
-    ensure_models_loaded_with(daemon, &mut load)
+    ensure_models_loaded_with(daemon, &mut load, &SHUTTING_DOWN)
 }
 
-/// [`ensure_models_loaded`] with the loader injected -- the seam a test uses
-/// to exercise the locking, the idempotence and the failure path without an
-/// ASR model on disk, in the same shape `supervise_llama_once`'s `respawn`
-/// parameter already establishes.
+/// [`ensure_models_loaded`] with the loader and the shutdown flag injected --
+/// the seam a test uses to exercise the locking, the idempotence and the
+/// failure path without an ASR model on disk, in the same shape
+/// `supervise_llama_once`'s `respawn` parameter already establishes.
+///
+/// `shutting_down` is `&SHUTTING_DOWN` in production, and the sole reason it
+/// is a parameter is that `SHUTTING_DOWN` is a process-global static: a test
+/// that set it to drive the re-check below would make every *other* test in
+/// the same binary that happened to be loading at that moment take the
+/// teardown path and fail, and `cargo test` runs them in parallel by
+/// default. Injecting a local `AtomicBool` instead removes the global from
+/// the test path entirely rather than serialising around it. The one thing
+/// that leaves unproven is the wiring itself -- that `ensure_models_loaded`
+/// passes the *real* static -- which is a single literal argument above.
 ///
 /// On failure it installs nothing at all: `pipeline` stays `None`,
 /// `models_loaded` stays `false`, and `state` is left alone. That is what
 /// makes a lazy load failure retryable on the next press (spec 2026-08-29 §4)
 /// rather than the permanent `FAILED` a startup failure still produces.
+///
+/// A load that finishes after `shutdown` has begun is released again rather
+/// than installed -- see the `SHUTTING_DOWN` re-check below, which is the
+/// only thing standing between a cancelled press and an orphaned
+/// `llama-server`.
 fn ensure_models_loaded_with(
     daemon: &Arc<Daemon>,
     load: &mut dyn FnMut() -> Result<(Pipeline, Option<LlamaServer>)>,
+    shutting_down: &AtomicBool,
 ) -> Result<(), String> {
     let _guard = lock_ignoring_poison(&daemon.load_lock);
     if daemon.models_loaded.load(Ordering::SeqCst) {
@@ -1004,6 +1020,48 @@ fn ensure_models_loaded_with(
             // housekeeping thread's supervisor gate and `Status` both read,
             // so it must never be true before the pipeline is installed.
             daemon.models_loaded.store(true, Ordering::SeqCst);
+            // Re-checked here, *after* the install, still holding
+            // `load_lock`. `load_models` spawns `llama-server` first and
+            // returns it only once `SherpaTranscriber`/`SileroTrimmer` have
+            // finished, so on every cold press there is a multi-second window
+            // in which a live ~955 MB child exists in a local that
+            // `daemon.llama` knows nothing about. `shutdown` deliberately
+            // does *not* take `load_lock` (that would hang Beenden for up to
+            // `STARTUP_HEALTH_TIMEOUT` behind an in-flight load), so its
+            // `kill_llama` finds `None`, `Request::Quit`'s
+            // `std::process::exit(0)` follows, and -- `LlamaServer` sets no
+            // `PR_SET_PDEATHSIG`, and `Drop` never runs through `exit` -- the
+            // child is orphaned. Silently: the next start's `pick_port` just
+            // walks past it, so the only symptom is the memory this whole
+            // feature exists to reclaim never coming back. Press SUPER+D,
+            // cancel with SUPER+ALT+D, click Beenden: `wait_for_busy_to_clear`
+            // returns at once (`IDLE` is not `is_busy`) while this thread is
+            // still loading.
+            //
+            // Install-then-check, rather than check-then-install, is what
+            // makes this airtight instead of merely narrower. Everything here
+            // and in `shutdown` is `SeqCst`, and `shutdown` sets
+            // `SHUTTING_DOWN` *before* it calls `kill_llama`: either that
+            // store precedes this load and we tear the child down ourselves,
+            // or `kill_llama` runs after the install above and finds it. No
+            // interleaving lets both miss it.
+            //
+            // `SHUTTING_DOWN`, not `Daemon::quitting`: `quitting` is set only
+            // by the `Request::Quit` arm, so it would miss `SIGTERM` at
+            // logout and Tauri's `RunEvent::Exit`, both of which call
+            // `shutdown` directly. `SHUTTING_DOWN` is set by `shutdown`
+            // itself -- the one point all four teardown routes converge on.
+            if shutting_down.load(Ordering::SeqCst) {
+                // Same order, and the same steps, as `unload_models`:
+                // `models_loaded` cleared first because it is what the
+                // supervisor gate reads, then the pipeline, then the child.
+                daemon.models_loaded.store(false, Ordering::SeqCst);
+                *lock_ignoring_poison(&daemon.pipeline) = None;
+                kill_llama(&daemon.llama);
+                daemon.normalize_available.store(false, Ordering::SeqCst);
+                tracing::info!("models finished loading during shutdown; released again");
+                return Err("shutting down".to_string());
+            }
             tracing::info!("models loaded");
             Ok(())
         }
@@ -1036,6 +1094,14 @@ fn spawn_and_wait_healthy(cfg: &NormalizeConfig, timeout: Duration) -> Result<Ll
 /// costs one atomic and documents the idempotence requirement (fix 2) rather
 /// than leaving it as an accident of control flow that a future edit could
 /// break.
+///
+/// Read by one other place: `ensure_models_loaded_with`, which uses it to
+/// tell "the load finished normally" from "the load finished after teardown
+/// began, and its `llama-server` must be released rather than installed".
+/// That is why this is the flag to check there rather than
+/// `Daemon::quitting` -- this one is set by `shutdown` itself, so it covers
+/// all four teardown routes (signal, `Request::Quit`, `RunEvent::Exit`, and
+/// a direct call), where `quitting` covers only `Request::Quit`.
 static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 
 /// Explicit, deterministic teardown, run on `SIGTERM`/`SIGINT`/`SIGHUP`
@@ -1345,25 +1411,78 @@ fn supervise_llama_once(
 
 /// The floor on an unload-derived housekeeping tick.
 ///
-/// When the deadline has passed but the daemon is busy, `unload_models`
-/// declines and the remaining time stays zero -- without this floor the
-/// housekeeping loop would spin at a zero timeout until the utterance
-/// finished. One second is invisible against a timeout measured in minutes.
+/// A deadline that has already passed leaves `remaining` at zero, and
+/// `unload_models` can still decline once it has the lock -- it re-reads the
+/// state and the deadline under `load_lock`, so a press landing between this
+/// calculation and that re-check (or a lazy load holding `load_lock` while
+/// this tick runs) leaves the deadline passed and nothing unloaded. Without
+/// this floor the housekeeping loop would spin at a zero timeout until that
+/// resolved. One second is invisible against a timeout measured in minutes.
 const MIN_UNLOAD_TICK: Duration = Duration::from_secs(1);
 
-/// How long until the idle-unload deadline, or `None` when there is no
-/// deadline at all: nothing is loaded, or unloading is disabled.
+/// Whether an idle unload may act on a daemon in this state at all.
+///
+/// `PAUSED` counts as idle deliberately. It is reached only by a CAS from
+/// `IDLE` (Task 13), so there is never an utterance to protect while paused,
+/// and a user who has explicitly paused dictation is the clearest possible
+/// signal that the models are not about to be needed.
+///
+/// Shared by `should_unload`, which acts on the deadline, and
+/// `time_until_unload`, which decides whether the housekeeping loop should
+/// wake early for it: two copies of "idle means `IDLE` or `PAUSED`" would be
+/// free to drift, and a `time_until_unload` that answered `Some` for a state
+/// `should_unload` refuses is exactly the busy-spin the fix below removes.
+fn state_permits_unload(state: u8) -> bool {
+    state == IDLE || state == PAUSED
+}
+
+/// How long until the idle-unload deadline, or `None` when there is nothing
+/// to wake early for: nothing is loaded, unloading is disabled, or the
+/// daemon is in a state no unload may act on.
 ///
 /// This is what makes `idle_unload_seconds = 60` mean 60 seconds rather than
 /// "somewhere in 60-70" at the mercy of `HEALTH_POLL_INTERVAL`: the
 /// housekeeping loop takes the smaller of its own wait and this.
 ///
-/// Reads `models_loaded`, never the `pipeline` lock -- this runs on the same
-/// thread that reaps dead subscribers, and blocking it behind a
+/// The state is part of the answer, not just the deadline, and that is the
+/// whole point of the `state_permits_unload` check: `unload_models` declines
+/// in every other state, so a busy daemon whose deadline has passed would
+/// otherwise get `MIN_UNLOAD_TICK` back on every tick -- and the loop takes
+/// `wait.min(..)` of it *unconditionally*, including on the arm carrying
+/// spec 15's 1 -> 2 -> 4 -> ... -> 30 s `llama-server` restart backoff. With
+/// a `llama-server` that fails fast (`wait_healthy` polls `Child::try_wait`,
+/// so a missing ggml backend is detected in milliseconds), that backoff
+/// collapses to a fresh fork/exec every single second for the whole length
+/// of the recording -- roughly 30 attempts across a 40 s dictation instead
+/// of about four, on the thread that shares this machine with live audio
+/// capture.
+///
+/// Returning `None` while busy costs the unload almost nothing. `IdleOnExit`'s
+/// `Drop` refreshes `last_activity` *before* it stores `IDLE`, so by the
+/// moment this can answer `Some` again the deadline is a full
+/// `idle_unload_seconds` away -- there is no passed deadline sitting there
+/// waiting to be honoured. From the loop's next wake onward the `wait.min(..)`
+/// converges on the deadline exactly, as it does for a daemon that was never
+/// busy at all.
+///
+/// The one thing it does cost: the loop may already be inside a long
+/// `recv_timeout` it entered while busy, and it cannot be woken early from
+/// here. So an unload whose deadline falls inside that sleep is late by
+/// whatever is left of it -- at most `HEALTH_POLL_INTERVAL`, or `MAX_BACKOFF`
+/// with `llama-server` down. That only bites an `idle_unload_seconds` shorter
+/// than the sleep, and being 10 s late to reclaim memory is a straight trade
+/// against fork/exec-ing a dead `llama-server` once a second for the whole
+/// recording.
+///
+/// Reads `models_loaded` and `state`, never the `pipeline` lock -- this runs
+/// on the same thread that reaps dead subscribers, and blocking it behind a
 /// transcription would stall that unrelated work for the whole utterance.
 fn time_until_unload(daemon: &Daemon) -> Option<Duration> {
     let idle_seconds = lock_ignoring_poison(&daemon.models_cfg).idle_unload_seconds;
     if idle_seconds == 0 || !daemon.models_loaded.load(Ordering::SeqCst) {
+        return None;
+    }
+    if !state_permits_unload(daemon.state.load(Ordering::SeqCst)) {
         return None;
     }
     let elapsed = Instant::now().duration_since(*lock_ignoring_poison(&daemon.last_activity));
@@ -1377,10 +1496,8 @@ fn time_until_unload(daemon: &Daemon) -> Option<Duration> {
 /// `should_emit_level` is: the interesting part is the boundary conditions,
 /// not the clock.
 ///
-/// `PAUSED` counts as idle deliberately. It is reached only by a CAS from
-/// `IDLE` (Task 13), so there is never an utterance to protect while paused,
-/// and a user who has explicitly paused dictation is the clearest possible
-/// signal that the models are not about to be needed.
+/// Which states qualify -- and why `PAUSED` is one of them -- lives in
+/// `state_permits_unload`, shared with `time_until_unload`.
 fn should_unload(
     last_activity: Instant,
     now: Instant,
@@ -1391,7 +1508,7 @@ fn should_unload(
     if !loaded || idle_seconds == 0 {
         return false;
     }
-    if state != IDLE && state != PAUSED {
+    if !state_permits_unload(state) {
         return false;
     }
     now.duration_since(last_activity) >= Duration::from_secs(idle_seconds as u64)
@@ -1959,6 +2076,29 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
             // (set in `start`), so this changes nothing there.
             match Config::load_from(&daemon.config_path) {
                 Ok(new_cfg) => {
+                    // Mirrored for exactly the reason `SetConfig` mirrors it:
+                    // the housekeeping thread reads the idle timeout from
+                    // `daemon.models_cfg` on every tick, and nothing else
+                    // ever refreshes it. Without this, hand-editing
+                    // `[models] idle_unload_seconds` and running
+                    // `openwhisprflow --reload` reported success and changed
+                    // nothing, while the same edit made in the settings GUI
+                    // applied live -- and README documents `--reload` as
+                    // applying every reloadable section.
+                    //
+                    // Unconditional, and before the live-apply below rather
+                    // than after it: the config parsed, which is all the
+                    // validation `[models]` needs (nothing here talks to a
+                    // model), so every way the rest of this arm can end --
+                    // pipeline resident, pipeline unloaded, or
+                    // `update_reloadable` refusing an `[asr]`/`[normalize]`
+                    // change -- must still leave the daemon tracking the file
+                    // on disk. `SetConfig` mirrors unconditionally after a
+                    // declined live reload for the same reason. Taken and
+                    // released before `pipeline` is locked, so this adds no
+                    // lock nesting of any kind (invariant 12).
+                    *lock_ignoring_poison(&daemon.models_cfg) = new_cfg.models.clone();
+
                     let injector = inject::build(&new_cfg.inject);
                     let mut guard = lock_ignoring_poison(&daemon.pipeline);
                     match guard.as_mut() {
@@ -4723,14 +4863,112 @@ mod tests {
         }
     }
 
+    /// What every load test that is *not* about shutdown passes for
+    /// `ensure_models_loaded_with`'s flag: a static that nothing ever sets.
+    ///
+    /// The production `SHUTTING_DOWN` is a process-global, and three tests in
+    /// this file drive the real `shutdown` and leave it `true` behind them.
+    /// Reading it here would make those tests and these ones fail each other
+    /// by scheduling accident under `cargo test`'s default parallelism --
+    /// which is exactly why the flag is a parameter at all (see
+    /// `ensure_models_loaded_with`'s doc comment).
+    static NOT_SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+
+    /// Final-review fix 2. `shutdown` takes no `load_lock` -- it must not,
+    /// because that would hang Beenden for up to `STARTUP_HEALTH_TIMEOUT`
+    /// behind an in-flight load -- so a load still running when teardown
+    /// begins used to install its `llama-server` into `daemon.llama` *after*
+    /// `shutdown`'s `kill_llama` had already looked there and found `None`.
+    /// `Request::Quit`'s `std::process::exit(0)` then left a ~955 MB child
+    /// resident, silently: nothing errors, the next start's `pick_port`
+    /// simply walks past it, and the user loses precisely the memory this
+    /// feature exists to reclaim. Reachable in three keystrokes -- SUPER+D,
+    /// SUPER+ALT+D, Beenden -- because cancelling leaves the state `IDLE`,
+    /// which `wait_for_busy_to_clear` does not wait on, while the loader
+    /// thread `start_recording` spawned is still going. `SIGTERM` at logout
+    /// is the same shape.
+    ///
+    /// The flag is flipped *inside* the loader, which is the moment that
+    /// matters: `load_lock` is held, the caller is committed, and
+    /// `daemon.llama` is still `None` for any concurrent `shutdown` to find.
+    /// A real load cannot run in this suite (no ASR model, no ggml backend),
+    /// so `stub_pipeline` and `stub_llama`'s `sleep 300` child stand in --
+    /// the same substitution `unloading_drops_the_pipeline_and_reaps_llama`
+    /// already makes.
+    ///
+    /// The assertion that carries the fix is `process_is_alive`: clearing
+    /// `pipeline` and `models_loaded` would satisfy the other three while
+    /// still orphaning the child.
+    #[test]
+    fn a_load_finishing_during_shutdown_releases_llama_instead_of_installing_it() {
+        let daemon = fake_daemon(IDLE);
+        let child = std::process::Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .expect("spawning a stub child (`sleep 300`) for this test");
+        let pid = child.id();
+        // `Option::take`, so the closure stays `FnMut` -- it is called once,
+        // but the seam's type does not know that.
+        let mut server = Some(LlamaServer::from_child(child, 0));
+        let shutting_down = AtomicBool::new(false);
+        let mut load = || {
+            // Beenden lands here: `shutdown` runs to completion on its own
+            // thread while this load is still in flight, finding
+            // `daemon.llama` empty.
+            shutting_down.store(true, Ordering::SeqCst);
+            Ok((stub_pipeline(), server.take()))
+        };
+
+        let err = ensure_models_loaded_with(&daemon, &mut load, &shutting_down)
+            .expect_err("a load that finished after teardown began must not report success");
+
+        assert!(err.contains("shutting down"), "unexpected reason: {err}");
+        assert!(!daemon.models_loaded.load(Ordering::SeqCst));
+        assert!(lock_ignoring_poison(&daemon.pipeline).is_none());
+        assert!(lock_ignoring_poison(&daemon.llama).is_none());
+        assert!(!daemon.normalize_available.load(Ordering::SeqCst));
+        assert!(
+            !process_is_alive(pid),
+            "child process {pid} survived a load that finished during shutdown: \
+             no llama-server may outlive the process that spawned it"
+        );
+    }
+
+    /// The other half, and the one that stops the re-check above from being
+    /// implemented as "always tear down": an ordinary load, with the flag
+    /// clear, must still install everything it produced.
+    #[test]
+    fn a_load_finishing_normally_still_installs_what_it_produced() {
+        let daemon = fake_daemon(IDLE);
+        let child = std::process::Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .expect("spawning a stub child (`sleep 300`) for this test");
+        let pid = child.id();
+        let mut server = Some(LlamaServer::from_child(child, 0));
+        let mut load = || Ok((stub_pipeline(), server.take()));
+
+        ensure_models_loaded_with(&daemon, &mut load, &NOT_SHUTTING_DOWN).unwrap();
+
+        assert!(daemon.models_loaded.load(Ordering::SeqCst));
+        assert!(lock_ignoring_poison(&daemon.pipeline).is_some());
+        assert!(lock_ignoring_poison(&daemon.llama).is_some());
+        assert!(daemon.normalize_available.load(Ordering::SeqCst));
+        assert!(process_is_alive(pid), "an ordinary load must keep its llama-server");
+
+        // This test spawned it, so this test reaps it: a `sleep 300` left
+        // behind would outlive the suite.
+        kill_llama(&daemon.llama);
+    }
+
     #[test]
     fn loading_the_models_twice_only_loads_them_once() {
         let daemon = fake_daemon(IDLE);
         let calls = Arc::new(AtomicU64::new(0));
 
         let mut load = counting_loader(Arc::clone(&calls));
-        ensure_models_loaded_with(&daemon, &mut load).unwrap();
-        ensure_models_loaded_with(&daemon, &mut load).unwrap();
+        ensure_models_loaded_with(&daemon, &mut load, &NOT_SHUTTING_DOWN).unwrap();
+        ensure_models_loaded_with(&daemon, &mut load, &NOT_SHUTTING_DOWN).unwrap();
 
         assert_eq!(calls.load(Ordering::SeqCst), 1, "the second call rebuilt the pipeline");
         assert!(daemon.models_loaded.load(Ordering::SeqCst));
@@ -4744,7 +4982,7 @@ mod tests {
         let daemon = fake_daemon(IDLE);
         let mut load = || anyhow::bail!("model paths: no such file");
 
-        let err = ensure_models_loaded_with(&daemon, &mut load).unwrap_err();
+        let err = ensure_models_loaded_with(&daemon, &mut load, &NOT_SHUTTING_DOWN).unwrap_err();
 
         assert!(err.contains("model paths"), "the real reason must survive: {err}");
         assert!(!daemon.models_loaded.load(Ordering::SeqCst));
@@ -4790,7 +5028,7 @@ mod tests {
         assert_eq!(before.warm, Some(false), "idle with no models is not warm");
 
         let mut load = counting_loader(Arc::new(AtomicU64::new(0)));
-        ensure_models_loaded_with(&daemon, &mut load).unwrap();
+        ensure_models_loaded_with(&daemon, &mut load, &NOT_SHUTTING_DOWN).unwrap();
 
         let after = dispatch(&daemon, Request::Status);
         assert_eq!(after.warm, Some(true));
@@ -4836,6 +5074,56 @@ mod tests {
         let r = dispatch(&daemon, Request::Reload);
 
         assert!(r.ok, "reload refused with no pipeline: {:?}", r.err);
+    }
+
+    /// Final-review fix 3. `SetConfig` mirrors `[models]` into
+    /// `daemon.models_cfg`; `Reload` returned `ok(Idle)` on both of its
+    /// branches without doing so, and `daemon.models_cfg` is the *only* thing
+    /// the housekeeping thread reads the idle timeout from. So hand-editing
+    /// `[models] idle_unload_seconds` and running `openwhisprflow --reload`
+    /// reported success and changed nothing until the next restart, while the
+    /// same edit made in the settings GUI applied live -- and README
+    /// documents `--reload` as applying every reloadable section.
+    ///
+    /// Driven with no pipeline installed, which is the ordinary state of a
+    /// lazily-loaded idle daemon *and* the branch that had no plausible
+    /// excuse for skipping the mirror.
+    #[test]
+    fn reload_mirrors_the_models_section_the_way_set_config_does() {
+        let path = scratch_config("reload-models");
+        std::fs::write(&path, "[models]\nidle_unload_seconds = 5\n").unwrap();
+        let daemon = fake_daemon_at(IDLE, false, path);
+        assert_eq!(
+            lock_ignoring_poison(&daemon.models_cfg).idle_unload_seconds,
+            ModelsConfig::default().idle_unload_seconds,
+            "precondition: the daemon still holds the startup value"
+        );
+
+        let r = dispatch(&daemon, Request::Reload);
+
+        assert!(r.ok, "{:?}", r.err);
+        assert_eq!(
+            lock_ignoring_poison(&daemon.models_cfg).idle_unload_seconds,
+            5,
+            "--reload reported success without applying the new idle timeout"
+        );
+    }
+
+    /// The other branch of the same arm: a daemon with a pipeline resident
+    /// must mirror too. Split from the test above rather than looped, because
+    /// the two branches sit either side of `update_reloadable` and a fix
+    /// applied to only one of them is exactly the shape of this bug.
+    #[test]
+    fn reload_mirrors_the_models_section_with_a_pipeline_resident_too() {
+        let path = scratch_config("reload-models-warm");
+        std::fs::write(&path, "[models]\nidle_unload_seconds = 7\n").unwrap();
+        let daemon = fake_daemon_at(IDLE, false, path);
+        *lock_ignoring_poison(&daemon.pipeline) = Some(stub_pipeline());
+
+        let r = dispatch(&daemon, Request::Reload);
+
+        assert!(r.ok, "{:?}", r.err);
+        assert_eq!(lock_ignoring_poison(&daemon.models_cfg).idle_unload_seconds, 7);
     }
 
     /// Pins `touch_activity`'s own body only -- not the ordering in
@@ -4938,7 +5226,7 @@ mod tests {
     fn unloading_drops_the_pipeline_and_reaps_llama() {
         let daemon = fake_daemon(IDLE);
         let mut load = counting_loader(Arc::new(AtomicU64::new(0)));
-        ensure_models_loaded_with(&daemon, &mut load).unwrap();
+        ensure_models_loaded_with(&daemon, &mut load, &NOT_SHUTTING_DOWN).unwrap();
         *lock_ignoring_poison(&daemon.llama) = Some(stub_llama());
         daemon.normalize_available.store(true, Ordering::SeqCst);
         *lock_ignoring_poison(&daemon.last_activity) = Instant::now() - Duration::from_secs(3600);
@@ -4962,7 +5250,7 @@ mod tests {
         // whether `touch_activity` ran at all.
         let daemon = fake_daemon(IDLE);
         let mut load = counting_loader(Arc::new(AtomicU64::new(0)));
-        ensure_models_loaded_with(&daemon, &mut load).unwrap();
+        ensure_models_loaded_with(&daemon, &mut load, &NOT_SHUTTING_DOWN).unwrap();
         *lock_ignoring_poison(&daemon.last_activity) = Instant::now() - Duration::from_secs(3600);
         touch_activity(&daemon); // the press lands, moving the deadline
 
@@ -5031,7 +5319,7 @@ mod tests {
     fn unloading_declines_mid_utterance() {
         let daemon = fake_daemon(TRANSCRIBING);
         let mut load = counting_loader(Arc::new(AtomicU64::new(0)));
-        ensure_models_loaded_with(&daemon, &mut load).unwrap();
+        ensure_models_loaded_with(&daemon, &mut load, &NOT_SHUTTING_DOWN).unwrap();
         *lock_ignoring_poison(&daemon.last_activity) = Instant::now() - Duration::from_secs(3600);
 
         assert!(!unload_models(&daemon), "unloaded a pipeline an utterance is using");
@@ -5067,10 +5355,12 @@ mod tests {
 
     #[test]
     fn a_passed_deadline_never_shrinks_the_tick_below_the_floor() {
-        // Without the floor, a deadline that has passed while the daemon is
-        // busy makes the housekeeping loop spin at zero timeout until the
-        // utterance finishes.
-        let daemon = fake_daemon(TRANSCRIBING);
+        // `unload_models` re-reads the state and the deadline under
+        // `load_lock`, so it can still decline on a tick this returned
+        // `Some` for -- a press landing in between, or a lazy load holding
+        // that lock. Without the floor the loop would then spin at a zero
+        // timeout until that resolved.
+        let daemon = fake_daemon(IDLE);
         daemon.models_loaded.store(true, Ordering::SeqCst);
         *lock_ignoring_poison(&daemon.last_activity) = Instant::now() - Duration::from_secs(3600);
 
@@ -5080,6 +5370,53 @@ mod tests {
         // reintroducing the busy-spin this test exists to catch.
         assert_eq!(time_until_unload(&daemon), Some(Duration::from_secs(1)));
         assert!(MIN_UNLOAD_TICK > Duration::ZERO, "the floor must not be zero");
+    }
+
+    /// The review finding this replaced the old `TRANSCRIBING` version of the
+    /// test above with. `time_until_unload` used to answer
+    /// `Some(MIN_UNLOAD_TICK)` for *any* state once the deadline had passed,
+    /// and the housekeeping loop takes `wait.min(..)` of that answer
+    /// unconditionally -- including on the arm carrying spec 15's
+    /// 1 -> 2 -> 4 -> ... -> 30 s `llama-server` restart backoff. With
+    /// `idle_unload_seconds = 10` and a `llama-server` that fails fast (a
+    /// missing ggml backend, which `wait_healthy` catches via `try_wait` in
+    /// milliseconds), a 40 s dictation drew roughly 30 fork/exec respawn
+    /// attempts instead of about four, on the thread that shares this
+    /// machine with live audio capture.
+    ///
+    /// Nothing is lost by returning `None`: `IdleOnExit`'s `Drop` refreshes
+    /// `last_activity` before it stores `IDLE`, so the deadline is a full
+    /// `idle_unload_seconds` away the moment a `Some` becomes possible again.
+    #[test]
+    fn a_busy_daemon_has_no_unload_deadline_to_wake_early_for() {
+        for state in [WARMING, RECORDING, TRANSCRIBING, NORMALIZING, INJECTING, FAILED] {
+            let daemon = fake_daemon(state);
+            daemon.models_loaded.store(true, Ordering::SeqCst);
+            *lock_ignoring_poison(&daemon.last_activity) =
+                Instant::now() - Duration::from_secs(3600);
+
+            assert_eq!(
+                time_until_unload(&daemon),
+                None,
+                "state {state} shortened the housekeeping tick despite `unload_models` refusing it"
+            );
+        }
+
+        // The other half: the two states an unload may actually act on must
+        // still shorten the tick, or `idle_unload_seconds` goes back to
+        // meaning "somewhere within `HEALTH_POLL_INTERVAL` of itself".
+        for state in [IDLE, PAUSED] {
+            let daemon = fake_daemon(state);
+            daemon.models_loaded.store(true, Ordering::SeqCst);
+            *lock_ignoring_poison(&daemon.last_activity) =
+                Instant::now() - Duration::from_secs(3600);
+
+            assert_eq!(
+                time_until_unload(&daemon),
+                Some(MIN_UNLOAD_TICK),
+                "state {state} must still wake the housekeeping loop for its deadline"
+            );
+        }
     }
 
     #[test]

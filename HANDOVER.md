@@ -206,9 +206,10 @@ needs a running `ydotoold` plus write access to `/dev/uinput`, which README's "T
 Design: `docs/superpowers/specs/2026-08-29-lazy-model-lifecycle-design.md`.
 Invariant 12 in CLAUDE.md is the part to read before editing `server.rs`.
 
-- `cargo test --workspace`: **410 passed, 0 failed, 4 ignored** (377 before,
-  plus 33 new). `cargo clippy --workspace --all-targets`: clean. Frontend
-  `bun run build`: clean.
+- `cargo test --workspace`: **415 passed, 0 failed, 4 ignored** (377 before,
+  plus 33 for this feature and 5 more from the whole-branch review round).
+  `cargo clippy --workspace --all-targets`: clean. Frontend `bun run build`:
+  clean.
 - **Verified on this machine, in an isolated instance** (an `XDG_RUNTIME_DIR`
   and config override; the real config, `rejections.jsonl`, and the running
   production daemon were all confirmed untouched by mtime afterwards):
@@ -264,6 +265,16 @@ Invariant 12 in CLAUDE.md is the part to read before editing `server.rs`.
     `llama-server` is already broken, a case `UnavailableNormalizer` already
     treats as a degraded mode, and shortening the budget on the lazy path is
     a design decision for the spec rather than a review fix.
+    - *Narrower than first recorded, and worse in one specific way.*
+      `wait_healthy` calls `Child::try_wait` between its health polls, so a
+      missing `llama-server` binary, a missing ggml compute backend (the
+      Arch case in CLAUDE.md's environment gotchas), or a bad model path all
+      fail in milliseconds rather than after 120 s. Spending the full budget
+      needs a child that stays alive and never answers `/health` — a much
+      rarer thing than "llama-server is broken". Against that: repeated
+      cancel-then-press cycles queue loader threads on `load_lock`, so if a
+      hang of that kind *does* happen, N presses serialise into N × 120 s
+      rather than sharing one wait.
   - **`cargo test` disturbs a running daemon's port file.** `LlamaServer::drop`
     unconditionally removes `paths::runtime_port()`, and several tests
     construct stub children. Pre-existing, not introduced here; fixing it
@@ -272,6 +283,23 @@ Invariant 12 in CLAUDE.md is the part to read before editing `server.rs`.
     deterministic handshake. It can only ever produce a false negative
     (missing a regression on a loaded machine), never a flaky failure, but a
     handshake would be strictly better.
+  - **`[normalize] enabled = false` is only *partially* applied until a
+    restart.** `restart_reason` already tells the user that `[normalize]`
+    needs one, and `--reload` refuses the flip outright — but the file is
+    written either way, so this is what a user who does not restart is
+    running. The pipeline side then behaves correctly: the next lazy load
+    builds `UnavailableNormalizer` and spawns no child. The housekeeping
+    thread does not, because its `normalize_cfg` is a value captured at
+    startup (`server.rs`'s `spawn_housekeeping` call in `start`) and never
+    re-read. Its supervisor keeps deciding a `llama-server` ought to be
+    running, finds `daemon.llama` empty, and respawns a ~955 MB child the
+    pipeline will never call. The end state the user asked for is still
+    correct — normalization really is off, the text is rule-cleaned and
+    injected — what leaks is the memory this feature exists to reclaim.
+    Restarting clears it. Not fixed here: the fix is to give
+    `spawn_housekeeping` a live view of `[normalize]` instead of a startup
+    snapshot, which is a change to how that thread is configured, not a
+    review-round patch.
   - **A stale RSS figure survives in one test comment.**
     `server.rs:5087`'s comment on
     `the_supervisor_is_skipped_entirely_while_the_models_are_unloaded` still

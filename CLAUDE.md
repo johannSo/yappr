@@ -35,7 +35,7 @@ bun run tauri dev                         # dev: Vite on :1420 + the Tauri windo
 bun run build                             # frontend only (tsc && vite build -> dist/)
 #   ^ builds BOTH pages: index.html (overlay) and settings.html (settings window).
 
-# Tests (410 passed, 0 failed, 4 #[ignore]d because they need downloaded models)
+# Tests (415 passed, 0 failed, 4 #[ignore]d because they need downloaded models)
 cargo test --workspace
 cargo test --workspace -- --ignored       # needs models already on disk (Settings' Setup pane, or --update-lock)
 cargo test -p owf-core guardrail::        # one module
@@ -240,11 +240,19 @@ happen to be resident.
     an idle daemon routinely has `pipeline: None` and no `llama-server` child
     at all — a state that used to be reachable only during warm-up and is now
     ordinary. Three consequences that are easy to break:
-    - **Never lock `pipeline` to ask whether the models are loaded.**
-      `process_utterance` holds that mutex for the whole `process` call, so a
-      reader that locks it blocks for the length of a transcription. `Status`
-      and the housekeeping thread read `daemon.models_loaded` instead — the
-      same reason `normalize_available` exists.
+    - **Never lock `pipeline` to ask whether the models are loaded.** Not
+      merely slow — an outright self-deadlock, on the commonest failure path
+      there is. `process_utterance` holds that mutex for the whole `process`
+      call (`server.rs:2603`) and broadcasts `Error` *from inside the guard*:
+      `:2613` for "no speech detected", `:2617` for a pipeline error. On
+      `Error`, and only on `Error`, `TauriSink::refresh_tray_icon` dispatches
+      `Request::Status` **synchronously** (`src-tauri/src/lib.rs:162`) to tell
+      a fatal startup failure from a transient one. So a `Status` handler that
+      locked `pipeline` would re-enter a `std::sync::Mutex` it already holds,
+      on the same thread — which is UB-or-deadlock, not a wait — every time
+      the user presses twice without speaking. `Status` and the housekeeping
+      thread read `daemon.models_loaded` instead, the same reason
+      `normalize_available` exists.
     - **The `llama-server` supervisor must stay gated on `models_loaded`.**
       Without that gate it respawns a ~955 MB child seconds after every unload,
       and the whole feature silently does nothing.
