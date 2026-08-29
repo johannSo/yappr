@@ -383,7 +383,19 @@ export default function Settings() {
     <MotionConfig reducedMotion="user">
       <main className="shell">
         <nav className="sidebar">
-          <div className="brand">OpenWhisprFlow</div>
+          <div className="brand">
+            {/* The overlay's level meter, frozen — the one mark this app
+                already has, so the two windows carry the same identity.
+                Decorative: the window's own title bar already says which
+                application this is. */}
+            <span className="brand__mark" aria-hidden="true">
+              <i />
+              <i />
+              <i />
+              <i />
+            </span>
+            <span className="brand__text">OpenWhisprFlow</span>
+          </div>
 
           <div className="searchbox">
             <Icon name="search" className="icon-sm searchbox__glyph" />

@@ -1,10 +1,18 @@
 /* The settings window.
  *
- * Two columns: a sidebar that separates the structure from the content, and a
- * scrolling pane of grouped setting rows with its own floating chrome. The
- * palette is a full set of tokens rather than one dark theme, because a window
- * that ignores the appearance the rest of the desktop is using is a window
- * that looks bolted on.
+ * The material is the one this app already uses: `Overlay.css` draws its HUD
+ * capsule as a translucent slab with a light top edge (`--mat`, `--mat-edge`,
+ * `--mat-sheen`), because a HUD floating over an unknown wallpaper has to
+ * bring its own ground. This window borrows those three tokens by name so the
+ * two windows read as one product -- but unlike the overlay it follows the
+ * user's light/dark theme, because a settings window is *inside* the desktop
+ * rather than floating over it.
+ *
+ * The layout is the compositor's. Hyprland puts gapped, rounded, blurred
+ * tiles on a wallpaper and marks the focused one with a gradient border;
+ * this window is a rail tile and a stack of section tiles on a tinted ground,
+ * and the active category wears that same border. One elevation for content,
+ * so nothing is a card inside a card.
  *
  * Sizes are in `rem`, so a user who has raised their text size gets a bigger
  * window's worth of layout rather than the same layout with bigger text
@@ -16,89 +24,157 @@
 :root {
   color-scheme: light dark;
 
+  /* Three type roles, all from families the desktop already has -- this
+     binary ships no font and cannot fetch one at runtime.
+
+     Display is iA Writer Duospace: a *writing* typeface in a dictation app,
+     which is the closest thing this product has to a native vernacular. It
+     is duospaced rather than proportional, so headings carry a typed quality
+     the UI face cannot fake. Every fallback in the stack is monospaced, so
+     the intent survives on a machine that lacks it. */
+  --font-display: "iA Writer Duospace", "iA Writer Quattro S",
+    "JetBrainsMono Nerd Font", ui-monospace, monospace;
+  /* The desktop's own UI face first: the window should look like it belongs
+     to the session, not to the web. */
+  --font-ui: "Adwaita Sans", Inter, system-ui, -apple-system, "Segoe UI",
+    "Noto Sans", sans-serif;
+  /* Data: config keys, milliseconds, thresholds, paths. */
+  --font-mono: "JetBrainsMono Nerd Font", "JetBrains Mono", ui-monospace,
+    "SFMono-Regular", monospace;
+
   /* Light is the base set. Dark redefines only what changes, so no colour has
      its single definition inside a media query -- a token that exists only in
      one branch is a token that goes missing in the other. */
-  --bg: #f2f2f7;
-  --chrome: rgba(242, 242, 247, 0.72);
-  --edge-fade: linear-gradient(to bottom, rgba(242, 242, 247, 0.9), rgba(242, 242, 247, 0));
-  --sidebar: #e6e6ec;
-  --card: #ffffff;
-  --field: #ffffff;
-  --field-edge: rgba(0, 0, 0, 0.16);
-  --card-edge: rgba(0, 0, 0, 0.08);
-  --hairline: rgba(0, 0, 0, 0.08);
-  --row-hover: rgba(0, 0, 0, 0.022);
-  --sunk: rgba(0, 0, 0, 0.05);
 
-  --text: #1d1d1f;
-  --muted: #6e6e73;
-  --faint: #8a8a8f;
+  /* -- The ground. --------------------------------------------------------
+     Two low-opacity blooms, not decoration: `backdrop-filter` over a flat
+     fill is invisible. The frost only reads as frost if there is something
+     varied behind it, and these are placed to pass behind both columns. */
+  --ground: #eaeef5;
+  --bloom-a: rgba(51, 204, 255, 0.2);
+  --bloom-b: rgba(0, 214, 138, 0.11);
+  /* A full-width vertical falloff under the blooms. The blooms only vary the
+     corners; this varies the middle band, which is where most tiles actually
+     sit -- and a tile whose whole footprint is one flat colour blurs to
+     exactly that colour. */
+  --veil: rgba(255, 255, 255, 0.55);
 
-  --accent: #0071e3;
-  /* A filled selection needs a darker blue than a text accent does: white on
-     #0071e3 measures 4.7:1, on #0062c4 it measures 6.0:1. The label sitting on
-     the fill is what sets the floor, not the fill itself. */
-  --accent-fill: #0062c4;
-  --accent-ink: #ffffff;
-  --accent-wash: rgba(0, 113, 227, 0.1);
+  /* -- The material, named as `Overlay.css` names it. --------------------- */
+  --mat: rgba(255, 255, 255, 0.66);
+  --mat-rail: rgba(255, 255, 255, 0.5);
+  --mat-edge: rgba(15, 23, 42, 0.1);
+  /* The inset highlight along the top edge. This is what actually sells
+     glass; without it a translucent panel just looks washed out. */
+  --mat-sheen: rgba(255, 255, 255, 0.9);
 
-  --danger: #d70015;
-  --danger-wash: rgba(215, 0, 21, 0.08);
-  --danger-ink: #a3000f;
-  --ok: #248a3d;
+  /* Sunk surfaces: fields, wells, tracks. Inset rather than raised, so a
+     control reads as cut into the tile it sits on. */
+  --well: rgba(255, 255, 255, 0.8);
+  --well-edge: rgba(15, 23, 42, 0.16);
+  --sunk: rgba(15, 23, 42, 0.05);
+  --hairline: rgba(15, 23, 42, 0.09);
+  --row-hover: rgba(15, 23, 42, 0.028);
+
+  --text: #101623;
+  --muted: #54607a;
+  --faint: #626b80;
+
+  /* The accent is Hyprland's default active-window gradient, used where the
+     compositor uses it: to mark what has focus. Nowhere else. */
+  --accent-2: #00d68a;
+  --accent-grad: linear-gradient(45deg, #33ccff, var(--accent-2));
+  /* A text/icon accent has to clear AA against the ground, which the bright
+     cyan does not -- it measures 4.3:1. This is the same cyan taken down
+     until it does (5.6:1). */
+  --accent: #06687f;
+  /* A filled chip keeps the bright cyan and takes *dark* ink rather than
+     white: #062430 on #33ccff measures 8.6:1, where white on it measures 2.0
+     and fails outright. The label on the fill is what sets the floor. */
+  --accent-fill: #33ccff;
+  --accent-ink: #062430;
+  --accent-wash: rgba(51, 204, 255, 0.16);
+  --focus: rgba(6, 104, 127, 0.6);
+
+  --danger: #c62a1c;
+  --danger-wash: rgba(198, 42, 28, 0.09);
+  --danger-ink: #9a1f14;
+  --ok: #0d7a52;
   --warn-ink: #7a4a00;
-  --warn-wash: rgba(255, 159, 10, 0.14);
+  --warn-wash: rgba(255, 159, 10, 0.16);
   --warn-edge: rgba(180, 110, 0, 0.35);
 
   --sidebar-w: 14.5rem;
   --control-w: 14.5rem;
   --gutter-w: 1.875rem;
-  --radius: 0.75rem;
+  /* The gap between tiles, and the window's own inset. One value: the space
+     around the rail is the space between sections, which is what makes the
+     whole window read as a single tiling rather than a frame with contents. */
+  --gap: 0.875rem;
+  --radius: 0.875rem;
   --radius-sm: 0.5rem;
-  --pane-x: 2rem;
+  --pane-x: 1.0625rem;
 
-  --shadow-pop:
-    0 12px 28px -6px rgba(0, 0, 0, 0.18),
-    0 2px 6px -1px rgba(0, 0, 0, 0.1);
+  /* Two elevations. Content tiles sit at e1 and never move; e2 is for the
+     things that arrive over them -- the tooltip, the save capsule. */
+  --e1:
+    0 1px 2px rgba(15, 23, 42, 0.06),
+    0 8px 24px -12px rgba(15, 23, 42, 0.22);
+  --e2:
+    0 12px 28px -6px rgba(15, 23, 42, 0.2),
+    0 2px 6px -1px rgba(15, 23, 42, 0.12);
+
+  --blur: blur(22px) saturate(1.7);
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #141416;
-    --chrome: rgba(20, 20, 22, 0.72);
-    --edge-fade: linear-gradient(to bottom, rgba(20, 20, 22, 0.92), rgba(20, 20, 22, 0));
-    --sidebar: #1c1c1f;
-    --card: #1e1e21;
-    --field: #161619;
-    --field-edge: rgba(255, 255, 255, 0.14);
-    --card-edge: rgba(255, 255, 255, 0.075);
+    --ground: #0b0e13;
+    /* Carried further than the light values, not less far. A tint that reads
+       clearly on porcelain disappears entirely on near-black, and a bloom
+       nobody can see is a frost with nothing to blur. */
+    --bloom-a: rgba(51, 204, 255, 0.28);
+    --bloom-b: rgba(0, 255, 153, 0.16);
+    --veil: rgba(126, 176, 214, 0.07);
+
+    --mat: rgba(23, 27, 34, 0.66);
+    --mat-rail: rgba(16, 19, 25, 0.72);
+    --mat-edge: rgba(255, 255, 255, 0.09);
+    --mat-sheen: rgba(255, 255, 255, 0.1);
+
+    --well: rgba(8, 10, 14, 0.55);
+    --well-edge: rgba(255, 255, 255, 0.13);
+    --sunk: rgba(255, 255, 255, 0.055);
     --hairline: rgba(255, 255, 255, 0.075);
-    --row-hover: rgba(255, 255, 255, 0.03);
-    --sunk: rgba(255, 255, 255, 0.05);
+    --row-hover: rgba(255, 255, 255, 0.032);
 
-    --text: #f5f5f7;
-    --muted: #98989d;
-    --faint: #737378;
+    --text: #e9edf3;
+    --muted: #9aa4b4;
+    --faint: #7d8798;
 
-    --accent: #0a84ff;
-    /* Same reasoning as light, inverted: white on #0a84ff is only 3.7:1, so
-       the fill goes darker until the label clears AA at 4.9:1. */
-    --accent-fill: #0a6fd8;
-    --accent-ink: #ffffff;
-    --accent-wash: rgba(10, 132, 255, 0.16);
+    --accent-2: #00ff99;
+    /* On the dark ground the bright cyan clears AA on its own (10.3:1), so
+       text and fill share one value here. The dark ink on the fill is
+       unchanged -- it is the fill's contrast, not the ground's. */
+    --accent: #33ccff;
+    --accent-fill: #33ccff;
+    --accent-ink: #062430;
+    --accent-wash: rgba(51, 204, 255, 0.14);
+    --focus: rgba(51, 204, 255, 0.65);
 
-    --danger: #ff453a;
-    --danger-wash: rgba(255, 69, 58, 0.14);
+    --danger: #ff5f52;
+    --danger-wash: rgba(255, 95, 82, 0.14);
     --danger-ink: #ffb3ad;
-    --ok: #30d158;
+    --ok: #46e0a0;
     --warn-ink: #f5c777;
     --warn-wash: rgba(255, 159, 10, 0.12);
     --warn-edge: rgba(255, 159, 10, 0.32);
 
-    --shadow-pop:
+    --e1:
+      0 1px 2px rgba(0, 0, 0, 0.4),
+      0 10px 30px -14px rgba(0, 0, 0, 0.8);
+    --e2:
       0 14px 32px -6px rgba(0, 0, 0, 0.6),
-      0 2px 8px -1px rgba(0, 0, 0, 0.4);
+      0 2px 8px -1px rgba(0, 0, 0, 0.45);
   }
 }
 
@@ -114,9 +190,9 @@ html {
 
 body {
   margin: 0;
-  background: var(--bg);
+  background: var(--ground);
   color: var(--text);
-  font-family: system-ui, -apple-system, "Segoe UI", "Noto Sans", sans-serif;
+  font-family: var(--font-ui);
   font-size: 0.875rem;
   line-height: 1.5;
   letter-spacing: 0;
@@ -124,15 +200,53 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
+/* The blooms. Fixed, so they stay put while a pane scrolls -- a ground that
+   scrolls with its content stops being a ground.
+
+   Placed so each one's *falloff* crosses the tiles rather than its centre:
+   frost reads as frost where there is a gradient behind it to bend, and a
+   flat patch of tint blurs to exactly itself. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(52rem 32rem at 22% -16%, var(--bloom-a), transparent 64%),
+    radial-gradient(44rem 34rem at 98% 106%, var(--bloom-b), transparent 62%),
+    linear-gradient(180deg, var(--veil), transparent 52%);
+}
+
 .shell {
+  position: relative;
+  z-index: 1;
   display: grid;
   grid-template-columns: var(--sidebar-w) 1fr;
+  gap: var(--gap);
   height: 100vh;
+  padding: var(--gap);
 }
 
 .shell--bare {
   display: block;
-  padding: var(--pane-x);
+  padding: calc(var(--gap) * 2);
+}
+
+/* ------------------------------------------------------------- the tiles
+
+   One rule's worth of material, applied to the three things that are tiles:
+   the rail, the pane's header, and every section. */
+
+.sidebar,
+.topbar,
+.group,
+.nothing {
+  border: 1px solid var(--mat-edge);
+  border-radius: var(--radius);
+  box-shadow: var(--e1), inset 0 1px 0 var(--mat-sheen);
+  backdrop-filter: var(--blur);
+  -webkit-backdrop-filter: var(--blur);
 }
 
 /* ---------------------------------------------------------------- sidebar */
@@ -141,21 +255,68 @@ body {
   display: flex;
   flex-direction: column;
   gap: 0.125rem;
-  padding: 1rem 0.625rem 0.75rem;
-  background: var(--sidebar);
-  border-right: 1px solid var(--card-edge);
+  min-height: 0;
+  padding: 0.875rem 0.5rem 0.625rem;
+  background: var(--mat-rail);
   overflow-y: auto;
 }
 
 .brand {
-  padding: 0.25rem 0.625rem 0.75rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.125rem 0.5rem 0.75rem;
+  font-family: var(--font-display);
   font-size: 0.6875rem;
   font-weight: 600;
   /* Small text is set slightly open: at this size the letters crowd, which is
      the mirror image of the display sizes below wanting negative tracking. */
-  letter-spacing: 0.08em;
+  letter-spacing: 0.06em;
   text-transform: uppercase;
-  color: var(--faint);
+  color: var(--muted);
+}
+
+/* The overlay's level meter, frozen. Those bars are the one mark this app
+   already has; sampling the focus gradient across them ties the identity and
+   the accent together instead of introducing a second idea. */
+.brand__mark {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 0.125rem;
+  height: 0.875rem;
+  flex: none;
+}
+
+.brand__mark i {
+  width: 0.125rem;
+  border-radius: 1px;
+  background: var(--accent-fill);
+}
+
+.brand__mark i:nth-child(1) {
+  height: 35%;
+}
+
+.brand__mark i:nth-child(2) {
+  height: 100%;
+  background: #1ad6c4;
+}
+
+.brand__mark i:nth-child(3) {
+  height: 60%;
+  background: var(--accent-2);
+}
+
+.brand__mark i:nth-child(4) {
+  height: 22%;
+  background: var(--accent-2);
+}
+
+.brand__text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ------------------------------------------------------------------ search
@@ -169,7 +330,7 @@ body {
   position: relative;
   display: flex;
   align-items: center;
-  margin: 0 0.25rem 0.75rem;
+  margin: 0 0.125rem 0.75rem;
 }
 
 .searchbox__glyph {
@@ -189,6 +350,7 @@ body {
   font: inherit;
   -webkit-appearance: none;
   appearance: none;
+  transition: background 140ms ease, border-color 140ms ease;
 }
 
 .searchbox__input::-webkit-search-cancel-button {
@@ -201,8 +363,9 @@ body {
 
 .searchbox__input:focus {
   outline: none;
-  background: var(--field);
+  background: var(--well);
   border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-wash);
 }
 
 .searchbox__clear {
@@ -217,7 +380,7 @@ body {
   border: 0;
   border-radius: 50%;
   background: var(--faint);
-  color: var(--card);
+  color: var(--ground);
   cursor: pointer;
 }
 
@@ -257,24 +420,11 @@ body {
   transform: scale(0.98);
 }
 
-.nav-item.active {
-  color: var(--accent-ink);
-  font-weight: 600;
-}
-
+.nav-item.active,
 .nav-item.active:hover {
   background: transparent;
-  color: var(--accent-ink);
-}
-
-/* The single selection that travels between rows (`layoutId` in
-   Settings.tsx). Behind the label, filling the row. */
-.nav-selection {
-  position: absolute;
-  inset: 0;
-  z-index: -1;
-  border-radius: var(--radius-sm);
-  background: var(--accent-fill);
+  color: var(--text);
+  font-weight: 600;
 }
 
 .nav-item .icon {
@@ -283,11 +433,51 @@ body {
   flex: none;
 }
 
+.nav-item.active .icon {
+  color: var(--accent);
+}
+
 .nav-item__text {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* The focused tile.
+
+   This is the one place the window spends its boldness. Hyprland marks the
+   focused window with a 45-degree gradient border and nothing else; the
+   active category is marked the same way, so the sidebar reads as a stack of
+   tiles with one of them focused. It travels between rows on `layoutId`
+   (Settings.tsx) -- every nav item is the same width and height, so that
+   animation is a pure translation and the 1px edge never gets scaled. */
+.nav-selection {
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: var(--radius-sm);
+  background: var(--accent-wash);
+}
+
+.nav-selection::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1px;
+  background: var(--accent-grad);
+  /* Draw the gradient, then punch the middle out of it: a gradient *border*,
+     which `border-image` cannot do at a radius. */
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  pointer-events: none;
 }
 
 .sidebar-foot {
@@ -303,13 +493,17 @@ body {
   margin: 0;
   padding: 0 0.5rem;
   color: var(--faint);
-  font-family: ui-monospace, "SFMono-Regular", "JetBrains Mono", monospace;
+  font-family: var(--font-mono);
   font-size: 0.65rem;
   line-height: 1.35;
   overflow-wrap: anywhere;
 }
 
-/* ------------------------------------------------------------------- pane */
+/* ------------------------------------------------------------------- pane
+
+   Not a tile itself: it is the region the section tiles are stacked in, so
+   giving it a surface of its own would put every section in a card inside a
+   card. It is transparent, and only scrolls. */
 
 .pane-wrap {
   position: relative;
@@ -319,11 +513,13 @@ body {
 .pane {
   height: 100%;
   overflow-y: auto;
+  /* Room for the scrollbar without the tiles hard against it. */
+  padding-right: 0.125rem;
 }
 
-/* Sticky inside the scroller, so rows really do pass underneath it and the
-   blur has content to work on. This is the one place in the window where a
-   translucent material is doing a job rather than decorating. */
+/* Sticky inside the scroller, so section tiles really do pass underneath it
+   and the blur has content to work on. This is the one place in the window
+   where a translucent material is doing a job rather than setting a mood. */
 .topbar {
   position: sticky;
   top: 0;
@@ -331,50 +527,41 @@ body {
   display: flex;
   align-items: baseline;
   gap: 0.75rem;
-  padding: 1.375rem var(--pane-x) 0.75rem;
-  background: var(--chrome);
-  backdrop-filter: blur(20px) saturate(180%);
-  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  margin-bottom: var(--gap);
+  padding: 0.625rem var(--pane-x) 0.6875rem;
+  background: var(--mat);
+  transition: box-shadow 220ms ease;
 }
 
 .topbar h1 {
   margin: 0;
-  font-size: 1.375rem;
+  font-family: var(--font-display);
+  font-size: 1.1875rem;
   font-weight: 700;
   /* Display size, so the tracking closes up. A single letter-spacing value
      shared with the 11px labels above would be wrong at both ends. */
-  letter-spacing: -0.018em;
+  letter-spacing: -0.015em;
   line-height: 1.15;
 }
 
 .topbar__count {
   color: var(--muted);
-  font-size: 0.8125rem;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
 }
 
-/* A soft edge where floating chrome meets content, instead of a hairline that
-   would sit there just as hard when there is nothing scrolled under it. */
-.topbar::after {
-  content: "";
-  position: absolute;
-  left: 0;
-  right: 0;
-  top: 100%;
-  height: 1.25rem;
-  background: var(--edge-fade);
-  opacity: 0;
-  transition: opacity 220ms ease;
-  pointer-events: none;
-}
-
-.topbar.is-scrolled::after {
-  opacity: 1;
+/* Content underneath is already visible through the frost. What the scrolled
+   state adds is depth -- the header lifts off the stack rather than drawing a
+   rule that would sit there just as hard with nothing under it. */
+.topbar.is-scrolled {
+  box-shadow: var(--e2), inset 0 1px 0 var(--mat-sheen);
 }
 
 .pane-body {
   /* Bottom padding clears the floating save capsule, so the last row of the
      last section is never the thing it covers. */
-  padding: 0.75rem var(--pane-x) 6rem;
+  padding: 0 0 5.5rem;
 }
 
 .status {
@@ -389,7 +576,7 @@ body {
   gap: 0.625rem;
   padding: 0.6875rem 0.8125rem;
   border-radius: var(--radius-sm);
-  margin-bottom: 1.25rem;
+  margin-bottom: var(--gap);
   border: 1px solid transparent;
   white-space: pre-wrap;
 }
@@ -415,26 +602,35 @@ body {
   color: var(--warn-ink);
 }
 
-/* ----------------------------------------------------------------- groups */
+/* ----------------------------------------------------------------- groups
 
+   A section is one tile: its heading, its note and its rows are inside the
+   same surface. The old shape put a floating label above a detached card,
+   which read as two objects for one section.
+
+   No `overflow: clip` here, however much the rounded corners want it: the
+   info popover is positioned inside a row, and clipping the tile would cut
+   it off. The last row rounds its own bottom corners instead. */
 .group {
-  margin-bottom: 1.625rem;
+  margin-bottom: var(--gap);
+  background: var(--mat);
 }
 
 .group-head {
   display: flex;
   align-items: center;
   gap: 0.5625rem;
-  padding: 0 0.25rem 0.5rem;
+  padding: 0.8125rem 1rem 0.6875rem;
 }
 
 .group-head h2 {
   margin: 0;
+  font-family: var(--font-display);
   font-size: 0.6875rem;
   font-weight: 600;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.09em;
   text-transform: uppercase;
-  color: var(--faint);
+  color: var(--text);
 }
 
 /* Which pane a search hit normally lives in. */
@@ -457,18 +653,16 @@ body {
 }
 
 .note {
-  margin: 0 0.25rem 0.5rem;
+  margin: -0.25rem 1rem 0.6875rem;
   color: var(--muted);
   font-size: 0.78rem;
 }
 
-/* No `overflow: clip` here, however much the rounded corners want it: the
-   ⓘ popover is positioned inside a row, and clipping the card would cut it
-   off. The first and last rows round their own corners instead. */
+/* The row list. Transparent -- the tile around it is the surface. The rule on
+   top is what separates the heading (and the note, when there is one) from
+   the rows, wherever the heading block happens to end. */
 .card {
-  background: var(--card);
-  border: 1px solid var(--card-edge);
-  border-radius: var(--radius);
+  border-top: 1px solid var(--hairline);
 }
 
 /* ------------------------------------------------------------------- rows */
@@ -479,7 +673,7 @@ body {
 
 /* Inset separators, the way a grouped list draws them: the rule starts where
    the label starts, so it reads as dividing entries rather than as slicing the
-   card into strips. */
+   tile into strips. */
 .row + .row::before {
   content: "";
   position: absolute;
@@ -490,16 +684,10 @@ body {
   background: var(--hairline);
 }
 
-.row:first-child {
-  border-radius: var(--radius) var(--radius) 0 0;
-}
-
-.row:last-child {
-  border-radius: 0 0 var(--radius) var(--radius);
-}
-
-.row:only-child {
-  border-radius: var(--radius);
+/* Only the bottom pair: the top of the list is a rule, not an edge. */
+.row:last-child,
+.setup-row:last-child {
+  border-radius: 0 0 calc(var(--radius) - 1px) calc(var(--radius) - 1px);
 }
 
 .row:hover {
@@ -554,7 +742,8 @@ body {
 
 .row-control .unit {
   color: var(--faint);
-  font-size: 0.75rem;
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
   flex: none;
 }
 
@@ -595,8 +784,10 @@ body {
   color: var(--accent);
 }
 
-/* Anchored to the ⓘ that opened it, not to its own centre: the origin is what
-   makes the panel read as belonging to this row. */
+/* Anchored to the info button that opened it, not to its own centre: the
+   origin is what makes the panel read as belonging to this row. Opaque, not
+   frosted -- it lands on top of the row it explains, and text over text is
+   the one place translucency costs more than it gives. */
 .tip {
   position: absolute;
   top: calc(100% + 0.4375rem);
@@ -607,9 +798,9 @@ body {
   max-width: 22rem;
   padding: 0.5625rem 0.6875rem;
   border-radius: var(--radius-sm);
-  background: var(--card);
-  border: 1px solid var(--card-edge);
-  box-shadow: var(--shadow-pop);
+  background: var(--ground);
+  border: 1px solid var(--mat-edge);
+  box-shadow: var(--e2);
   color: var(--text);
   font-size: 0.78rem;
   line-height: 1.45;
@@ -627,18 +818,32 @@ body {
   flex: none;
 }
 
-/* --------------------------------------------------------------- controls */
+/* --------------------------------------------------------------- controls
+
+   Wells: cut into the tile rather than raised off it, so the eye reads the
+   tile as the surface and the control as a hole in it. The inset shadow is
+   the whole of that effect -- without it a translucent field on a
+   translucent tile is just a lighter rectangle. */
 
 input[type="text"],
-input[type="number"] {
+input[type="number"],
+.select select {
   width: 100%;
-  background: var(--field);
+  background: var(--well);
   color: var(--text);
-  border: 1px solid var(--field-edge);
-  border-radius: 0.4375rem;
+  border: 1px solid var(--well-edge);
+  border-radius: var(--radius-sm);
   padding: 0.375rem 0.625rem;
   font: inherit;
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.06);
   transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+
+/* Numbers are data, not prose. */
+input[type="number"],
+.trow input[type="text"] {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
 }
 
 input[type="number"] {
@@ -674,17 +879,10 @@ select:focus {
 }
 
 .select select {
-  width: 100%;
   appearance: none;
-  background: var(--field);
-  color: var(--text);
-  border: 1px solid var(--field-edge);
-  border-radius: 0.4375rem;
-  padding: 0.375rem 1.875rem 0.375rem 0.625rem;
-  font: inherit;
+  padding-right: 1.875rem;
   cursor: pointer;
   text-overflow: ellipsis;
-  transition: border-color 120ms ease, box-shadow 120ms ease;
 }
 
 .select-caret {
@@ -708,9 +906,10 @@ option:disabled {
   height: 1.5rem;
   flex: none;
   padding: 0;
-  border: 1px solid var(--field-edge);
+  border: 1px solid var(--well-edge);
   border-radius: 999px;
   background: var(--sunk);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.08);
   cursor: pointer;
   transition: background 160ms ease, border-color 160ms ease;
 }
@@ -723,7 +922,7 @@ option:disabled {
   height: 1.125rem;
   border-radius: 50%;
   background: #fff;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
 }
 
 .toggle.on {
@@ -739,7 +938,7 @@ option:disabled {
 .icon-btn:focus-visible,
 .infotip-btn:focus-visible,
 .searchbox__clear:focus-visible {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--focus);
   outline-offset: 2px;
 }
 
@@ -776,10 +975,10 @@ button.ghost {
   display: inline-flex;
   align-items: center;
   gap: 0.3125rem;
-  background: var(--card);
+  background: var(--well);
   color: var(--text);
-  border: 1px solid var(--field-edge);
-  border-radius: 0.4375rem;
+  border: 1px solid var(--well-edge);
+  border-radius: var(--radius-sm);
   padding: 0.375rem 0.6875rem;
   font: inherit;
   cursor: pointer;
@@ -838,7 +1037,7 @@ button:disabled {
   padding: 0.1875rem 0.3125rem 0.1875rem 0.625rem;
   border-radius: 999px;
   background: var(--sunk);
-  border: 1px solid var(--card-edge);
+  border: 1px solid var(--mat-edge);
   font-size: 0.78rem;
 }
 
@@ -873,7 +1072,7 @@ button:disabled {
   gap: 0.375rem;
 }
 
-/* A section that is itself a list puts its table straight into the card, with
+/* A section that is itself a list puts its table straight into the tile, with
    no row around it to supply the inset. */
 .card > .table {
   padding: 0.875rem 1rem;
@@ -888,8 +1087,9 @@ button:disabled {
 
 .trow.head {
   color: var(--faint);
+  font-family: var(--font-display);
   font-size: 0.6875rem;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.05em;
   text-transform: uppercase;
   padding-right: 2rem;
 }
@@ -900,12 +1100,16 @@ button:disabled {
 
 /* ------------------------------------------------------------ empty search */
 
+/* A tile too. Everything else in this column is one, and a headline sitting
+   directly on the ground reads as the pane having failed to load rather than
+   as the pane having nothing to show. */
 .nothing {
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: 0.5rem;
   padding: 3.5rem 1rem;
+  background: var(--mat);
   text-align: center;
 }
 
@@ -918,8 +1122,9 @@ button:disabled {
 
 .nothing__title {
   margin: 0.25rem 0 0;
+  font-family: var(--font-display);
   font-weight: 600;
-  font-size: 1rem;
+  font-size: 0.9375rem;
   letter-spacing: -0.01em;
 }
 
@@ -930,8 +1135,9 @@ button:disabled {
   font-size: 0.8125rem;
 }
 
-.nothing__body code {
-  font-family: ui-monospace, "SFMono-Regular", monospace;
+.nothing__body code,
+.setup-command code {
+  font-family: var(--font-mono);
   font-size: 0.9em;
   background: var(--sunk);
   border-radius: 0.25rem;
@@ -960,11 +1166,11 @@ button:disabled {
   gap: 0.5rem;
   padding: 0.4375rem 0.9375rem;
   border-radius: 999px;
-  background: var(--chrome);
-  border: 1px solid var(--card-edge);
-  box-shadow: var(--shadow-pop);
-  backdrop-filter: blur(20px) saturate(180%);
-  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  background: var(--mat);
+  border: 1px solid var(--mat-edge);
+  box-shadow: var(--e2), inset 0 1px 0 var(--mat-sheen);
+  backdrop-filter: var(--blur);
+  -webkit-backdrop-filter: var(--blur);
   color: var(--text);
   font-size: 0.8125rem;
   font-weight: 500;
@@ -992,8 +1198,8 @@ button:disabled {
 /* ------------------------------------------------------------- setup pane
 
    Rows shaped like `.row` (same padding rhythm, same inset hairline between
-   siblings, same corner rounding on the first/last child) but not `.row`
-   itself: nothing here has a control column or a reset gutter, so reusing
+   siblings, same corner rounding on the last child) but not `.row` itself:
+   nothing here has a control column or a reset gutter, so reusing
    `.row-head`'s grid would just leave both empty. */
 
 .setup-row {
@@ -1013,18 +1219,6 @@ button:disabled {
   right: 0;
   height: 1px;
   background: var(--hairline);
-}
-
-.setup-row:first-child {
-  border-radius: var(--radius) var(--radius) 0 0;
-}
-
-.setup-row:last-child {
-  border-radius: 0 0 var(--radius) var(--radius);
-}
-
-.setup-row:only-child {
-  border-radius: var(--radius);
 }
 
 .setup-row .icon-sm {
@@ -1062,7 +1256,8 @@ button:disabled {
 .setup-row__status {
   flex: none;
   color: var(--muted);
-  font-size: 0.75rem;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
   font-variant-numeric: tabular-nums;
 }
 
@@ -1070,13 +1265,16 @@ button:disabled {
   height: 0.3125rem;
   border-radius: 999px;
   background: var(--sunk);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.1);
   overflow: hidden;
 }
 
+/* The one other place the focus gradient appears: a download is the only
+   thing in this window that is actively happening. */
 .progressbar__fill {
   height: 100%;
   border-radius: inherit;
-  background: var(--accent);
+  background: var(--accent-grad);
   transition: width 0.2s ease;
 }
 
@@ -1088,22 +1286,14 @@ button:disabled {
 }
 
 .setup-command {
-  margin: 0.5rem 0.25rem 0;
+  margin: 0.5rem 1rem 0.875rem;
   color: var(--muted);
   font-size: 0.78rem;
 }
 
-.setup-command code {
-  font-family: ui-monospace, "SFMono-Regular", monospace;
-  font-size: 0.9em;
-  background: var(--sunk);
-  border-radius: 0.25rem;
-  padding: 0 0.3125rem;
-}
-
 /* ---------------------------------------------------------------- narrower
 
-   The window opens at 940 px but this is a tiling compositor, so a narrower
+   The window opens at 980 px but this is a tiling compositor, so a narrower
    one is the normal case rather than the edge. The control column gives way
    first -- a dropdown loses less by being narrow than a label does by wrapping
    onto two lines -- and the sidebar drops to icons only before anything is
@@ -1112,7 +1302,7 @@ button:disabled {
 @media (max-width: 56rem) {
   :root {
     --control-w: 11.875rem;
-    --pane-x: 1.5rem;
+    --pane-x: 1rem;
   }
 }
 
@@ -1120,7 +1310,7 @@ button:disabled {
   :root {
     --sidebar-w: 11.5rem;
     --control-w: 10.5rem;
-    --pane-x: 1.25rem;
+    --gap: 0.75rem;
   }
 
   .row-head {
@@ -1131,14 +1321,22 @@ button:disabled {
 
 @media (max-width: 38rem) {
   :root {
-    --sidebar-w: 3.25rem;
+    --sidebar-w: 3.5rem;
   }
 
-  .brand,
+  /* The mark stays: at this width it is the only thing left saying which
+     application this window belongs to. */
+  .brand__text,
   .nav-item__text,
   .path,
   .sidebar-foot .ghost span {
     display: none;
+  }
+
+  .brand {
+    justify-content: center;
+    padding-left: 0;
+    padding-right: 0;
   }
 
   .searchbox__input {
@@ -1160,7 +1358,7 @@ button:disabled {
 
 /* Motion's `reducedMotion="user"` already strips the springs' transforms and
    keeps their cross-fades. What is left is the CSS: the press feedback, the
-   scroll edge, and the one indefinite rotation. */
+   header's lift, and the one indefinite rotation. */
 @media (prefers-reduced-motion: reduce) {
   .nav-item:active,
   button.add:active:not(:disabled),
@@ -1168,7 +1366,7 @@ button:disabled {
     transform: none;
   }
 
-  .topbar::after {
+  .topbar {
     transition: none;
   }
 
@@ -1179,10 +1377,26 @@ button:disabled {
   }
 }
 
+/* Translucency is the one thing in this window that can quietly destroy
+   contrast, so it is the first thing to go. The tiles stay tiles -- edges,
+   radius and elevation are what carry the layout; the blur was only ever the
+   material. */
 @media (prefers-reduced-transparency: reduce) {
+  :root {
+    --mat: var(--ground);
+    --mat-rail: var(--ground);
+    --well: var(--ground);
+  }
+
+  body::before {
+    display: none;
+  }
+
+  .sidebar,
   .topbar,
+  .group,
+  .nothing,
   .save-capsule {
-    background: var(--bg);
     backdrop-filter: none;
     -webkit-backdrop-filter: none;
   }
@@ -1190,14 +1404,23 @@ button:disabled {
 
 @media (prefers-contrast: more) {
   :root {
+    --mat: var(--ground);
+    --mat-rail: var(--ground);
+    --well: var(--ground);
     --hairline: rgba(128, 128, 128, 0.6);
-    --card-edge: rgba(128, 128, 128, 0.7);
-    --field-edge: rgba(128, 128, 128, 0.85);
+    --mat-edge: rgba(128, 128, 128, 0.7);
+    --well-edge: rgba(128, 128, 128, 0.85);
   }
 
+  body::before {
+    display: none;
+  }
+
+  .sidebar,
   .topbar,
+  .group,
+  .nothing,
   .save-capsule {
-    background: var(--bg);
     backdrop-filter: none;
     -webkit-backdrop-filter: none;
   }
