@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use crate::asr::SherpaTranscriber;
 use crate::capture::{CaptureStats, Recorder};
-use crate::config::{AudioConfig, Config, DebugConfig, NormalizeConfig};
+use crate::config::{AudioConfig, Config, DebugConfig, ModelsConfig, NormalizeConfig};
 use crate::config_write;
 use crate::inject;
 use crate::lang::WhatlangDetector;
@@ -233,6 +233,40 @@ pub struct Daemon {
     /// "restart the daemon" would be a poor answer for it.
     audio_cfg: Mutex<AudioConfig>,
     pipeline: Mutex<Option<Pipeline>>,
+    /// Held across a model load so two concurrent presses share one load
+    /// rather than racing two, and so an unload can never interleave with
+    /// one.
+    ///
+    /// **Lock order: this is always taken before `pipeline`, never after.**
+    /// `process_utterance` takes only `pipeline`, and holds it for the whole
+    /// `process` call; `ensure_models_loaded` and `unload_models` take this
+    /// first and hold `pipeline` only for the assignment.
+    load_lock: Mutex<()>,
+    /// Lock-free projection of "`pipeline` is `Some`", for readers that must
+    /// never block on it.
+    ///
+    /// Not redundant bookkeeping, for the same reason `normalize_available`
+    /// is not: `process_utterance` holds `pipeline`'s mutex for the entire
+    /// `process` call (deliberately -- see its own comment on the
+    /// sherpa-onnx FFI), so any thread that answers a question by locking
+    /// `pipeline` blocks for the length of a whole transcription. Two such
+    /// readers exist -- `dispatch`'s `Status` handler, which would make
+    /// `--status` hang mid-utterance, and the housekeeping thread, which
+    /// would stop reaping subscribers for the same window. Both read this.
+    models_loaded: AtomicBool,
+    /// When the daemon was last doing something dictation-shaped: bumped by
+    /// `start_recording` and by every utterance that ends (`IdleOnExit`).
+    /// The idle-unload deadline is measured from this.
+    ///
+    /// Nothing reads or bumps this yet -- that lands with the idle-unload
+    /// timer in a later task. `#[allow(dead_code)]` rather than leaving the
+    /// field out of this task entirely: both construction sites need to
+    /// agree on the daemon's full field set now, not grow it again later.
+    #[allow(dead_code)]
+    last_activity: Mutex<Instant>,
+    /// `[models]`, mirrored here so a Settings change takes effect without a
+    /// restart -- the same reason, and the same shape, as `audio_cfg`.
+    models_cfg: Mutex<ModelsConfig>,
     /// Owns the supervised `llama-server` child (R3): storing it here, rather
     /// than leaking it with `mem::forget`, keeps `LlamaServer::drop` reachable
     /// for the lifetime of the daemon instead of permanently severing it.
@@ -597,6 +631,10 @@ pub fn start(sink: Arc<dyn EventSink>) -> Result<(Arc<Daemon>, UnixListener)> {
         recorder: Mutex::new(None),
         audio_cfg: Mutex::new(cfg.audio.clone()),
         pipeline: Mutex::new(None),
+        load_lock: Mutex::new(()),
+        models_loaded: AtomicBool::new(false),
+        last_activity: Mutex::new(Instant::now()),
+        models_cfg: Mutex::new(cfg.models.clone()),
         llama: Mutex::new(None),
         window_class: Mutex::new(None),
         config_path: paths::config_file(),
@@ -643,6 +681,7 @@ pub fn start(sink: Arc<dyn EventSink>) -> Result<(Arc<Daemon>, UnixListener)> {
                     // re-confirms the same thing to decide whether a
                     // `NormalizeDegraded`/`NormalizeRecovered` broadcast is due.
                     daemon.normalize_available.store(available, Ordering::SeqCst);
+                    daemon.models_loaded.store(true, Ordering::SeqCst);
                     daemon.state.store(IDLE, Ordering::SeqCst);
                     daemon.broadcast(OverlayEvent::Idle);
                     tracing::info!("ready");
@@ -875,6 +914,59 @@ fn load_models(cfg: Config, daemon: &Arc<Daemon>) -> Result<(Pipeline, Option<Ll
     )
     .with_stage_events(stage_events);
     Ok((pipeline, server))
+}
+
+/// Brings the models up if they are not already, and does nothing if they
+/// are. Idempotent, safe to call from any thread, and safe to call
+/// concurrently: `load_lock` makes two presses share one load rather than
+/// racing two.
+///
+/// Reads its `Config` from disk at the moment of the call rather than from a
+/// snapshot taken at startup, as `GetConfig` and `Reload` already do. A
+/// consequence worth naming: for a user running lazily, a changed `[asr]` or
+/// `[normalize]` setting takes effect on the next dictation rather than the
+/// next restart. That is a side effect, not a promise -- `schema.ts`'s
+/// `RESTART_SECTIONS` is unchanged because it is still correct whenever the
+/// models happen to be resident.
+#[allow(dead_code)] // wired to the key press in Task 4; unused in production until then
+fn ensure_models_loaded(daemon: &Arc<Daemon>) -> Result<(), String> {
+    let cfg = Config::load_from(&daemon.config_path).map_err(|e| format!("config error: {e}"))?;
+    let mut load = || load_models(cfg.clone(), daemon);
+    ensure_models_loaded_with(daemon, &mut load)
+}
+
+/// [`ensure_models_loaded`] with the loader injected -- the seam a test uses
+/// to exercise the locking, the idempotence and the failure path without an
+/// ASR model on disk, in the same shape `supervise_llama_once`'s `respawn`
+/// parameter already establishes.
+///
+/// On failure it installs nothing at all: `pipeline` stays `None`,
+/// `models_loaded` stays `false`, and `state` is left alone. That is what
+/// makes a lazy load failure retryable on the next press (spec 2026-08-29 §4)
+/// rather than the permanent `FAILED` a startup failure still produces.
+fn ensure_models_loaded_with(
+    daemon: &Arc<Daemon>,
+    load: &mut dyn FnMut() -> Result<(Pipeline, Option<LlamaServer>)>,
+) -> Result<(), String> {
+    let _guard = lock_ignoring_poison(&daemon.load_lock);
+    if daemon.models_loaded.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    match load() {
+        Ok((pipeline, server)) => {
+            let available = server.is_some();
+            *lock_ignoring_poison(&daemon.pipeline) = Some(pipeline);
+            *lock_ignoring_poison(&daemon.llama) = server;
+            daemon.normalize_available.store(available, Ordering::SeqCst);
+            // Last, and only on the success path: this is what the
+            // housekeeping thread's supervisor gate and `Status` both read,
+            // so it must never be true before the pipeline is installed.
+            daemon.models_loaded.store(true, Ordering::SeqCst);
+            tracing::info!("models loaded");
+            Ok(())
+        }
+        Err(e) => Err(format!("{e:#}")),
+    }
 }
 
 /// Startup's health-wait budget: a cold model load can genuinely take this
@@ -1508,7 +1600,10 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
     match req {
         Request::Status => {
             let mut r = Response::ok(state_of(current));
-            r.warm = Some(current != WARMING);
+            // "The models are resident right now", not "startup finished".
+            // The atomic, never the `pipeline` lock -- see the field's own
+            // doc comment for the hang that would otherwise be.
+            r.warm = Some(daemon.models_loaded.load(Ordering::SeqCst));
             // Task 3: "status must stop lying" -- only meaningful (and only
             // reported) when normalization was ever turned on; see
             // `Daemon::normalize_enabled`'s doc comment.
@@ -1670,10 +1765,13 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
                             Ok(()) => Response::ok(State::Idle),
                             Err(msg) => Response::err(msg),
                         },
-                        // Unreachable in normal operation: IDLE is only ever
-                        // reached once warm-up has populated `pipeline` (see
-                        // `process_utterance`'s identical note).
-                        None => Response::err("reload requires the pipeline to be warmed up"),
+                        // No longer unreachable, and no longer an error: with
+                        // `[models] preload_at_startup` off, an idle daemon
+                        // between dictations routinely has no pipeline. The
+                        // config parsed above is all the validation there is
+                        // to do -- `ensure_models_loaded` reads the file
+                        // again when the next press brings the models up.
+                        None => Response::ok(State::Idle),
                     }
                 }
                 Err(e) => Response::err(format!("config error: {e}")),
@@ -1749,6 +1847,11 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
                     }
                 }
             }
+
+            // Mirrored for the same reason `audio_cfg` is: the housekeeping
+            // thread reads the idle timeout on every tick, and a user who
+            // changes it in Settings must not have to restart for it.
+            *lock_ignoring_poison(&daemon.models_cfg) = new_cfg.models.clone();
 
             if new_cfg.audio != old.audio {
                 *lock_ignoring_poison(&daemon.audio_cfg) = new_cfg.audio.clone();
@@ -2763,6 +2866,10 @@ mod tests {
             recorder: Mutex::new(None),
             audio_cfg: Mutex::new(AudioConfig::default()),
             pipeline: Mutex::new(None),
+            load_lock: Mutex::new(()),
+            models_loaded: AtomicBool::new(false),
+            last_activity: Mutex::new(Instant::now()),
+            models_cfg: Mutex::new(ModelsConfig::default()),
             llama: Mutex::new(None),
             window_class: Mutex::new(None),
             config_path: config_path.clone(),
@@ -2852,6 +2959,10 @@ mod tests {
             recorder: Mutex::new(None),
             audio_cfg: Mutex::new(AudioConfig::default()),
             pipeline: Mutex::new(None),
+            load_lock: Mutex::new(()),
+            models_loaded: AtomicBool::new(false),
+            last_activity: Mutex::new(Instant::now()),
+            models_cfg: Mutex::new(ModelsConfig::default()),
             llama: Mutex::new(None),
             window_class: Mutex::new(None),
             config_path: PathBuf::from("/nonexistent/owf-test/config.toml"),
@@ -4278,5 +4389,116 @@ mod tests {
 
         assert!(r.ok, "{:?}", r.err);
         assert!(*lock_ignoring_poison(&sink.0), "show_settings must reach the sink");
+    }
+
+    /// A `Pipeline` built from the stub stages this module already defines, for
+    /// tests that only need *a* pipeline to be installed. None of them ever call
+    /// `process` on it -- a real one needs an ASR model on disk, which is why
+    /// this file's four model-dependent tests are `#[ignore]`d.
+    fn stub_pipeline() -> Pipeline {
+        Pipeline::new(
+            Config::from_str("").unwrap(),
+            Box::new(PanickingTranscriber),
+            Box::new(WholeBuffer),
+            Box::new(AlwaysEnglish),
+            Box::new(NeverNormalizer),
+            Box::new(MockInjector::default()),
+        )
+    }
+
+    /// The seam that makes the loader testable at all. Counts its own calls, so
+    /// idempotence is observable.
+    fn counting_loader(
+        calls: Arc<AtomicU64>,
+    ) -> impl FnMut() -> anyhow::Result<(Pipeline, Option<LlamaServer>)> {
+        move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok((stub_pipeline(), None))
+        }
+    }
+
+    #[test]
+    fn loading_the_models_twice_only_loads_them_once() {
+        let daemon = fake_daemon(IDLE);
+        let calls = Arc::new(AtomicU64::new(0));
+
+        let mut load = counting_loader(Arc::clone(&calls));
+        ensure_models_loaded_with(&daemon, &mut load).unwrap();
+        ensure_models_loaded_with(&daemon, &mut load).unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the second call rebuilt the pipeline");
+        assert!(daemon.models_loaded.load(Ordering::SeqCst));
+        assert!(lock_ignoring_poison(&daemon.pipeline).is_some());
+    }
+
+    #[test]
+    fn a_failed_load_leaves_the_daemon_unloaded_and_retryable() {
+        // Spec 2026-08-29 §4: lazily, a load failure is not fatal. It must leave
+        // no half-installed state behind, so the next press can simply try again.
+        let daemon = fake_daemon(IDLE);
+        let mut load = || anyhow::bail!("model paths: no such file");
+
+        let err = ensure_models_loaded_with(&daemon, &mut load).unwrap_err();
+
+        assert!(err.contains("model paths"), "the real reason must survive: {err}");
+        assert!(!daemon.models_loaded.load(Ordering::SeqCst));
+        assert!(lock_ignoring_poison(&daemon.pipeline).is_none());
+        assert_eq!(daemon.state.load(Ordering::SeqCst), IDLE, "must not latch FAILED");
+    }
+
+    #[test]
+    fn status_reports_model_residency_rather_than_startup_completion() {
+        let daemon = fake_daemon(IDLE);
+
+        let before = dispatch(&daemon, Request::Status);
+        assert_eq!(before.warm, Some(false), "idle with no models is not warm");
+
+        let mut load = counting_loader(Arc::new(AtomicU64::new(0)));
+        ensure_models_loaded_with(&daemon, &mut load).unwrap();
+
+        let after = dispatch(&daemon, Request::Status);
+        assert_eq!(after.warm, Some(true));
+    }
+
+    /// `process_utterance` holds `pipeline`'s mutex for the whole `process`
+    /// call, so a `Status` handler that asked `pipeline.is_some()` would hang
+    /// for the length of a transcription. `models_loaded` is read instead.
+    ///
+    /// The call under test runs on its own thread and is awaited with a
+    /// timeout: a regression here is a deadlock, and an inline call would hang
+    /// the suite forever rather than fail this test (`std::sync::Mutex` is not
+    /// reentrant, so a same-thread call that regressed to locking `pipeline`
+    /// would deadlock, not merely run slow -- see this test's own history for
+    /// why it is not written that way).
+    #[test]
+    fn status_answers_promptly_while_an_utterance_holds_the_pipeline_lock() {
+        let daemon = fake_daemon(TRANSCRIBING);
+        let held = lock_ignoring_poison(&daemon.pipeline);
+
+        let d = Arc::clone(&daemon);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(dispatch(&d, Request::Status).ok);
+        });
+
+        let answered = rx.recv_timeout(Duration::from_secs(5));
+        drop(held);
+        assert_eq!(answered, Ok(true), "Status blocked on the pipeline lock");
+    }
+
+    #[test]
+    fn an_unloaded_pipeline_is_not_a_reason_to_refuse_a_reload() {
+        // Before lazy loading this arm was documented as unreachable. It is now
+        // the ordinary state of an idle daemon between dictations, and the next
+        // `load_models` reads the file anyway.
+        // `scratch_config` is this module's existing helper; `tempfile` is not a
+        // dependency of this crate.
+        let path = scratch_config("reload-unloaded");
+        let daemon = fake_daemon_at(IDLE, false, path);
+        assert!(lock_ignoring_poison(&daemon.pipeline).is_none());
+
+        let r = dispatch(&daemon, Request::Reload);
+
+        assert!(r.ok, "reload refused with no pipeline: {:?}", r.err);
     }
 }
