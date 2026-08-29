@@ -30,7 +30,7 @@ export const CATEGORIES: Category[] = [
   { id: "allgemein", title: "Allgemein", icon: "sliders", sections: ["audio", "inject"] },
   { id: "sprache", title: "Sprache", icon: "waveform", sections: ["asr", "vocabulary"] },
   { id: "stil", title: "Stil", icon: "pen", sections: ["style_default", "style_rules"] },
-  { id: "erweitert", title: "Erweitert", icon: "gear", sections: ["normalize", "guardrail"] },
+  { id: "erweitert", title: "Erweitert", icon: "gear", sections: ["models", "normalize", "guardrail"] },
   { id: "diagnose", title: "Diagnose", icon: "pulse", sections: ["debug", "overlay"] },
 ];
 
@@ -66,6 +66,7 @@ export const SECTION_TITLES: Record<string, string> = {
   vocabulary: "Vokabular",
   style_default: "Stil",
   style_rules: "Stilregeln pro Fenster",
+  models: "Modelle & Speicher",
   normalize: "Nachbearbeitung",
   inject: "Texteingabe",
   asr: "Spracherkennung",
@@ -89,6 +90,8 @@ export const LABELS: Record<string, string> = {
   "audio.max_seconds": "Maximale Aufnahmedauer",
   "audio.vad_padding_ms": "Sprachpuffer",
   "asr.num_threads": "Threads",
+  "models.preload_at_startup": "Modelle beim Start laden",
+  "models.idle_unload_seconds": "Modelle entladen nach",
   "normalize.enabled": "Nachbearbeitung aktiv",
   "normalize.port": "Port",
   "normalize.timeout_ms": "Zeitlimit",
@@ -133,6 +136,7 @@ export const LABELS: Record<string, string> = {
 export const UNITS: Record<string, string> = {
   "audio.max_seconds": "s",
   "audio.vad_padding_ms": "ms",
+  "models.idle_unload_seconds": "s",
   "normalize.timeout_ms": "ms",
   "normalize.context_size": "Token",
   "inject.keystroke_delay_ms": "ms",
@@ -155,6 +159,10 @@ export const HELP: Record<string, string> = {
     "Wie viel Ton vor und nach der erkannten Sprache erhalten bleibt. Zu wenig schneidet Wortanfänge ab, zu viel nimmt Stille mit in die Erkennung.",
   "asr.num_threads":
     "Rechenkerne für die Spracherkennung. Mehr Threads verkürzen die Wartezeit, bis die Kerne ausgelastet sind.",
+  "models.preload_at_startup":
+    "Lädt Spracherkennung und Sprachmodell schon beim Programmstart. Aus heißt: sie werden erst beim ersten Tastendruck geladen — das spart im Leerlauf über ein Gigabyte, kostet aber beim ersten Diktat einmalig Wartezeit.",
+  "models.idle_unload_seconds":
+    "So lange nach dem letzten Diktat bleiben die Modelle im Speicher. Danach werden sie entladen und beim nächsten Tastendruck neu geladen. 0 heißt: nie entladen.",
   "normalize.enabled":
     "Lässt das lokale Sprachmodell den erkannten Text glätten. Aus heißt: der Text wird nur nach Regeln bereinigt und sofort eingefügt.",
   "normalize.port":

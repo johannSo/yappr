@@ -148,6 +148,46 @@ impl Default for AsrConfig {
     }
 }
 
+/// How long the models stay in memory, and whether they are there before
+/// anyone asks. See `docs/superpowers/specs/2026-08-29-lazy-model-lifecycle-design.md`.
+///
+/// The default is lazy: nothing model-shaped is loaded until the first
+/// `ptt-start`, and both the ASR/VAD models and the `llama-server` child are
+/// released `idle_unload_seconds` after the last dictation. Measured on the
+/// development machine, that is ~1.4 GB not held while the app sits idle.
+///
+/// `preload_at_startup = true` with `idle_unload_seconds = 0` reproduces the
+/// behaviour that predates this section: everything loaded during startup and
+/// never released. That pair is the configuration to point a user at if any
+/// of the lazy path misbehaves.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelsConfig {
+    #[serde(default = "d_preload_at_startup")]
+    pub preload_at_startup: bool,
+    /// `0` disables unloading entirely; there is deliberately no lower bound
+    /// above that, because a user who wants the models gone the moment a
+    /// dictation ends is asking for something coherent.
+    #[serde(default = "d_idle_unload_seconds")]
+    pub idle_unload_seconds: u32,
+}
+
+fn d_preload_at_startup() -> bool {
+    false
+}
+fn d_idle_unload_seconds() -> u32 {
+    60
+}
+
+impl Default for ModelsConfig {
+    fn default() -> Self {
+        Self {
+            preload_at_startup: d_preload_at_startup(),
+            idle_unload_seconds: d_idle_unload_seconds(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NormalizeConfig {
@@ -426,6 +466,8 @@ pub struct Config {
     #[serde(default)]
     pub asr: AsrConfig,
     #[serde(default)]
+    pub models: ModelsConfig,
+    #[serde(default)]
     pub normalize: NormalizeConfig,
     #[serde(default)]
     pub guardrail: GuardrailConfig,
@@ -585,6 +627,14 @@ vad_padding_ms = 200
 
 [asr]
 num_threads = 4
+
+[models]
+# Modelle erst beim ersten Tastendruck laden, statt beim Start. Aus heißt:
+# das erste Diktat nach dem Start wartet einmalig auf die Modelle.
+preload_at_startup = false
+# Modelle nach dieser Ruhezeit wieder entladen und den Speicher freigeben.
+# 0 = nie entladen.
+idle_unload_seconds = 60
 
 [normalize]
 # Cleanup runs on S1-mini by Superwhisper.
@@ -894,5 +944,42 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("from"), "got: {err}");
+    }
+
+    #[test]
+    fn models_defaults_to_lazy_loading_with_a_sixty_second_idle_timeout() {
+        let c = ModelsConfig::default();
+        assert!(!c.preload_at_startup);
+        assert_eq!(c.idle_unload_seconds, 60);
+    }
+
+    #[test]
+    fn a_config_written_before_the_models_section_existed_still_parses() {
+        // Every user upgrading into this feature has one of these on disk.
+        let c = Config::from_str("[audio]\ndevice = \"default\"\n").unwrap();
+        assert_eq!(c.models, ModelsConfig::default());
+    }
+
+    #[test]
+    fn an_unknown_key_in_models_is_a_hard_error() {
+        // Invariant 4: `deny_unknown_fields`, so a typo fails loudly at startup
+        // rather than being silently ignored.
+        let err = Config::from_str("[models]\nidle_unload_secs = 30\n").unwrap_err().to_string();
+        assert!(err.contains("idle_unload_secs"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn zero_seconds_is_accepted_and_means_never_unload() {
+        let c = Config::from_str("[models]\nidle_unload_seconds = 0\n").unwrap();
+        assert_eq!(c.models.idle_unload_seconds, 0);
+    }
+
+    #[test]
+    fn the_shipped_default_config_declares_the_models_section() {
+        // DEFAULT_CONFIG_TOML is what a first run writes to disk; a section that
+        // exists in Rust but not there is a setting no hand-editor discovers.
+        let c = Config::from_str(DEFAULT_CONFIG_TOML).unwrap();
+        assert_eq!(c.models, ModelsConfig::default());
+        assert!(DEFAULT_CONFIG_TOML.contains("[models]"));
     }
 }
