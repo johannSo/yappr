@@ -133,11 +133,13 @@ and only the thin wrapper touches the environment.
 
 ```rust
 pub struct ShortcutInstructions {
-    pub kind: Kind,           // HyprLua | HyprConf | Gnome | Generic
-    pub target: Option<String>,   // file path or settings location
-    pub snippet: String,          // the copyable block
-    pub fields: Vec<Field>,       // GNOME's GUI triples; empty elsewhere
+    pub kind: ShortcutKind,           // HyprLua | HyprConf | Gnome | Generic
+    pub target: Option<String>,       // file path or settings location
+    pub snippet: String,              // the copyable block
+    pub bindings: Vec<ShortcutBinding>, // GNOME's GUI triples; empty on Hyprland
 }
+
+pub struct ShortcutBinding { pub name: String, pub command: String, pub keys: String }
 
 pub fn shortcut_instructions(d: &Desktop) -> ShortcutInstructions;
 ```
@@ -165,6 +167,10 @@ copyable fields:
 |---|---|---|
 | `yappr: Diktat starten/stoppen` | `yappr --toggle` | `Super+D` |
 | `yappr: Diktat abbrechen` | `yappr --cancel` | `Super+Alt+D` |
+
+Those three columns are one `ShortcutBinding` each — grouped rather than
+flattened into label/value pairs, so the step renders two cards instead of six
+repeated-label rows.
 
 The `gsettings` equivalent sits behind a secondary "oder per Terminal"
 disclosure:
@@ -359,10 +365,12 @@ wizard_state() -> {
   "current_backend":     "wtype" | "ydotool",
   "backend_prereqs":     ["ydotool", "ydotoold"],
   "shortcut": {
-    "kind":    "hypr-lua" | "hypr-conf" | "gnome" | "generic",
-    "target":  "~/.config/hypr/bindings.lua" | null,
-    "snippet": "...",
-    "fields":  [ { "label": "Befehl", "value": "yappr --toggle" }, ... ]
+    "kind":     "hypr-lua" | "hypr-conf" | "gnome" | "generic",
+    "target":   "~/.config/hypr/bindings.lua" | null,
+    "snippet":  "...",
+    "bindings": [ { "name": "yappr: Diktat starten/stoppen",
+                    "command": "yappr --toggle",
+                    "keys": "Super+D" }, ... ]
   }
 }
 
