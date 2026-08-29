@@ -198,7 +198,7 @@ mod tests {
         }
     }
 
-    /// The real misrecognition from `~/owf/logs/20260828-094008-643.json`.
+    /// The real misrecognition from `~/yappr/logs/20260828-094008-643.json`.
     #[test]
     fn an_exact_replacement_is_applied() {
         let out = apply(

@@ -19,15 +19,22 @@ const HYPRCTL_TIMEOUT: Duration = Duration::from_secs(3);
 ///
 /// ## Migration (spec §10)
 ///
-/// This is a breaking change from the previous, `owf-ctl`-based shortcut
-/// block: `owf-ctl` no longer exists, autostart is now the Settings
-/// window's "Beim Anmelden starten" toggle (spec §9) rather than a Hyprland
-/// line, and hold-to-talk's release-edge binding (the paired
-/// `{ release = true }` `o.bind` call here; `bindr` in the classic format)
-/// has no replacement under press/press toggle (spec §3) -- there is
-/// nothing to rewrite it *to*. So this text leads with what to delete, per
-/// spec §10, rather than silently leaving stale lines that call a binary
-/// which no longer exists.
+/// This has now broken twice, and the emitted text has to carry both
+/// breaks, because a user's Hyprland config may be stale by either
+/// generation. First, `owf-ctl` stopped existing: autostart became the
+/// Settings window's "Beim Anmelden starten" toggle (spec §9) rather than a
+/// Hyprland line, and hold-to-talk's release-edge binding (the paired
+/// `{ release = true }` `o.bind` call; `bindr` in the classic format) lost
+/// its replacement under press/press toggle (spec §3) -- there is nothing
+/// to rewrite it *to*. Then the app itself was renamed from
+/// `openwhisprflow` to `yappr`, which invalidates the *second* generation
+/// of that block wholesale: its binds call a binary that is no longer
+/// installed under that name, and its window rule matches a title
+/// (`openwhisprflow overlay`) no window carries any more. Neither failure
+/// is visible -- a bind to a missing binary is silent, and a window rule
+/// that matches nothing is inert. So this text leads with what to delete,
+/// per spec §10, naming both dead binaries rather than silently leaving
+/// stale lines behind.
 ///
 /// ## Window rules
 ///
@@ -53,9 +60,9 @@ const HYPRCTL_TIMEOUT: Duration = Duration::from_secs(3);
 /// shares the app's class -- a class-matched rule would make the settings
 /// form unable to take a keystroke too, which is exactly the class-collision
 /// bug the previous two-app split existed to avoid (spec §12 item 2). The
-/// overlay's title, `"openwhisprflow overlay"`, comes from its window
+/// overlay's title, `"yappr overlay"`, comes from its window
 /// declaration in `src-tauri/tauri.conf.json`; the settings window's title
-/// there, `"OpenWhisprFlow – Einstellungen"`, does not match the regex below,
+/// there, `"yappr – Einstellungen"`, does not match the regex below,
 /// so the rule reaches only the overlay.
 ///
 /// Every rule *effect* below is the exact Lua spelling registered by the
@@ -94,28 +101,32 @@ const HYPRCTL_TIMEOUT: Duration = Duration::from_secs(3);
 /// pill -- without it Hyprland would still draw its own compositor border
 /// around the window regardless of the Tauri window's own
 /// `decorations: false`.
-pub const SHORTCUT_CONFIG_LUA: &str = r#"-- OpenWhisprFlow dictation shortcuts and window rules.
+pub const SHORTCUT_CONFIG_LUA: &str = r#"-- yappr dictation shortcuts and window rules.
 --
 -- Delete first, wherever they currently live (bindings.lua, autostart.lua,
--- windows.lua): the old owf-ctl bind pair (the "ptt-start" press binding
--- and its paired "ptt-stop" release binding), both
--- o.launch_on_start(...) lines ("owf-ctl daemon" and "openwhisprflow"),
--- and the old o.window("openwhisprflow", { ... }) rule keyed on the app's
--- class. owf-ctl no longer exists; autostart is now the Settings window's
--- "Beim Anmelden starten" toggle, not a Hyprland line; and the
--- class-matched rule also reaches the settings window, which then cannot
--- take a keystroke.
+-- windows.lua): every line naming `openwhisprflow` or `owf-ctl`. Neither
+-- binary exists any more -- the app is now `yappr`. Concretely that is the
+-- old owf-ctl bind pair (the "ptt-start" press binding and its paired
+-- "ptt-stop" release binding), the later
+-- o.bind(..., "openwhisprflow --toggle") / ("openwhisprflow --cancel")
+-- pair, both o.launch_on_start(...) lines ("owf-ctl daemon" and
+-- "openwhisprflow"), the o.window("openwhisprflow", { ... }) rule keyed on
+-- the app's class, and its title-keyed successor
+-- o.window({ title = "^openwhisprflow overlay$" }, { ... }).
+-- Autostart is now the Settings window's "Beim Anmelden starten" toggle,
+-- not a Hyprland line; and the class-matched rule also reaches the settings
+-- window, which then cannot take a keystroke.
 --
 -- Add to ~/.config/hypr/bindings.lua. Press-only: there is no release-edge
 -- counterpart to pair either bind with.
-o.bind("SUPER + D", "Dictation: toggle", "openwhisprflow --toggle")
-o.bind("SUPER + ALT + D", "Dictation: cancel", "openwhisprflow --cancel")
+o.bind("SUPER + D", "Dictation: toggle", "yappr --toggle")
+o.bind("SUPER + ALT + D", "Dictation: cancel", "yappr --cancel")
 
 -- Add to ~/.config/hypr/windows.lua. Keyed on the overlay's title, not its
 -- class -- see this module's doc comment for why, and for why this rule is
 -- emitted even when the layer-shell surface (which needs no window rule at
 -- all) is available.
-o.window({ title = "^openwhisprflow overlay$" }, {
+o.window({ title = "^yappr overlay$" }, {
   float = true,
   pin = true,
   no_focus = true,
@@ -169,28 +180,32 @@ o.window({ title = "^openwhisprflow overlay$" }, {
 /// which is the strongest available cross-check without a classic-conf
 /// Hyprland session on hand to test against directly. `no_dim` is left out of
 /// this block because it has no independently confirmed classic spelling.
-pub const SHORTCUT_CONFIG_CONF: &str = r#"# OpenWhisprFlow dictation shortcuts and window rules.
+pub const SHORTCUT_CONFIG_CONF: &str = r#"# yappr dictation shortcuts and window rules.
 #
-# Delete first: the old exec-once lines (owf-ctl daemon, openwhisprflow),
-# the old owf-ctl bind/bindr pair (ptt-start / ptt-stop), and every
-# windowrulev2 line matched on class:^(openwhisprflow)$. owf-ctl no longer
-# exists; autostart is now the Settings window's "Beim Anmelden starten"
-# toggle, not a Hyprland line; and the class-matched rule also reaches the
-# settings window, which then cannot take a keystroke.
+# Delete first: every line naming `openwhisprflow` or `owf-ctl`. Neither
+# binary exists any more -- the app is now `yappr`. Concretely that is the
+# old exec-once lines (owf-ctl daemon, openwhisprflow), the old owf-ctl
+# bind/bindr pair (ptt-start / ptt-stop), the later
+# `exec, openwhisprflow --toggle` / `--cancel` binds, and every
+# windowrulev2 line matched on class:^(openwhisprflow)$ or on
+# title:^(openwhisprflow overlay)$. Autostart is now the Settings window's
+# "Beim Anmelden starten" toggle, not a Hyprland line; and the
+# class-matched rule also reaches the settings window, which then cannot
+# take a keystroke.
 #
 # Press-only: there is no release-edge counterpart to pair either bind with.
-bind  = SUPER, D,     exec, openwhisprflow --toggle
-bind  = SUPER ALT, D, exec, openwhisprflow --cancel
+bind  = SUPER, D,     exec, yappr --toggle
+bind  = SUPER ALT, D, exec, yappr --cancel
 
 # Keyed on the overlay's title, not its class -- see SHORTCUT_CONFIG_LUA's
 # doc comment for why, and for why this rule is emitted even when the
 # layer-shell surface (which needs no window rule at all) is available.
-windowrulev2 = float,title:^(openwhisprflow overlay)$
-windowrulev2 = pin,title:^(openwhisprflow overlay)$
-windowrulev2 = nofocus,title:^(openwhisprflow overlay)$
-windowrulev2 = noinitialfocus,title:^(openwhisprflow overlay)$
-windowrulev2 = bordersize 0,title:^(openwhisprflow overlay)$
-windowrulev2 = move (monitor_w/2-window_w/2) (monitor_h-window_h-40),title:^(openwhisprflow overlay)$
+windowrulev2 = float,title:^(yappr overlay)$
+windowrulev2 = pin,title:^(yappr overlay)$
+windowrulev2 = nofocus,title:^(yappr overlay)$
+windowrulev2 = noinitialfocus,title:^(yappr overlay)$
+windowrulev2 = bordersize 0,title:^(yappr overlay)$
+windowrulev2 = move (monitor_w/2-window_w/2) (monitor_h-window_h-40),title:^(yappr overlay)$
 "#;
 
 /// True when this machine configures Hyprland in Lua rather than `.conf`.
@@ -199,7 +214,7 @@ fn uses_lua_config(config_dir: &std::path::Path) -> bool {
 }
 
 /// The shortcut/window-rule snippet appropriate to this machine (spec §3,
-/// §10) -- what `openwhisprflow --print-shortcuts` prints. Renamed from
+/// §10) -- what `yappr --print-shortcuts` prints. Renamed from
 /// `hypr_config()`: this crate no longer emits anything Hyprland-specific
 /// beyond the shortcut bindings and the overlay's fallback window rule, so
 /// the name should say what the function actually produces.
@@ -288,9 +303,9 @@ mod tests {
         // Rev 3 dropped hold-to-talk (spec §3): both binds are press-only,
         // so a `{ release = true }` counterpart must never reappear here.
         assert!(SHORTCUT_CONFIG_LUA
-            .contains(r#"o.bind("SUPER + D", "Dictation: toggle", "openwhisprflow --toggle")"#));
+            .contains(r#"o.bind("SUPER + D", "Dictation: toggle", "yappr --toggle")"#));
         assert!(SHORTCUT_CONFIG_LUA.contains(
-            r#"o.bind("SUPER + ALT + D", "Dictation: cancel", "openwhisprflow --cancel")"#
+            r#"o.bind("SUPER + ALT + D", "Dictation: cancel", "yappr --cancel")"#
         ));
         for line in active_lines(SHORTCUT_CONFIG_LUA, "--") {
             assert!(!line.contains("release"), "a release-edge binding leaked in: {line:?}");
@@ -298,15 +313,26 @@ mod tests {
     }
 
     #[test]
-    fn neither_config_mentions_the_deleted_owf_ctl_binary_as_a_command_to_run() {
-        // owf-ctl no longer exists (spec §10) -- every command this text
-        // tells the user to run must be `openwhisprflow`, not the deleted
-        // binary. The word still legitimately appears in the "delete this"
-        // migration comments, so this checks the actual commands, not the
-        // whole text.
-        for config in [SHORTCUT_CONFIG_LUA, SHORTCUT_CONFIG_CONF] {
-            assert!(config.contains("openwhisprflow --toggle"));
-            assert!(config.contains("openwhisprflow --cancel"));
+    fn neither_config_names_a_deleted_binary_on_a_line_it_tells_the_user_to_add() {
+        // Two binaries have now been retired: `owf-ctl`, and
+        // `openwhisprflow` itself (renamed to `yappr`). Both still appear
+        // legitimately in the "delete this" migration comments, which is
+        // exactly why this checks the *active* lines -- the ones the user
+        // pastes into a live config -- rather than the whole text. A bind
+        // to a missing binary fails silently, so a leak here is invisible
+        // in use.
+        for (config, comment) in
+            [(SHORTCUT_CONFIG_LUA, "--"), (SHORTCUT_CONFIG_CONF, "#")]
+        {
+            assert!(config.contains("yappr --toggle"));
+            assert!(config.contains("yappr --cancel"));
+            for line in active_lines(config, comment) {
+                assert!(!line.contains("owf-ctl"), "a dead binary leaked in: {line:?}");
+                assert!(
+                    !line.contains("openwhisprflow"),
+                    "the pre-rename binary leaked in: {line:?}"
+                );
+            }
         }
     }
 
@@ -329,9 +355,15 @@ mod tests {
     #[test]
     fn the_emitted_block_names_the_lines_to_delete_before_the_ones_to_add() {
         for config in [SHORTCUT_CONFIG_LUA, SHORTCUT_CONFIG_CONF] {
-            let delete_at = config.find("owf-ctl").expect("must name the old command");
-            let add_at = config.find("--toggle").expect("must name the new one");
-            assert!(delete_at < add_at, "must name what to delete before what to add");
+            let ctl_at = config.find("owf-ctl").expect("must name the owf-ctl-era command");
+            let old_at =
+                config.find("openwhisprflow").expect("must name the pre-rename command");
+            // `"yappr --toggle"`, not bare `"--toggle"`: the delete comment
+            // itself quotes `openwhisprflow --toggle` as a line to remove,
+            // and in the Lua block `--` is also the comment marker.
+            let add_at = config.find("yappr --toggle").expect("must name the new one");
+            assert!(ctl_at < add_at, "must name what to delete before what to add");
+            assert!(old_at < add_at, "must name what to delete before what to add");
         }
         assert!(
             SHORTCUT_CONFIG_CONF.contains("bindr"),
@@ -388,14 +420,14 @@ mod tests {
         // keystroke. This is the specific regression this task exists to
         // fix, so it is pinned directly rather than only inferred from the
         // presence of a title selector.
-        assert!(SHORTCUT_CONFIG_LUA.contains(r#"o.window({ title = "^openwhisprflow overlay$" }"#));
+        assert!(SHORTCUT_CONFIG_LUA.contains(r#"o.window({ title = "^yappr overlay$" }"#));
         for line in active_lines(SHORTCUT_CONFIG_LUA, "--") {
-            assert!(!line.contains("o.window(\"openwhisprflow\""), "class-keyed rule leaked in: {line:?}");
+            assert!(!line.contains("o.window(\"yappr\""), "class-keyed rule leaked in: {line:?}");
         }
 
-        assert!(SHORTCUT_CONFIG_CONF.contains(",title:^(openwhisprflow overlay)$"));
+        assert!(SHORTCUT_CONFIG_CONF.contains(",title:^(yappr overlay)$"));
         for line in active_lines(SHORTCUT_CONFIG_CONF, "#") {
-            assert!(!line.contains(",class:^(openwhisprflow)$"), "class-keyed rule leaked in: {line:?}");
+            assert!(!line.contains(",class:^(yappr)$"), "class-keyed rule leaked in: {line:?}");
         }
     }
 
@@ -434,8 +466,8 @@ mod tests {
 
     #[test]
     fn the_conf_config_still_serves_classic_installations() {
-        assert!(SHORTCUT_CONFIG_CONF.contains("bind  = SUPER, D,     exec, openwhisprflow --toggle"));
-        assert!(SHORTCUT_CONFIG_CONF.contains("bind  = SUPER ALT, D, exec, openwhisprflow --cancel"));
+        assert!(SHORTCUT_CONFIG_CONF.contains("bind  = SUPER, D,     exec, yappr --toggle"));
+        assert!(SHORTCUT_CONFIG_CONF.contains("bind  = SUPER ALT, D, exec, yappr --cancel"));
         for line in active_lines(SHORTCUT_CONFIG_CONF, "#") {
             assert!(!line.contains("bindr"), "a release-edge bindr leaked in: {line:?}");
         }
@@ -466,7 +498,7 @@ mod tests {
         let overlay_title = title_of("overlay");
         let settings_title = title_of("settings");
 
-        assert_eq!(overlay_title, "openwhisprflow overlay");
+        assert_eq!(overlay_title, "yappr overlay");
 
         // Both emitted regexes must match the real overlay title...
         assert!(SHORTCUT_CONFIG_LUA.contains(&overlay_title));
@@ -480,7 +512,7 @@ mod tests {
 
     #[test]
     fn lua_is_selected_only_when_hyprland_lua_is_present() {
-        let base = std::env::temp_dir().join("owf-hypr-detect-test");
+        let base = std::env::temp_dir().join("yappr-hypr-detect-test");
         let lua_dir = base.join("with-lua");
         let conf_dir = base.join("without-lua");
         std::fs::create_dir_all(&lua_dir).unwrap();

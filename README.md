@@ -1,4 +1,4 @@
-# OpenWhisprFlow
+# yappr
 
 Press-to-start, press-to-stop dictation for Hyprland. Press `SUPER+D`, speak,
 press `SUPER+D` again: the audio is transcribed, cleaned up, and typed into
@@ -7,7 +7,7 @@ Everything runs locally — no network calls at dictation time.
 
 ## How it works
 
-`openwhisprflow` is the only binary. Launching it with no arguments starts
+`yappr` is the only binary. Launching it with no arguments starts
 everything: a tray icon (no window), the pipeline, and a Unix socket. A
 shortcut you bind yourself (see below) runs the same binary with `--toggle` or
 `--cancel` — that invocation is a thin client that talks to the running app
@@ -68,7 +68,7 @@ end to end** — second press to text appearing.
   sudo pacman -S ggml-cpu
   ```
   (Use `ggml-vulkan`, `ggml-cuda`, etc. instead/as well if you have the
-  matching hardware and want it used — `owf-core` does not pass any backend
+  matching hardware and want it used — `yappr-core` does not pass any backend
   selection flags, so `llama-server` picks the best one it finds.)
 - **`gtk-layer-shell`** — needed to *build* the app at all, not just to run it:
   the overlay positions and unfocuses itself via `wlr-layer-shell` on Hyprland
@@ -86,9 +86,9 @@ end to end** — second press to text appearing.
 ## Install
 
 ```bash
-cargo build --release -p openwhisprflow --features custom-protocol
+cargo build --release -p yappr --features custom-protocol
 mkdir -p ~/.local/bin
-install -m755 target/release/openwhisprflow ~/.local/bin/
+install -m755 target/release/yappr ~/.local/bin/
 ```
 
 Make sure `~/.local/bin` is on your `PATH`.
@@ -99,12 +99,12 @@ entry — this is the same `.desktop` shape and the same bare, `PATH`-relative
 
 ```bash
 mkdir -p ~/.local/share/applications
-cat > ~/.local/share/applications/openwhisprflow.desktop <<'EOF'
+cat > ~/.local/share/applications/yappr.desktop <<'EOF'
 [Desktop Entry]
 Type=Application
-Name=OpenWhisprFlow
+Name=yappr
 Comment=Startet das Diktat-Overlay im Hintergrund
-Exec=openwhisprflow
+Exec=yappr
 Terminal=false
 Categories=Utility;AudioVideo;
 EOF
@@ -112,38 +112,42 @@ EOF
 
 ### Upgrading from an older, multi-binary build
 
-If you built this project before the one-process rewrite, delete every binary
-that no longer exists — a stale one on your `PATH` keeps working and keeps
-running the *old* code, which is the worst possible failure mode:
+This project used to be called **openwhisprflow**, and before that it shipped as
+several binaries. Every one of those names is now dead. Delete them — a stale one
+on your `PATH` keeps working and keeps running the *old* code, which is the worst
+possible failure mode:
 
 ```bash
 rm -f ~/.local/bin/owf-ctl ~/.local/bin/owf-daemon ~/.local/bin/owf-bench \
-      ~/.local/bin/openwhisprflow-settings
+      ~/.local/bin/openwhisprflow ~/.local/bin/openwhisprflow-settings
 ```
 
-`~/.local/bin/openwhisprflow` is deliberately *not* on that list — it is the one
-name the rewrite kept, so deleting it would delete the new build too. It is also
-the most dangerous leftover of the three, because it fails silently rather than
-loudly: the pre-rewrite binary of that name is the overlay-only Tauri app, which
-parses no arguments at all. Run it as `openwhisprflow --toggle` and it never
-touches the socket — it opens *its own* overlay window, subscribes to whatever
-daemon is listening, and draws a second overlay from the same events. Both pills
-show the same waveform and the same timer, because they are the same events; one
-of them is a ghost. Overwrite it, and confirm afterwards that only one binary
-answers to the name:
+`~/.local/bin/openwhisprflow` is the one that matters, and it is on that list only
+because of the rename. The one-process rewrite kept the old overlay's name, so the
+new build and the pre-rewrite overlay-only Tauri app were the same filename and
+either could shadow the other — the most dangerous leftover of the lot, because it
+fails silently rather than loudly. That app parses no arguments at all: run it as
+`openwhisprflow --toggle` and it never touches the socket, it opens *its own*
+overlay window, subscribes to whatever daemon is listening, and draws a second
+overlay from the same events. Both pills show the same waveform and the same
+timer, because they are the same events; one of them is a ghost.
+
+`yappr` cannot collide with it, so deleting the old name is now a plain cleanup
+rather than a rescue. Install the new build and confirm the old name is gone:
 
 ```bash
-install -m755 target/release/openwhisprflow ~/.local/bin/   # overwrites in place
-which -a openwhisprflow                                     # expect exactly one path
-openwhisprflow --status                                     # expect one line of JSON
+install -m755 target/release/yappr ~/.local/bin/
+which -a yappr                # expect exactly one path
+which -a openwhisprflow       # expect nothing
+yappr --status                # expect one line of JSON
 ```
 
 That last line is the cheap test: the current binary answers `--status` on stdout
-and exits. A pre-rewrite binary of the same name prints nothing and opens a
-window. If you run the AppImage rather than installing, point `~/.local/bin/openwhisprflow`
-at it (`ln -s`) instead of leaving an older real file there — a shortcut, a
-`.desktop` entry or a shell that resolves the bare name through `PATH` will
-otherwise find the old build and you get the two-overlay symptom above.
+and exits. If you run the AppImage rather than installing, point
+`~/.local/bin/yappr` at it (`ln -s`) — and if a shortcut, a `.desktop` entry or an
+autostart line still names `openwhisprflow` by bare name or by absolute path, it
+now points at nothing. Rebind it (next section) rather than leaving it to fail
+quietly.
 
 Then see [Migrating an existing Hyprland config](#migrating-an-existing-hyprland-config)
 below — this is a breaking change for your shortcuts and window rules too, not
@@ -151,9 +155,9 @@ just for which binaries exist.
 
 ## First run
 
-Launch it — from the app launcher, or `openwhisprflow &`. It starts with no
+Launch it — from the app launcher, or `yappr &`. It starts with no
 window, just a tray icon. If the models aren't downloaded yet, left-click the
-tray icon (or run `openwhisprflow --settings`) to open Settings; a **Setup**
+tray icon (or run `yappr --settings`) to open Settings; a **Setup**
 pane appears automatically. It checks the same prerequisites listed above
 (naming the exact `pacman` package if one is missing) and, once they're
 satisfied, downloads and verifies (~1.1 GB total):
@@ -162,17 +166,17 @@ satisfied, downloads and verifies (~1.1 GB total):
 - Silero VAD
 - S1-mini by Superwhisper (GGUF, q4_k_m)
 
-into `models_dir()` (`$XDG_DATA_HOME/openwhisprflow/models`, typically
-`~/.local/share/openwhisprflow/models`), pinned by sha256 in
+into `models_dir()` (`$XDG_DATA_HOME/yappr/models`, typically
+`~/.local/share/yappr/models`), pinned by sha256 in
 `models.lock.toml`, with per-model progress shown in the pane. Until this
 finishes, the tray shows "warming" and `--toggle` is refused with a stated
-reason. Run `openwhisprflow --update-lock` (not part of normal first run) to
+reason. Run `yappr --update-lock` (not part of normal first run) to
 re-resolve and re-pin the lock file, e.g. after an upstream model update.
 
 ## Bind your shortcuts
 
 ```bash
-openwhisprflow --print-shortcuts
+yappr --print-shortcuts
 ```
 
 This detects whether your Hyprland is configured in Lua (as Omarchy is) or
@@ -184,15 +188,15 @@ parser entirely, so the two formats are not interchangeable.
 `~/.config/hypr/bindings.lua`:
 
 ```lua
-o.bind("SUPER + D", "Dictation: toggle", "openwhisprflow --toggle")
-o.bind("SUPER + ALT + D", "Dictation: cancel", "openwhisprflow --cancel")
+o.bind("SUPER + D", "Dictation: toggle", "yappr --toggle")
+o.bind("SUPER + ALT + D", "Dictation: cancel", "yappr --cancel")
 ```
 
 **Classic config** — add to `~/.config/hypr/hyprland.conf`:
 
 ```
-bind  = SUPER, D,     exec, openwhisprflow --toggle
-bind  = SUPER ALT, D, exec, openwhisprflow --cancel
+bind  = SUPER, D,     exec, yappr --toggle
+bind  = SUPER ALT, D, exec, yappr --cancel
 ```
 
 Check first that those keys are free — `omarchy menu keybindings --print` on
@@ -220,26 +224,30 @@ It's inert everywhere else.
 If you set this up before this rewrite, your config still has the old lines:
 `exec-once = owf-ctl daemon`, `exec-once = openwhisprflow`, a `bind`/`bindr`
 pair calling `owf-ctl ptt-start`/`ptt-stop`, and a window rule matched on
-`class:^(openwhisprflow)$`. All of that is now dead weight, and it fails in
-the worst way available: `owf-ctl` no longer exists, so the shortcut silently
-does nothing. Worse — the old class-matched window rule now also matches the
-*settings* window, since it became a window of this same app, so until you
-delete that rule you cannot type into the Settings form at all.
+`class:^(openwhisprflow)$`. If you set it up after the rewrite but before the
+rename, you instead have binds calling `openwhisprflow --toggle`/`--cancel` and
+rules matched on `title:^(openwhisprflow overlay)$`. All of it is now dead weight,
+and all of it fails in the worst way available — silently. Neither `owf-ctl` nor
+`openwhisprflow` exists any more, so those shortcuts simply do nothing, and a
+window rule matching a title no window carries is inert. Worse, if you still have
+the *class*-matched rule: it now also matches the *settings* window, since that
+became a window of this same app, so until you delete it you cannot type into the
+Settings form at all.
 
-`openwhisprflow --print-shortcuts`'s output leads with exactly what to
+`yappr --print-shortcuts`'s output leads with exactly what to
 delete, before the lines to add — paste the whole thing and follow it.
 
 ## Autostart
 
 A **"Beim Anmelden starten"** toggle in Settings writes or removes
-`~/.config/autostart/openwhisprflow.desktop`. There is no Hyprland
+`~/.config/autostart/yappr.desktop`. There is no Hyprland
 `exec-once` line to add by hand, and this project installs no systemd unit —
 `xdg-autostart-generator` turns the `.desktop` entry into one automatically.
 Off by default.
 
 ## Settings
 
-Left-click the tray icon, or run `openwhisprflow --settings`. Everything in
+Left-click the tray icon, or run `yappr --settings`. Everything in
 `config.toml` is editable there, including the microphone and the dictation
 vocabulary. Saving writes the file in place: comments and layout survive, a
 save that changes nothing leaves the file byte-identical, and a config that
@@ -250,8 +258,8 @@ next dictation.
 
 ## Configuration
 
-The config file lives at `$XDG_CONFIG_HOME/openwhisprflow/config.toml`
-(typically `~/.config/openwhisprflow/config.toml`) and is created with
+The config file lives at `$XDG_CONFIG_HOME/yappr/config.toml`
+(typically `~/.config/yappr/config.toml`) and is created with
 commented defaults on first run. The main knobs:
 
 - **`[audio]`** — `device`, `max_seconds` (ends a forgotten recording — under press/press toggle nothing else does; see "How it works" above), `vad_padding_ms` (silence kept around trimmed speech).
@@ -261,9 +269,9 @@ commented defaults on first run. The main knobs:
 - **`[guardrail]`** — `min_word_ratio`/`max_word_ratio`, `min_overlap_english`/`min_overlap_other`, `short_input_words` (below this many raw words, the ratio/overlap checks are skipped — see Known limitations), `ngram_size`/`ngram_max_repeats` (loop detection).
 - **`[inject]`** — `backend` (`wtype`, `ydotool` or `clipboard`), `trailing_space`, `keystroke_delay_ms`.
 - **`[style_default]`** and **`[[style_rules]]`** — the default `styling`/`structure`/`context` axes S1-mini is prompted with, and per-application overrides matched by focused window class (regex).
-- **`[debug]`** — `enabled` (off by default), `dir` (default `~/owf`), `save_audio`. When enabled, every utterance writes a WAV of the raw capture and the post-VAD-trim buffer under `<dir>/audio/`, plus a JSON diagnostic record (capture stats — device, native rate, samples captured vs. expected, stream error count — audio RMS/peak, VAD span, ASR/normalize/guardrail/inject results, and timings) under `<dir>/logs/`. The app's own log is also mirrored to `<dir>/logs/daemon.log` (append) while enabled. Run `openwhisprflow --debug` to print a summary of the most recent record and the paths to its files.
+- **`[debug]`** — `enabled` (off by default), `dir` (default `~/yappr`), `save_audio`. When enabled, every utterance writes a WAV of the raw capture and the post-VAD-trim buffer under `<dir>/audio/`, plus a JSON diagnostic record (capture stats — device, native rate, samples captured vs. expected, stream error count — audio RMS/peak, VAD span, ASR/normalize/guardrail/inject results, and timings) under `<dir>/logs/`. The app's own log is also mirrored to `<dir>/logs/daemon.log` (append) while enabled. Run `yappr --debug` to print a summary of the most recent record and the paths to its files.
 
-`openwhisprflow --reload` re-validates `config.toml` against the running app
+`yappr --reload` re-validates `config.toml` against the running app
 and applies every reloadable section to the live pipeline immediately —
 `[guardrail]`, `[inject]`, `[style_default]`/`[[style_rules]]`, the
 vocabulary, and more. Only `[asr]` and `[normalize]` still need a restart (see
@@ -281,19 +289,31 @@ the default:
 
 ```bash
 sudo pacman -S ydotool
-
-# /dev/uinput is root-only by default. Grant the input group write access:
-echo 'KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"' \
-  | sudo tee /etc/udev/rules.d/80-uinput.rules
-sudo usermod -aG input "$USER"          # log out and back in for this to apply
-
-systemctl --user enable --now ydotoold
+systemctl --user enable --now ydotool.service   # the unit is named for the
+                                                # package, not for ydotoold
 ```
 
-`ydotool` talks to `ydotoold` over a socket. If your `ydotoold` does not use
-the default path, export `YDOTOOL_SOCKET` in the session environment
-OpenWhisprFlow itself starts in — a value set only in your shell's rc file will
-not reach a tray app started by the session.
+On Arch that is the whole of it. The package already ships
+`/usr/lib/udev/rules.d/80-uinput.rules`, which gives the `input` group write
+access to `/dev/uinput` (`crw-rw---- root input`), and Arch already puts a
+desktop user in `input`. Confirm both before reaching for `sudo`:
+
+```bash
+ls -l /dev/uinput     # want: crw-rw---- 1 root input
+id -nG | grep input   # want: your user is in the input group
+```
+
+Only if the group is missing do you need `sudo usermod -aG input "$USER"` and a
+re-login; only if the device is `crw------- root root` do you need the udev rule
+by hand. On a distribution that ships neither, both steps apply.
+
+`ydotool` talks to `ydotoold` over a socket. Client and daemon both default to
+`$XDG_RUNTIME_DIR/.ydotool_socket` (falling back to `/tmp/.ydotool_socket` when
+that is unset), so a systemd user unit and a session app agree without any
+configuration. Only if you run `ydotoold` with `--socket-path` do you need to
+export `YDOTOOL_SOCKET` — and then it has to be exported in the session
+environment yappr itself starts in, since a value set only in your
+shell's rc file will not reach a tray app started by the session.
 
 Then set the backend in Settings → Allgemein → Texteingabe → Verfahren, or in
 `config.toml`:
@@ -338,7 +358,7 @@ erste Einstellung auf an und die zweite auf `0`.
 Found during development, not yet fixed — worth knowing before relying on this:
 
 - **Short utterances are effectively unguarded.** Below `guardrail.short_input_words` raw words (4 by default), the ratio and overlap checks are skipped entirely, so a short S1-mini rewrite that inverts the meaning of what was said could be typed verbatim. Longer dictations are checked normally.
-- **Dense digit sequences get rejected back to raw ASR text.** Dictating a phone number as separate digits ("five five five one two three four") normalizes to a much shorter token count ("555-1234"), which trips `min_word_ratio` before the (faithful) rewrite is ever evaluated for overlap. The fallback is safe — you get the raw ASR text, not silence or garbage — but not the cleaned-up form you'd expect. This is pinned by a test named `known_limitation_dense_digit_sequences_trip_word_ratio` in `crates/owf-core/src/guardrail.rs`.
+- **Dense digit sequences get rejected back to raw ASR text.** Dictating a phone number as separate digits ("five five five one two three four") normalizes to a much shorter token count ("555-1234"), which trips `min_word_ratio` before the (faithful) rewrite is ever evaluated for overlap. The fallback is safe — you get the raw ASR text, not silence or garbage — but not the cleaned-up form you'd expect. This is pinned by a test named `known_limitation_dense_digit_sequences_trip_word_ratio` in `crates/yappr-core/src/guardrail.rs`.
 - **Nothing physically ends a recording under press/press toggle.** A missed second press keeps the microphone open until `audio.max_seconds` (see "How it works"); the only warning before then is on screen. This is the price of dropping hold-to-talk, not a bug.
 
 Both of the first two are slated for guardrail threshold tuning against real
@@ -350,16 +370,16 @@ The following has **not** been performed on real hardware and is not
 claimed to work; it requires a human speaking into a microphone and
 watching the result. Treat dictation as unverified until this is done:
 
-- [ ] `openwhisprflow --status` reports `warm: true` right after a first `--toggle`, and `warm: false` again once `idle_unload_seconds` after that has passed — `warm` now means "models are resident right now", not "startup finished" (see [Speicherverbrauch](#speicherverbrauch); under the default lazy config, `warm` stays `false` until the first press)
+- [ ] `yappr --status` reports `warm: true` right after a first `--toggle`, and `warm: false` again once `idle_unload_seconds` after that has passed — `warm` now means "models are resident right now", not "startup finished" (see [Speicherverbrauch](#speicherverbrauch); under the default lazy config, `warm` stays `false` until the first press)
 - [ ] Dictation into Alacritty, Firefox's address bar, an Electron app (VS Code/Slack), and an XWayland window (`xterm` or a Wine app)
 - [ ] Pressing `SUPER+D` and pressing it again immediately without speaking types nothing and logs "no speech detected"
 - [ ] `SUPER+ALT+D` while a recording is in progress cancels cleanly
 - [ ] Two dictations back-to-back without a pause don't run together
 - [ ] Killing `llama-server` mid-session still types raw ASR text (with a logged warning) instead of failing
 - [ ] A German dictation, and whether the guardrail fires for it (check `rejections.jsonl`)
-- [ ] `~/.local/state/openwhisprflow/rejections.jsonl` contains valid JSON, one object per line
-- [ ] A second `openwhisprflow` instance refuses to start with "already running"
-- [ ] `openwhisprflow --toggle` with no instance running exits non-zero and raises a visible desktop notification, rather than doing nothing silently
+- [ ] `~/.local/state/yappr/rejections.jsonl` contains valid JSON, one object per line
+- [ ] A second `yappr` instance refuses to start with "already running"
+- [ ] `yappr --toggle` with no instance running exits non-zero and raises a visible desktop notification, rather than doing nothing silently
 - [ ] Forgetting the second press: the watchdog ends the recording at `audio.max_seconds` and types what it captured, rather than losing it
 - [ ] Stopwatch timing from the second press to text appearing, for comparison against the estimate above
 

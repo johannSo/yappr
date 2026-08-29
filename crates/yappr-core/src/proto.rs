@@ -221,7 +221,7 @@ impl Response {
 pub fn send(req: &Request) -> Result<Response> {
     let sock = paths::runtime_socket();
     let stream = UnixStream::connect(&sock).with_context(|| {
-        format!("cannot reach the daemon at {} — is owf-daemon running?", sock.display())
+        format!("cannot reach the daemon at {} — is yappr running?", sock.display())
     })?;
     let mut w = stream.try_clone()?;
     writeln!(w, "{}", serde_json::to_string(req)?)?;
@@ -457,7 +457,7 @@ mod tests {
     }
 
     /// `src-tauri/src/wire.rs` deliberately hand-duplicates this enum's wire
-    /// format rather than depending on `owf-core` (see that module's doc
+    /// format rather than depending on `yappr-core` (see that module's doc
     /// comment for why), which means the two can silently drift: a variant
     /// added or reshaped here with no matching change there would only be
     /// caught by someone remembering to update `wire.rs`'s own hand-written

@@ -3,14 +3,14 @@
 //! without a microphone (M2 plan, Task 5). Enabled with `--replay <path>`.
 //!
 //! The fixture at `src-tauri/fixtures/replay-full.ndjson` exercises every
-//! variant in `owf_core::proto::OverlayEvent`, including a realistic
+//! variant in `yappr_core::proto::OverlayEvent`, including a realistic
 //! `recording` burst with varying levels.
 
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::time::Duration;
 
-use owf_core::proto::OverlayEvent;
+use yappr_core::proto::OverlayEvent;
 
 /// How long to hold each event on screen before advancing to the next line,
 /// chosen per event kind: state-transition events get long enough to
@@ -96,7 +96,7 @@ mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir()
-            .join(format!("owf-overlay-replay-test-{tag}-{}-{n}", std::process::id()));
+            .join(format!("yappr-overlay-replay-test-{tag}-{}-{n}", std::process::id()));
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(contents.as_bytes()).unwrap();
         path
@@ -198,11 +198,11 @@ mod tests {
 
     /// Invariant 3 used to say `OverlayEvent` exists in three hand-maintained
     /// copies. `wire.rs` is gone, so it exists in two: this crate now shares
-    /// `owf-core`'s type outright, and only the TypeScript union in
+    /// `yappr-core`'s type outright, and only the TypeScript union in
     /// `src/Overlay.tsx` is still maintained by hand.
     #[test]
-    fn this_crate_shares_owf_cores_overlay_event_rather_than_copying_it() {
-        let e: owf_core::proto::OverlayEvent = owf_core::proto::OverlayEvent::Idle;
+    fn this_crate_shares_yappr_cores_overlay_event_rather_than_copying_it() {
+        let e: yappr_core::proto::OverlayEvent = yappr_core::proto::OverlayEvent::Idle;
         assert_eq!(serde_json::to_string(&e).unwrap(), r#"{"event":"idle"}"#);
     }
 }

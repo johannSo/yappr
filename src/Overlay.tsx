@@ -6,7 +6,7 @@ import { AnimatePresence, MotionConfig, motion, type Transition } from "motion/r
 import "./Overlay.css";
 
 // Wire shape emitted by the Rust backend: a hand-maintained mirror of
-// `owf_core::proto::OverlayEvent` (crates/owf-core/src/proto.rs), forwarded
+// `yappr_core::proto::OverlayEvent` (crates/yappr-core/src/proto.rs), forwarded
 // here as a Tauri event by `TauriSink::emit` (src-tauri/src/lib.rs) -- the
 // in-process daemon serialises its own enum straight to JSON, with no
 // intermediate `wire.rs` copy any more (invariant 3: this union is now the

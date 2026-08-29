@@ -9,10 +9,10 @@
 //! sample: it prints timings and sample *counts* only, never audio, and writes
 //! nothing to disk.
 //!
-//! Run: cargo run --release -p owf-core --example capture_latency
+//! Run: cargo run --release -p yappr-core --example capture_latency
 
-use owf_core::capture::Recorder;
-use owf_core::config::{AudioConfig, Config};
+use yappr_core::capture::Recorder;
+use yappr_core::config::{AudioConfig, Config};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};

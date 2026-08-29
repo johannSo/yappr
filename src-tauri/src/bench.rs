@@ -1,5 +1,5 @@
 use anyhow::{ensure, Result};
-use owf_core::asr::{SherpaTranscriber, Transcriber};
+use yappr_core::asr::{SherpaTranscriber, Transcriber};
 use std::time::Instant;
 
 fn read_wav_16k_mono(path: &str) -> Result<Vec<f32>> {
@@ -42,7 +42,7 @@ struct Measurement {
 }
 
 fn measure(asr: &dyn Transcriber, samples: &[f32]) -> Result<Measurement> {
-    let audio_secs = samples.len() as f64 / owf_core::asr::SAMPLE_RATE as f64;
+    let audio_secs = samples.len() as f64 / yappr_core::asr::SAMPLE_RATE as f64;
     // First pass warms ONNX Runtime's internal allocations; report the second.
     let _ = asr.transcribe(samples)?;
     let t0 = Instant::now();
@@ -67,14 +67,14 @@ fn print_measurement(label: &str, m: &Measurement) {
 pub fn run() -> Result<()> {
     let path = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "crates/owf-core/fixtures/hello_english.wav".to_string());
+        .unwrap_or_else(|| "crates/yappr-core/fixtures/hello_english.wav".to_string());
 
     let short_samples = read_wav_16k_mono(&path)?;
     // ~3.85 s fixture x3 -> ~11.5 s, close to the spec's 10 s budget.
     let long_samples = repeat_buffer(&short_samples, 3);
 
     let t0 = Instant::now();
-    let asr = SherpaTranscriber::new(&owf_core::paths::models_dir(), 4)?;
+    let asr = SherpaTranscriber::new(&yappr_core::paths::models_dir(), 4)?;
     let load_ms = t0.elapsed().as_millis();
     println!("model load   {load_ms} ms  (once, at daemon start)");
     println!();

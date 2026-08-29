@@ -25,7 +25,7 @@ pub fn dispatch(route: Route) -> Result<bool> {
     }
     match route {
         Route::Send(req) => {
-            let resp = owf_core::proto::send(&req)?;
+            let resp = yappr_core::proto::send(&req)?;
             println!("{}", serde_json::to_string(&resp)?);
             if !resp.ok {
                 std::process::exit(1);
@@ -34,7 +34,7 @@ pub fn dispatch(route: Route) -> Result<bool> {
         Route::Subscribe => crate::client_stream::subscribe()?,
         Route::Debug => crate::setup::debug_summary()?,
         Route::Bench => crate::bench::run()?,
-        Route::PrintShortcuts => print!("{}", owf_core::hypr::shortcut_config()),
+        Route::PrintShortcuts => print!("{}", yappr_core::hypr::shortcut_config()),
         Route::PurgeLogs => crate::setup::purge_logs()?,
         Route::UpdateLock => crate::setup::setup(true)?,
         Route::Usage => {
@@ -51,7 +51,7 @@ pub fn dispatch(route: Route) -> Result<bool> {
 /// and stderr goes nowhere anyone will read.
 pub fn notify_failure(e: &anyhow::Error) {
     let body = format!("{e:#}");
-    owf_core::procutil::notify_send("OpenWhisprFlow", &body);
+    yappr_core::procutil::notify_send("yappr", &body);
 }
 
 #[cfg(test)]
@@ -71,8 +71,8 @@ mod tests {
     fn only_run_starts_the_app_every_other_route_exits() {
         assert!(!handled_without_starting_the_app(&Route::Run));
         for r in [
-            Route::Send(owf_core::proto::Request::Toggle),
-            Route::Send(owf_core::proto::Request::Quit),
+            Route::Send(yappr_core::proto::Request::Toggle),
+            Route::Send(yappr_core::proto::Request::Quit),
             Route::Subscribe,
             Route::Debug,
             Route::Bench,

@@ -6,17 +6,17 @@
 //! as it was when this lived in `owf-cli` -- the crate moved, the discipline
 //! did not.
 
-use owf_core::proto::Request;
+use yappr_core::proto::Request;
 
 pub const USAGE: &str = "\
-usage: openwhisprflow                     start the app (tray, no window)
-       openwhisprflow --toggle            start or stop dictating
-       openwhisprflow --cancel            discard the current utterance
-       openwhisprflow --settings          show the settings window
-       openwhisprflow --quit              shut everything down
-       openwhisprflow --status|--debug|--subscribe|--reload
-       openwhisprflow --bench|--print-shortcuts|--purge-logs|--update-lock
-       openwhisprflow --replay <path>";
+usage: yappr                  start the app (tray, no window)
+       yappr --toggle         start or stop dictating
+       yappr --cancel         discard the current utterance
+       yappr --settings       show the settings window
+       yappr --quit           shut everything down
+       yappr --status|--debug|--subscribe|--reload
+       yappr --bench|--print-shortcuts|--purge-logs|--update-lock
+       yappr --replay <path>";
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Route {
@@ -108,7 +108,7 @@ mod tests {
         assert_eq!(route(&["toggle"]), Route::Usage);
     }
 
-    /// `openwhisprflow --toggle now` is a typo, not a request to dictate.
+    /// `yappr --toggle now` is a typo, not a request to dictate.
     #[test]
     fn trailing_arguments_are_rejected_rather_than_ignored() {
         assert_eq!(route(&["--toggle", "now"]), Route::Usage);

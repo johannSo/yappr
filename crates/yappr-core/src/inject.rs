@@ -298,7 +298,7 @@ pub(crate) fn inject_with_recovery(
             match fallback.inject(text) {
                 Ok(()) => {
                     procutil::notify_send(
-                        "OpenWhisprFlow",
+                        "yappr",
                         "Typing failed — transcript copied to clipboard",
                     );
                     Ok(fallback.name())
@@ -410,7 +410,7 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("owf-core-test-{tag}-{}-{n}", std::process::id()))
+        std::env::temp_dir().join(format!("yappr-core-test-{tag}-{}-{n}", std::process::id()))
     }
 
     #[test]

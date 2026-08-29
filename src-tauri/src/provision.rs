@@ -2,7 +2,7 @@
 //!
 //! Before this module existed, provisioning lived entirely behind
 //! `owf-ctl setup`/`--update-lock` -- a command that no longer exists on this
-//! branch. `crates/owf-core/src/server.rs`'s warm-up *loads* models from disk
+//! branch. `crates/yappr-core/src/server.rs`'s warm-up *loads* models from disk
 //! but never downloads them, so a machine with no models had no way to get
 //! them at all. This is that way in: `setup_status` reports what's missing
 //! (prerequisite binaries, separately from model files -- neither check
@@ -18,7 +18,7 @@
 //!
 //! `download_all`'s `update_lock` is always `false` here. Rewriting
 //! `models.lock.toml` -- the file that pins every model by sha256 -- is a
-//! developer action (`openwhisprflow --update-lock`, spec 14.2's "generated
+//! developer action (`yappr --update-lock`, spec 14.2's "generated
 //! once during M0"), never something a user's first run may do: that would
 //! mean a first run silently re-pins whatever it happened to download,
 //! defeating the point of pinning at all.
@@ -40,7 +40,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 
-use owf_core::models::{self, Artifact, LockFile, ARTIFACTS};
+use yappr_core::models::{self, Artifact, LockFile, ARTIFACTS};
 use serde::Serialize;
 use tauri::Emitter;
 
@@ -218,7 +218,7 @@ pub(crate) fn is_ready_or_assume_not(app_ctx: &str) -> bool {
 }
 
 /// What the Setup pane renders: every prerequisite binary `check_prerequisites`
-/// finds missing, and every model `owf_core::models::verify` finds absent or
+/// finds missing, and every model `yappr_core::models::verify` finds absent or
 /// failing its pinned hash -- reported separately (see the module doc) so the
 /// pane can tell the user "install `wtype`" apart from "downloading the ASR
 /// model".
@@ -244,7 +244,7 @@ pub async fn setup_status() -> Result<serde_json::Value, String> {
 pub(crate) enum SetupProgress {
     /// Progress within one artifact's download, throttled through
     /// `setup::crosses_report_threshold` -- the same underflow-safe decision
-    /// `openwhisprflow --update-lock`'s own progress line uses.
+    /// `yappr --update-lock`'s own progress line uses.
     Downloading {
         name: String,
         display: String,

@@ -230,7 +230,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const ANNOTATED: &str = r#"# OpenWhisprFlow configuration
+    const ANNOTATED: &str = r#"# yappr configuration
 
 [audio]
 device = "default"
@@ -444,13 +444,13 @@ context = "email"
         let out = merge_json_into_toml(ANNOTATED, &whole).unwrap();
         assert!(!out.contains("style_rules"), "materialised an unset array:\n{out}");
         assert!(
-            out.starts_with("# OpenWhisprFlow configuration"),
+            out.starts_with("# yappr configuration"),
             "the header comment was displaced:\n{out}"
         );
     }
 
     fn scratch(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("owf-config-write-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("yappr-config-write-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("config.toml")
     }

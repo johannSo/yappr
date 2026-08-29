@@ -1,12 +1,12 @@
-use owf_core::asr::Transcriber;
-use owf_core::capture::CaptureStats;
-use owf_core::config::Config;
-use owf_core::inject::MockInjector;
-use owf_core::lang::{Lang, LanguageDetector};
-use owf_core::normalize::Normalizer;
-use owf_core::pipeline::Pipeline;
-use owf_core::proto::OverlayEvent;
-use owf_core::vad::Trimmer;
+use yappr_core::asr::Transcriber;
+use yappr_core::capture::CaptureStats;
+use yappr_core::config::Config;
+use yappr_core::inject::MockInjector;
+use yappr_core::lang::{Lang, LanguageDetector};
+use yappr_core::normalize::Normalizer;
+use yappr_core::pipeline::Pipeline;
+use yappr_core::proto::OverlayEvent;
+use yappr_core::vad::Trimmer;
 
 struct FixedAsr(String);
 impl Transcriber for FixedAsr {
@@ -83,8 +83,8 @@ impl Normalizer for PanickingNormalizer {
 /// `SpyNormalizer` pattern `the_window_class_selects_the_control_line`
 /// already uses on the normalizer side.
 struct FwdInjector(std::sync::Arc<MockInjector>);
-impl owf_core::inject::TextInjector for FwdInjector {
-    fn inject(&self, text: &str) -> Result<(), owf_core::inject::InjectError> {
+impl yappr_core::inject::TextInjector for FwdInjector {
+    fn inject(&self, text: &str) -> Result<(), yappr_core::inject::InjectError> {
         self.0.inject(text)
     }
     fn name(&self) -> &'static str {
@@ -116,14 +116,14 @@ fn samples() -> Vec<f32> {
 }
 
 /// A fresh, collision-free scratch path for a single test's rejections log.
-/// Mirrors the identical helper pattern in `owf-core`'s own `pipeline.rs`
+/// Mirrors the identical helper pattern in `yappr-core`'s own `pipeline.rs`
 /// and `inject.rs` unit tests -- `tempfile` isn't a dependency here either.
 fn scratch_rejections_path(tag: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir()
-        .join(format!("owf-core-test-pipeline-e2e-{tag}-{}-{n}", std::process::id()))
+        .join(format!("yappr-core-test-pipeline-e2e-{tag}-{}-{n}", std::process::id()))
         .join("rejections.jsonl")
 }
 
@@ -133,7 +133,7 @@ fn scratch_debug_dir(tag: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("owf-core-test-pipeline-e2e-debug-{tag}-{}-{n}", std::process::id()))
+    std::env::temp_dir().join(format!("yappr-core-test-pipeline-e2e-debug-{tag}-{}-{n}", std::process::id()))
 }
 
 fn debug_config(dir: &std::path::Path, save_audio: bool) -> Config {
@@ -180,8 +180,8 @@ fn debug_capture_records_capture_ratio_and_stream_errors_when_enabled() {
     assert!(out.normalized);
 
     let logs_dir = dir.join("logs");
-    let json_path = owf_core::debug::latest_record_path(&logs_dir).unwrap();
-    let record: owf_core::debug::DebugRecord =
+    let json_path = yappr_core::debug::latest_record_path(&logs_dir).unwrap();
+    let record: yappr_core::debug::DebugRecord =
         serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
 
     let capture = record.capture.expect("capture section must be present");
@@ -224,8 +224,8 @@ fn debug_capture_omits_the_capture_section_when_process_is_called_without_stats(
     p.process(&samples(), None).unwrap();
 
     let logs_dir = dir.join("logs");
-    let json_path = owf_core::debug::latest_record_path(&logs_dir).unwrap();
-    let record: owf_core::debug::DebugRecord =
+    let json_path = yappr_core::debug::latest_record_path(&logs_dir).unwrap();
+    let record: yappr_core::debug::DebugRecord =
         serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
     assert!(record.capture.is_none());
 
@@ -250,8 +250,8 @@ fn debug_capture_records_no_speech_utterances_too() {
     assert!(p.process(&samples(), None).unwrap().is_none());
 
     let logs_dir = dir.join("logs");
-    let json_path = owf_core::debug::latest_record_path(&logs_dir).unwrap();
-    let record: owf_core::debug::DebugRecord =
+    let json_path = yappr_core::debug::latest_record_path(&logs_dir).unwrap();
+    let record: yappr_core::debug::DebugRecord =
         serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
     assert!(!record.vad.found);
     assert!(record.asr_raw.is_none());
@@ -302,9 +302,9 @@ fn debug_record_is_written_when_asr_errors() {
     assert!(err.to_string().contains("asr exploded"), "got {err}");
 
     let logs_dir = dir.join("logs");
-    let json_path = owf_core::debug::latest_record_path(&logs_dir)
+    let json_path = yappr_core::debug::latest_record_path(&logs_dir)
         .expect("a debug record must be written even when ASR errors");
-    let record: owf_core::debug::DebugRecord =
+    let record: yappr_core::debug::DebugRecord =
         serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
     assert!(record.vad.found, "VAD had already run before ASR errored");
     assert!(record.asr_raw.is_none(), "ASR never produced a transcript");
@@ -342,9 +342,9 @@ fn debug_record_is_written_when_both_injectors_fail() {
     assert!(err.to_string().contains("unsent.txt"), "got {err}");
 
     let logs_dir = dir.join("logs");
-    let json_path = owf_core::debug::latest_record_path(&logs_dir)
+    let json_path = yappr_core::debug::latest_record_path(&logs_dir)
         .expect("a debug record must be written even when both injectors fail");
-    let record: owf_core::debug::DebugRecord =
+    let record: yappr_core::debug::DebugRecord =
         serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
     assert_eq!(record.asr_raw.as_deref(), Some("send the invoice on friday"));
     let normalize = record.normalize.expect("normalization should have already run");
@@ -378,7 +378,7 @@ fn a_good_cleanup_is_injected() {
 #[test]
 fn a_rejected_cleanup_falls_back_to_raw() {
     // Guardrail rejections are the input dataset for M3 threshold tuning
-    // (see `owf_core::pipeline::log_rejection_to`); this test's synthetic
+    // (see `yappr_core::pipeline::log_rejection_to`); this test's synthetic
     // rejection must land in a scratch file, never the real
     // `rejections.jsonl`, or every CI run would quietly poison that data.
     let rejections_path = scratch_rejections_path("rejected-cleanup-falls-back-to-raw");
@@ -766,8 +766,8 @@ fn the_stage_events_sink_cannot_influence_the_pipeline_outcome() {
     assert_eq!(calls.0.load(std::sync::atomic::Ordering::SeqCst), 2, "Normalizing + Injecting");
 }
 
-/// Regression for the defect that motivated `owf_core::finish`, reproduced
-/// from a real capture (`~/owf/logs/20260828-094124-489.json`): Parakeet
+/// Regression for the defect that motivated `yappr_core::finish`, reproduced
+/// from a real capture (`~/yappr/logs/20260828-094124-489.json`): Parakeet
 /// transcribed correct German, S1-mini returned it with the opening letter
 /// lowercased and the closing full stop removed, and the guardrail accepted
 /// it -- `guardrail::tokenize` lowercases and strips punctuation before
@@ -805,7 +805,7 @@ fn an_accepted_cleanup_is_still_capitalised_and_terminated() {
 
 /// The other half of the same choke point: a cleanup that opens lowercase
 /// must be capitalised even when nothing else about it is wrong. Taken from
-/// `~/owf/logs/20260828-094044-799.json`, where `Au\u{df}erdem` came back as
+/// `~/yappr/logs/20260828-094044-799.json`, where `Au\u{df}erdem` came back as
 /// `au\u{df}erdem` -- a multi-byte opening letter, which is the case a
 /// byte-indexed fix would corrupt.
 #[test]
@@ -833,9 +833,9 @@ from = "Settings-SQUI"
 to = "Settings-GUI"
 "#;
 
-/// The real misrecognition from `~/owf/logs/20260828-094008-643.json`:
+/// The real misrecognition from `~/yappr/logs/20260828-094008-643.json`:
 /// Parakeet heard "Settings-SQUI". Short acronyms cannot be matched fuzzily
-/// (see `owf_core::config::Replacement`), so this is the exact-replacement
+/// (see `yappr_core::config::Replacement`), so this is the exact-replacement
 /// path, proven all the way through to what gets injected.
 #[test]
 fn the_vocabulary_corrects_the_transcript_before_it_is_injected() {

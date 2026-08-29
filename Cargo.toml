@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/owf-core", "src-tauri"]
+members = ["crates/yappr-core", "src-tauri"]
 
 [workspace.package]
 edition = "2021"

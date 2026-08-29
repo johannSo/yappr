@@ -474,7 +474,7 @@ impl Recorder {
         let cfg = cfg.clone();
 
         let handle = std::thread::Builder::new()
-            .name("owf-audio".into())
+            .name("yappr-audio".into())
             .spawn(move || audio_thread_main(cfg, ready_tx, cmd_rx, recording_for_thread))
             .context("spawning audio capture thread")?;
 

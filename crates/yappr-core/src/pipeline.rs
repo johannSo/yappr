@@ -225,7 +225,7 @@ impl Pipeline {
         if cfg.normalize.enabled != self.cfg.normalize.enabled {
             return Err(format!(
                 "reload cannot change [normalize].enabled from {} to {} without rebuilding \
-                 llama-server -- restart owf-daemon instead",
+                 llama-server -- restart yappr instead",
                 self.cfg.normalize.enabled, cfg.normalize.enabled
             ));
         }
@@ -640,7 +640,7 @@ mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir()
-            .join(format!("owf-core-test-{tag}-{}-{n}", std::process::id()))
+            .join(format!("yappr-core-test-{tag}-{}-{n}", std::process::id()))
             .join("rejections.jsonl")
     }
 

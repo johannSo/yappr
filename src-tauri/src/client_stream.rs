@@ -1,10 +1,10 @@
-//! `openwhisprflow --subscribe`: the one-shot CLI counterpart to the
+//! `yappr --subscribe`: the one-shot CLI counterpart to the
 //! overlay's own long-lived socket client (`connection.rs`). Split out of
 //! `setup.rs` because `client::dispatch` calls it directly and `setup.rs`
 //! is reserved for the setup/debug/purge-logs surface.
 
 use anyhow::{Context, Result};
-use owf_core::proto::Request;
+use yappr_core::proto::Request;
 
 /// Connects to the daemon, sends `Request::Subscribe`, and prints every
 /// `OverlayEvent` NDJSON line it receives until the daemon closes the
@@ -20,9 +20,9 @@ pub fn subscribe() -> Result<()> {
     use std::io::{BufRead, BufReader, Write as _};
     use std::os::unix::net::UnixStream;
 
-    let sock = owf_core::paths::runtime_socket();
+    let sock = yappr_core::paths::runtime_socket();
     let stream = UnixStream::connect(&sock).with_context(|| {
-        format!("cannot reach the daemon at {} — is owf-daemon running?", sock.display())
+        format!("cannot reach the daemon at {} — is yappr running?", sock.display())
     })?;
     let mut writer = stream.try_clone().context("cloning socket for writing")?;
     writeln!(writer, "{}", serde_json::to_string(&Request::Subscribe)?)?;

@@ -8,15 +8,15 @@
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = argv.iter().map(String::as_str).collect();
-    let route = openwhisprflow_lib::cli::route(&args);
-    match openwhisprflow_lib::client::dispatch(route) {
+    let route = yappr_lib::cli::route(&args);
+    match yappr_lib::client::dispatch(route) {
         Ok(true) => return,
         Ok(false) => {}
         Err(e) => {
-            eprintln!("openwhisprflow: {e:#}");
-            openwhisprflow_lib::client::notify_failure(&e);
+            eprintln!("yappr: {e:#}");
+            yappr_lib::client::notify_failure(&e);
             std::process::exit(1);
         }
     }
-    openwhisprflow_lib::run();
+    yappr_lib::run();
 }

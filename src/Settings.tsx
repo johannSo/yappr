@@ -189,7 +189,7 @@ export default function Settings() {
         setInstalling(false);
         setDownloads({});
         setNotice(
-          "Installation abgeschlossen. Starte OpenWhisprFlow neu, damit die neuen Modelle geladen werden.",
+          "Installation abgeschlossen. Starte yappr neu, damit die neuen Modelle geladen werden.",
         );
         void checkSetup();
       } else if (payload.kind === "failed") {
@@ -384,17 +384,12 @@ export default function Settings() {
       <main className="shell">
         <nav className="sidebar">
           <div className="brand">
-            {/* The overlay's level meter, frozen — the one mark this app
-                already has, so the two windows carry the same identity.
-                Decorative: the window's own title bar already says which
-                application this is. */}
-            <span className="brand__mark" aria-hidden="true">
-              <i />
-              <i />
-              <i />
-              <i />
-            </span>
-            <span className="brand__text">OpenWhisprFlow</span>
+            {/* The app icon itself — the same `public/yappr.png` the bundle
+                installs, so the window, the launcher and this rail all show
+                one mark. Decorative: the window's own title bar already says
+                which application this is. */}
+            <img className="brand__mark" src="/yappr.png" alt="" aria-hidden="true" />
+            <span className="brand__text">yappr</span>
           </div>
 
           <div className="searchbox">
@@ -665,7 +660,7 @@ function SaveCapsule({ state }: { state: SaveState }) {
 /// "Beim Anmelden starten" (spec §9, task 16). Deliberately **not** rendered
 /// through `SectionCard`/`config[section]` the way every other row in this
 /// window is: the thing being toggled is whether
-/// `~/.config/autostart/openwhisprflow.desktop` exists, which is filesystem
+/// `~/.config/autostart/yappr.desktop` exists, which is filesystem
 /// state that can change behind this app's back (the user clearing that
 /// directory by hand, another autostart manager). Mirroring that into a
 /// `config.toml` key would be a second copy of the same fact, free to
@@ -820,7 +815,7 @@ function SectionCard({
 
 /// Renders one download's progress as a fraction of a known total, or (no
 /// `Content-Length` header) as a raw MB count climbing with no visible
-/// ceiling — the same fallback `openwhisprflow --update-lock`'s own terminal
+/// ceiling — the same fallback `yappr --update-lock`'s own terminal
 /// output uses for the same reason (`setup.rs`'s `progress_line`).
 function downloadStatusText(progress: DownloadProgress | undefined, installing: boolean): string {
   if (!progress) return installing ? "wartet…" : "fehlt";
@@ -879,7 +874,7 @@ function SetupPane({
           <h2>Voraussetzungen</h2>
         </div>
         <p className="note">
-          Diese Programme kommen nicht von OpenWhisprFlow selbst und müssen von Hand
+          Diese Programme kommen nicht von yappr selbst und müssen von Hand
           installiert werden.
         </p>
         <div className="card">

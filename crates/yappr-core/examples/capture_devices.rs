@@ -6,7 +6,7 @@
 //! number, not content -- ambient room noise is enough to tell a live
 //! microphone from a dead digital input.
 //!
-//! Run: cargo run --release -p owf-core --example capture_devices
+//! Run: cargo run --release -p yappr-core --example capture_devices
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::sync::atomic::{AtomicUsize, Ordering};

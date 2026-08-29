@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-const APP: &str = "openwhisprflow";
+const APP: &str = "yappr";
 
 fn xdg_runtime() -> PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR")
@@ -27,7 +27,7 @@ pub fn state_dir() -> PathBuf {
 }
 
 pub fn log_file() -> PathBuf {
-    state_dir().join("openwhisprflow.log")
+    state_dir().join("yappr.log")
 }
 
 pub fn rejections_file() -> PathBuf {
@@ -35,15 +35,15 @@ pub fn rejections_file() -> PathBuf {
 }
 
 pub fn runtime_socket() -> PathBuf {
-    xdg_runtime().join("openwhisprflow.sock")
+    xdg_runtime().join("yappr.sock")
 }
 
 pub fn runtime_lock() -> PathBuf {
-    xdg_runtime().join("openwhisprflow.lock")
+    xdg_runtime().join("yappr.lock")
 }
 
 pub fn runtime_port() -> PathBuf {
-    xdg_runtime().join("openwhisprflow.port")
+    xdg_runtime().join("yappr.port")
 }
 
 /// The XDG autostart entry (design doc §9, task 16). Deliberately **not**
@@ -58,7 +58,7 @@ pub fn autostart_desktop_file() -> PathBuf {
     dirs::config_dir()
         .expect("no config dir")
         .join("autostart")
-        .join("openwhisprflow.desktop")
+        .join("yappr.desktop")
 }
 
 #[cfg(test)]
@@ -67,9 +67,9 @@ mod tests {
 
     #[test]
     fn paths_are_namespaced_under_the_app_name() {
-        assert!(config_file().ends_with("openwhisprflow/config.toml"));
-        assert!(models_dir().ends_with("openwhisprflow/models"));
-        assert!(rejections_file().ends_with("openwhisprflow/rejections.jsonl"));
+        assert!(config_file().ends_with("yappr/config.toml"));
+        assert!(models_dir().ends_with("yappr/models"));
+        assert!(rejections_file().ends_with("yappr/rejections.jsonl"));
     }
 
     /// `~/.config/autostart/` is a shared directory, not this app's own
@@ -80,7 +80,7 @@ mod tests {
     #[test]
     fn the_autostart_entry_lives_beside_this_apps_config_dir_not_inside_it() {
         let p = autostart_desktop_file();
-        assert!(p.ends_with("autostart/openwhisprflow.desktop"));
+        assert!(p.ends_with("autostart/yappr.desktop"));
         assert!(!p.starts_with(config_dir()));
     }
 
@@ -88,8 +88,8 @@ mod tests {
     fn runtime_paths_follow_xdg_runtime_dir() {
         // Not asserting the prefix (it varies by machine); assert the file names,
         // which the daemon and ctl must agree on exactly.
-        assert_eq!(runtime_socket().file_name().unwrap(), "openwhisprflow.sock");
-        assert_eq!(runtime_lock().file_name().unwrap(), "openwhisprflow.lock");
-        assert_eq!(runtime_port().file_name().unwrap(), "openwhisprflow.port");
+        assert_eq!(runtime_socket().file_name().unwrap(), "yappr.sock");
+        assert_eq!(runtime_lock().file_name().unwrap(), "yappr.lock");
+        assert_eq!(runtime_port().file_name().unwrap(), "yappr.port");
     }
 }

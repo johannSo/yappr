@@ -1,5 +1,5 @@
 [package]
-name = "owf-core"
+name = "yappr-core"
 edition.workspace = true
 version.workspace = true
 

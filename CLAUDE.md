@@ -11,11 +11,23 @@ typed into the focused window with `wtype` (or `ydotool`, if `[inject] backend` 
 it). Fully local at dictation time. `SUPER+ALT+D`
 cancels a recording in progress; nothing else can end one deliberately — see invariant 11.
 
-OpenWhisprFlow is one binary, `openwhisprflow`, and one process. Running it with no
+yappr is one binary, `yappr`, and one process. Running it with no
 arguments starts everything: a tray icon (no window), the Unix socket, the models, and
-the pipeline. Left-clicking the tray (or `openwhisprflow --settings`) opens the settings
+the pipeline. Left-clicking the tray (or `yappr --settings`) opens the settings
 window; right-clicking gives Status / Einstellungen / Diktat pausieren / Beenden. There is
 no `owf-ctl`, no separate daemon binary, and no systemd unit.
+
+The app was called **OpenWhisprFlow** until 2026-08-29, and the rename reached the
+binary, the crate (`owf-core` → `yappr-core`), the Tauri identifier, and the whole
+XDG namespace (`~/.config/yappr`, `~/.local/share/yappr/models`, `yappr.sock`,
+`~/yappr` for debug capture). Two places deliberately still say `openwhisprflow`,
+and both are correct: the design docs and SDD logs described below, which are dated
+records of what was decided under the old name, and the migration text in `hypr.rs`
+plus README's upgrade section, which name the *old* binary and window title because
+their whole job is telling a user which dead lines to delete. Watch for that
+distinction when editing either — a blanket rename through them makes them false.
+`owf-ctl`, `owf-cli` and `owf-daemon` in comments are the same case: deleted crates
+that genuinely had those names, not stale spellings.
 
 `README.md` is the user-facing setup guide. `HANDOVER.md` is the current state-of-play,
 including what has and has not been verified on real hardware.
@@ -23,11 +35,11 @@ including what has and has not been verified on real hardware.
 ## Commands
 
 ```bash
-# One binary, `openwhisprflow`. No arguments starts the app (tray, socket, models,
+# One binary, `yappr`. No arguments starts the app (tray, socket, models,
 # pipeline); every other invocation is a client call against a running instance or a
 # local utility, and both exit before touching Tauri/GTK/WebKit or a model
 # (`src-tauri/src/cli.rs`'s route(), `client.rs`'s dispatch).
-cargo build --release -p openwhisprflow --features custom-protocol
+cargo build --release -p yappr --features custom-protocol
 #   ^ `custom-protocol` is deliberately NOT a default feature. Without it a plain
 #     cargo build embeds `devUrl` instead of `frontendDist` and the window is blank
 #     unless a Vite dev server is running.
@@ -38,20 +50,20 @@ bun run build                             # frontend only (tsc && vite build -> 
 # Tests (415 passed, 0 failed, 4 #[ignore]d because they need downloaded models)
 cargo test --workspace
 cargo test --workspace -- --ignored       # needs models already on disk (Settings' Setup pane, or --update-lock)
-cargo test -p owf-core guardrail::        # one module
-cargo test -p owf-core --test pipeline_e2e a_good_cleanup_is_injected
-cargo test -p owf-core --lib server::tests::state_of_and_snapshot_event_report_failed_as_a_real_error_state
+cargo test -p yappr-core guardrail::        # one module
+cargo test -p yappr-core --test pipeline_e2e a_good_cleanup_is_injected
+cargo test -p yappr-core --lib server::tests::state_of_and_snapshot_event_report_failed_as_a_real_error_state
 cargo clippy --workspace --all-targets    # kept clean
 
 # Exercising things without a microphone
-cargo run -p openwhisprflow -- --replay src-tauri/fixtures/replay-full.ndjson
-cargo run -p owf-core --example list_devices
-cargo run --release -p openwhisprflow -- --bench   # ASR latency table
+cargo run -p yappr -- --replay src-tauri/fixtures/replay-full.ndjson
+cargo run -p yappr-core --example list_devices
+cargo run --release -p yappr -- --bench   # ASR latency table
 
 # Runtime inspection / control (against a running instance)
-openwhisprflow --status | --debug | --subscribe | --reload
-openwhisprflow --settings | --toggle | --cancel | --quit
-openwhisprflow --print-shortcuts | --purge-logs | --update-lock
+yappr --status | --debug | --subscribe | --reload
+yappr --settings | --toggle | --cancel | --quit
+yappr --print-shortcuts | --purge-logs | --update-lock
 ```
 
 There is no CI. `cargo test --workspace && cargo clippy --workspace --all-targets` is the
@@ -63,17 +75,17 @@ a "recent work" undo button; nothing on this branch has added an equivalent tag 
 
 Two Cargo members, one process:
 
-- **`crates/owf-core`** — the library. Every pipeline stage plus config, paths, wire
+- **`crates/yappr-core`** — the library. Every pipeline stage plus config, paths, wire
   format, model provisioning, debug capture — and, since the one-process rewrite,
   `server.rs`: the socket server and the `AtomicU8` state machine, moved here unchanged
   (with its tests) from the now-deleted `crates/owf-cli`. Links `sherpa-onnx`, `cpal`,
   `rubato`, so anything that depends on it inherits a heavy build — which now includes
   the GUI itself, deliberately (see "Why not keep the daemon separate" in the design doc).
-- **`src-tauri`** (package `openwhisprflow`, binary `openwhisprflow`) — the whole app:
+- **`src-tauri`** (package `yappr`, binary `yappr`) — the whole app:
   the overlay window, the settings window, the tray (a native StatusNotifierItem via
   `ksni` — see `tray.rs`'s module doc for why not Tauri's own `tray-icon` feature), the
-  layer-shell placement logic (`layer.rs`), and the socket server itself (`owf_core::server`,
-  started in-process by `setup()` in `lib.rs`). It links `owf-core` directly — the split
+  layer-shell placement logic (`layer.rs`), and the socket server itself (`yappr_core::server`,
+  started in-process by `setup()` in `lib.rs`). It links `yappr-core` directly — the split
   that used to keep the overlay a lightweight, read-only socket client is gone along with
   `settings-tauri`, the second Tauri app the settings window used to be; both were casualties
   of collapsing to one process. `cli.rs`'s `route()` and `client.rs`'s `dispatch()` are what
@@ -82,7 +94,7 @@ Two Cargo members, one process:
   ahead of any Tauri/GTK/WebKit initialisation for every flag except no-args and `--replay`.
   `GetConfig`/`SetConfig`/`ListInputDevices` (`settings_cmds.rs`) are plain Tauri commands
   now, not socket requests — the settings window is in-process, so there's no transport
-  left to put them on; they call `owf_core::server::dispatch` directly with the same
+  left to put them on; they call `yappr_core::server::dispatch` directly with the same
   request/response JSON shapes the socket used to carry, so `src/settings/` and
   `Settings.tsx` needed no changes at all.
 - **`src/`** — the React frontend for both of the app's windows, built as two Vite entry
@@ -110,10 +122,10 @@ Two Cargo members, one process:
 
 Wayland has no global keyboard grab, which is why argument dispatch in `main.rs` runs
 `cli::route()` *before* any Tauri/GTK/WebKit initialisation and before any model is
-touched: a shortcut you bind yourself runs `openwhisprflow --toggle` / `--cancel`, and
+touched: a shortcut you bind yourself runs `yappr --toggle` / `--cancel`, and
 that invocation must behave like a thin client, not pay the cost of the whole app, even
-though it *is* the same binary. A client call opens `$XDG_RUNTIME_DIR/openwhisprflow.sock`,
-writes one NDJSON request line, and reads one response line back (`owf-core/src/proto.rs`
+though it *is* the same binary. A client call opens `$XDG_RUNTIME_DIR/yappr.sock`,
+writes one NDJSON request line, and reads one response line back (`yappr-core/src/proto.rs`
 — unchanged wire format from when a separate `owf-ctl` held this logic).
 `Request::Subscribe` is the exception: it converts the connection into an open-ended
 NDJSON `OverlayEvent` stream, starting with a snapshot of the current state.
@@ -158,13 +170,13 @@ happen to be resident.
      protocol level, no compositor window rule involved.
    - Where layer-shell is unavailable (GNOME/Mutter, or `anchor_overlay` failing for any
      other reason), `hypr.rs`'s emitted window rule is the fallback — now keyed on the
-     overlay's **title** (`"openwhisprflow overlay"`), not its class. The settings window
+     overlay's **title** (`"yappr overlay"`), not its class. The settings window
      became a window of this same app, so a class-matched rule would reach it too and it
      could no longer take a keystroke — exactly the regression the previous two-Tauri-app
      split existed to avoid, now fixed by matching title instead.
-3. **`OverlayEvent` exists in two hand-maintained copies**: `owf-core/src/proto.rs` (source
+3. **`OverlayEvent` exists in two hand-maintained copies**: `yappr-core/src/proto.rs` (source
    of truth) and the TS union in `src/Overlay.tsx`. `src-tauri/src/wire.rs`'s separate
-   mirror is gone — the overlay now links `owf-core` directly (same process as the server),
+   mirror is gone — the overlay now links `yappr-core` directly (same process as the server),
    so there is nothing left to avoid pulling `sherpa-onnx`/`cpal` into by duplicating the
    type. Changing or adding a variant still means touching both *and* adding a line to
    `src-tauri/fixtures/replay-full.ndjson` — two tests cross-check drift mechanically
@@ -277,7 +289,10 @@ happen to be resident.
   what the surrounding code does — worth watching for a section-number collision between
   the two docs, since nothing currently disambiguates one from the other in the comment
   itself. Implementation plans live in `docs/superpowers/plans/`, and per-task decision
-  logs in `.superpowers/sdd/*/progress.md`.
+  logs in `.superpowers/sdd/*/progress.md`. All of these predate the rename and still
+  say `openwhisprflow` throughout, filenames included — they are history, and the
+  stored `review-*.diff` files under `.superpowers/sdd/` have to keep matching the
+  commits they record.
 - Tests are named as full sentences. Documented-but-unfixed behaviour is pinned by a test
   prefixed `known_limitation_` (e.g. `known_limitation_dense_digit_sequences_trip_word_ratio`
   in `guardrail.rs`).
@@ -285,17 +300,28 @@ happen to be resident.
   `with_recovery_dir`, `with_fallback_injector`, `with_stage_events`), not new positional
   parameters on `new`. `rejections_file()` is a live guardrail-tuning dataset — tests must
   redirect writes to it or they poison real data.
-- `owf-core`'s `test-util` feature exposes `LlamaServer::from_child` (test-only child-process
+- `yappr-core`'s `test-util` feature exposes `LlamaServer::from_child` (test-only child-process
   construction) so a crate testing the server can stub a process that cannot run here (a
   real `llama-server` needs a model file and a working `ggml` backend). Since `server.rs`
-  moved into `owf-core` itself, its own `#[cfg(test)]` builds already satisfy
+  moved into `yappr-core` itself, its own `#[cfg(test)]` builds already satisfy
   `cfg(any(test, feature = "test-util"))` without the feature flag — it now matters only if
-  a crate *outside* `owf-core` ever needs the same seam, which none currently does.
-- All filesystem locations come from `owf-core/src/paths.rs` (XDG): config
-  `~/.config/openwhisprflow/config.toml`, models `~/.local/share/openwhisprflow/models`
-  (pinned by sha256 in `crates/owf-core/models.lock.toml`), `rejections.jsonl` in the
+  a crate *outside* `yappr-core` ever needs the same seam, which none currently does.
+- All filesystem locations come from `yappr-core/src/paths.rs` (XDG): config
+  `~/.config/yappr/config.toml`, models `~/.local/share/yappr/models`
+  (pinned by sha256 in `crates/yappr-core/models.lock.toml`), `rejections.jsonl` in the
   state dir, socket/lock/port in `$XDG_RUNTIME_DIR`, autostart entry at
-  `~/.config/autostart/openwhisprflow.desktop`. Debug capture writes to `~/owf` by default.
+  `~/.config/autostart/yappr.desktop`. Debug capture writes to `~/yappr` by default.
+- **The app icon has one source: `public/yappr.png`.** Everything else is derived from
+  it. `src-tauri/icons/*` is generated — `bunx tauri icon public/yappr.png`, then delete
+  the `android/` and `ios/` trees it also writes, which this app has no target for.
+  `tauri.conf.json`'s `bundle.icon` list is what Linux packaging turns into
+  `hicolor/<w>x<h>/apps/yappr.png`, so a size missing from that list is a size the
+  desktop has to scale for itself. The two HTML entries' favicons and the settings
+  sidebar's brand mark reference `/yappr.png` directly, out of `public/` — replace that
+  one file and the whole app follows. The tray is the deliberate exception: `tray.rs`
+  names *freedesktop symbolic* icons because its icon is a state readout, not branding
+  (invariant: recording must never look like idle), and a full-colour plate would neither
+  theme with the panel nor survive 22 px.
 
 ## Environment gotchas
 
@@ -341,7 +367,7 @@ happen to be resident.
 - **Do not trust `cpal`'s advertised sample-rate range.** It advertised 16 kHz on hardware
   that rejected the stream build; `capture.rs` now probes by building a throwaway stream and
   falls back to 48 kHz plus `rubato` resampling.
-- **Never apply Hyprland config on the user's behalf** — emit it (`openwhisprflow
+- **Never apply Hyprland config on the user's behalf** — emit it (`yappr
   --print-shortcuts`) and let them paste it. A bad window rule breaks their desktop.
   `hypr.rs` detects Lua vs classic `.conf`; Hyprland 0.56+ with a Lua config rejects the
   legacy keyword parser outright, so the formats are not interchangeable.

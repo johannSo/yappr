@@ -50,27 +50,33 @@ re-touch it.
 
 2. **Install the new build.** Either run the AppImage above, or build from source —
    `README.md`'s Install section, which now needs only `cargo build --release -p
-   openwhisprflow --features custom-protocol` plus `install`. Then delete every binary
+   yappr --features custom-protocol` plus `install`. Then delete every binary
    that no longer exists:
    ```bash
    rm -f ~/.local/bin/owf-ctl ~/.local/bin/owf-daemon ~/.local/bin/owf-bench \
-         ~/.local/bin/openwhisprflow-settings
+         ~/.local/bin/openwhisprflow ~/.local/bin/openwhisprflow-settings
    ```
-   `~/.local/bin/openwhisprflow` is missing from that list on purpose — it is the one name
-   the rewrite kept — but it is the leftover that actually bites, and it did: **observed on
-   this machine on 2026-08-29, two overlays on screen at once.** The pre-rewrite binary of
-   that name parses no arguments, so a `SUPER+D` bound to the bare name resolved through
-   `PATH` to the old build, which opened its own overlay, subscribed to the *new* daemon's
-   socket, and rendered a second pill from the same events — same waveform, same timer, no
-   error anywhere. Overwrite it with `install`, or symlink it at the AppImage, and then run
-   `which -a openwhisprflow` (expect one path) and `openwhisprflow --status` (expect one
-   line of JSON — a stale build prints nothing and opens a window). See README's
-   "Upgrading from an older, multi-binary build".
+   `~/.local/bin/openwhisprflow` is in that list now, and the rename is why. Before it,
+   the one-process build kept the old overlay's name, and that shared name is the leftover
+   that actually bit: **observed on this machine on 2026-08-29, two overlays on screen at
+   once.** The pre-rewrite binary of that name parses no arguments, so a `SUPER+D` bound to
+   the bare name resolved through `PATH` to the old build, which opened its own overlay,
+   subscribed to the *new* daemon's socket, and rendered a second pill from the same events
+   — same waveform, same timer, no error anywhere. Renaming the app to `yappr` retires that
+   collision by construction: the new binary cannot shadow or be shadowed by the old one,
+   because they no longer answer to the same name. What replaces the hazard is a quieter
+   one — a `SUPER+D` still bound to `openwhisprflow` now runs a binary that either doesn't
+   exist (nothing happens, silently) or is the stale pre-rewrite overlay (a ghost pill and
+   no dictation). Deleting it, per the `rm` above, turns the second case into the first,
+   and step 3 rebinds the shortcut. Afterwards: `which -a yappr` (expect one path),
+   `which -a openwhisprflow` (expect none), and `yappr --status` (expect one line of JSON —
+   a stale build prints nothing and opens a window). See README's "Upgrading from an older,
+   multi-binary build".
 
 3. **Edit your three Hyprland files** (this session did not do this for you — see the
    standing rule about never touching your compositor config):
    - `bindings.lua`: delete the three `o.bind` lines calling `owf-ctl ptt-start` /
-     `ptt-stop` / `cancel`. Add the two lines `openwhisprflow --print-shortcuts` prints.
+     `ptt-stop` / `cancel`. Add the two lines `yappr --print-shortcuts` prints.
    - `autostart.lua`: delete both `o.launch_on_start` lines. There is no replacement line —
      autostart is now the Settings window's "Beim Anmelden starten" toggle (step 5).
    - `windows.lua`: delete the `o.window("openwhisprflow", {...})` block. On Hyprland you
@@ -78,7 +84,7 @@ re-touch it.
      via `wlr-layer-shell`. (If you'd rather have the belt-and-braces fallback rule too,
      `--print-shortcuts` prints a title-matched one; it's harmless either way.)
 
-   `openwhisprflow --print-shortcuts`'s output leads with exactly what to delete, in that
+   `yappr --print-shortcuts`'s output leads with exactly what to delete, in that
    order, before what to add — this is tested (`hypr.rs`'s
    `the_emitted_block_names_the_lines_to_delete_before_the_ones_to_add`).
 
@@ -88,13 +94,13 @@ re-touch it.
    ```
 
 5. **Launch the app** (from an app launcher, if you added the `.desktop` entry from
-   `README.md`, or `openwhisprflow &`). You should see a tray icon and no window. Left-click
+   `README.md`, or `yappr &`). You should see a tray icon and no window. Left-click
    it — Settings should open. Since the models are already downloaded from before, the
    Setup pane should not appear; if it does, something about the on-disk models changed and
    it will say what.
 
 6. **Turn on "Beim Anmelden starten"** in Settings if you want the old autostart behaviour
-   back — it now writes `~/.config/autostart/openwhisprflow.desktop` instead of a Hyprland
+   back — it now writes `~/.config/autostart/yappr.desktop` instead of a Hyprland
    line.
 
 7. **Press `SUPER+D`.** This is press-to-start, press-to-stop now, not hold-to-talk: press
@@ -106,7 +112,7 @@ re-touch it.
 
 | | |
 |---|---|
-| **Process topology** | Three processes (daemon, overlay, settings) become one binary, `openwhisprflow`, hosting the pipeline, socket, tray, overlay, and settings window in a single process. `crates/owf-cli` and `settings-tauri` are deleted. |
+| **Process topology** | Three processes (daemon, overlay, settings) become one binary, `yappr`, hosting the pipeline, socket, tray, overlay, and settings window in a single process. `crates/owf-cli` and `settings-tauri` are deleted. |
 | **Dictation gesture** | Hold-to-talk (`ptt-start`/`ptt-stop` on press/release) becomes press-to-start/press-to-stop (`--toggle`, resolved against the server's current state). `--cancel` is unchanged as a separate shortcut. |
 | **The tray** | New. A native StatusNotifierItem (`ksni`, not Tauri's own tray feature — appindicator-only hosts don't send click events). Left-click opens Settings; right-click gives Status / Einstellungen / Diktat pausieren / Beenden. |
 | **Pausing** | New. `PAUSED` is a real state; `--toggle` is refused and no microphone opens while paused. Never interrupts an utterance already in flight. |
@@ -114,7 +120,7 @@ re-touch it.
 | **Autostart** | An XDG `.desktop` entry written by a Settings toggle, not a Hyprland `exec-once` line. No systemd unit is authored by this project. |
 | **The overlay** | Self-anchors bottom-centre and refuses focus at the protocol level via `wlr-layer-shell`, on Hyprland and other wlroots compositors — no window rule needed there. Falls back to an unpositioned toplevel plus an emitted, **title**-matched (not class-matched) window rule on GNOME/Mutter. |
 | **The settings window** | Still a second window, now of the *same* Tauri app rather than a second Tauri app — its GUI code (`src/settings/`, `Settings.tsx`) is unchanged; only the transport under it changed from a socket to direct Tauri commands. |
-| **`OverlayEvent`** | Down to two hand-maintained copies (`owf-core/src/proto.rs`, `src/Overlay.tsx`) from three — `src-tauri/src/wire.rs` is gone now that the overlay links `owf-core` directly. |
+| **`OverlayEvent`** | Down to two hand-maintained copies (`yappr-core/src/proto.rs`, `src/Overlay.tsx`) from three — `src-tauri/src/wire.rs` is gone now that the overlay links `yappr-core` directly. |
 
 ## What I verified myself
 

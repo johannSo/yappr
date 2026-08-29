@@ -1,7 +1,7 @@
-//! The OpenWhisprFlow overlay: a small always-on-top window that renders
+//! The yappr overlay: a small always-on-top window that renders
 //! the dictation pipeline's state (spec 12). As of this app hosting the
 //! server itself, this crate no longer talks to a daemon over a socket for
-//! its own events -- `setup()` below starts `owf_core::server` in-process
+//! its own events -- `setup()` below starts `yappr_core::server` in-process
 //! and forwards its broadcasts to the frontend directly as a Tauri event.
 //! (`--replay <path>` (`replay.rs`) still drives the overlay from a
 //! checked-in NDJSON fixture instead, with neither a pipeline nor a
@@ -22,8 +22,8 @@ mod tray;
 
 use tauri::{Emitter, Manager, PhysicalPosition};
 
-use owf_core::proto::{OverlayEvent, Request};
-use owf_core::server::{dispatch, shutdown, Daemon, EventSink};
+use yappr_core::proto::{OverlayEvent, Request};
+use yappr_core::server::{dispatch, shutdown, Daemon, EventSink};
 
 /// Must match the window `label` in `tauri.conf.json`.
 const OVERLAY_LABEL: &str = "overlay";
@@ -44,9 +44,9 @@ const OVERLAY_HEIGHT_LOGICAL: f64 = 120.0;
 /// edge. Overridable with `OWF_OVERLAY_MARGIN` (logical px) -- spec 12
 /// calls out "position is configurable"; this env var is the M2 mechanism
 /// for that. Wiring it to `[overlay]` in `config.toml` (as the design's
-/// table suggests) is future work: this crate now depends on `owf-core`
+/// table suggests) is future work: this crate now depends on `yappr-core`
 /// for its wire types (see the module doc above), but does not yet use
-/// `owf-core`'s config loader.
+/// `yappr-core`'s config loader.
 ///
 /// This is the gap to the *window*, and the window is now a canvas larger
 /// than the capsule drawn on it -- `.stage` in `Overlay.css` insets the
@@ -102,7 +102,7 @@ pub(crate) fn show_settings_window(app: &tauri::AppHandle) {
     }
 }
 
-/// Forwards every broadcast from the in-process `owf_core::server::Daemon`
+/// Forwards every broadcast from the in-process `yappr_core::server::Daemon`
 /// to the frontend as a Tauri event, and to the tray icon -- the overlay's
 /// `src/Overlay.tsx` already listens for `"overlay-event"`; it used to
 /// arrive there via `connection.rs`'s socket client, and now arrives the
@@ -146,7 +146,7 @@ impl TauriSink {
     ///
     /// `try_state` rather than `state` for that lookup: it can in principle
     /// run before `setup()` has finished calling `app.manage(Server(..))`
-    /// (warm-up is spawned from inside `owf_core::server::start`, before it
+    /// (warm-up is spawned from inside `yappr_core::server::start`, before it
     /// returns to `setup()`), in which case `status` below is `None` for
     /// that one `Error` -- harmless: `icon_state_for` treats a `None`
     /// status as "nothing to resolve `Error` with", same as `--replay`.
@@ -173,12 +173,12 @@ impl TauriSink {
 /// `"overlay-event"` (`src/Overlay.tsx`) -- replays whatever state the
 /// daemon is in *right now* as a fresh `"overlay-event"` emission, via
 /// `Daemon::connect_snapshot`. That is the same snapshot
-/// `owf_core::server::serve_subscriber` sends a freshly connected socket
+/// `yappr_core::server::serve_subscriber` sends a freshly connected socket
 /// subscriber; the overlay stopped being a socket client, but still needs
 /// the same "what's happening right now" answer on attach.
 ///
 /// Without this, nothing shows during the several-second warm-up (nothing
-/// ever *broadcasts* `Warming` -- `owf_core::server::start` only stores it),
+/// ever *broadcasts* `Warming` -- `yappr_core::server::start` only stores it),
 /// and a warm-up failure broadcast from a background thread that happened to
 /// outrun this window's `listen()` registration would be lost to the
 /// overlay forever. Calling this only after `listen()`'s own promise has
@@ -229,7 +229,7 @@ pub fn run() {
             // an ordinary toplevel. Invariant 2 (never take keyboard focus)
             // still holds on that path: `tauri.conf.json`'s
             // `focusable: false` applies regardless of which path this
-            // takes, and `owf_core::hypr::shortcut_config`'s emitted
+            // takes, and `yappr_core::hypr::shortcut_config`'s emitted
             // title-matched `nofocus`/`noinitialfocus` window rule is the
             // compositor-side belt-and-braces for exactly this fallback.
             if let Err(e) = layer::anchor_overlay(&window) {
@@ -294,13 +294,13 @@ pub fn run() {
                 None => {
                     let sink =
                         Arc::new(TauriSink { app: app.handle().clone(), tray: tray_handle.clone() });
-                    let (daemon, listener) = owf_core::server::start(sink)?;
+                    let (daemon, listener) = yappr_core::server::start(sink)?;
                     app.manage(daemon.clone());
                     app.manage(settings_cmds::Server(Some(daemon.clone())));
                     // Never on the Tauri event-loop thread -- the accept
                     // loop blocks, and a blocked event loop is a frozen
                     // window and an unclickable tray.
-                    std::thread::spawn(move || owf_core::server::serve(daemon, listener));
+                    std::thread::spawn(move || yappr_core::server::serve(daemon, listener));
 
                     // Now that the tray (Task 12) exists, Einstellungen is
                     // always reachable -- this is a redundant safety net,
@@ -312,7 +312,7 @@ pub fn run() {
                     // run.
                     let setup_check_handle = app.handle().clone();
                     std::thread::spawn(move || {
-                        if !provision::is_ready_or_assume_not("openwhisprflow") {
+                        if !provision::is_ready_or_assume_not("yappr") {
                             if let Some(w) = setup_check_handle.get_webview_window(SETTINGS_LABEL) {
                                 let _ = w.show();
                                 let _ = w.set_focus();
@@ -328,8 +328,8 @@ pub fn run() {
         .expect("error while building tauri application");
 
     // Task 10 / spec §8: every exit route must converge on
-    // `owf_core::server::shutdown`, not just the signal handler inside
-    // `owf_core::server::start`. `Request::Quit` (Beenden -- Task 12's
+    // `yappr_core::server::shutdown`, not just the signal handler inside
+    // `yappr_core::server::start`. `Request::Quit` (Beenden -- Task 12's
     // `tray::OwfTray::quit` dispatches this and nothing else, deliberately,
     // see that function's doc comment -- and `--quit`) already calls
     // `shutdown` directly, on its own background thread, before its

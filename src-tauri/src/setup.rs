@@ -1,4 +1,4 @@
-//! `openwhisprflow --setup`, `--debug` and `--purge-logs`: everything that
+//! `yappr --setup`, `--debug` and `--purge-logs`: everything that
 //! inspects or provisions the local install without talking to the daemon.
 //! `send()` and `open_settings()` used to live here too; `client::dispatch`
 //! replaces both directly, so they were deleted rather than moved.
@@ -8,23 +8,23 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 /// Prints a short summary of the most recently written debug record --
-/// see `owf_core::debug` and `[debug]` in config.toml. Reads straight off
+/// see `yappr_core::debug` and `[debug]` in config.toml. Reads straight off
 /// disk (not through the daemon): the debug facility writes independently
 /// of `owf-ctl`, so there is nothing to ask the daemon for.
 pub fn debug_summary() -> Result<()> {
-    let cfg = owf_core::config::Config::load().context("loading config")?;
+    let cfg = yappr_core::config::Config::load().context("loading config")?;
     if !cfg.debug.enabled {
         eprintln!("[debug].enabled is false in config.toml -- no records are being written");
         std::process::exit(1);
     }
 
-    let dir = owf_core::debug::expand_tilde(&cfg.debug.dir);
+    let dir = yappr_core::debug::expand_tilde(&cfg.debug.dir);
     let logs_dir = dir.join("logs");
-    let json_path = owf_core::debug::latest_record_path(&logs_dir)
+    let json_path = yappr_core::debug::latest_record_path(&logs_dir)
         .with_context(|| format!("no debug records found under {}", logs_dir.display()))?;
     let contents = std::fs::read_to_string(&json_path)
         .with_context(|| format!("reading {}", json_path.display()))?;
-    let record: owf_core::debug::DebugRecord = serde_json::from_str(&contents)
+    let record: yappr_core::debug::DebugRecord = serde_json::from_str(&contents)
         .with_context(|| format!("parsing {}", json_path.display()))?;
 
     print_debug_summary(&record, &json_path, &dir);
@@ -32,7 +32,7 @@ pub fn debug_summary() -> Result<()> {
 }
 
 fn print_debug_summary(
-    record: &owf_core::debug::DebugRecord,
+    record: &yappr_core::debug::DebugRecord,
     json_path: &Path,
     dir: &Path,
 ) {
@@ -200,7 +200,7 @@ fn status_line(label: &str, name: &str, why: &str) {
 ///
 /// `pub(crate)`: the Setup pane's `setup_status` command (`provision.rs`)
 /// reports this alongside model presence, which is a separate question
-/// (`owf_core::models::verify`) -- neither subsumes the other, so both are
+/// (`yappr_core::models::verify`) -- neither subsumes the other, so both are
 /// checked and reported independently rather than duplicating either check.
 pub(crate) fn check_prerequisites() -> Vec<&'static str> {
     // (binary, why it is needed, pacman package that provides it, fatal)
@@ -346,14 +346,14 @@ pub fn setup(update_lock: bool) -> Result<()> {
     }
 
     let mut state = ProgressState::default();
-    owf_core::models::download_all(update_lock, &mut |url, done, total| {
+    yappr_core::models::download_all(update_lock, &mut |url, done, total| {
         let (line, new_state) = progress_line(url, done, total, std::mem::take(&mut state));
         state = new_state;
         if let Some(line) = line {
             eprintln!("{line}");
         }
     })?;
-    println!("models ready in {}", owf_core::paths::models_dir().display());
+    println!("models ready in {}", yappr_core::paths::models_dir().display());
     Ok(())
 }
 
@@ -372,7 +372,7 @@ enum PurgeOutcome {
 ///
 /// Split out from `purge_logs` so this destructive operation is testable
 /// against a scratch path instead of the real
-/// `~/.local/state/openwhisprflow/rejections.jsonl`.
+/// `~/.local/state/yappr/rejections.jsonl`.
 fn purge_logs_at(path: &Path) -> Result<PurgeOutcome> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(PurgeOutcome::Removed),
@@ -389,12 +389,12 @@ fn purge_logs_at(path: &Path) -> Result<PurgeOutcome> {
 /// happening as a side effect of `setup` or `reload`.
 ///
 /// Deletes exactly that one file -- nothing else under
-/// `~/.local/state/openwhisprflow/` (the daemon's own `openwhisprflow.log`,
+/// `~/.local/state/yappr/` (the daemon's own `yappr.log`,
 /// in particular, is untouched) -- and, being destructive, always says
 /// exactly what it did: the path it removed, or that there was nothing to
 /// remove.
 pub fn purge_logs() -> Result<()> {
-    let path = owf_core::paths::rejections_file();
+    let path = yappr_core::paths::rejections_file();
     match purge_logs_at(&path)? {
         PurgeOutcome::Removed => println!("removed {} -- rejection dataset cleared", path.display()),
         PurgeOutcome::AlreadyAbsent => {
@@ -410,12 +410,12 @@ mod tests {
 
     /// A fresh, collision-free scratch directory for a single test. Not a
     /// dependency: `tempfile` isn't in `[dev-dependencies]` here either (see
-    /// the identical helper in `owf-core`'s `inject.rs` tests).
+    /// the identical helper in `yappr-core`'s `inject.rs` tests).
     fn scratch_dir(tag: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("owf-ctl-test-{tag}-{}-{n}", std::process::id()))
+        std::env::temp_dir().join(format!("yappr-ctl-test-{tag}-{}-{n}", std::process::id()))
     }
 
     #[test]
@@ -558,7 +558,7 @@ mod tests {
         let dir = scratch_dir("purge-scoped");
         std::fs::create_dir_all(&dir).unwrap();
         let rejections = dir.join("rejections.jsonl");
-        let daemon_log = dir.join("openwhisprflow.log");
+        let daemon_log = dir.join("yappr.log");
         std::fs::write(&rejections, b"{}\n").unwrap();
         std::fs::write(&daemon_log, b"log line\n").unwrap();
 

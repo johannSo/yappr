@@ -39,7 +39,7 @@
 //!
 //! A deliberate deviation from this task's own brief sketch, which routes
 //! `activate` through `Request::ShowSettings`. That request's only handler
-//! (`owf_core::server::dispatch`) calls `EventSink::show_settings`, which
+//! (`yappr_core::server::dispatch`) calls `EventSink::show_settings`, which
 //! for `TauriSink` (`lib.rs`) does nothing but show and focus the settings
 //! window -- so routing through it would be a round trip through a
 //! `Daemon` for an action that never touches daemon state, and `--replay`
@@ -55,7 +55,7 @@
 //!
 //! ## Icon and daemon state
 //!
-//! [`icon_name`] is a pure function over [`owf_core::proto::State`].
+//! [`icon_name`] is a pure function over [`yappr_core::proto::State`].
 //! Recording is the one that matters most: under press/press toggle the
 //! user's own finger no longer indicates an open microphone, so this icon
 //! and the overlay are the only two indicators left, and neither may
@@ -127,8 +127,8 @@
 
 use std::sync::{Arc, Mutex, PoisonError};
 
-use owf_core::proto::{OverlayEvent, Request, State};
-use owf_core::server::dispatch;
+use yappr_core::proto::{OverlayEvent, Request, State};
+use yappr_core::server::dispatch;
 use tauri::{AppHandle, Manager};
 
 /// Freedesktop icon name for each daemon state. Pure so it is testable
@@ -313,11 +313,11 @@ impl OwfTray {
 
 impl ksni::Tray for OwfTray {
     fn id(&self) -> String {
-        "openwhisprflow".into()
+        "yappr".into()
     }
 
     fn title(&self) -> String {
-        "OpenWhisprFlow".into()
+        "yappr".into()
     }
 
     fn icon_name(&self) -> String {

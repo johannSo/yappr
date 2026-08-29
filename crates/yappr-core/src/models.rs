@@ -49,7 +49,7 @@ pub static ARTIFACTS: [Artifact; 3] = [
     },
 ];
 
-/// The lock file committed to the repository at `crates/owf-core/models.lock.toml`,
+/// The lock file committed to the repository at `crates/yappr-core/models.lock.toml`,
 /// generated once during M0 via `owf-ctl setup --update-lock` (spec 14.2).
 ///
 /// C2: nothing in the tree ever read this file -- `LockFile::load()` only
@@ -75,7 +75,7 @@ impl LockFile {
     }
 
     /// Parses the lock file compiled into this binary. The only way this can
-    /// fail is if `crates/owf-core/models.lock.toml` itself were malformed,
+    /// fail is if `crates/yappr-core/models.lock.toml` itself were malformed,
     /// which would fail every build, not just this call.
     fn compiled_in() -> Result<Self> {
         Ok(toml::from_str(COMPILED_IN_LOCK)?)
@@ -433,7 +433,7 @@ mod tests {
 
     #[test]
     fn sha256_of_known_content_matches() {
-        let dir = std::env::temp_dir().join("owf-test-sha");
+        let dir = std::env::temp_dir().join("yappr-test-sha");
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("abc.txt");
         let mut f = std::fs::File::create(&p).unwrap();
@@ -456,7 +456,7 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("owf-models-test-{tag}-{}-{n}", std::process::id()))
+        std::env::temp_dir().join(format!("yappr-models-test-{tag}-{}-{n}", std::process::id()))
     }
 
     #[test]
@@ -511,7 +511,7 @@ mod tests {
         for a in ARTIFACTS.iter() {
             assert!(
                 compiled.hashes.contains_key(a.name),
-                "crates/owf-core/models.lock.toml has no pinned hash for {}",
+                "crates/yappr-core/models.lock.toml has no pinned hash for {}",
                 a.name
             );
         }
@@ -526,7 +526,7 @@ mod tests {
     #[test]
     fn load_falls_back_to_the_compiled_in_pin_when_no_runtime_lock_exists() {
         let dir = std::env::temp_dir()
-            .join(format!("owf-test-no-runtime-lock-{}", std::process::id()));
+            .join(format!("yappr-test-no-runtime-lock-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let never_created = dir.join("models.lock.toml");
 
@@ -539,7 +539,7 @@ mod tests {
                 a.name
             );
         }
-        // Matches the hash actually committed in crates/owf-core/models.lock.toml.
+        // Matches the hash actually committed in crates/yappr-core/models.lock.toml.
         assert_eq!(
             lock.hashes.get("silero").map(String::as_str),
             Some("9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6")
@@ -549,7 +549,7 @@ mod tests {
     #[test]
     fn load_prefers_a_runtime_entry_but_fills_gaps_from_the_compiled_in_pin() {
         let dir =
-            std::env::temp_dir().join(format!("owf-test-partial-runtime-lock-{}", std::process::id()));
+            std::env::temp_dir().join(format!("yappr-test-partial-runtime-lock-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("models.lock.toml");
         std::fs::write(&path, "[hashes]\nsilero = \"deadbeef\"\n").unwrap();
@@ -615,7 +615,7 @@ mod tests {
 
     #[test]
     fn promote_file_replaces_an_existing_destination() {
-        let dir = std::env::temp_dir().join("owf-test-promote-file");
+        let dir = std::env::temp_dir().join("yappr-test-promote-file");
         std::fs::create_dir_all(&dir).unwrap();
         let dest = dir.join("model.bin");
         let staged = dir.join("model.bin.part");
@@ -631,7 +631,7 @@ mod tests {
 
     #[test]
     fn promote_dir_replaces_an_existing_nonempty_destination() {
-        let dir = std::env::temp_dir().join("owf-test-promote-dir");
+        let dir = std::env::temp_dir().join("yappr-test-promote-dir");
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         let dest = dir.join("parakeet-tdt-0.6b-v3-int8");
@@ -655,7 +655,7 @@ mod tests {
 
     #[test]
     fn discard_staged_removes_files_and_directories() {
-        let dir = std::env::temp_dir().join("owf-test-discard");
+        let dir = std::env::temp_dir().join("yappr-test-discard");
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
 

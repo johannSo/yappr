@@ -1,4 +1,4 @@
-# Checked-in NDJSON OverlayEvent fixture for `openwhisprflow --replay`.
+# Checked-in NDJSON OverlayEvent fixture for `yappr --replay`.
 # Exercises every wire::OverlayEvent variant (M2 Task 5 acceptance
 # evidence) across four scenarios: a full successful dictation, a
 # no-speech error, a busy rejection, and llama-server degrading then

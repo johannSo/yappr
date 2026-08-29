@@ -1,5 +1,5 @@
 use httpmock::prelude::*;
-use owf_core::normalize::{Normalizer, S1MiniClient, SYSTEM_PROMPT};
+use yappr_core::normalize::{Normalizer, S1MiniClient, SYSTEM_PROMPT};
 
 fn ok_body(content: &str) -> serde_json::Value {
     serde_json::json!({

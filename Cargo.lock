@@ -2999,23 +2999,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "openwhisprflow"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "gtk",
- "gtk-layer-shell",
- "hound",
- "ksni",
- "owf-core",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-opener",
-]
-
-[[package]]
 name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3029,34 +3012,6 @@ checksum = "9aa2b01e1d916879f73a53d01d1d6cee68adbb31d6d9177a8cfce093cced1d50"
 dependencies = [
  "futures-core",
  "pin-project-lite",
-]
-
-[[package]]
-name = "owf-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bzip2 0.5.2",
- "cpal",
- "dirs",
- "hound",
- "httpmock",
- "regex",
- "rubato",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "sherpa-onnx",
- "signal-hook",
- "strsim 0.11.1",
- "tar",
- "thiserror 2.0.20",
- "toml 1.1.4+spec-1.1.0",
- "toml_edit 0.25.13+spec-1.1.0",
- "tracing",
- "tracing-subscriber",
- "ureq 3.4.0",
- "whatlang",
 ]
 
 [[package]]
@@ -6031,6 +5986,51 @@ name = "xml-rs"
 version = "0.8.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
+
+[[package]]
+name = "yappr"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gtk",
+ "gtk-layer-shell",
+ "hound",
+ "ksni",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-opener",
+ "yappr-core",
+]
+
+[[package]]
+name = "yappr-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bzip2 0.5.2",
+ "cpal",
+ "dirs",
+ "hound",
+ "httpmock",
+ "regex",
+ "rubato",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "sherpa-onnx",
+ "signal-hook",
+ "strsim 0.11.1",
+ "tar",
+ "thiserror 2.0.20",
+ "toml 1.1.4+spec-1.1.0",
+ "toml_edit 0.25.13+spec-1.1.0",
+ "tracing",
+ "tracing-subscriber",
+ "ureq 3.4.0",
+ "whatlang",
+]
 
 [[package]]
 name = "yoke"

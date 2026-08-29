@@ -22,7 +22,7 @@ use crate::pipeline::Timings;
 /// Expands a leading `~/` to the user's home directory (`dirs::home_dir()`).
 /// Any other input -- an absolute path, a relative path, or a bare `~` with
 /// no following slash -- is returned unchanged; only the documented `~/foo`
-/// form in `[debug].dir`'s default (`"~/owf"`) needs to work.
+/// form in `[debug].dir`'s default (`"~/yappr"`) needs to work.
 pub fn expand_tilde(path: &str) -> PathBuf {
     match path.strip_prefix("~/") {
         Some(rest) => match dirs::home_dir() {
@@ -332,20 +332,20 @@ mod tests {
 
     #[test]
     fn expand_tilde_expands_a_leading_tilde_slash() {
-        let expanded = expand_tilde("~/owf");
+        let expanded = expand_tilde("~/yappr");
         assert!(expanded.is_absolute(), "got {}", expanded.display());
-        assert!(expanded.ends_with("owf"), "got {}", expanded.display());
-        assert_ne!(expanded, PathBuf::from("~/owf"));
+        assert!(expanded.ends_with("yappr"), "got {}", expanded.display());
+        assert_ne!(expanded, PathBuf::from("~/yappr"));
     }
 
     #[test]
     fn expand_tilde_leaves_other_paths_alone() {
-        assert_eq!(expand_tilde("/tmp/owf"), PathBuf::from("/tmp/owf"));
-        assert_eq!(expand_tilde("relative/owf"), PathBuf::from("relative/owf"));
+        assert_eq!(expand_tilde("/tmp/yappr"), PathBuf::from("/tmp/yappr"));
+        assert_eq!(expand_tilde("relative/yappr"), PathBuf::from("relative/yappr"));
         // A bare `~` with no following slash is not the documented form and
         // is deliberately left unexpanded.
         assert_eq!(expand_tilde("~"), PathBuf::from("~"));
-        assert_eq!(expand_tilde("~owf"), PathBuf::from("~owf"));
+        assert_eq!(expand_tilde("~yappr"), PathBuf::from("~yappr"));
     }
 
     #[test]
@@ -619,6 +619,6 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("owf-core-test-debug-{tag}-{}-{n}", std::process::id()))
+        std::env::temp_dir().join(format!("yappr-core-test-debug-{tag}-{}-{n}", std::process::id()))
     }
 }

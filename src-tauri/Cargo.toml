@@ -1,7 +1,7 @@
 [package]
-name = "openwhisprflow"
+name = "yappr"
 version = "0.1.0"
-description = "A Tauri App"
+description = "Press-to-start, press-to-stop dictation for Hyprland"
 authors = ["you"]
 edition = "2021"
 
@@ -11,7 +11,7 @@ edition = "2021"
 # The `_lib` suffix may seem redundant but it is necessary
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
-name = "openwhisprflow_lib"
+name = "yappr_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
@@ -22,7 +22,7 @@ tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-owf-core = { path = "../crates/owf-core" }
+yappr-core = { path = "../crates/yappr-core" }
 anyhow = "1"
 # For `bench.rs`'s `read_wav_16k_mono`, moved here from `owf-cli` (matches
 # its pinned version).
@@ -70,6 +70,6 @@ gtk-layer-shell = { version = "0.8", features = ["v0_6"] }
 # by default is what lets `bun run tauri dev` keep talking to the live Vite
 # server on port 1420. Standalone production builds of the overlay binary
 # must pass `--features custom-protocol` explicitly, e.g.:
-#   cargo build --release -p openwhisprflow --features custom-protocol
+#   cargo build --release -p yappr --features custom-protocol
 custom-protocol = ["tauri/custom-protocol"]
 

@@ -3,7 +3,7 @@
 //!
 //! Wayland has no global keyboard grab, so `owf-ctl` (invoked by a Hyprland
 //! keybind) writes one NDJSON request line here and reads one response line
-//! back. See `owf_core::proto` for the wire format.
+//! back. See `yappr_core::proto` for the wire format.
 
 use anyhow::{Context, Result};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
@@ -328,7 +328,7 @@ pub struct Daemon {
     /// field rather than a bare `paths::config_file()` call: a test that
     /// calls `shutdown` (which several in this module now do, to prove the
     /// llama child is reaped) must never be able to delete
-    /// `$XDG_RUNTIME_DIR/openwhisprflow.sock` out from under a real daemon
+    /// `$XDG_RUNTIME_DIR/yappr.sock` out from under a real daemon
     /// running on the same machine as the test suite.
     runtime_socket_path: PathBuf,
     runtime_lock_path: PathBuf,
@@ -337,7 +337,7 @@ pub struct Daemon {
     /// non-blocking `flock` on a runtime file. Held for the life of the
     /// daemon only because this `File` lives here -- `start` used to keep it
     /// in a local that dropped, and released the lock, the moment `start`
-    /// returned, letting a second `openwhisprflow` race this one for the
+    /// returned, letting a second `yappr` race this one for the
     /// socket. Never read; it exists only so `Drop` doesn't run early.
     _runtime_lock: std::fs::File,
 }
@@ -596,7 +596,7 @@ pub fn start(sink: Arc<dyn EventSink>) -> Result<(Arc<Daemon>, UnixListener)> {
     // file. The `File` is stored in `Daemon::_runtime_lock` so the lock is
     // held for the life of the *daemon*, not just this function -- a local
     // here would drop, and release the exclusive flock with it, the moment
-    // `start` returns, letting a second `openwhisprflow` race this one for
+    // `start` returns, letting a second `yappr` race this one for
     // the socket.
     let lock_path = paths::runtime_lock();
     if let Some(parent) = lock_path.parent() {
@@ -608,7 +608,7 @@ pub fn start(sink: Arc<dyn EventSink>) -> Result<(Arc<Daemon>, UnixListener)> {
         .truncate(false)
         .open(&lock_path)?;
     if !try_lock_exclusive(&lock) {
-        eprintln!("openwhisprflow is already running (lock held on {})", lock_path.display());
+        eprintln!("yappr is already running (lock held on {})", lock_path.display());
         std::process::exit(1);
     }
 
@@ -1218,7 +1218,7 @@ fn kill_llama(llama: &Mutex<Option<LlamaServer>>) {
 /// Takes explicit paths -- rather than calling `paths::runtime_*()` itself --
 /// so `shutdown` can be exercised in a test against `Daemon::runtime_*_path`
 /// scratch values instead of always resolving to
-/// `$XDG_RUNTIME_DIR/openwhisprflow.sock`, which a real daemon elsewhere on
+/// `$XDG_RUNTIME_DIR/yappr.sock`, which a real daemon elsewhere on
 /// the same machine may be holding open at the moment the test suite runs.
 fn remove_runtime_files(socket: &Path, lock: &Path, port: &Path) {
     let _ = std::fs::remove_file(socket);
@@ -2089,7 +2089,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
             // config file: `Config::load_from`'s own doc comment warns that
             // it *creates* the file when absent, so the bare `Config::load()`
             // this used to call would have silently written into whoever ran
-            // the suite's real `~/.config/openwhisprflow/config.toml`. In
+            // the suite's real `~/.config/yappr/config.toml`. In
             // production `daemon.config_path` *is* `paths::config_file()`
             // (set in `start`), so this changes nothing there.
             match Config::load_from(&daemon.config_path) {
@@ -2099,7 +2099,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
                     // `daemon.models_cfg` on every tick, and nothing else
                     // ever refreshes it. Without this, hand-editing
                     // `[models] idle_unload_seconds` and running
-                    // `openwhisprflow --reload` reported success and changed
+                    // `yappr --reload` reported success and changed
                     // nothing, while the same edit made in the settings GUI
                     // applied live -- and README documents `--reload` as
                     // applying every reloadable section.
@@ -2181,7 +2181,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
                 Err(e) => return Response::err(format!("config error: {e}")),
             };
             // Writes only if the result validates; on rejection the file on
-            // disk is untouched. See `owf_core::config_write`.
+            // disk is untouched. See `yappr_core::config_write`.
             if let Err(e) = config_write::save_config(&daemon.config_path, &config) {
                 return Response::err(format!("{e:#}"));
             }
@@ -3089,7 +3089,7 @@ mod tests {
     #[test]
     fn secure_socket_locks_the_socket_down_to_owner_only() {
         let dir =
-            std::env::temp_dir().join(format!("owf-test-socket-perms-{}", std::process::id()));
+            std::env::temp_dir().join(format!("yappr-test-socket-perms-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let sock_path = dir.join("test.sock");
         let _ = std::fs::remove_file(&sock_path);
@@ -3279,7 +3279,7 @@ mod tests {
     /// See `a_late_subscriber_sees_the_degraded_badge_replayed_on_connect`,
     /// the test that needs `true`.
     fn fake_daemon_with_normalize(initial_state: u8, normalize_enabled: bool) -> Arc<Daemon> {
-        fake_daemon_at(initial_state, normalize_enabled, PathBuf::from("/nonexistent/owf-test/config.toml"))
+        fake_daemon_at(initial_state, normalize_enabled, PathBuf::from("/nonexistent/yappr-test/config.toml"))
     }
 
     /// The seam the config handlers need: `set-config` writes, so a test must
@@ -3347,7 +3347,7 @@ mod tests {
     /// file just needs to exist -- nothing ever calls `try_lock_exclusive`
     /// on it the way `start` does.
     fn fake_runtime_lock() -> std::fs::File {
-        let path = std::env::temp_dir().join("owf-core-tests-fake-runtime-lock");
+        let path = std::env::temp_dir().join("yappr-core-tests-fake-runtime-lock");
         std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(path).unwrap()
     }
 
@@ -3358,11 +3358,11 @@ mod tests {
     /// that nothing here ever creates them -- but a test in this suite
     /// (`quit_reaps_the_llama_child_and_removes_the_runtime_files`) really
     /// does call `shutdown`, and a real daemon on this same machine may be
-    /// holding `$XDG_RUNTIME_DIR/openwhisprflow.sock` open at that exact
+    /// holding `$XDG_RUNTIME_DIR/yappr.sock` open at that exact
     /// moment. These paths must never be able to collide with that.
     fn fake_runtime_files() -> (PathBuf, PathBuf, PathBuf) {
-        let dir = std::env::temp_dir().join("owf-core-tests-fake-runtime-files");
-        (dir.join("openwhisprflow.sock"), dir.join("openwhisprflow.lock"), dir.join("openwhisprflow.port"))
+        let dir = std::env::temp_dir().join("yappr-core-tests-fake-runtime-files");
+        (dir.join("yappr.sock"), dir.join("yappr.lock"), dir.join("yappr.port"))
     }
 
     /// Whether a process with this pid still exists, checked the
@@ -3391,7 +3391,7 @@ mod tests {
             models_cfg: Mutex::new(ModelsConfig::default()),
             llama: Mutex::new(None),
             window_class: Mutex::new(None),
-            config_path: PathBuf::from("/nonexistent/owf-test/config.toml"),
+            config_path: PathBuf::from("/nonexistent/yappr-test/config.toml"),
             recording_epoch: AtomicU64::new(0),
             subscribers: Mutex::new(Vec::new()),
             normalize_enabled: false,
@@ -3431,7 +3431,7 @@ mod tests {
 
     fn scratch_config(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir()
-            .join(format!("owf-daemon-cfg-{tag}-{}", std::process::id()));
+            .join(format!("yappr-daemon-cfg-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
         std::fs::write(&path, "[audio]\ndevice = \"default\"   # kommentiert\n").unwrap();
@@ -3620,7 +3620,7 @@ mod tests {
     #[test]
     fn a_disconnected_subscriber_does_not_wedge_the_accept_loop_or_other_connections() {
         let dir =
-            std::env::temp_dir().join(format!("owf-daemon-test-subscribe-{}", std::process::id()));
+            std::env::temp_dir().join(format!("yappr-daemon-test-subscribe-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let sock_path = dir.join("test.sock");
         let _ = std::fs::remove_file(&sock_path);
@@ -3724,7 +3724,7 @@ mod tests {
     /// Task 15: on a fresh install with no models yet, `load_models` fails with
     /// `SherpaTranscriber`/`SileroTrimmer`'s own "model paths" error and the
     /// daemon lands in `FAILED` with that exact message stored -- see
-    /// `crates/owf-core/src/asr.rs`'s `SherpaTranscriber::new`. `ptt-start`
+    /// `crates/yappr-core/src/asr.rs`'s `SherpaTranscriber::new`. `ptt-start`
     /// (and therefore `--toggle`, which delegates to it for every
     /// non-`RECORDING` state) must state that real reason, not the generic
     /// "see logs" `snapshot_event` falls back to when no reason was ever
@@ -3780,7 +3780,7 @@ mod tests {
     #[test]
     fn a_late_subscriber_learns_about_a_fatal_warm_up_failure_instead_of_spinning_forever() {
         let dir = std::env::temp_dir()
-            .join(format!("owf-daemon-test-subscribe-failed-{}", std::process::id()));
+            .join(format!("yappr-daemon-test-subscribe-failed-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let sock_path = dir.join("test.sock");
         let _ = std::fs::remove_file(&sock_path);
@@ -3828,7 +3828,7 @@ mod tests {
     #[test]
     fn a_late_subscriber_sees_the_degraded_badge_replayed_on_connect() {
         let dir = std::env::temp_dir()
-            .join(format!("owf-daemon-test-subscribe-degraded-{}", std::process::id()));
+            .join(format!("yappr-daemon-test-subscribe-degraded-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let sock_path = dir.join("test.sock");
         let _ = std::fs::remove_file(&sock_path);
@@ -3960,7 +3960,7 @@ mod tests {
     #[test]
     fn a_transition_racing_a_new_subscriber_is_never_lost() {
         let dir = std::env::temp_dir()
-            .join(format!("owf-daemon-test-subscribe-race-{}", std::process::id()));
+            .join(format!("yappr-daemon-test-subscribe-race-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let sock_path = dir.join("test.sock");
         let _ = std::fs::remove_file(&sock_path);
@@ -4092,7 +4092,7 @@ mod tests {
     #[test]
     fn a_disconnected_subscriber_is_reaped_without_any_broadcast_while_idle() {
         let dir = std::env::temp_dir()
-            .join(format!("owf-daemon-test-subscribe-reap-{}", std::process::id()));
+            .join(format!("yappr-daemon-test-subscribe-reap-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let sock_path = dir.join("test.sock");
         let _ = std::fs::remove_file(&sock_path);
@@ -4337,7 +4337,7 @@ mod tests {
         let daemon = fake_daemon(IDLE);
         daemon.models_loaded.store(true, Ordering::SeqCst);
         let normalize_cfg = Some(NormalizeConfig {
-            llama_server_path: "/nonexistent/owf-test-llama-server-binary".to_string(),
+            llama_server_path: "/nonexistent/yappr-test-llama-server-binary".to_string(),
             ..NormalizeConfig::default()
         });
 
@@ -4668,13 +4668,13 @@ mod tests {
     ///
     /// Uses `fake_daemon_at`, whose `runtime_*_path` fields are scratch
     /// paths (`fake_runtime_files`), never the real
-    /// `$XDG_RUNTIME_DIR/openwhisprflow.sock` -- this machine may have a real
+    /// `$XDG_RUNTIME_DIR/yappr.sock` -- this machine may have a real
     /// daemon holding that file open while this suite runs, and `shutdown`
     /// really does call `remove_file` on whatever paths it's given.
     #[test]
     fn quit_reaps_the_llama_child_and_removes_the_runtime_files() {
         with_a_fresh_shutting_down_guard(|| {
-            let d = fake_daemon_at(IDLE, false, PathBuf::from("/nonexistent/owf-test/config.toml"));
+            let d = fake_daemon_at(IDLE, false, PathBuf::from("/nonexistent/yappr-test/config.toml"));
             let child = std::process::Command::new("sleep")
                 .arg("300")
                 .spawn()
@@ -4704,7 +4704,7 @@ mod tests {
     #[test]
     fn wait_for_busy_to_clear_then_shutdown_keeps_llama_alive_until_the_state_clears_then_reaps_it() {
         with_a_fresh_shutting_down_guard(|| {
-            let d = fake_daemon_at(TRANSCRIBING, false, PathBuf::from("/nonexistent/owf-test/config.toml"));
+            let d = fake_daemon_at(TRANSCRIBING, false, PathBuf::from("/nonexistent/yappr-test/config.toml"));
             let child = std::process::Command::new("sleep")
                 .arg("300")
                 .spawn()
@@ -4739,7 +4739,7 @@ mod tests {
     #[test]
     fn wait_for_busy_to_clear_then_shutdown_gives_up_at_the_bound_and_shuts_down_anyway() {
         with_a_fresh_shutting_down_guard(|| {
-            let d = fake_daemon_at(TRANSCRIBING, false, PathBuf::from("/nonexistent/owf-test/config.toml"));
+            let d = fake_daemon_at(TRANSCRIBING, false, PathBuf::from("/nonexistent/yappr-test/config.toml"));
             let child = std::process::Command::new("sleep")
                 .arg("300")
                 .spawn()
@@ -5021,7 +5021,7 @@ mod tests {
     #[test]
     fn an_already_warm_daemon_ignores_a_config_that_no_longer_parses() {
         let dir = std::env::temp_dir()
-            .join(format!("owf-daemon-cfg-broken-warm-{}", std::process::id()));
+            .join(format!("yappr-daemon-cfg-broken-warm-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
         // `deny_unknown_fields` (invariant 4) makes this a hard parse
@@ -5098,7 +5098,7 @@ mod tests {
     /// `daemon.models_cfg`; `Reload` returned `ok(Idle)` on both of its
     /// branches without doing so, and `daemon.models_cfg` is the *only* thing
     /// the housekeeping thread reads the idle timeout from. So hand-editing
-    /// `[models] idle_unload_seconds` and running `openwhisprflow --reload`
+    /// `[models] idle_unload_seconds` and running `yappr --reload`
     /// reported success and changed nothing until the next restart, while the
     /// same edit made in the settings GUI applied live -- and README
     /// documents `--reload` as applying every reloadable section.
@@ -5547,7 +5547,7 @@ mod tests {
         *lock_ignoring_poison(&daemon.last_activity) = Instant::now() - Duration::from_secs(3600);
 
         let normalize_cfg = Some(NormalizeConfig {
-            llama_server_path: "/nonexistent/owf-test-llama-server-binary".to_string(),
+            llama_server_path: "/nonexistent/yappr-test-llama-server-binary".to_string(),
             ..NormalizeConfig::default()
         });
         let handle = spawn_housekeeping(Arc::clone(&daemon), normalize_cfg, true);

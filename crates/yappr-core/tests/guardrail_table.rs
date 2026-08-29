@@ -1,4 +1,4 @@
-//! Table-driven fixtures for `owf_core::guardrail::evaluate`.
+//! Table-driven fixtures for `yappr_core::guardrail::evaluate`.
 //!
 //! Each row pins exactly one branch of the guardrail (accept, or one of the
 //! five `RejectReason` variants) against the default `GuardrailConfig`. The
@@ -10,9 +10,9 @@
 //! `src/guardrail.rs`, which also exercise `tokenize`/`overlap` directly as
 //! standalone helpers.
 
-use owf_core::config::GuardrailConfig;
-use owf_core::guardrail::{evaluate, RejectReason, Verdict};
-use owf_core::lang::Lang;
+use yappr_core::config::GuardrailConfig;
+use yappr_core::guardrail::{evaluate, RejectReason, Verdict};
+use yappr_core::lang::Lang;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Expect {

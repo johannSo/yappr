@@ -13,7 +13,7 @@
 //! Every other setting in this window is a key the daemon reads out of
 //! `Config` and validates with `#[serde(deny_unknown_fields)]`. Autostart
 //! doesn't fit that shape: the thing being toggled is *whether a file
-//! exists* (`owf_core::paths::autostart_desktop_file()`), and that file can
+//! exists* (`yappr_core::paths::autostart_desktop_file()`), and that file can
 //! be deleted or edited by something entirely outside this app -- the user
 //! clearing `~/.config/autostart/` by hand, a distro migration, another
 //! autostart manager. A `config.toml` key mirroring that ("autostart.enabled
@@ -46,7 +46,7 @@
 //!   genuinely different threads from the event loop, not just a different
 //!   `async` block on the same one. `Request::ListInputDevices` alone can
 //!   take `DEVICE_LIST_TIMEOUT` = 5 s enumerating ALSA/PipeWire devices
-//!   (`owf_core::server`), so these three are `async fn`. `dispatch` itself
+//!   (`yappr_core::server`), so these three are `async fn`. `dispatch` itself
 //!   is still a *blocking* call (mutex locks, a blocking device-enumeration
 //!   thread join, blocking file I/O for `SetConfig`/`GetConfig`), so `call`
 //!   below further hands it to `tauri::async_runtime::spawn_blocking` rather
@@ -66,8 +66,8 @@
 
 use std::sync::Arc;
 
-use owf_core::proto::{Request, Response};
-use owf_core::server::{dispatch, Daemon};
+use yappr_core::proto::{Request, Response};
+use yappr_core::server::{dispatch, Daemon};
 
 /// What `setup()` in `lib.rs` manages in both the normal and `--replay`
 /// branches, so a settings command's `tauri::State` extraction always
@@ -111,17 +111,17 @@ pub async fn list_input_devices(
 /// mirrors the minimal working shape already on this machine at
 /// `~/.config/autostart/Handy.desktop` (no `Hidden`, no `OnlyShowIn`/
 /// `NotShowIn`, which is what lets `xdg-autostart-generator` pick it up
-/// unconditionally). `Exec=openwhisprflow` names the binary bare, matching
-/// how `crates/owf-core/src/hypr.rs` invokes it in the Hyprland config it
-/// emits (`exec-once = openwhisprflow`) -- both rely on a `PATH` install
+/// unconditionally). `Exec=yappr` names the binary bare, matching
+/// how `crates/yappr-core/src/hypr.rs` invokes it in the Hyprland config it
+/// emits (`exec-once = yappr`) -- both rely on a `PATH` install
 /// rather than an absolute path baked in.
 const AUTOSTART_DESKTOP_ENTRY: &str = "\
 [Desktop Entry]
 Type=Application
 Version=1.0
-Name=OpenWhisprFlow
+Name=yappr
 Comment=Startet das Diktat-Overlay im Hintergrund
-Exec=openwhisprflow
+Exec=yappr
 StartupNotify=false
 Terminal=false
 ";
@@ -136,7 +136,7 @@ Terminal=false
 /// already off -- never fails.
 ///
 /// Takes `path` as a parameter rather than resolving
-/// `owf_core::paths::autostart_desktop_file()` itself, purely so this is
+/// `yappr_core::paths::autostart_desktop_file()` itself, purely so this is
 /// testable against a scratch directory: see this module's tests, none of
 /// which ever construct the real path. Only [`set_autostart`] below does.
 fn set_autostart_at(path: &std::path::Path, enabled: bool) -> std::io::Result<()> {
@@ -154,14 +154,14 @@ fn set_autostart_at(path: &std::path::Path, enabled: bool) -> std::io::Result<()
     }
 }
 
-/// Whether OpenWhisprFlow currently starts itself at login -- read straight
+/// Whether yappr currently starts itself at login -- read straight
 /// off the filesystem (see the module doc's "why not a config key"), so a
 /// file removed behind this app's back is reported truthfully instead of
 /// from stale state. A single `Path::exists()` stat; no `spawn_blocking`
 /// needed for that, unlike [`call`]'s `dispatch` or `list_input_devices`.
 #[tauri::command]
 pub fn autostart_status() -> serde_json::Value {
-    let enabled = owf_core::paths::autostart_desktop_file().exists();
+    let enabled = yappr_core::paths::autostart_desktop_file().exists();
     serde_json::json!({ "enabled": enabled })
 }
 
@@ -171,7 +171,7 @@ pub fn autostart_status() -> serde_json::Value {
 /// of work `settings_cmds.rs`'s module doc reserves `spawn_blocking` for.
 #[tauri::command]
 pub fn set_autostart(enabled: bool) -> Result<(), String> {
-    set_autostart_at(&owf_core::paths::autostart_desktop_file(), enabled).map_err(|e| {
+    set_autostart_at(&yappr_core::paths::autostart_desktop_file(), enabled).map_err(|e| {
         format!("Autostart-Eintrag konnte nicht geschrieben werden: {e}")
     })
 }
@@ -207,11 +207,11 @@ fn to_json(resp: Response) -> Result<serde_json::Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use owf_core::proto::State as WireState;
+    use yappr_core::proto::State as WireState;
 
     /// A fresh, collision-free scratch directory for a single test. Not a
     /// dependency: `tempfile` isn't in `[dev-dependencies]` here either (see
-    /// the identical helper in `owf-core`'s `inject.rs` and `owf-cli`'s --
+    /// the identical helper in `yappr-core`'s `inject.rs` and `owf-cli`'s --
     /// now this crate's -- `setup.rs` tests). Load-bearing for this file in
     /// particular: this is what keeps every autostart test off the real
     /// `~/.config/autostart/`, which on this machine holds five files this
@@ -221,7 +221,7 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("owf-settings-cmds-test-{tag}-{}-{n}", std::process::id()))
+        std::env::temp_dir().join(format!("yappr-settings-cmds-test-{tag}-{}-{n}", std::process::id()))
     }
 
     /// Writing the file is what enables autostart; removing it is what
@@ -233,12 +233,12 @@ mod tests {
     #[test]
     fn the_autostart_desktop_file_is_written_and_removed_idempotently() {
         let dir = scratch_dir("autostart");
-        let p = dir.join("openwhisprflow.desktop");
+        let p = dir.join("yappr.desktop");
 
         set_autostart_at(&p, true).unwrap();
         set_autostart_at(&p, true).unwrap();
         assert!(p.exists());
-        assert!(std::fs::read_to_string(&p).unwrap().contains("Exec=openwhisprflow"));
+        assert!(std::fs::read_to_string(&p).unwrap().contains("Exec=yappr"));
 
         set_autostart_at(&p, false).unwrap();
         set_autostart_at(&p, false).unwrap();
@@ -254,7 +254,7 @@ mod tests {
     #[test]
     fn disabling_autostart_when_nothing_was_ever_enabled_is_not_an_error() {
         let dir = scratch_dir("autostart-never-enabled");
-        let p = dir.join("openwhisprflow.desktop");
+        let p = dir.join("yappr.desktop");
         assert!(!dir.exists());
 
         set_autostart_at(&p, false).unwrap();
@@ -270,13 +270,13 @@ mod tests {
     #[test]
     fn the_written_entry_has_the_shape_xdg_autostart_generator_requires() {
         let dir = scratch_dir("autostart-shape");
-        let p = dir.join("openwhisprflow.desktop");
+        let p = dir.join("yappr.desktop");
 
         set_autostart_at(&p, true).unwrap();
         let content = std::fs::read_to_string(&p).unwrap();
         assert!(content.starts_with("[Desktop Entry]"));
         assert!(content.contains("Type=Application"));
-        assert!(content.contains("Exec=openwhisprflow"));
+        assert!(content.contains("Exec=yappr"));
         assert!(!content.contains("Hidden"));
         assert!(!content.contains("OnlyShowIn"));
         assert!(!content.contains("NotShowIn"));

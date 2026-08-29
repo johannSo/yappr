@@ -124,7 +124,7 @@ export const LABELS: Record<string, string> = {
   "overlay.height": "Höhe",
   // Not a `config.toml` key — see `Settings.tsx`'s `AutostartCard` and
   // `settings_cmds.rs`'s module doc for why this is filesystem state
-  // (`~/.config/autostart/openwhisprflow.desktop` existing or not) rather
+  // (`~/.config/autostart/yappr.desktop` existing or not) rather
   // than a section here. The path `"autostart.enabled"` exists only so this
   // row can borrow the same `LABELS`/`HELP` lookup every config row uses.
   "autostart.enabled": "Beim Anmelden starten",
@@ -217,7 +217,7 @@ export const HELP: Record<string, string> = {
   "overlay.width": "Wird eingelesen, steuert aber nichts.",
   "overlay.height": "Wird eingelesen, steuert aber nichts.",
   "autostart.enabled":
-    "Legt ~/.config/autostart/openwhisprflow.desktop an; systemd startet OpenWhisprFlow davon bei der nächsten Anmeldung automatisch. Aus heißt: die Datei existiert nicht, und nichts startet von selbst.",
+    "Legt ~/.config/autostart/yappr.desktop an; systemd startet yappr davon bei der nächsten Anmeldung automatisch. Aus heißt: die Datei existiert nicht, und nichts startet von selbst.",
 };
 
 export const ENUMS: Record<string, string[]> = {

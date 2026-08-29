@@ -449,7 +449,7 @@ fn d_debug_enabled() -> bool {
     false
 }
 fn d_debug_dir() -> String {
-    "~/owf".into()
+    "~/yappr".into()
 }
 
 impl Default for DebugConfig {
@@ -618,7 +618,7 @@ impl Config {
     }
 }
 
-pub const DEFAULT_CONFIG_TOML: &str = r#"# OpenWhisprFlow configuration
+pub const DEFAULT_CONFIG_TOML: &str = r#"# yappr configuration
 
 [audio]
 device = "default"
@@ -702,7 +702,7 @@ min_term_chars = 5       # shorter terms are matched exactly only
 # mirrored to `<dir>/logs/daemon.log`. Off by default -- nothing here is on
 # the critical path when disabled.
 enabled = false
-dir = "~/owf"
+dir = "~/yappr"
 save_audio = true    # only meaningful when enabled = true
 "#;
 
@@ -735,7 +735,7 @@ mod tests {
         assert_eq!(c.style_default.structure, Structure::Prose);
         assert_eq!(c.style_default.context, Context::General);
         assert!(!c.debug.enabled);
-        assert_eq!(c.debug.dir, "~/owf");
+        assert_eq!(c.debug.dir, "~/yappr");
         assert!(c.debug.save_audio);
     }
 

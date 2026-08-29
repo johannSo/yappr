@@ -276,40 +276,25 @@ body::before {
   color: var(--muted);
 }
 
-/* The overlay's level meter, frozen. Those bars are the one mark this app
-   already has; sampling the focus gradient across them ties the identity and
-   the accent together instead of introducing a second idea. */
+/* The app icon, at rail scale. The source is a 500px plate inset in a
+   transparent canvas (~11% margin a side), so the box is set larger than the
+   mark should read and the padding is absorbed rather than trimmed. On the
+   light rail it is a near-white plate on a near-white frost: the drop-shadow
+   -- which follows the plate's alpha, unlike a box-shadow, which would trace
+   the square img box around it -- is what keeps its edge. */
 .brand__mark {
-  display: inline-flex;
-  align-items: flex-end;
-  gap: 0.125rem;
-  height: 0.875rem;
+  width: 1.5rem;
+  height: 1.5rem;
   flex: none;
+  filter: drop-shadow(0 1px 1.5px rgb(0 0 0 / 0.22));
 }
 
-.brand__mark i {
-  width: 0.125rem;
-  border-radius: 1px;
-  background: var(--accent-fill);
-}
-
-.brand__mark i:nth-child(1) {
-  height: 35%;
-}
-
-.brand__mark i:nth-child(2) {
-  height: 100%;
-  background: #1ad6c4;
-}
-
-.brand__mark i:nth-child(3) {
-  height: 60%;
-  background: var(--accent-2);
-}
-
-.brand__mark i:nth-child(4) {
-  height: 22%;
-  background: var(--accent-2);
+@media (prefers-color-scheme: dark) {
+  /* On the dark rail the plate carries its own edge; a shadow under a bright
+     tile only muddies it. */
+  .brand__mark {
+    filter: none;
+  }
 }
 
 .brand__text {
