@@ -257,8 +257,10 @@ pub struct Daemon {
     /// When the daemon was last doing something dictation-shaped: bumped by
     /// `start_recording` (via `touch_activity`) and by every utterance that
     /// ends (`IdleOnExit`). The idle-unload deadline is measured from this --
-    /// nothing reads it yet, that lands with the idle-unload timer in a
-    /// later task, but both places that must bump it do so already.
+    /// read by `unload_models` (via `should_unload`), and re-read under
+    /// `load_lock` there specifically so a press landing after the
+    /// housekeeping thread's decision but before it takes the lock can still
+    /// change the answer.
     last_activity: Mutex<Instant>,
     /// `[models]`, mirrored here so a Settings change takes effect without a
     /// restart -- the same reason, and the same shape, as `audio_cfg`.
@@ -447,6 +449,36 @@ impl Daemon {
         Broadcaster { subscribers: &self.subscribers, sink: Arc::clone(&self.sink) }
     }
 
+    /// Whether a subscriber connecting *right now* should be told
+    /// normalization is degraded -- the connect-time counterpart of the live
+    /// `NormalizeDegraded`/`NormalizeRecovered` broadcasts `supervise_llama_once`
+    /// sends on a transition.
+    ///
+    /// Requires model residency, not just `!normalize_available`: before lazy
+    /// loading, `normalize_enabled && !normalize_available` alone was a
+    /// reliable fault signal, because a resident daemon only ever reached
+    /// that combination by a real, unhealthy `llama-server`. Lazy unloading
+    /// (this task) makes `!normalize_available` the *steady state between
+    /// dictations* too -- `unload_models` clears it on every unload, with no
+    /// fault involved -- so a subscriber connecting while idle-unloaded would
+    /// otherwise be told about a fault that isn't happening: there is no
+    /// `llama-server` to be down while nothing is loaded. Gating on
+    /// `models_loaded` restores the original meaning: a genuinely broken
+    /// `llama-server` still raises this the moment models are next loaded
+    /// (`ensure_models_loaded_with`'s own `normalize_available` write runs
+    /// before `models_loaded`'s, so the two are never observed out of step --
+    /// see `unload_models`'s doc comment for the other half of that
+    /// argument).
+    ///
+    /// Called from both `connect_snapshot` and `serve_subscriber` so they
+    /// can never diverge on this question again -- see `connect_snapshot`'s
+    /// own doc comment on why the two must "mirror" each other.
+    fn normalize_degraded(&self) -> bool {
+        self.normalize_enabled
+            && self.models_loaded.load(Ordering::SeqCst)
+            && !self.normalize_available.load(Ordering::SeqCst)
+    }
+
     /// The events an in-process consumer must see right now, as though it
     /// had just connected -- mirrors what `serve_subscriber` sends a
     /// freshly connected socket subscriber, via the same [`connect_events`].
@@ -469,7 +501,7 @@ impl Daemon {
     /// thread could otherwise outrun that listener's registration.
     pub fn connect_snapshot(&self) -> Vec<OverlayEvent> {
         let state_now = self.state.load(Ordering::SeqCst);
-        let degraded = self.normalize_enabled && !self.normalize_available.load(Ordering::SeqCst);
+        let degraded = self.normalize_degraded();
         let fatal_error =
             if state_now == FAILED { lock_ignoring_poison(&self.fatal_error).clone() } else { None };
         connect_events(state_now, degraded, fatal_error)
@@ -1583,10 +1615,7 @@ fn serve_subscriber(daemon: Arc<Daemon>, stream: UnixStream) {
     let (state_now, degraded) = {
         let mut subs = lock_ignoring_poison(&daemon.subscribers);
         register_subscriber(&mut subs, tx, alive);
-        (
-            daemon.state.load(Ordering::SeqCst),
-            daemon.normalize_enabled && !daemon.normalize_available.load(Ordering::SeqCst),
-        )
+        (daemon.state.load(Ordering::SeqCst), daemon.normalize_degraded())
     };
 
     let fatal_error =
@@ -3584,10 +3613,16 @@ mod tests {
         let listener = UnixListener::bind(&sock_path).unwrap();
 
         // `normalize_available` defaults to `false` in `fake_daemon_with_normalize`
-        // -- combined with `normalize_enabled: true`, this is exactly
-        // "normalization is turned on but currently down", the condition
-        // `serve_subscriber` checks to decide whether to replay the badge.
+        // -- combined with `normalize_enabled: true` and `models_loaded: true`
+        // (models are resident; the child just isn't healthy), this is
+        // exactly "normalization is turned on but currently down", the
+        // condition `serve_subscriber`/`normalize_degraded` check to decide
+        // whether to replay the badge. Without `models_loaded: true` this
+        // would instead be the ordinary idle-unloaded steady state, which
+        // must NOT replay the badge -- see
+        // `connect_snapshot_omits_the_degraded_badge_while_models_are_unloaded`.
         let daemon = fake_daemon_with_normalize(IDLE, true);
+        daemon.models_loaded.store(true, Ordering::SeqCst);
 
         let accept_daemon = Arc::clone(&daemon);
         let accept_listener = listener.try_clone().unwrap();
@@ -3626,15 +3661,18 @@ mod tests {
 
     /// `connect_snapshot` is the in-process mirror of what `serve_subscriber`
     /// sends a freshly connected socket subscriber (proven over a real
-    /// socket by the two `a_late_subscriber_*` tests above) -- this proves
+    /// socket by the `a_late_subscriber_*` tests above) -- this proves
     /// the two agree directly, via the public entry point the app's
     /// `overlay_ready` Tauri command actually calls, covering both the
     /// degraded badge and the stored fatal-failure reason.
     #[test]
     fn connect_snapshot_mirrors_what_a_freshly_connected_subscriber_would_see() {
         // Same precondition `a_late_subscriber_sees_the_degraded_badge_replayed_on_connect`
-        // relies on: `normalize_available` defaults to `false`.
+        // relies on: `normalize_available` defaults to `false`, and
+        // `models_loaded` is set explicitly so this models a real fault
+        // (resident but unhealthy), not the ordinary idle-unloaded state.
         let daemon = fake_daemon_with_normalize(IDLE, true);
+        daemon.models_loaded.store(true, Ordering::SeqCst);
         assert_eq!(
             daemon.connect_snapshot(),
             vec![
@@ -3648,6 +3686,26 @@ mod tests {
         assert_eq!(
             failed.connect_snapshot(),
             vec![OverlayEvent::Error { reason: "no ggml compute backend".to_string() }]
+        );
+    }
+
+    /// Finding 2 of the Task 5 review: `normalize_enabled && !normalize_available`
+    /// alone used to be treated as a fault, but lazy unloading makes
+    /// `!normalize_available` the ordinary state between dictations too
+    /// (`unload_models` clears it on every unload). A subscriber connecting
+    /// while idle-unloaded must not be told normalization is degraded --
+    /// there is no `llama-server` to be down while nothing is loaded.
+    #[test]
+    fn connect_snapshot_omits_the_degraded_badge_while_models_are_unloaded() {
+        let daemon = fake_daemon_with_normalize(IDLE, true);
+        // `models_loaded` defaults to `false` here -- the idle-unloaded (or
+        // never-yet-loaded) steady state -- and `normalize_available` also
+        // defaults to `false`, the exact combination that used to be
+        // mistaken for a fault.
+        assert_eq!(
+            daemon.connect_snapshot(),
+            vec![OverlayEvent::Idle],
+            "the degraded badge must not be replayed while models are unloaded"
         );
     }
 
@@ -4824,13 +4882,74 @@ mod tests {
     fn unloading_declines_when_a_recording_started_after_the_decision() {
         // The race `unload_models`' re-check under `load_lock` exists to close:
         // the housekeeping thread decided to unload, then a press moved the
-        // deadline before it got the lock.
+        // deadline before it got the lock. `last_activity` is set stale
+        // *first*, so `touch_activity`'s refresh is load-bearing: `fake_daemon`
+        // already starts `last_activity` fresh (`Instant::now()`), so without
+        // this the deadline would already have been fresh regardless of
+        // whether `touch_activity` ran at all.
         let daemon = fake_daemon(IDLE);
         let mut load = counting_loader(Arc::new(AtomicU64::new(0)));
         ensure_models_loaded_with(&daemon, &mut load).unwrap();
-        touch_activity(&daemon); // the press lands
+        *lock_ignoring_poison(&daemon.last_activity) = Instant::now() - Duration::from_secs(3600);
+        touch_activity(&daemon); // the press lands, moving the deadline
 
         assert!(!unload_models(&daemon), "unloaded despite a fresh deadline");
+        assert!(daemon.models_loaded.load(Ordering::SeqCst));
+        assert!(lock_ignoring_poison(&daemon.pipeline).is_some());
+    }
+
+    /// The only construction that actually distinguishes "re-check the
+    /// deadline after taking `load_lock`" from "read it, then take the lock":
+    /// a hoisted re-check would read the stale deadline *before* blocking on
+    /// the lock and decide `true`, then perform the teardown unconditionally
+    /// once the lock is free. Holding `load_lock` on this thread and moving
+    /// the deadline while a second thread's `unload_models` call is blocked
+    /// waiting for it is what forces the two placements to disagree -- the
+    /// seven tests above this one all pass identically under either
+    /// placement, which is exactly what this one exists to catch.
+    ///
+    /// `recv_timeout`, never a bare `recv`/`join`: if the re-check ever
+    /// regresses to reading before the lock (or deadlocks some other way),
+    /// this must fail, not hang the whole suite -- same discipline as
+    /// `status_answers_promptly_while_an_utterance_holds_the_pipeline_lock`.
+    #[test]
+    fn unload_re_checks_the_deadline_after_taking_the_lock_not_before() {
+        let daemon = fake_daemon(IDLE);
+        *lock_ignoring_poison(&daemon.pipeline) = Some(stub_pipeline());
+        daemon.models_loaded.store(true, Ordering::SeqCst);
+        *lock_ignoring_poison(&daemon.last_activity) = Instant::now() - Duration::from_secs(3600);
+
+        let held = lock_ignoring_poison(&daemon.load_lock);
+
+        let d = Arc::clone(&daemon);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(unload_models(&d));
+        });
+
+        // Give the spawned thread time to actually run before the press
+        // lands: `std::thread::spawn` returning is no guarantee the new
+        // thread has been scheduled yet, and without this a hoisted, pre-lock
+        // re-check could just as easily run *after* `touch_activity` below by
+        // scheduling accident, which would pass this test either way and
+        // prove nothing (100ms is the same margin
+        // `wait_for_busy_to_clear_then_shutdown_with`'s own test above uses
+        // for the identical "let the other thread get going" purpose).
+        // Correct code is genuinely blocked on `load_lock` for the whole of
+        // this sleep, so it never races; only the hoisted version is timing-
+        // sensitive, and this sleep is what pins it deterministically.
+        std::thread::sleep(Duration::from_millis(100));
+
+        // The press lands here, while the spawned thread is blocked
+        // acquiring `load_lock` -- a hoisted, pre-lock re-check would have
+        // already read the stale deadline by now and missed this entirely.
+        touch_activity(&daemon);
+        drop(held);
+
+        let unloaded = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("unload_models did not return promptly -- deadlock in the re-check?");
+        assert!(!unloaded, "unload_models acted on the deadline as it stood before the lock, not after");
         assert!(daemon.models_loaded.load(Ordering::SeqCst));
         assert!(lock_ignoring_poison(&daemon.pipeline).is_some());
     }
