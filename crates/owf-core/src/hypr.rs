@@ -229,7 +229,12 @@ fn parse_class(json: &str) -> Option<String> {
 /// The class of the currently focused window, or `None` when Hyprland is
 /// unavailable or nothing is focused.
 ///
-/// Called at ptt-start, off the latency-critical path.
+/// Called from `start_recording` (`server.rs`) when a recording begins, off
+/// the latency-critical path. `Request::PttStart` still exists internally
+/// and is still what triggers this call -- but there is no longer an
+/// `owf-ctl ptt-start` route that sends it directly: `Request::Toggle`
+/// resolves to it when the daemon is `IDLE` (see spec §2, "Toggle
+/// semantics"), which is the only way a user-facing action reaches here now.
 pub fn active_window_class() -> Option<String> {
     let mut cmd = Command::new("hyprctl");
     cmd.args(["-j", "activewindow"]);
@@ -303,6 +308,35 @@ mod tests {
             assert!(config.contains("openwhisprflow --toggle"));
             assert!(config.contains("openwhisprflow --cancel"));
         }
+    }
+
+    /// Spec §10: this breaks in the worst way available -- a shortcut that
+    /// silently does nothing. So the emitted block leads with what to
+    /// delete, before it says what to add.
+    ///
+    /// Tested against both format constants directly rather than through
+    /// `shortcut_config()`: which one that returns depends on whether
+    /// *this* machine has `~/.config/hypr/hyprland.lua` (see
+    /// `lua_is_selected_only_when_hyprland_lua_is_present` below), and the
+    /// Lua constant never mentions `bindr` at all -- only the classic
+    /// format's migration comment does, since `bindr` is that format's own
+    /// spelling for hold-to-talk's release-edge bind. A test that called
+    /// `shortcut_config()` would therefore pass or fail depending on which
+    /// config format happens to be installed on whoever runs the suite,
+    /// which is exactly the kind of environment-dependent test this
+    /// project's own test discipline (full-sentence names, no hidden
+    /// coupling to the runner's machine) exists to avoid.
+    #[test]
+    fn the_emitted_block_names_the_lines_to_delete_before_the_ones_to_add() {
+        for config in [SHORTCUT_CONFIG_LUA, SHORTCUT_CONFIG_CONF] {
+            let delete_at = config.find("owf-ctl").expect("must name the old command");
+            let add_at = config.find("--toggle").expect("must name the new one");
+            assert!(delete_at < add_at, "must name what to delete before what to add");
+        }
+        assert!(
+            SHORTCUT_CONFIG_CONF.contains("bindr"),
+            "the bindr line has no replacement and must be named"
+        );
     }
 
     #[test]

@@ -1,169 +1,156 @@
-# Good morning — overnight handover
+# Handover — the one-process rewrite
 
-**Everything is built, merged to `main`, installed, and running.** 224 tests, clippy clean.
-Nothing touched your microphone, your Hyprland config, or your system settings.
+**This replaces the previous `HANDOVER.md`**, which was a letter about a single night's
+work on the old three-process architecture (the capture-rate bug, the M2 overlay). That
+system no longer exists in this repo, so that letter stopped being true days ago. This one
+describes what 17 tasks changed, what's verified, and — the part that matters most, since
+there is exactly one user — exactly what to do on *this* machine to cut over.
 
-Two safety tags exist: `known-good-m1` (where you went to bed) and `known-good-m2` (now).
-`git reset --hard known-good-m1` undoes the entire night.
+**Nothing has touched your running system.** No task in this effort started the new app,
+bound the runtime socket, removed a runtime file, registered a tray item, opened the
+microphone, or edited anything under `~/.config/hypr/`. Everything below is either a test
+result, a `--replay` run, or a description of files this session only *read*.
 
----
+## The state of this exact machine, right now
 
-## Do this first (2 minutes)
+Two old-architecture processes are still running, from before this rewrite:
 
-The daemon is already running on the new build. To get the **overlay** and the fixed
-keybindings, add the emitted config:
+- `owf-ctl daemon` (PID varies — `pgrep -fa 'owf-ctl daemon'`) — the old two-binary daemon.
+- `openwhisprflow` (PID varies — `pgrep -fa '/openwhisprflow$'`) — the old, overlay-only M2
+  build. Both were started by `~/.config/hypr/autostart.lua`'s two `o.launch_on_start` lines
+  at your last login, and both are the *old* code — this session has not rebuilt or
+  restarted them.
 
-```bash
-owf-ctl setup --print-hypr
-```
+`~/.config/hypr/bindings.lua`, `autostart.lua`, and `windows.lua` on this machine still
+have the exact old-architecture lines the design doc describes as the worst-case migration
+target: `owf-ctl ptt-start`/`ptt-stop`/`cancel` bindings, two `launch_on_start` lines, and a
+class-matched `o.window("openwhisprflow", {...})` rule. This isn't a hypothetical example —
+it's what's actually on disk here, read (not edited) for this handover.
 
-It prints three blocks — bindings, autostart, and window rules. Paste them into
-`~/.config/hypr/bindings.lua`, `autostart.lua`, and `windows.lua` respectively, then:
+An AppImage was built and smoke-tested earlier in this effort:
+`~/Downloads/openwhisprflow_0.1.0_amd64.AppImage` (114 MB). It answered `--status` correctly
+against the *old* running daemon, which only proves the new binary's client fast path speaks
+the same wire protocol — it has not been run as the app itself, and this session did not
+re-touch it.
 
-```bash
-hyprctl reload && hyprctl configerrors
-```
+## Do this first — cutting over
 
-**I deliberately did not apply these myself.** A bad window rule on an unattended machine
-is exactly the damage you told me to avoid. Your `bindings.lua` and `autostart.lua`
-already have the dictation keybinds from yesterday; the **window rules block is new** and
-is what places the overlay bottom-centre and keeps it unfocused.
+1. **Stop the old processes.**
+   ```bash
+   pkill -f 'owf-ctl daemon'
+   pkill -f '/openwhisprflow$'
+   ```
+   The old daemon's `llama-server` child should exit with it (see CLAUDE.md invariant
+   6-adjacent supervision code); check `pgrep llama-server` afterward and kill it directly
+   if it didn't.
 
-Then start the overlay (or log out and back in, since it now autostarts):
+2. **Install the new build.** Either run the AppImage above, or build from source —
+   `README.md`'s Install section, which now needs only `cargo build --release -p
+   openwhisprflow --features custom-protocol` plus `install`. Then delete every binary
+   that no longer exists:
+   ```bash
+   rm -f ~/.local/bin/owf-ctl ~/.local/bin/owf-daemon ~/.local/bin/owf-bench \
+         ~/.local/bin/openwhisprflow-settings
+   ```
 
-```bash
-openwhisprflow &
-```
+3. **Edit your three Hyprland files** (this session did not do this for you — see the
+   standing rule about never touching your compositor config):
+   - `bindings.lua`: delete the three `o.bind` lines calling `owf-ctl ptt-start` /
+     `ptt-stop` / `cancel`. Add the two lines `openwhisprflow --print-shortcuts` prints.
+   - `autostart.lua`: delete both `o.launch_on_start` lines. There is no replacement line —
+     autostart is now the Settings window's "Beim Anmelden starten" toggle (step 5).
+   - `windows.lua`: delete the `o.window("openwhisprflow", {...})` block. On Hyprland you
+     do not need to paste a replacement — the overlay now positions and unfocuses itself
+     via `wlr-layer-shell`. (If you'd rather have the belt-and-braces fallback rule too,
+     `--print-shortcuts` prints a title-matched one; it's harmless either way.)
 
-Hold **SUPER+D**, speak, release. **SUPER+ALT+D** cancels.
+   `openwhisprflow --print-shortcuts`'s output leads with exactly what to delete, in that
+   order, before what to add — this is tested (`hypr.rs`'s
+   `the_emitted_block_names_the_lines_to_delete_before_the_ones_to_add`).
 
----
+4. **Reload and check:**
+   ```bash
+   hyprctl reload && hyprctl configerrors
+   ```
 
-## The thing you actually care about: why you got single words
+5. **Launch the app** (from an app launcher, if you added the `.desktop` entry from
+   `README.md`, or `openwhisprflow &`). You should see a tray icon and no window. Left-click
+   it — Settings should open. Since the models are already downloaded from before, the
+   Setup pane should not appear; if it does, something about the on-disk models changed and
+   it will say what.
 
-**I could not diagnose this.** It needs you to speak, and I was not willing to record
-audio in your room while you were asleep. What I did instead was build the instrument
-that will answer it in one shot.
+6. **Turn on "Beim Anmelden starten"** in Settings if you want the old autostart behaviour
+   back — it now writes `~/.config/autostart/openwhisprflow.desktop` instead of a Hyprland
+   line.
 
-Debug capture is **already enabled** in your config. Dictate one full sentence, then:
+7. **Press `SUPER+D`.** This is press-to-start, press-to-stop now, not hold-to-talk: press
+   once to start recording, speak, press again to stop and transcribe. `SUPER+ALT+D`
+   cancels. Nothing ends a recording on its own except `audio.max_seconds` (120 s default)
+   if you forget the second press — see CLAUDE.md invariant 11.
 
-```bash
-owf-ctl debug
-```
-
-The number that matters is **captured vs expected samples**. Hold the key 5 seconds at
-48 kHz stereo and the audio callback should deliver ~480,000 samples.
-
-- **ratio ≈ 1.0** → capture is fine, and the problem is downstream (VAD over-trimming, or
-  ASR itself). Compare `~/owf/audio/<ts>-raw.wav` against `<ts>-trimmed.wav` — the first
-  is what your mic gave us, the second is what Parakeet actually received.
-- **ratio well below 1.0** → ALSA is dropping your audio, which fully explains single
-  words. `stream_errors` in the same record counts the `Xrun`s.
-
-Both numbers come from genuinely independent sources (an atomic fed by the audio callback
-vs. monotonic wall-clock on another thread), so the ratio can't lie by construction. A
-reviewer verified that specifically, because a self-referential ratio would have read 1.0
-always and sent us after the wrong component.
-
-Everything lands in `~/owf/`: `logs/<ts>.json` per utterance, `logs/daemon.log`,
-`audio/*.wav`.
-
----
-
-## What changed overnight
+## What changed
 
 | | |
 |---|---|
-| **Capture-rate bug fixed** | Your mic was unusable. We asked for 16 kHz because cpal *advertised* a range containing it; real ALSA hardware rejected the stream build. PipeWire had been hiding this by resampling silently. The resampler this project carries for exactly that case was unreachable code. Now it probes by building a throwaway stream and falls back to 48 kHz + resampling. |
-| **Debug capture** | Per-utterance WAVs + JSON records + daemon log under `~/owf/`. |
-| **Overlay** | Tauri window, spec §12's eight states, live waveform bars, 280×72, bottom-centre, never focused. |
-| **State broadcast** | The daemon publishes `OverlayEvent`s over its socket. `Normalizing` and `Injecting` are now real states — previously everything after key-release collapsed into "transcribing". |
-| **`llama-server` supervision** | 10 s health poll, backoff restart 1→30 s, zombie reaping. |
-| **`status` stopped lying** | Now reports `normalize_available`. |
-| **`--purge-logs`, `last_ms`, `[overlay]` config** | Small spec gaps closed. |
-
-### Your `llama-server` died while you slept
-
-Around 02:00 it became a zombie, `/health` served nothing, and the daemon went right on
-reporting `"warm":true`. You'd have woken, dictated, and gotten raw unpunctuated text with
-no explanation. I restarted it, and that incident is why supervision jumped the queue —
-it was on the list as a theoretical spec gap and became a real one.
-
----
+| **Process topology** | Three processes (daemon, overlay, settings) become one binary, `openwhisprflow`, hosting the pipeline, socket, tray, overlay, and settings window in a single process. `crates/owf-cli` and `settings-tauri` are deleted. |
+| **Dictation gesture** | Hold-to-talk (`ptt-start`/`ptt-stop` on press/release) becomes press-to-start/press-to-stop (`--toggle`, resolved against the server's current state). `--cancel` is unchanged as a separate shortcut. |
+| **The tray** | New. A native StatusNotifierItem (`ksni`, not Tauri's own tray feature — appindicator-only hosts don't send click events). Left-click opens Settings; right-click gives Status / Einstellungen / Diktat pausieren / Beenden. |
+| **Pausing** | New. `PAUSED` is a real state; `--toggle` is refused and no microphone opens while paused. Never interrupts an utterance already in flight. |
+| **First run** | `owf-ctl setup` is gone. A Setup pane in the Settings window now provisions models and checks prerequisites (same checks, driven from the GUI). |
+| **Autostart** | An XDG `.desktop` entry written by a Settings toggle, not a Hyprland `exec-once` line. No systemd unit is authored by this project. |
+| **The overlay** | Self-anchors bottom-centre and refuses focus at the protocol level via `wlr-layer-shell`, on Hyprland and other wlroots compositors — no window rule needed there. Falls back to an unpositioned toplevel plus an emitted, **title**-matched (not class-matched) window rule on GNOME/Mutter. |
+| **The settings window** | Still a second window, now of the *same* Tauri app rather than a second Tauri app — its GUI code (`src/settings/`, `Settings.tsx`) is unchanged; only the transport under it changed from a socket to direct Tauri commands. |
+| **`OverlayEvent`** | Down to two hand-maintained copies (`owf-core/src/proto.rs`, `src/Overlay.tsx`) from three — `src-tauri/src/wire.rs` is gone now that the overlay links `owf-core` directly. |
 
 ## What I verified myself
 
-- Overlay window appears at **exactly 280×72**, floating (`hyprctl clients`).
-- **Focus stayed on `kitty` through a full replay cycle** — the overlay does not steal it.
-  This is the invariant the product depends on: a focused overlay means `wtype` types your
-  dictation *into the overlay* instead of your editor.
-- Daemon reaches `idle`/`warm` in ~6 s with `llama-server` healthy.
-- `SIGTERM` reaps everything cleanly — no orphaned 600 MB model, no stale socket, and an
-  immediate restart works.
-- All eight overlay states render (headless renders of the shipped CSS, since your display
-  was blanked — an agent tried to wake it for real screenshots and was correctly blocked).
+- `cargo test --workspace`: **371 passed, 0 failed, 4 ignored** (the pre-existing 370, plus
+  one new test this task added — see below). `cargo clippy --workspace --all-targets`:
+  clean.
+- The exact migration lines this machine needs, by reading its actual
+  `~/.config/hypr/{bindings,autostart,windows}.lua` side by side with
+  `shortcut_config()`'s output — not from the spec's example or from memory.
+- That `shortcut_config()`'s emitted text genuinely leads with what to delete before what
+  to add, and that the classic `.conf` format still names the `bindr` line that has no
+  replacement — added a test for this (`hypr.rs`'s
+  `the_emitted_block_names_the_lines_to_delete_before_the_ones_to_add`) after confirming,
+  by actually running it, that the brief's own suggested version (calling `shortcut_config()`
+  rather than the two format constants directly) fails on this very machine — it has
+  `hyprland.lua`, so `shortcut_config()` returns the Lua variant, and the Lua text never
+  contains the string `"bindr"` (only the *classic* format's migration comment does, since
+  `bindr` is that format's own name for the bind pair's release edge). Fixed by testing both
+  constants directly instead of the machine-dependent dispatcher.
+- That the two new environment gotchas below (`gtk-layer-shell` at build time, the AppImage
+  `gdk-pixbuf` `.pc` issue) are accurately described, by reading the code and the earlier
+  tasks' own reports of hitting them live on this machine. I did not re-trigger either
+  myself — see below.
 
-## What I could NOT verify
+## What I could NOT verify (and why)
 
-**Nobody has spoken into this system since yesterday.** That means:
+- **Real dictation, end to end.** Still never done by a human on this project. Unchanged by
+  this rewrite, and I did not open a microphone to test it — forbidden by this project's
+  standing rule, independent of this task.
+- **Whether left-click on the tray actually sends `Activate` on this machine's tray host.**
+  The code handles both answers (if it doesn't, Einstellungen is the context menu's first,
+  actionable item), but nobody has clicked the tray icon of the *new*, one-process build —
+  doing that myself would mean starting a second instance while the old one still owns the
+  socket and tray slot, which is exactly what this task's constraints forbid.
+- **Whether `wlr-layer-shell` actually anchors the overlay bottom-centre with no window rule,
+  live, on this Hyprland session.** Same reason: starting the app was off-limits here.
+- **Whether the AppImage at `~/Downloads/openwhisprflow_0.1.0_amd64.AppImage` still runs
+  correctly today.** It was smoke-tested via `--status` (against the old daemon) when it was
+  built; I did not re-run it for this task.
+- **Whether the emitted shortcut block, actually pasted into this machine's real config,
+  reloads clean under `hyprctl configerrors`.** I compared the emitted text against the
+  machine's current config by reading both; pasting and reloading edits your live compositor
+  config, which no task in this project may do without you doing it yourself.
 
-- Whether the single-word bug is fixed or even changed.
-- Whether the 48 kHz → 16 kHz resample path produces usable audio. It had never run on
-  real audio until yesterday evening.
-- Whether text lands correctly in Firefox, Electron apps, or XWayland windows (`wtype` is
-  known to fail on XWayland; you should get a "copied to clipboard" notification rather
-  than silence — if text vanishes with no notification, that's a bug I want to hear about).
-- Whether the overlay's timing *feels* right in real use.
-- The `.conf`-format window rules — verified against published configs on GitHub, not this
-  machine, because your setup is Lua-only. The Lua block got the strong verification.
+## Judgement calls
 
----
-
-## Morning checklist
-
-- [ ] Apply the window rules, `hyprctl reload && hyprctl configerrors`
-- [ ] Dictate one full sentence into a terminal → text appears
-- [ ] `owf-ctl debug` → check the captured/expected ratio
-- [ ] Watch the overlay: does it show recording bars, then "transcribing", then "cleaning",
-      then flash what it typed?
-- [ ] Dictate into Firefox
-- [ ] Dictate into an XWayland window (`xterm`) — expect text *or* a clipboard notification
-- [ ] Say two words ("yes ok") — below 4 words the guardrail is off by design
-- [ ] Dictate a phone number as digits — known limitation, falls back to raw ASR
-- [ ] Dictate in German — Parakeet handles it; S1-mini is English-only so expect fallback
-
----
-
-## Known limitations (documented, not bugs)
-
-- **Below 4 words the guardrail is effectively off.** A meaning inversion could be typed
-  verbatim. This is intrinsic: the legitimate case ("k thx" → "Okay, thanks!") also has
-  zero token overlap, so bag-of-words can't separate good from bad at that length.
-- **Dense digit sequences** (a phone number as separate digits) compress word count past
-  the guardrail floor and fall back to raw ASR. Pinned by a named test.
-- **Guardrail thresholds are still guesses.** They get tuned against real rejection data —
-  which `~/owf/` and `rejections.jsonl` now collect.
-- **`owf-ctl reload` refuses to change `normalize.enabled`** — restart instead. Rebuilding
-  live would freeze the daemon for up to 120 s of model cold-start.
-- **`owf-ctl` is a 39.5 MB binary** because it links ONNX Runtime. It starts in 2.1–2.3 ms
-  against a 10 ms budget, so it's deferred — but if the keybind ever feels laggy, that's
-  the first thing to fix.
-
----
-
-## Judgement calls I made without you
-
-Full reasoning is in `.superpowers/sdd/*/progress.md`. The ones worth knowing:
-
-1. **Didn't apply your window rules.** Emitted them instead. A bad rule while you're away
-   is exactly the "don't destroy anything" case.
-2. **Refused to record audio**, including for testing. Every agent got this instruction
-   explicitly. It's why the mic half is unverified.
-3. **Rebuilt and reinstalled your binaries.** The ones you had running predated last
-   night's supervision work — `status` didn't even have `normalize_available`. Without
-   this you'd have been testing yesterday's code.
-4. **Deferred the `owf-ctl` crate split** on measured evidence (2.1–2.3 ms vs 10 ms).
-5. **Overruled my own contrast complaint.** I said the overlay text was too dim; an agent
-   measured actual rendered pixels and found I'd judged from a screenshot captured
-   mid-animation. Only one state genuinely failed WCAG AA. It fixed that one and left the
-   rest alone — correctly.
+- **Replaced this file rather than appending to it.** The previous version was a letter
+  about the M1→M2 capture-rate bug on a system that no longer exists; CLAUDE.md calls this
+  file "the current state-of-play," which stopped being true the moment the one-process
+  rewrite started, well before this task. Nothing in it described anything still running.
+- **Adapted the brief's example test** (see "What I verified myself" above) rather than
+  implementing it verbatim, because I could show, on this exact machine, that the verbatim
+  version fails for a reason unrelated to the thing it's supposed to check.
