@@ -62,7 +62,7 @@ cargo run --release -p yappr -- --bench   # ASR latency table
 
 # Runtime inspection / control (against a running instance)
 yappr --status | --debug | --subscribe | --reload
-yappr --settings | --toggle | --cancel | --quit
+yappr --settings | --wizard | --toggle | --cancel | --quit
 yappr --print-shortcuts | --purge-logs | --update-lock
 ```
 
@@ -108,6 +108,9 @@ Two Cargo members, one process:
   overshoot is reserved for motion that had momentum behind it.
   `App.tsx` is just `<Overlay />`. `Settings.tsx` is
   the settings window's shell — sidebar, panes, autosave — over `src/settings/`:
+  `wizard.tsx` (the four-step first-run wizard, which takes over the whole
+  window while it is active and replaced the old Setup pane; it owns the
+  `setup_status`/`run_setup` calls that pane used to make),
   `schema.ts` (which pane a section lives in, what a field is called in German, which
   fields get an editor better than a text box), `controls.tsx` (the setting-row
   primitive and its toggle/select/number/list/table editors), `icons.tsx` (inline SVG,
@@ -162,8 +165,11 @@ happen to be resident.
 2. **The overlay must never take keyboard focus** — a focused overlay means `wtype` types
    the dictation into the overlay instead of the target window. Enforced twice, on two
    mechanisms that both apply unconditionally, not chosen between at runtime:
-   - Every window always carries Tauri's `focus: false` / `focusable: false`
-     (`tauri.conf.json`), regardless of compositor.
+   - The **overlay** always carries Tauri's `focus: false` / `focusable: false`
+     (`tauri.conf.json`), regardless of compositor. The settings window is
+     `focus: true` / `focusable: true` and must stay that way -- it hosts a
+     form and the setup wizard, neither of which could take a keystroke
+     otherwise. That asymmetry is why the fallback rule below matches title.
    - On a compositor implementing `wlr-layer-shell` (every wlroots compositor, including
      Hyprland; not Mutter), `src-tauri/src/layer.rs`'s `anchor_overlay` additionally puts
      the overlay on a layer-shell surface with `KeyboardMode::None` — focus refused at the
@@ -277,6 +283,21 @@ happen to be resident.
     pre-2026-08-29 behaviour exactly, and is what to point a user at if the
     lazy path misbehaves. See
     `docs/superpowers/specs/2026-08-29-lazy-model-lifecycle-design.md`.
+
+13. **The first-run wizard never writes desktop config, on either desktop.**
+    Hyprland is the standing rule (a bad window rule breaks the desktop).
+    GNOME is the same rule for a different reason: `gsettings set ...
+    custom-keybindings` *replaces* the list, so the obvious one-liner destroys
+    every custom shortcut the user already had -- `desktop.rs`'s
+    `GNOME_GSETTINGS_SNIPPET` reads the current value and appends, and the
+    wizard shows it rather than running it. The wizard opens when
+    `~/.local/state/yappr/wizard-done` is absent *or* `setup_status()` is not
+    ready (`src-tauri/src/wizard.rs`'s `should_open`), so a model deleted
+    after setup brings it back -- at the models step, not the welcome -- 
+    instead of surfacing as a failed dictation days later. A state file, not
+    a config key: a key would have to join a `deny_unknown_fields` struct and
+    then appear in the settings GUI as a setting nobody should touch. See
+    `docs/superpowers/specs/2026-08-29-first-run-wizard-design.md`.
 
 ## Conventions
 

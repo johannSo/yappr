@@ -23,6 +23,11 @@ pub enum Request {
     Quit,
     /// Show and focus the settings window.
     ShowSettings,
+    /// Show the settings window with the first-run wizard on top of it
+    /// (`yappr --wizard`, and the tray's Einrichtung item). Distinct from
+    /// [`Request::ShowSettings`] because the two land the user in different
+    /// places -- one in the settings form, one at the top of the setup flow.
+    ShowWizard,
     /// Turns this connection into a long-lived `OverlayEvent` stream (spec
     /// 12) instead of the usual one-request-one-response exchange: after
     /// this line, the daemon writes one NDJSON `OverlayEvent` per line,
@@ -256,6 +261,10 @@ mod tests {
             r#"{"cmd":"show-settings"}"#
         );
         assert_eq!(
+            serde_json::to_string(&Request::ShowWizard).unwrap(),
+            r#"{"cmd":"show-wizard"}"#
+        );
+        assert_eq!(
             serde_json::to_string(&Request::Subscribe).unwrap(),
             r#"{"cmd":"subscribe"}"#
         );
@@ -291,6 +300,7 @@ mod tests {
             Request::Toggle,
             Request::Quit,
             Request::ShowSettings,
+            Request::ShowWizard,
             Request::Subscribe,
             Request::GetConfig,
             Request::ListInputDevices,

@@ -13,6 +13,7 @@ usage: yappr                  start the app (tray, no window)
        yappr --toggle         start or stop dictating
        yappr --cancel         discard the current utterance
        yappr --settings       show the settings window
+       yappr --wizard         show the setup wizard
        yappr --quit           shut everything down
        yappr --status|--debug|--subscribe|--reload
        yappr --bench|--print-shortcuts|--purge-logs|--update-lock
@@ -38,6 +39,7 @@ pub fn route(args: &[&str]) -> Route {
         ["--toggle"] => Route::Send(Request::Toggle),
         ["--cancel"] => Route::Send(Request::Cancel),
         ["--settings"] => Route::Send(Request::ShowSettings),
+        ["--wizard"] => Route::Send(Request::ShowWizard),
         ["--quit"] => Route::Send(Request::Quit),
         ["--status"] => Route::Send(Request::Status),
         ["--reload"] => Route::Send(Request::Reload),
@@ -76,6 +78,12 @@ mod tests {
     #[test]
     fn the_lifecycle_and_inspection_flags_route() {
         assert_eq!(route(&["--settings"]), Route::Send(Request::ShowSettings));
+        assert_eq!(route(&["--wizard"]), Route::Send(Request::ShowWizard));
+        // Two flags, two destinations: `--settings` lands in the settings
+        // form, `--wizard` at the top of the setup flow. Collapsing them
+        // would make the tray's Einrichtung item indistinguishable from
+        // Einstellungen.
+        assert_ne!(route(&["--wizard"]), route(&["--settings"]));
         assert_eq!(route(&["--quit"]), Route::Send(Request::Quit));
         assert_eq!(route(&["--status"]), Route::Send(Request::Status));
         assert_eq!(route(&["--reload"]), Route::Send(Request::Reload));

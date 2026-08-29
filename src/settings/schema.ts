@@ -45,22 +45,6 @@ export const CATCH_ALL: Category = {
   sections: [],
 };
 
-/// The first-run Setup pane (spec §7). Unlike every other category, it has
-/// no `config.toml` section behind it — it renders from `setup_status()`
-/// (prerequisite binaries, model presence) and `run_setup()`'s progress
-/// events, not from the JSON config `Settings.tsx` loads. `sections: []` is
-/// deliberate: `Settings.tsx` recognises `id === "setup"` and renders its own
-/// component there instead of walking `sections` the way every other pane
-/// does. Prepended to the sidebar only while `setup_status()` reports
-/// something missing — see `Settings.tsx`'s `categories` — so it disappears
-/// on its own the moment a fresh install closes every gap.
-export const SETUP_CATEGORY: Category = {
-  id: "setup",
-  title: "Einrichtung",
-  icon: "download",
-  sections: [],
-};
-
 export const SECTION_TITLES: Record<string, string> = {
   audio: "Mikrofon & Aufnahme",
   vocabulary: "Vokabular",

@@ -3,6 +3,7 @@ pub mod capture;
 pub mod config;
 pub mod config_write;
 pub mod debug;
+pub mod desktop;
 pub mod finish;
 pub mod guardrail;
 pub mod hypr;

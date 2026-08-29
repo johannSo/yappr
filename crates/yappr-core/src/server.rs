@@ -195,6 +195,10 @@ pub trait EventSink: Send + Sync + 'static {
     /// `TauriSink` (`src-tauri/src/lib.rs`), which actually owns a window to
     /// show, needs to override it.
     fn show_settings(&self) {}
+    /// Shows the settings window with the wizard on top
+    /// (`Request::ShowWizard`). A no-op default for the same reason
+    /// `show_settings`'s is: only `TauriSink` owns a window to show.
+    fn show_wizard(&self) {}
     /// Unregisters the tray item, spec §8 step 3 -- called once from
     /// [`shutdown`], between killing `llama-server` (step 2) and removing
     /// the runtime socket/lock (step 4). A no-op default for the same
@@ -2280,6 +2284,10 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
         }
         Request::ShowSettings => {
             daemon.sink.show_settings();
+            Response::ok(state_of(current))
+        }
+        Request::ShowWizard => {
+            daemon.sink.show_wizard();
             Response::ok(state_of(current))
         }
     }

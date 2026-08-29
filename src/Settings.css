@@ -1418,3 +1418,132 @@ button:disabled {
     color: var(--text);
   }
 }
+
+/* ---- Setup wizard ------------------------------------------------------ */
+
+/* The wizard replaces the sidebar-and-pane layout entirely, so the shell
+   stops being a two-column grid for as long as it is up. */
+.shell--wizard {
+  display: block;
+  overflow: auto;
+}
+
+.wizard {
+  max-width: 44rem;
+  margin: 0 auto;
+  padding: 3rem 2rem 2.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 2rem;
+  min-height: 100%;
+  box-sizing: border-box;
+}
+
+.wizard-dots {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: center;
+}
+
+.wizard-dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.22;
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+
+.wizard-dot.is-done {
+  opacity: 0.45;
+}
+
+.wizard-dot.is-current {
+  opacity: 1;
+  transform: scale(1.25);
+}
+
+.wizard-step {
+  flex: 1;
+  display: flex;
+}
+
+.wizard-body {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  flex: 1;
+}
+
+.wizard-body h1 {
+  margin: 0;
+  font-size: 1.6rem;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.wizard-lead {
+  margin: 0;
+  max-width: 34rem;
+  line-height: 1.5;
+  opacity: 0.75;
+}
+
+.wizard-mark {
+  width: 4rem;
+  height: 4rem;
+}
+
+.wizard-tick {
+  width: 2.5rem;
+  height: 2.5rem;
+}
+
+/* Pinned to the bottom of the step, so the primary action sits in the same
+   place on every screen instead of chasing the content's height. */
+.wizard-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: auto;
+  padding-top: 1.5rem;
+}
+
+.wizard-target {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin: 0;
+  opacity: 0.75;
+}
+
+.wizard-command {
+  font-size: 0.85em;
+  opacity: 0.8;
+}
+
+.wizard-snippet summary {
+  cursor: pointer;
+  opacity: 0.75;
+  user-select: none;
+}
+
+.wizard-pre {
+  margin: 0.75rem 0;
+  padding: 0.9rem 1rem;
+  border-radius: 0.6rem;
+  background: rgb(0 0 0 / 0.22);
+  overflow-x: auto;
+  font-size: 0.8rem;
+  line-height: 1.5;
+  white-space: pre;
+}
+
+.wizard kbd {
+  font: inherit;
+  font-size: 0.85em;
+  padding: 0.1em 0.4em;
+  border-radius: 0.35em;
+  border: 1px solid currentColor;
+  opacity: 0.8;
+}

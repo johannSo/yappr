@@ -18,6 +18,7 @@ mod provision;
 mod replay;
 mod settings_cmds;
 mod setup;
+mod wizard;
 mod tray;
 
 use tauri::{Emitter, Manager, PhysicalPosition};
@@ -28,7 +29,7 @@ use yappr_core::server::{dispatch, shutdown, Daemon, EventSink};
 /// Must match the window `label` in `tauri.conf.json`.
 const OVERLAY_LABEL: &str = "overlay";
 /// Must match the settings window's `label` in `tauri.conf.json`.
-const SETTINGS_LABEL: &str = "settings";
+pub(crate) const SETTINGS_LABEL: &str = "settings";
 /// The transparent *canvas* the capsule is drawn on -- not the capsule's own
 /// size. Spec 12 fixed both at 280 x 72 because the pill was a fixed-size
 /// pill; it is now a surface that springs its width and height to whatever
@@ -95,6 +96,24 @@ fn position_overlay(window: tauri::WebviewWindow) {
 /// through a `Daemon` -- see `tray.rs`'s module doc for why) so there is
 /// one definition of "show Settings", not two independently-maintained
 /// copies of the same two lines.
+/// Shows the settings window with the first-run wizard on top of it.
+///
+/// Shared by `TauriSink::show_wizard` (`Request::ShowWizard`, the CLI's
+/// `--wizard` flag's path) and `tray.rs`'s Einrichtung menu item, for the
+/// same reason `show_settings_window` is shared: one definition of "show the
+/// wizard", not two that can drift.
+///
+/// The event is what puts the window into wizard mode. The window is shown
+/// first, so a webview that has not mounted yet still ends up correct -- it
+/// asks `wizard_state()` on mount regardless -- and an already-open one gets
+/// the event.
+pub(crate) fn show_wizard_window(app: &tauri::AppHandle) {
+    show_settings_window(app);
+    if let Some(w) = app.get_webview_window(SETTINGS_LABEL) {
+        let _ = w.emit("show-wizard", ());
+    }
+}
+
 pub(crate) fn show_settings_window(app: &tauri::AppHandle) {
     if let Some(w) = app.get_webview_window(SETTINGS_LABEL) {
         let _ = w.show();
@@ -125,6 +144,11 @@ impl EventSink for TauriSink {
     /// `Request::ShowSettings` (spec §8, the CLI's `--settings` flag).
     fn show_settings(&self) {
         show_settings_window(&self.app);
+    }
+
+    /// `Request::ShowWizard` (the CLI's `--wizard` flag, and the tray).
+    fn show_wizard(&self) {
+        show_wizard_window(&self.app);
     }
 
     /// Spec §8 step 3.
@@ -215,7 +239,9 @@ pub fn run() {
             settings_cmds::autostart_status,
             settings_cmds::set_autostart,
             provision::setup_status,
-            provision::run_setup
+            provision::run_setup,
+            wizard::wizard_state,
+            wizard::wizard_finish
         ])
         .setup(move |app| {
             let window = app
@@ -312,7 +338,7 @@ pub fn run() {
                     // run.
                     let setup_check_handle = app.handle().clone();
                     std::thread::spawn(move || {
-                        if !provision::is_ready_or_assume_not("yappr") {
+                        if wizard::should_open_wizard() {
                             if let Some(w) = setup_check_handle.get_webview_window(SETTINGS_LABEL) {
                                 let _ = w.show();
                                 let _ = w.set_focus();

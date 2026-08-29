@@ -221,14 +221,23 @@ fn uses_lua_config(config_dir: &std::path::Path) -> bool {
 ///
 /// Picks Lua when `~/.config/hypr/hyprland.lua` exists, `.conf` otherwise.
 pub fn shortcut_config() -> &'static str {
-    let dir = dirs::config_dir()
-        .map(|d| d.join("hypr"))
-        .unwrap_or_else(|| std::path::PathBuf::from("/nonexistent"));
-    if uses_lua_config(&dir) {
+    if uses_lua_config_here() {
         SHORTCUT_CONFIG_LUA
     } else {
         SHORTCUT_CONFIG_CONF
     }
+}
+
+/// Whether *this machine* configures Hyprland in Lua. Public because
+/// `desktop.rs` has to name the file the user pastes into (`bindings.lua` vs
+/// `hyprland.conf`), and that answer must come from the same probe
+/// [`shortcut_config`] branches on -- two probes could disagree, and then the
+/// wizard would name a file whose syntax does not match the text above it.
+pub fn uses_lua_config_here() -> bool {
+    let dir = dirs::config_dir()
+        .map(|d| d.join("hypr"))
+        .unwrap_or_else(|| std::path::PathBuf::from("/nonexistent"));
+    uses_lua_config(&dir)
 }
 
 fn parse_class(json: &str) -> Option<String> {

@@ -4,12 +4,12 @@ import { listen } from "@tauri-apps/api/event";
 import { AnimatePresence, MotionConfig, motion } from "motion/react";
 import { Icon } from "./settings/icons";
 import { Commit, Device, Field, ResetButton, Row, TableEditor, Toggle } from "./settings/controls";
+import { Wizard, WizardState } from "./settings/wizard";
 import {
   HELP,
   Json,
   RESTART_SECTIONS,
   SECTION_NOTES,
-  SETUP_CATEGORY,
   Section,
   categorize,
   jsonEqual,
@@ -48,31 +48,6 @@ const GLIDE = { type: "spring", bounce: 0.18, duration: 0.42 } as const;
 
 type SaveState = "clean" | "pending" | "saving" | "saved" | "error";
 
-/// A model `setup_status()`/`run_setup()` reported missing — `provision.rs`'s
-/// `MissingModel`, unchanged across the wire.
-type MissingModel = { name: string; display: string };
-
-/// `provision::setup_status`'s response shape, and also what `run_setup`
-/// resolves to once provisioning finishes.
-type SetupStatus = {
-  ready: boolean;
-  missing_prerequisites: string[];
-  missing_models: MissingModel[];
-};
-
-/// One artifact's live download progress, keyed by `MissingModel.name` — kept
-/// only for artifacts a `"setup-progress"` event has actually mentioned, so a
-/// model nothing has reported on yet renders as "fehlt" rather than a bar
-/// stuck at 0%.
-type DownloadProgress = { display: string; done: number; total: number | null };
-
-/// `provision::SetupProgress`, unchanged across the wire (`#[serde(tag =
-/// "kind")]` is what makes the discriminated union below work).
-type SetupProgressEvent =
-  | { kind: "downloading"; name: string; display: string; done: number; total: number | null }
-  | { kind: "finished" }
-  | { kind: "failed"; message: string };
-
 export default function Settings() {
   const [config, setConfig] = useState<Section | null>(null);
   const [defaults, setDefaults] = useState<Section | null>(null);
@@ -87,14 +62,11 @@ export default function Settings() {
   const [saveState, setSaveState] = useState<SaveState>("clean");
   const [loading, setLoading] = useState(true);
 
-  // Task 15: first-run Setup. `setupStatus` is `null` until the first check
-  // resolves, deliberately distinct from "ready" — the Setup pane must not
-  // flash into existence and back out before the very first answer arrives.
-  const [setupStatus, setSetupStatus] = useState<SetupStatus | null>(null);
-  const [setupCheckError, setSetupCheckError] = useState<string | null>(null);
-  const [installing, setInstalling] = useState(false);
-  const [installError, setInstallError] = useState<string | null>(null);
-  const [downloads, setDownloads] = useState<Record<string, DownloadProgress>>({});
+  // The wizard takes over this whole window when it is active. `wizardState`
+  // is `null` until `wizard_state()` answers, deliberately distinct from "not
+  // needed" — nothing may flash on screen before the first answer arrives.
+  const [wizardState, setWizardState] = useState<WizardState | null>(null);
+  const [wizardActive, setWizardActive] = useState(false);
 
   // The save path reads the config through a ref: a debounced write fires long
   // after the render that scheduled it, and must send what the config looks
@@ -142,92 +114,37 @@ export default function Settings() {
     void load();
   }, [load]);
 
-  /// `setup_status()` hashes whatever models are already on disk (up to
-  /// ~1.1 GB the first time it runs, cached after that — see
-  /// `provision.rs`'s module doc), so it can take noticeably longer than
-  /// `get_config` — a separate call for the same reason `list_input_devices`
-  /// is one: a slow check here must not hold up the rest of the window
-  /// loading.
-  ///
-  /// A failure fails *closed*: `ready: false` with the error carried
-  /// separately, not a silent `ready: true` that hides the Setup pane. The
-  /// scenario that matters is a fresh install where `setup_status` itself
-  /// is broken — that is precisely the moment this pane exists to be seen,
-  /// and reporting "ready" here would make the one piece of first-run
-  /// guidance the app can offer disappear exactly when it's needed most.
-  /// `SetupPane` renders `setupCheckError` as its own state (with a retry)
-  /// rather than the normal prerequisite/model lists, which would otherwise
-  /// show a misleading "nothing missing" built from empty placeholder data.
-  const checkSetup = useCallback(async () => {
+  // The window decides its own mode: `should_open` is computed from the same
+  // marker-plus-readiness rule `lib.rs`'s startup thread uses, so there is no
+  // ordering hazard between that thread and this webview's first paint.
+  const loadWizardState = useCallback(async (activate: boolean) => {
     try {
-      const res = (await invoke("setup_status")) as SetupStatus;
-      setSetupStatus(res);
-      setSetupCheckError(null);
+      const res = (await invoke("wizard_state")) as WizardState;
+      setWizardState(res);
+      if (activate || res.should_open) setWizardActive(true);
     } catch (e) {
-      setSetupStatus({ ready: false, missing_prerequisites: [], missing_models: [] });
-      setSetupCheckError(String(e));
+      // A wizard that cannot describe itself must not replace the settings
+      // form with a blank screen — the window still works, and a user who
+      // reached it from the tray gets what they asked for.
+      console.error("wizard_state failed", e);
     }
   }, []);
 
   useEffect(() => {
-    void checkSetup();
-  }, [checkSetup]);
+    void loadWizardState(false);
+  }, [loadWizardState]);
 
-  // Listens for `run_setup`'s progress for the life of the window, not just
-  // while the Setup pane is on screen — a user who switches to another pane
-  // mid-download must not lose the running total, and `Finished`/`Failed`
-  // still need to land on `installing`/`notice` wherever they arrive.
+  // `yappr --wizard` and the tray's Einrichtung item. The state is re-read
+  // rather than reused: the desktop or the backend may have changed since
+  // this window mounted.
   useEffect(() => {
-    const unlistenPromise = listen<SetupProgressEvent>("setup-progress", (event) => {
-      const payload = event.payload;
-      if (payload.kind === "downloading") {
-        setDownloads((prev) => ({
-          ...prev,
-          [payload.name]: { display: payload.display, done: payload.done, total: payload.total },
-        }));
-      } else if (payload.kind === "finished") {
-        setInstalling(false);
-        setDownloads({});
-        setNotice(
-          "Installation abgeschlossen. Starte yappr neu, damit die neuen Modelle geladen werden.",
-        );
-        void checkSetup();
-      } else if (payload.kind === "failed") {
-        setInstalling(false);
-        setInstallError(payload.message);
-        // An artifact failing partway through does not undo the ones
-        // already promoted before it (`download_all`), so the list of
-        // what's still missing may be shorter than it was. Cheap to refresh
-        // now that the backend caches the unchanged case (see
-        // `provision.rs`) rather than hashing again on every call.
-        void checkSetup();
-      }
+    const unlistenPromise = listen("show-wizard", () => {
+      void loadWizardState(true);
     });
     return () => {
       unlistenPromise.then((unlisten) => unlisten());
     };
-  }, [checkSetup]);
-
-  const startInstall = useCallback(() => {
-    setInstalling(true);
-    setInstallError(null);
-    setDownloads({});
-    invoke("run_setup").catch((e) => {
-      // A failure that happens *inside* `download_all` also arrives as a
-      // "setup-progress" `failed` event, which is what normally drives
-      // `installing`/`installError` back down — this usually just re-sets
-      // state that event already set. But the backend's reentrancy guard
-      // (a second concurrent `run_setup` call) rejects before
-      // `download_all` ever runs, so no event fires for it at all; without
-      // handling the rejection here too, the button would stay stuck on
-      // "Installation läuft…" forever. The functional update keeps a more
-      // specific error the event already reported rather than overwriting
-      // it with this rejection's (possibly identical, possibly generic)
-      // text.
-      setInstalling(false);
-      setInstallError((prev) => prev ?? String(e));
-    });
-  }, []);
+  }, [loadWizardState]);
 
   useEffect(() => {
     return () => {
@@ -332,14 +249,10 @@ export default function Settings() {
     [schedule],
   );
 
-  const categories = useMemo(() => {
-    const base = config ? categorize(Object.keys(config)) : [];
-    // Prepended, not appended: a first-run user's very first pane should be
-    // the one telling them what's missing, not the last thing they scroll
-    // past to find it. Disappears on its own once `setupStatus.ready` flips
-    // true — see `SETUP_CATEGORY`'s doc comment.
-    return setupStatus && !setupStatus.ready ? [SETUP_CATEGORY, ...base] : base;
-  }, [config, setupStatus]);
+  const categories = useMemo(
+    () => (config ? categorize(Object.keys(config)) : []),
+    [config],
+  );
 
   // The first pane, until the user picks one. Resolved rather than stored so a
   // config whose sections changed under us cannot leave the sidebar pointing
@@ -378,6 +291,28 @@ export default function Settings() {
   const searching = hits !== null;
   const hitCount = hits?.reduce((n, h) => n + (h.keys?.length ?? 1), 0) ?? 0;
   const shown = searching ? hits : current.sections.map((s) => ({ section: s, keys: null }));
+
+  if (wizardActive && wizardState) {
+    return (
+      <MotionConfig reducedMotion="user">
+        <main className="shell shell--wizard">
+          <Wizard
+            state={wizardState}
+            onFinish={(setBackend) => {
+              // Not swallowed silently, but it must not trap the user in the
+              // wizard either: the marker is a convenience, and a wizard that
+              // will not close is worse than one that reappears next launch.
+              invoke("wizard_finish", { setBackend }).catch((e) => {
+                console.error("wizard_finish failed", e);
+              });
+              setWizardActive(false);
+            }}
+            onOpenSettings={() => setWizardActive(false)}
+          />
+        </main>
+      </MotionConfig>
+    );
+  }
 
   return (
     <MotionConfig reducedMotion="user">
@@ -560,22 +495,6 @@ export default function Settings() {
                   animate={{ opacity: 1, y: 0 }}
                   transition={SETTLE}
                 >
-                  {/* Not config-backed (see `SETUP_CATEGORY`'s doc comment),
-                      so it renders alongside `shown.map` below rather than
-                      through it — `current.sections` is empty for this
-                      category, so that map contributes nothing here on its
-                      own. */}
-                  {!searching && current.id === "setup" && setupStatus && (
-                    <SetupPane
-                      status={setupStatus}
-                      checkError={setupCheckError}
-                      onRetryCheck={() => void checkSetup()}
-                      downloads={downloads}
-                      installing={installing}
-                      installError={installError}
-                      onInstall={startInstall}
-                    />
-                  )}
                   {shown.map(({ section, keys }) => (
                     <SectionCard
                       key={section}
@@ -810,157 +729,5 @@ function SectionCard({
         )}
       </div>
     </section>
-  );
-}
-
-/// Renders one download's progress as a fraction of a known total, or (no
-/// `Content-Length` header) as a raw MB count climbing with no visible
-/// ceiling — the same fallback `yappr --update-lock`'s own terminal
-/// output uses for the same reason (`setup.rs`'s `progress_line`).
-function downloadStatusText(progress: DownloadProgress | undefined, installing: boolean): string {
-  if (!progress) return installing ? "wartet…" : "fehlt";
-  if (progress.total !== null) {
-    const pct = Math.min(100, Math.round((progress.done / progress.total) * 100));
-    return `${pct} %`;
-  }
-  return `${Math.round(progress.done / (1 << 20))} MB`;
-}
-
-/// The first-run Setup pane (spec §7, Task 15): the one pane in this window
-/// that renders from `setup_status()`/`run_setup()` rather than from
-/// `config.toml` — see `SETUP_CATEGORY`'s doc comment in `schema.ts` for why
-/// it gets its own component instead of a `SectionCard`.
-function SetupPane({
-  status,
-  checkError,
-  onRetryCheck,
-  downloads,
-  installing,
-  installError,
-  onInstall,
-}: {
-  status: SetupStatus;
-  /** Set when `setup_status()` itself failed — see `checkSetup`'s doc
-   *  comment for why this fails closed instead of hiding the pane. */
-  checkError: string | null;
-  onRetryCheck: () => void;
-  downloads: Record<string, DownloadProgress>;
-  installing: boolean;
-  installError: string | null;
-  onInstall: () => void;
-}) {
-  // `status` is placeholder data (empty lists) whenever `checkError` is set
-  // — rendering the normal "nothing missing" / "here's what's missing"
-  // content from it would be actively misleading, so this replaces the
-  // whole pane rather than adding a banner on top of it.
-  if (checkError) {
-    return (
-      <div className="banner error">
-        <Icon name="warn" className="icon-sm" />
-        <span>Setup-Status konnte nicht ermittelt werden: {checkError}</span>
-        <button type="button" className="ghost" onClick={onRetryCheck}>
-          Erneut versuchen
-        </button>
-      </div>
-    );
-  }
-
-  const { missing_prerequisites: missingPrerequisites, missing_models: missingModels } = status;
-
-  return (
-    <>
-      <section className="group">
-        <div className="group-head">
-          <h2>Voraussetzungen</h2>
-        </div>
-        <p className="note">
-          Diese Programme kommen nicht von yappr selbst und müssen von Hand
-          installiert werden.
-        </p>
-        <div className="card">
-          {missingPrerequisites.length === 0 ? (
-            <div className="setup-row ok">
-              <Icon name="check" className="icon-sm" />
-              <span>Alle benötigten Programme sind installiert.</span>
-            </div>
-          ) : (
-            missingPrerequisites.map((pkg) => (
-              <div className="setup-row missing" key={pkg}>
-                <Icon name="warn" className="icon-sm" />
-                <span>{pkg} fehlt.</span>
-              </div>
-            ))
-          )}
-        </div>
-        {missingPrerequisites.length > 0 && (
-          <p className="setup-command">
-            Installieren mit: <code>sudo pacman -S {missingPrerequisites.join(" ")}</code>
-          </p>
-        )}
-      </section>
-
-      <section className="group">
-        <div className="group-head">
-          <h2>Modelle</h2>
-        </div>
-        <p className="note">
-          Spracherkennung, Erkennung von Sprachpausen und Nachbearbeitung laufen lokal
-          und brauchen dafür diese Modelle — insgesamt etwa 1,1 GB.
-        </p>
-        <div className="card">
-          {missingModels.length === 0 ? (
-            <div className="setup-row ok">
-              <Icon name="check" className="icon-sm" />
-              <span>Alle Modelle sind vorhanden.</span>
-            </div>
-          ) : (
-            missingModels.map((m) => {
-              const progress = downloads[m.name];
-              const done = !!progress && progress.total !== null && progress.done >= progress.total;
-              return (
-                <div className={`setup-row${done ? " ok" : " missing"}`} key={m.name}>
-                  <Icon name={done ? "check" : "warn"} className="icon-sm" />
-                  <div className="setup-row__body">
-                    <div className="setup-row__head">
-                      <span>{m.display}</span>
-                      <span className="setup-row__status">
-                        {downloadStatusText(progress, installing)}
-                      </span>
-                    </div>
-                    {progress && !done && (
-                      <div className="progressbar">
-                        <div
-                          className="progressbar__fill"
-                          style={{
-                            width:
-                              progress.total !== null
-                                ? `${Math.min(100, (progress.done / progress.total) * 100)}%`
-                                : "35%",
-                          }}
-                        />
-                      </div>
-                    )}
-                  </div>
-                </div>
-              );
-            })
-          )}
-        </div>
-        {missingModels.length > 0 && (
-          <div className="setup-actions">
-            <button type="button" className="add" onClick={onInstall} disabled={installing}>
-              {installing ? "Installation läuft…" : "Installation starten"}
-            </button>
-          </div>
-        )}
-      </section>
-
-      {installError && (
-        <div className="banner error">
-          <Icon name="warn" className="icon-sm" />
-          <span>{installError}</span>
-        </div>
-      )}
-    </>
   );
 }

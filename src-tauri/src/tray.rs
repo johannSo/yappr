@@ -341,6 +341,16 @@ impl ksni::Tray for OwfTray {
                 ..Default::default()
             }
             .into(),
+            // Calls the helper directly rather than dispatching
+            // `Request::ShowWizard`, exactly as Einstellungen above does and
+            // for the reason this module's doc comment gives: a menu
+            // activation must never block on the accept loop.
+            StandardItem {
+                label: "Einrichtung…".into(),
+                activate: Box::new(|this: &mut Self| crate::show_wizard_window(&this.app)),
+                ..Default::default()
+            }
+            .into(),
             // Task 13: checked exactly when the daemon's real state is
             // `Paused` -- never an optimistic guess set at click time -- so
             // a click that the daemon actually refused (mid-utterance) is

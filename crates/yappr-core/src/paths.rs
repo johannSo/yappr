@@ -34,6 +34,15 @@ pub fn rejections_file() -> PathBuf {
     state_dir().join("rejections.jsonl")
 }
 
+/// Records that a human reached the last step of the setup wizard and clicked
+/// Fertig. An empty file: it carries one bit and no format, so there is
+/// nothing to version. Deliberately not a `config.toml` key -- that would
+/// have to join a `deny_unknown_fields` struct and then show up in the
+/// settings GUI as a setting nobody should touch.
+pub fn wizard_marker() -> PathBuf {
+    state_dir().join("wizard-done")
+}
+
 pub fn runtime_socket() -> PathBuf {
     xdg_runtime().join("yappr.sock")
 }
