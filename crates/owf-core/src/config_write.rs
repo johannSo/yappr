@@ -495,4 +495,41 @@ context = "email"
         assert_eq!(reloaded.audio.device, "hw:1,0");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
+
+    #[test]
+    fn a_config_without_a_models_section_gains_one_when_the_gui_saves() {
+        // Every existing user's file looks like this. The GUI must be able to
+        // write a setting whose whole section is missing from the document.
+        let original = "[audio]\ndevice = \"default\"\n";
+        let mut cfg = Config::from_str(original).unwrap();
+        cfg.models.idle_unload_seconds = 30;
+        let as_json = serde_json::to_value(&cfg).unwrap();
+
+        let out = merge_json_into_toml(original, &as_json).unwrap();
+
+        assert!(out.contains("[models]"), "section not created:\n{out}");
+        assert!(out.contains("idle_unload_seconds = 30"), "value not written:\n{out}");
+        // The rendered result must still be a config the daemon accepts.
+        assert_eq!(Config::from_str(&out).unwrap().models.idle_unload_seconds, 30);
+    }
+
+    #[test]
+    fn changing_the_idle_timeout_produces_a_one_line_diff() {
+        // Invariant 9: `config.toml` is a file the user is invited to edit by
+        // hand, so a save that changes one setting must not rewrite the document.
+        let original = crate::config::DEFAULT_CONFIG_TOML;
+        let mut cfg = Config::from_str(original).unwrap();
+        cfg.models.idle_unload_seconds = 300;
+        let as_json = serde_json::to_value(&cfg).unwrap();
+
+        let out = merge_json_into_toml(original, &as_json).unwrap();
+
+        let changed: Vec<_> = original
+            .lines()
+            .zip(out.lines())
+            .filter(|(a, b)| a != b)
+            .collect();
+        assert_eq!(changed.len(), 1, "expected exactly one changed line, got {changed:?}");
+        assert_eq!(changed[0].1.trim(), "idle_unload_seconds = 300");
+    }
 }

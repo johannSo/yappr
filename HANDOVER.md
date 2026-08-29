@@ -196,3 +196,146 @@ needs a running `ydotoold` plus write access to `/dev/uinput`, which README's "T
   (`inject("-- hello -x")` produces exactly `-- hello -x`) has an unrun `ydotool` twin. If it
   turns out `ydotool type` rejects `--`, the fix is `--file -` on stdin, which its man page
   also documents; do not invent an escaping scheme.
+
+---
+
+## Added after this letter: the models follow the dictation
+
+`[models] preload_at_startup` (default `false`) and `idle_unload_seconds`
+(default `60`) replace "every model resident for the life of the process".
+Design: `docs/superpowers/specs/2026-08-29-lazy-model-lifecycle-design.md`.
+Invariant 12 in CLAUDE.md is the part to read before editing `server.rs`.
+
+- `cargo test --workspace`: **415 passed, 0 failed, 4 ignored** (377 before,
+  plus 33 for this feature and 5 more from the whole-branch review round).
+  `cargo clippy --workspace --all-targets`: clean. Frontend `bun run build`:
+  clean.
+- **Verified on this machine, in an isolated instance** (an `XDG_RUNTIME_DIR`
+  and config override; the real config, `rejections.jsonl`, and the running
+  production daemon were all confirmed untouched by mtime afterwards):
+  - `preload_at_startup = true` with `idle_unload_seconds = 20`: models
+    loaded, `llama-server` up, then at +20 s `--status` reported `"warm":
+    false` and `llama-server` was gone.
+  - It stayed gone for a further 67 s — six or seven housekeeping ticks —
+    proving the supervisor gate holds. The daemon's own log shows no further
+    "llama-server spawned" line.
+  - A separate run with `idle_unload_seconds = 25` unloaded at +25-26 s,
+    which confirms the deadline shrink is real rather than a coincidence of
+    the 10 s health-poll interval.
+- **Not verified: the cold-start latency of a real dictation.** The
+  press-triggered load specifically was exercised only by tests, never on the
+  real binary, because `--toggle` opens the microphone and CLAUDE.md forbids
+  recording without explicit permission — which was not given for this work.
+  So the cold-start latency of a real first dictation is unmeasured: the
+  number that matters is how long `run_utterance` blocks in
+  `ensure_models_loaded` after a short utterance, and `--status`'s `last_ms`
+  does not include it. This is on top of the pre-existing fact that real
+  dictation has never been verified end to end at all.
+- **Memory, measured on the same isolated instance:**
+
+  | State | Main process | `llama-server` |
+  |---|---|---|
+  | Never loaded (nothing ever pressed) | ~216 MB | — |
+  | Warm | ~1.24 GB | ~955 MB |
+  | After the idle unload | ~826 MB | gone entirely |
+
+  ~1.37 GB is returned to the OS by an unload. The ~955 MB is unambiguous — a
+  real process exit. The main process itself only drops ~411 MB, though, and
+  settles ~610 MB above its never-loaded baseline rather than back down to
+  it. `smaps_rollup` showed that residual over 97% anonymous, and a second
+  load/unload cycle peaked *lower* (980-1000 MB) than the first (1062-1065
+  MB) — so it reads as glibc holding freed memory rather than returning it to
+  the kernel, reused by the next load, not a leak and not a live model
+  reference. **Left unsettled, not resolved:** across those same two cycles,
+  the idle floor *after* unload crept up ~150-200 MB even though the peak did
+  not grow. Two cycles is not enough to call that either way; worth watching
+  if this gets measured again.
+- **Judgement call:** a lazy load failure returns to `IDLE` instead of
+  latching `FAILED`. The startup path still latches, because a failure
+  discovered at startup is a different thing from one discovered on the
+  user's third dictation. This makes a fresh install recover from the Setup
+  pane without a restart, which the old behaviour did not.
+- **Known issues, deliberately not fixed:**
+  - **A hung `llama-server` can hold the first dictation for a long time.**
+    `load_models` waits on `spawn_and_wait_healthy` with the 120 s
+    `STARTUP_HEALTH_TIMEOUT` *before* building ASR/VAD, and a failed
+    background load is not shared with the blocking caller, so the worst case
+    is roughly double that. Under the old design this budget was spent at
+    startup; lazily it lands on a dictation. Left alone: it only bites when
+    `llama-server` is already broken, a case `UnavailableNormalizer` already
+    treats as a degraded mode, and shortening the budget on the lazy path is
+    a design decision for the spec rather than a review fix.
+    - *Narrower than first recorded, and worse in one specific way.*
+      `wait_healthy` calls `Child::try_wait` between its health polls, so a
+      missing `llama-server` binary, a missing ggml compute backend (the
+      Arch case in CLAUDE.md's environment gotchas), or a bad model path all
+      fail in milliseconds rather than after 120 s. Spending the full budget
+      needs a child that stays alive and never answers `/health` — a much
+      rarer thing than "llama-server is broken". Against that: repeated
+      cancel-then-press cycles queue loader threads on `load_lock`, so if a
+      hang of that kind *does* happen, N presses serialise into N × 120 s
+      rather than sharing one wait.
+  - **`cargo test` disturbs a running daemon's port file.** `LlamaServer::drop`
+    unconditionally removes `paths::runtime_port()`, and several tests
+    construct stub children. Pre-existing, not introduced here; fixing it
+    means changing `LlamaServer::drop`.
+  - **One race test synchronises with a 100 ms sleep** rather than a
+    deterministic handshake. It can only ever produce a false negative
+    (missing a regression on a loaded machine), never a flaky failure, but a
+    handshake would be strictly better.
+  - **`[normalize] enabled = false` is only *partially* applied until a
+    restart.** `restart_reason` already tells the user that `[normalize]`
+    needs one, and `--reload` refuses the flip outright — but the file is
+    written either way, so this is what a user who does not restart is
+    running. The pipeline side then behaves correctly: the next lazy load
+    builds `UnavailableNormalizer` and spawns no child. The housekeeping
+    thread does not, because its `normalize_cfg` is a value captured at
+    startup (`server.rs`'s `spawn_housekeeping` call in `start`) and never
+    re-read. Its supervisor keeps deciding a `llama-server` ought to be
+    running, finds `daemon.llama` empty, and respawns a ~955 MB child the
+    pipeline will never call. The end state the user asked for is still
+    correct — normalization really is off, the text is rule-cleaned and
+    injected — what leaks is the memory this feature exists to reclaim.
+    Restarting clears it, but so does the idle unload: the stray child is
+    bounded by `idle_unload_seconds` unless that is set to `0`, since
+    `unload_models` doesn't consult the stale `normalize_cfg` either — it
+    just tears down whatever `daemon.llama` holds. Not fixed here: the fix
+    is to give `spawn_housekeeping` a live view of `[normalize]` instead of
+    a startup snapshot, which is a change to how that thread is configured,
+    not a review-round patch.
+  - **A stale RSS figure survives in one test comment.** The comment on
+    `the_supervisor_is_skipped_entirely_while_the_models_are_unloaded`
+    (`server.rs`) still says "a fresh 697 MB llama-server" — an earlier
+    estimate, predating the measurement above. `~955 MB` is the measured
+    figure and the one used everywhere else in this document and in
+    CLAUDE.md's invariant 12. Left alone because it's comment-only
+    staleness with no functional or test impact, same class as the
+    `warm_up`-naming fix this task already made elsewhere in this file —
+    flagging here so the next person editing that test doesn't propagate
+    the wrong number.
+  - **A model load still in flight when the process quits orphans its
+    `llama-server` child.** `ensure_models_loaded_with` re-checks
+    `SHUTTING_DOWN` after installing the pipeline, but every route into
+    `shutdown` calls it and then immediately `std::process::exit(0)`, and
+    nothing joins the detached thread `start_recording` spawns to run the
+    load. So the re-check only ever fires for a load that finishes in the
+    narrow gap between `kill_llama` and `exit(0)`; a load still inside
+    `load_models` — which on every cold press means the ~3.5 s window
+    between `llama-server`'s cold start (~750 ms in) and the ASR model
+    finishing — is not reached at all before the process is gone. Press
+    SUPER+D, cancel with SUPER+ALT+D, then tray → Beenden, during that
+    window, and a ~955 MB `llama-server` is left running; the next start is
+    unaffected (`pick_port` just walks past it), so the only symptom is the
+    memory this feature exists to reclaim never coming back. Not fixed
+    here: a real fix needs either installing the `LlamaServer` into
+    `daemon.llama` right after `spawn_and_wait_healthy` returns instead of
+    after the ASR build finishes (the supervisor's `models_loaded` gate
+    already keeps it inert until then), or setting `PR_SET_PDEATHSIG` on
+    the child. See the comment on `ensure_models_loaded_with`'s `Ok` arm in
+    `server.rs` for the full reasoning.
+  - **`--reload` mirrors `[models]` into the daemon but not `[audio]`.**
+    The same shape of gap as the `[normalize]` one above: a hand-edited
+    `max_seconds` or `device` still needs a restart to take effect, because
+    nothing re-populates `daemon.audio_cfg` from a reloaded config, while
+    the Settings GUI's own save path applies such changes live. Pre-existing,
+    not introduced by this branch; recorded here so it isn't rediscovered.

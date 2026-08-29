@@ -92,10 +92,11 @@
 //! the daemon genuinely `Idle` again immediately), and `State::Error`'s own
 //! doc comment says the two must stay distinct. Only for that one case,
 //! `TauriSink::refresh_tray_icon` (`lib.rs`) still asks `Request::Status`:
-//! `State::Error` is set only on the warm-up path (`server.rs`'s `warm_up`
-//! `Err` arm, before it ever broadcasts), so "`Status` reports anything
-//! other than `State::Error`" unambiguously means this was the transient
-//! case, mapped to `Idle`. `--replay` has no `Daemon` to ask, so its
+//! `State::Error` is set only on the startup preload path (`server.rs`'s
+//! `start`, the `Err` arm of its `load_models` call -- reached only with
+//! `[models] preload_at_startup` on -- before it ever broadcasts), so
+//! "`Status` reports anything other than `State::Error`" unambiguously means
+//! this was the transient case, mapped to `Idle`. `--replay` has no `Daemon` to ask, so its
 //! `Error` broadcasts are simply left unmapped by [`state_from_event`] and
 //! do not move the tray's icon.
 //!
@@ -222,8 +223,9 @@ pub(crate) fn state_from_event(event: &OverlayEvent) -> Option<State> {
 /// under `--replay`, or when `refresh_tray_icon` didn't need to ask at all.
 /// It only matters for `OverlayEvent::Error`, the one event
 /// [`state_from_event`] cannot resolve alone: `Some(State::Error)` means
-/// the one fatal, permanent warm-up failure (`State::Error` is stored only
-/// on that path, `server.rs`'s `warm_up` `Err` arm); any other `Some`
+/// the one fatal, permanent startup failure (`State::Error` is stored only
+/// on that path, `server.rs`'s `start`, the `Err` arm of its `load_models`
+/// call); any other `Some`
 /// means an ordinary per-utterance failure, mapped to `Idle`; `None` means
 /// there was nothing to ask, so the icon is left exactly as it was --
 /// matching `--replay`'s own behaviour, which never resolves `Error` at
