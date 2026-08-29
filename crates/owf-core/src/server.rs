@@ -259,10 +259,13 @@ pub struct Daemon {
     /// The idle-unload deadline is measured from this.
     ///
     /// Nothing reads or bumps this yet -- that lands with the idle-unload
-    /// timer in a later task. `#[allow(dead_code)]` rather than leaving the
+    /// timer in a later task. `#[expect(dead_code)]` rather than leaving the
     /// field out of this task entirely: both construction sites need to
     /// agree on the daemon's full field set now, not grow it again later.
-    #[allow(dead_code)]
+    /// `expect`, not `allow`: once the idle-unload timer starts reading it,
+    /// an unfulfilled-expectation warning forces this attribute's removal
+    /// instead of it silently going stale.
+    #[expect(dead_code, reason = "read by the idle-unload timer added in a later task; unused until then")]
     last_activity: Mutex<Instant>,
     /// `[models]`, mirrored here so a Settings change takes effect without a
     /// restart -- the same reason, and the same shape, as `audio_cfg`.
@@ -928,7 +931,15 @@ fn load_models(cfg: Config, daemon: &Arc<Daemon>) -> Result<(Pipeline, Option<Ll
 /// next restart. That is a side effect, not a promise -- `schema.ts`'s
 /// `RESTART_SECTIONS` is unchanged because it is still correct whenever the
 /// models happen to be resident.
-#[allow(dead_code)] // wired to the key press in Task 4; unused in production until then
+// `expect`, not `allow`: the moment Task 4 wires this to the key press,
+// `unfulfilled_lint_expectations` (warn-by-default, stable since 1.81) fires
+// here and forces this attribute's removal instead of it silently going
+// stale. One attribute covers three otherwise-dead symbols, not just this
+// function: rustc treats an `expect`/`allow`-attributed item as a live root
+// and walks its callees when deciding what else counts as reachable, so this
+// also covers `ensure_models_loaded_with` and the `load_lock` field, neither
+// of which is reachable through any other path yet.
+#[expect(dead_code, reason = "wired to the key press in Task 4; also covers ensure_models_loaded_with and Daemon::load_lock")]
 fn ensure_models_loaded(daemon: &Arc<Daemon>) -> Result<(), String> {
     let cfg = Config::load_from(&daemon.config_path).map_err(|e| format!("config error: {e}"))?;
     let mut load = || load_models(cfg.clone(), daemon);
@@ -1756,7 +1767,16 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
             // its doc comment for why rebuilding the normalizer here instead
             // is the wrong fix) rather than reporting success while leaving
             // the old normalizer in place.
-            match Config::load() {
+            // `daemon.config_path`, matching `GetConfig`/`SetConfig` below --
+            // not `Config::load()`, which resolves `paths::config_file()`
+            // unconditionally. A test must never be pointed at the real
+            // config file: `Config::load_from`'s own doc comment warns that
+            // it *creates* the file when absent, so the bare `Config::load()`
+            // this used to call would have silently written into whoever ran
+            // the suite's real `~/.config/openwhisprflow/config.toml`. In
+            // production `daemon.config_path` *is* `paths::config_file()`
+            // (set in `start`), so this changes nothing there.
+            match Config::load_from(&daemon.config_path) {
                 Ok(new_cfg) => {
                     let injector = inject::build(&new_cfg.inject);
                     let mut guard = lock_ignoring_poison(&daemon.pipeline);
