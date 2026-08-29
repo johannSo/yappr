@@ -310,17 +310,34 @@ happen to be resident.
   unable to find `gtk-layer-shell-0` via `pkg-config`. On Arch: `sudo pacman -S
   gtk-layer-shell`. Unlike the `ggml-cpu` gotcha above, there is no way to defer this to a
   runtime check or a Setup-pane warning — the binary simply does not exist without it.
-- **Building an AppImage fails on current Arch with only "failed to run linuxdeploy".**
-  The real cause is one layer down: Tauri's `linuxdeploy-plugin-gtk` asks `pkg-config` for
-  gdk-pixbuf's loader directory, and Arch's installed `.pc` file still advertises
-  `/usr/lib/gdk-pixbuf-2.0/2.10.0`, a path modern gdk-pixbuf no longer ships because its
-  loaders are compiled in now. The plugin tries to `cp` from that nonexistent path and
-  dies; the Tauri CLI swallows its stderr, leaving only the unhelpful top-level message.
-  Workaround: shadow `gdk-pixbuf-2.0.pc` on `PKG_CONFIG_PATH` with a copy whose
-  `gdk_pixbuf_binarydir`/`moduledir`/`cache_file` point at an existing empty directory,
-  then run `linuxdeploy` directly rather than through `tauri build` — the Tauri CLI does
-  not propagate `PKG_CONFIG_PATH` to the plugin subprocess it spawns. Keep every compile
-  flag identical between the shadowed and real runs.
+- **Building an AppImage on current Arch needs two environment fixes, and fails with only
+  "failed to run linuxdeploy" if either is missing.** Both failures produce that same
+  unhelpful message: the Tauri CLI swallows linuxdeploy's stderr, so the error text tells
+  you nothing about which one you hit.
+  1. **gdk-pixbuf's `.pc` advertises a path that no longer exists.** Tauri's
+     `linuxdeploy-plugin-gtk` asks `pkg-config` for gdk-pixbuf's loader directory, and
+     Arch's installed `.pc` still advertises `/usr/lib/gdk-pixbuf-2.0/2.10.0`, which
+     modern gdk-pixbuf no longer ships because its loaders are compiled in now. The plugin
+     tries to `cp` from that nonexistent path and dies. Shadow the `.pc` on
+     `PKG_CONFIG_PATH`: copy `/usr/lib/pkgconfig/gdk-pixbuf-2.0.pc` to a scratch directory
+     and rewrite `gdk_pixbuf_binarydir`, `gdk_pixbuf_moduledir` and
+     `gdk_pixbuf_cache_file` to point inside a directory that exists. The directory must
+     exist; the `loaders.cache` file it names does **not** need to (verified).
+  2. **`NO_STRIP=1` is required.** Without it linuxdeploy's strip step fails and takes the
+     whole bundle with it.
+
+  Verified 2026-08-29, one command, no manual `linuxdeploy` invocation:
+
+  ```bash
+  PKG_CONFIG_PATH=<scratch-dir>:$PKG_CONFIG_PATH NO_STRIP=1 \
+      bun run tauri build --bundles appimage
+  ```
+
+  This corrects two earlier claims here. The Tauri CLI **does** propagate
+  `PKG_CONFIG_PATH` to the plugin subprocess, so driving `linuxdeploy` by hand — and the
+  matching warning about keeping compile flags identical across two runs — is no longer
+  necessary. `NO_STRIP=1` was not previously documented and is the likelier cause if a
+  build fails today with the shadow `.pc` already in place.
 - **Do not trust `cpal`'s advertised sample-rate range.** It advertised 16 kHz on hardware
   that rejected the stream build; `capture.rs` now probes by building a throwaway stream and
   falls back to 48 kHz plus `rubato` resampling.
