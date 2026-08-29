@@ -296,17 +296,46 @@ Invariant 12 in CLAUDE.md is the part to read before editing `server.rs`.
     pipeline will never call. The end state the user asked for is still
     correct — normalization really is off, the text is rule-cleaned and
     injected — what leaks is the memory this feature exists to reclaim.
-    Restarting clears it. Not fixed here: the fix is to give
-    `spawn_housekeeping` a live view of `[normalize]` instead of a startup
-    snapshot, which is a change to how that thread is configured, not a
-    review-round patch.
-  - **A stale RSS figure survives in one test comment.**
-    `server.rs:5087`'s comment on
-    `the_supervisor_is_skipped_entirely_while_the_models_are_unloaded` still
-    says "a fresh 697 MB llama-server" — an earlier estimate, predating the
-    measurement above. `~955 MB` is the measured figure and the one used
-    everywhere else in this document and in CLAUDE.md's invariant 12. Left
-    alone because it's comment-only staleness with no functional or test
-    impact, same class as the `warm_up`-naming fix this task already made
-    elsewhere in this file — flagging here so the next person editing that
-    test doesn't propagate the wrong number.
+    Restarting clears it, but so does the idle unload: the stray child is
+    bounded by `idle_unload_seconds` unless that is set to `0`, since
+    `unload_models` doesn't consult the stale `normalize_cfg` either — it
+    just tears down whatever `daemon.llama` holds. Not fixed here: the fix
+    is to give `spawn_housekeeping` a live view of `[normalize]` instead of
+    a startup snapshot, which is a change to how that thread is configured,
+    not a review-round patch.
+  - **A stale RSS figure survives in one test comment.** The comment on
+    `the_supervisor_is_skipped_entirely_while_the_models_are_unloaded`
+    (`server.rs`) still says "a fresh 697 MB llama-server" — an earlier
+    estimate, predating the measurement above. `~955 MB` is the measured
+    figure and the one used everywhere else in this document and in
+    CLAUDE.md's invariant 12. Left alone because it's comment-only
+    staleness with no functional or test impact, same class as the
+    `warm_up`-naming fix this task already made elsewhere in this file —
+    flagging here so the next person editing that test doesn't propagate
+    the wrong number.
+  - **A model load still in flight when the process quits orphans its
+    `llama-server` child.** `ensure_models_loaded_with` re-checks
+    `SHUTTING_DOWN` after installing the pipeline, but every route into
+    `shutdown` calls it and then immediately `std::process::exit(0)`, and
+    nothing joins the detached thread `start_recording` spawns to run the
+    load. So the re-check only ever fires for a load that finishes in the
+    narrow gap between `kill_llama` and `exit(0)`; a load still inside
+    `load_models` — which on every cold press means the ~3.5 s window
+    between `llama-server`'s cold start (~750 ms in) and the ASR model
+    finishing — is not reached at all before the process is gone. Press
+    SUPER+D, cancel with SUPER+ALT+D, then tray → Beenden, during that
+    window, and a ~955 MB `llama-server` is left running; the next start is
+    unaffected (`pick_port` just walks past it), so the only symptom is the
+    memory this feature exists to reclaim never coming back. Not fixed
+    here: a real fix needs either installing the `LlamaServer` into
+    `daemon.llama` right after `spawn_and_wait_healthy` returns instead of
+    after the ASR build finishes (the supervisor's `models_loaded` gate
+    already keeps it inert until then), or setting `PR_SET_PDEATHSIG` on
+    the child. See the comment on `ensure_models_loaded_with`'s `Ok` arm in
+    `server.rs` for the full reasoning.
+  - **`--reload` mirrors `[models]` into the daemon but not `[audio]`.**
+    The same shape of gap as the `[normalize]` one above: a hand-edited
+    `max_seconds` or `device` still needs a restart to take effect, because
+    nothing re-populates `daemon.audio_cfg` from a reloaded config, while
+    the Settings GUI's own save path applies such changes live. Pre-existing,
+    not introduced by this branch; recorded here so it isn't rediscovered.

@@ -1038,13 +1038,31 @@ fn ensure_models_loaded_with(
             // returns at once (`IDLE` is not `is_busy`) while this thread is
             // still loading.
             //
-            // Install-then-check, rather than check-then-install, is what
-            // makes this airtight instead of merely narrower. Everything here
-            // and in `shutdown` is `SeqCst`, and `shutdown` sets
-            // `SHUTTING_DOWN` *before* it calls `kill_llama`: either that
-            // store precedes this load and we tear the child down ourselves,
-            // or `kill_llama` runs after the install above and finds it. No
-            // interleaving lets both miss it.
+            // Install-then-check, rather than check-then-install, closes the
+            // window between `kill_llama` and the `std::process::exit(0)`
+            // that follows every route into `shutdown` (see `shutdown`'s own
+            // call sites) -- it is not airtight against the leak described
+            // above. Everything here and in `shutdown` is `SeqCst`, and
+            // `shutdown` sets `SHUTTING_DOWN` *before* it calls `kill_llama`:
+            // either that store precedes this load and we tear the child
+            // down ourselves, or `kill_llama` runs after the install above
+            // and finds it. No interleaving *that reaches this re-check*
+            // lets both miss it -- but `exit(0)` follows `shutdown` within
+            // milliseconds, and nothing joins the detached thread
+            // `start_recording` spawns to run this load (`ensure_models_loaded`
+            // via `std::thread::spawn`), so a load that is still inside
+            // `load_models` -- anywhere in the ~3.5 s window between
+            // `llama-server`'s cold start and the ASR model finishing its
+            // own load -- never reaches this code at all: the process is
+            // gone first, and the `llama-server` child it already spawned is
+            // orphaned exactly as before this re-check existed. A real fix
+            // needs one of: installing the `LlamaServer` into `daemon.llama`
+            // immediately after `spawn_and_wait_healthy` returns, rather than
+            // after the ASR build finishes (the supervisor's `models_loaded`
+            // gate already keeps it inert until then, so this is safe); or
+            // setting `PR_SET_PDEATHSIG` on the child so the kernel reaps it
+            // when this process dies regardless of where `shutdown` finds it.
+            // Both are design changes, deliberately out of scope here.
             //
             // `SHUTTING_DOWN`, not `Daemon::quitting`: `quitting` is set only
             // by the `Request::Quit` arm, so it would miss `SIGTERM` at

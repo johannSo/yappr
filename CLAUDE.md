@@ -242,12 +242,12 @@ happen to be resident.
     ordinary. Three consequences that are easy to break:
     - **Never lock `pipeline` to ask whether the models are loaded.** Not
       merely slow — an outright self-deadlock, on the commonest failure path
-      there is. `process_utterance` holds that mutex for the whole `process`
-      call (`server.rs:2613`) and broadcasts `Error` *from inside the guard*:
-      `:2623` for "no speech detected", `:2627` for a pipeline error. On
-      `Error`, and only on `Error`, `TauriSink::refresh_tray_icon` dispatches
-      `Request::Status` **synchronously** (`src-tauri/src/lib.rs:162`) to tell
-      a fatal startup failure from a transient one. So a `Status` handler that
+      there is. `process_utterance` holds that mutex's guard for the whole
+      `process` call and broadcasts `Error` *from inside the guard*: once for
+      "no speech detected", once for a pipeline error. On `Error`, and only on
+      `Error`, `TauriSink::refresh_tray_icon` dispatches `Request::Status`
+      **synchronously** (`src-tauri/src/lib.rs`) to tell a fatal startup
+      failure from a transient one. So a `Status` handler that
       locked `pipeline` would re-enter a `std::sync::Mutex` it already holds,
       on the same thread — which is UB-or-deadlock, not a wait — every time
       the user presses twice without speaking. `Status` and the housekeeping
