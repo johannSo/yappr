@@ -1305,6 +1305,97 @@ fn supervise_llama_once(
     healthy_now
 }
 
+/// Whether the idle-unload deadline has passed and it is safe to act on it.
+///
+/// Pure, and therefore directly unit-testable, for the same reason
+/// `should_emit_level` is: the interesting part is the boundary conditions,
+/// not the clock.
+///
+/// `PAUSED` counts as idle deliberately. It is reached only by a CAS from
+/// `IDLE` (Task 13), so there is never an utterance to protect while paused,
+/// and a user who has explicitly paused dictation is the clearest possible
+/// signal that the models are not about to be needed.
+fn should_unload(
+    last_activity: Instant,
+    now: Instant,
+    idle_seconds: u32,
+    state: u8,
+    loaded: bool,
+) -> bool {
+    if !loaded || idle_seconds == 0 {
+        return false;
+    }
+    if state != IDLE && state != PAUSED {
+        return false;
+    }
+    now.duration_since(last_activity) >= Duration::from_secs(idle_seconds as u64)
+}
+
+/// Releases the models, if the deadline still says to. Returns whether it
+/// actually did.
+///
+/// Takes `&Daemon` rather than the seven bare pieces it touches, which
+/// `fake_daemon` makes perfectly testable -- `claim_busy` already takes one
+/// the same way. The pieces-not-`&Daemon` convention elsewhere in this file
+/// exists for functions a test cannot otherwise reach without live audio
+/// hardware; this is not one of them.
+///
+/// The re-check under `load_lock` is what makes this race-free.
+/// `start_recording` refreshes `last_activity` *before* it stores
+/// `RECORDING`, so a recording that begins between the housekeeping thread's
+/// decision and its acquisition of the lock has already moved the deadline,
+/// and this declines. The worst remaining outcome is an unload immediately
+/// followed by the load that same press requested: wasteful for one
+/// dictation, never incorrect.
+///
+/// Nothing is broadcast. The daemon's `State` does not change -- it was
+/// `IDLE` before and is `IDLE` after -- and the tray's icon is driven
+/// entirely by broadcasts (`tray.rs`, "Icon and daemon state"), so an event
+/// here would mean inventing a tray icon for it too.
+// `expect`, not `allow`: the moment Task 6 wires this into the housekeeping
+// tick, `unfulfilled_lint_expectations` fires here and forces this
+// attribute's removal instead of it silently going stale. `cfg_attr(not(test),
+// ...)` rather than a bare `#[expect]`, because this task's own tests already
+// call `unload_models` directly (unlike `ensure_models_loaded`'s equivalent
+// attribute in the previous task, whose tests called the `_with` variant
+// instead and left the outer function genuinely uncalled everywhere) -- a
+// bare `#[expect(dead_code)]` would be unfulfilled, and thus itself a
+// warning, in the `#[cfg(test)]` build where these tests make it live. One
+// attribute covers both otherwise-dead symbols, not just this function:
+// rustc treats an `expect`/`allow`-attributed item as a live root and walks
+// its callees when deciding what else counts as reachable, so this also
+// covers `should_unload`, which has no other caller yet.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired to the housekeeping tick in Task 6; also covers should_unload")
+)]
+fn unload_models(daemon: &Daemon) -> bool {
+    let _guard = lock_ignoring_poison(&daemon.load_lock);
+
+    let idle_seconds = lock_ignoring_poison(&daemon.models_cfg).idle_unload_seconds;
+    if !should_unload(
+        *lock_ignoring_poison(&daemon.last_activity),
+        Instant::now(),
+        idle_seconds,
+        daemon.state.load(Ordering::SeqCst),
+        daemon.models_loaded.load(Ordering::SeqCst),
+    ) {
+        return false;
+    }
+
+    // Cleared first: it is what the supervisor's gate reads, and it must
+    // never still say "loaded" while the pipeline is being torn out.
+    daemon.models_loaded.store(false, Ordering::SeqCst);
+    *lock_ignoring_poison(&daemon.pipeline) = None;
+    // The same kill-then-reap path `shutdown` uses; a `None` llama is fine.
+    kill_llama(&daemon.llama);
+    // Not `NormalizeDegraded`: normalization is not degraded, it is not
+    // currently loaded, and the overlay's degraded badge means the former.
+    daemon.normalize_available.store(false, Ordering::SeqCst);
+    tracing::info!(idle_seconds, "models unloaded after idle timeout");
+    true
+}
+
 /// Reaps dead subscribers on a periodic tick (Task 3, Work Item 2) and, when
 /// `normalize_cfg` is `Some`, supervises the `llama-server` child on the
 /// same tick (Task 3, Work Item 1 / spec 15, 5.1): restarts a missing or
@@ -4659,5 +4750,99 @@ mod tests {
             lock_ignoring_poison(&daemon.last_activity).elapsed() < Duration::from_secs(1),
             "the deadline was not refreshed on unwind"
         );
+    }
+
+    /// A stand-in for the supervised `llama-server` child. A real one cannot run
+    /// on this machine (no ggml compute backend), so every test that needs one
+    /// uses `sleep 300` through the test-only `LlamaServer::from_child`, exactly
+    /// as `kill_llama_terminates_a_stub_child_and_is_idempotent` already does.
+    fn stub_llama() -> LlamaServer {
+        let child = std::process::Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .expect("spawning a stub child (`sleep 300`) for this test");
+        LlamaServer::from_child(child, 0)
+    }
+
+    #[test]
+    fn should_unload_waits_for_the_full_idle_timeout() {
+        let now = Instant::now();
+        let long_ago = now - Duration::from_secs(60);
+        let recent = now - Duration::from_secs(59);
+
+        assert!(should_unload(long_ago, now, 60, IDLE, true), "the boundary is inclusive");
+        assert!(!should_unload(recent, now, 60, IDLE, true), "unloaded a second early");
+    }
+
+    #[test]
+    fn should_unload_never_fires_with_zero_seconds_configured() {
+        // 0 is the documented "never unload" setting, not "unload immediately".
+        let now = Instant::now();
+        assert!(!should_unload(now - Duration::from_secs(86_400), now, 0, IDLE, true));
+    }
+
+    #[test]
+    fn should_unload_never_fires_when_nothing_is_loaded() {
+        let now = Instant::now();
+        assert!(!should_unload(now - Duration::from_secs(3600), now, 60, IDLE, false));
+    }
+
+    #[test]
+    fn should_unload_accepts_idle_and_paused_but_no_busy_state() {
+        let now = Instant::now();
+        let stale = now - Duration::from_secs(3600);
+
+        // Paused counts as idle deliberately: it is reached only by a CAS from
+        // IDLE, so there is never an utterance to protect, and a user who paused
+        // dictation is the clearest signal the models are not about to be needed.
+        for s in [IDLE, PAUSED] {
+            assert!(should_unload(stale, now, 60, s, true), "state {s} should unload");
+        }
+        for s in [WARMING, RECORDING, TRANSCRIBING, NORMALIZING, INJECTING, FAILED] {
+            assert!(!should_unload(stale, now, 60, s, true), "state {s} must not unload");
+        }
+    }
+
+    #[test]
+    fn unloading_drops_the_pipeline_and_reaps_llama() {
+        let daemon = fake_daemon(IDLE);
+        let mut load = counting_loader(Arc::new(AtomicU64::new(0)));
+        ensure_models_loaded_with(&daemon, &mut load).unwrap();
+        *lock_ignoring_poison(&daemon.llama) = Some(stub_llama());
+        daemon.normalize_available.store(true, Ordering::SeqCst);
+        *lock_ignoring_poison(&daemon.last_activity) = Instant::now() - Duration::from_secs(3600);
+
+        assert!(unload_models(&daemon));
+
+        assert!(!daemon.models_loaded.load(Ordering::SeqCst));
+        assert!(lock_ignoring_poison(&daemon.pipeline).is_none());
+        assert!(lock_ignoring_poison(&daemon.llama).is_none());
+        assert!(!daemon.normalize_available.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn unloading_declines_when_a_recording_started_after_the_decision() {
+        // The race `unload_models`' re-check under `load_lock` exists to close:
+        // the housekeeping thread decided to unload, then a press moved the
+        // deadline before it got the lock.
+        let daemon = fake_daemon(IDLE);
+        let mut load = counting_loader(Arc::new(AtomicU64::new(0)));
+        ensure_models_loaded_with(&daemon, &mut load).unwrap();
+        touch_activity(&daemon); // the press lands
+
+        assert!(!unload_models(&daemon), "unloaded despite a fresh deadline");
+        assert!(daemon.models_loaded.load(Ordering::SeqCst));
+        assert!(lock_ignoring_poison(&daemon.pipeline).is_some());
+    }
+
+    #[test]
+    fn unloading_declines_mid_utterance() {
+        let daemon = fake_daemon(TRANSCRIBING);
+        let mut load = counting_loader(Arc::new(AtomicU64::new(0)));
+        ensure_models_loaded_with(&daemon, &mut load).unwrap();
+        *lock_ignoring_poison(&daemon.last_activity) = Instant::now() - Duration::from_secs(3600);
+
+        assert!(!unload_models(&daemon), "unloaded a pipeline an utterance is using");
+        assert!(lock_ignoring_poison(&daemon.pipeline).is_some());
     }
 }
