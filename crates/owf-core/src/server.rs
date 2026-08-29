@@ -255,17 +255,10 @@ pub struct Daemon {
     /// would stop reaping subscribers for the same window. Both read this.
     models_loaded: AtomicBool,
     /// When the daemon was last doing something dictation-shaped: bumped by
-    /// `start_recording` and by every utterance that ends (`IdleOnExit`).
-    /// The idle-unload deadline is measured from this.
-    ///
-    /// Nothing reads or bumps this yet -- that lands with the idle-unload
-    /// timer in a later task. `#[expect(dead_code)]` rather than leaving the
-    /// field out of this task entirely: both construction sites need to
-    /// agree on the daemon's full field set now, not grow it again later.
-    /// `expect`, not `allow`: once the idle-unload timer starts reading it,
-    /// an unfulfilled-expectation warning forces this attribute's removal
-    /// instead of it silently going stale.
-    #[expect(dead_code, reason = "read by the idle-unload timer added in a later task; unused until then")]
+    /// `start_recording` (via `touch_activity`) and by every utterance that
+    /// ends (`IdleOnExit`). The idle-unload deadline is measured from this --
+    /// nothing reads it yet, that lands with the idle-unload timer in a
+    /// later task, but both places that must bump it do so already.
     last_activity: Mutex<Instant>,
     /// `[models]`, mirrored here so a Settings change takes effect without a
     /// restart -- the same reason, and the same shape, as `audio_cfg`.
@@ -931,15 +924,6 @@ fn load_models(cfg: Config, daemon: &Arc<Daemon>) -> Result<(Pipeline, Option<Ll
 /// next restart. That is a side effect, not a promise -- `schema.ts`'s
 /// `RESTART_SECTIONS` is unchanged because it is still correct whenever the
 /// models happen to be resident.
-// `expect`, not `allow`: the moment Task 4 wires this to the key press,
-// `unfulfilled_lint_expectations` (warn-by-default, stable since 1.81) fires
-// here and forces this attribute's removal instead of it silently going
-// stale. One attribute covers three otherwise-dead symbols, not just this
-// function: rustc treats an `expect`/`allow`-attributed item as a live root
-// and walks its callees when deciding what else counts as reachable, so this
-// also covers `ensure_models_loaded_with` and the `load_lock` field, neither
-// of which is reachable through any other path yet.
-#[expect(dead_code, reason = "wired to the key press in Task 4; also covers ensure_models_loaded_with and Daemon::load_lock")]
 fn ensure_models_loaded(daemon: &Arc<Daemon>) -> Result<(), String> {
     let cfg = Config::load_from(&daemon.config_path).map_err(|e| format!("config error: {e}"))?;
     let mut load = || load_models(cfg.clone(), daemon);
@@ -1979,7 +1963,21 @@ fn recording_start_failed(daemon: &Daemon, reason: String) -> Response {
     Response::err(reason)
 }
 
+/// Refreshes the idle-unload deadline. Called at the start of every
+/// recording and at the end of every utterance, which between them cover
+/// every way the daemon does dictation-shaped work.
+fn touch_activity(daemon: &Daemon) {
+    *lock_ignoring_poison(&daemon.last_activity) = Instant::now();
+}
+
 fn start_recording(daemon: &Arc<Daemon>) -> Response {
+    // Before anything else, and specifically before the `RECORDING` store
+    // below: `unload_models` re-checks this deadline while holding
+    // `load_lock`, so a press that refreshes it first can never have its
+    // models pulled out from under it by an unload that was already in
+    // flight. Same discipline as `recording_epoch` and the safety valve.
+    touch_activity(daemon);
+
     // Tell the overlay "wait" *before* anything that can take real time.
     // The microphone is not live yet: `ensure_recorder` below may still have
     // to build the recorder, and even once `start()` has returned,
@@ -2065,6 +2063,25 @@ fn start_recording(daemon: &Arc<Daemon>) -> Response {
     // (invariant 1), not discard it. See `spawn_safety_valve`'s own doc.
     spawn_safety_valve(daemon, epoch);
 
+    // The models come up on their own thread, deliberately *after* capture is
+    // already live. Nothing in the capture path needs a model, so the
+    // microphone opens on exactly the timeline it always did and the load
+    // overlaps with the user speaking -- for any utterance longer than the
+    // load, it costs nothing at all. `run_utterance` calls the same function
+    // and blocks there if this has not finished by the second press.
+    //
+    // A failure here is logged and dropped: `run_utterance` retries and is
+    // the one that reports it to the user, so a failed load never produces
+    // two error broadcasts for one press.
+    {
+        let d = Arc::clone(daemon);
+        std::thread::spawn(move || {
+            if let Err(e) = ensure_models_loaded(&d) {
+                tracing::warn!(error = %e, "background model load failed; ptt-stop will retry");
+            }
+        });
+    }
+
     Response::ok(State::Recording)
 }
 
@@ -2131,17 +2148,26 @@ fn spawn_safety_valve(daemon: &Arc<Daemon>, epoch: u64) {
 struct IdleOnExit<'a> {
     state: &'a AtomicU8,
     broadcaster: Broadcaster<'a>,
+    /// Refreshed on every exit path, unwinding included: a panicking
+    /// utterance that left a stale deadline behind would have its models
+    /// unloaded early, on a clock that started before the utterance did.
+    last_activity: &'a Mutex<Instant>,
     terminal_sent: Cell<bool>,
 }
 
 impl<'a> IdleOnExit<'a> {
-    fn new(state: &'a AtomicU8, broadcaster: Broadcaster<'a>) -> Self {
-        Self { state, broadcaster, terminal_sent: Cell::new(false) }
+    fn new(
+        state: &'a AtomicU8,
+        broadcaster: Broadcaster<'a>,
+        last_activity: &'a Mutex<Instant>,
+    ) -> Self {
+        Self { state, broadcaster, last_activity, terminal_sent: Cell::new(false) }
     }
 }
 
 impl Drop for IdleOnExit<'_> {
     fn drop(&mut self) {
+        *lock_ignoring_poison(self.last_activity) = Instant::now();
         self.state.store(IDLE, Ordering::SeqCst);
         if !self.terminal_sent.get() {
             self.broadcaster.broadcast(OverlayEvent::Idle);
@@ -2150,7 +2176,7 @@ impl Drop for IdleOnExit<'_> {
 }
 
 fn run_utterance(daemon: Arc<Daemon>) {
-    let idle_on_exit = IdleOnExit::new(&daemon.state, daemon.broadcaster());
+    let idle_on_exit = IdleOnExit::new(&daemon.state, daemon.broadcaster(), &daemon.last_activity);
 
     let stop_result = match lock_ignoring_poison(&daemon.recorder).as_ref() {
         Some(r) => r.stop(),
@@ -2173,6 +2199,23 @@ fn run_utterance(daemon: Arc<Daemon>) {
         }
     };
     let class = lock_ignoring_poison(&daemon.window_class).clone();
+    // Blocks only if the load started by `start_recording` has not finished.
+    // No new overlay state: the daemon really is `TRANSCRIBING` (`claim_busy`
+    // ran before this thread was spawned), so the overlay shows its existing
+    // Transcribing view for however long this takes.
+    if let Err(reason) = ensure_models_loaded(&daemon) {
+        // Spec 2026-08-29 §4: retryable, not fatal. `FAILED` and
+        // `fatal_error` are left alone, so the next press tries again -- on a
+        // fresh install that means downloading the models in the Setup pane
+        // and pressing again, with no restart. `reason` carries
+        // `SherpaTranscriber`/`SileroTrimmer`'s own "model paths" error,
+        // which is the string that tells the user which pane to open.
+        tracing::error!(error = %reason, "models could not be loaded for this utterance");
+        daemon.broadcast(OverlayEvent::Error { reason });
+        idle_on_exit.terminal_sent.set(true);
+        return;
+    }
+
     process_utterance(
         &daemon.pipeline,
         daemon.broadcaster(),
@@ -2248,10 +2291,15 @@ fn process_utterance(
             }
         }
     } else {
-        // Unreachable in normal operation: reaching RECORDING/busy requires
-        // having passed through IDLE, which is only set once warm-up has
-        // populated `pipeline`. Logged rather than unwrapped so a future
-        // change to that invariant fails loudly instead of panicking.
+        // Unreachable in normal operation, but for a different reason than
+        // before lazy loading: `IDLE` is no longer proof that `pipeline` is
+        // populated (a lazy daemon reaches it with no models loaded at all).
+        // What makes this arm unreachable now is `run_utterance`, which calls
+        // `ensure_models_loaded` and returns before ever reaching this
+        // function if that call failed -- so by the time `process_utterance`
+        // runs, the load has already succeeded. Logged rather than unwrapped
+        // so a future change to that guarantee fails loudly instead of
+        // panicking.
         tracing::warn!("utterance finished but the pipeline was not ready");
         broadcaster.broadcast(OverlayEvent::Error { reason: "pipeline not ready".to_string() });
     }
@@ -2332,10 +2380,11 @@ mod tests {
         subscribers.lock().unwrap().push(Subscriber { tx, alive: Arc::new(AtomicBool::new(true)) });
         let samples = vec![0.1f32; 16_000];
         let last_timings: Mutex<Option<Timings>> = Mutex::new(None);
+        let last_activity: Mutex<Instant> = Mutex::new(Instant::now());
 
         let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
             let broadcaster = dropping_broadcaster(&subscribers);
-            let _idle_on_exit = IdleOnExit::new(&state, broadcaster.clone());
+            let _idle_on_exit = IdleOnExit::new(&state, broadcaster.clone(), &last_activity);
             process_utterance(&pipeline, broadcaster, &last_timings, &samples, None, None);
         }));
 
@@ -2381,10 +2430,11 @@ mod tests {
         subscribers.lock().unwrap().push(Subscriber { tx, alive: Arc::new(AtomicBool::new(true)) });
         let samples = vec![0.1f32; 16_000];
         let last_timings: Mutex<Option<Timings>> = Mutex::new(None);
+        let last_activity: Mutex<Instant> = Mutex::new(Instant::now());
 
         {
             let broadcaster = dropping_broadcaster(&subscribers);
-            let idle_on_exit = IdleOnExit::new(&state, broadcaster.clone());
+            let idle_on_exit = IdleOnExit::new(&state, broadcaster.clone(), &last_activity);
             process_utterance(&pipeline, broadcaster, &last_timings, &samples, None, None);
             idle_on_exit.terminal_sent.set(true);
         }
@@ -2434,10 +2484,11 @@ mod tests {
         subscribers.lock().unwrap().push(Subscriber { tx, alive: Arc::new(AtomicBool::new(true)) });
         let samples = vec![0.1f32; 16_000];
         let last_timings: Mutex<Option<Timings>> = Mutex::new(None);
+        let last_activity: Mutex<Instant> = Mutex::new(Instant::now());
 
         {
             let broadcaster = dropping_broadcaster(&subscribers);
-            let idle_on_exit = IdleOnExit::new(&state, broadcaster.clone());
+            let idle_on_exit = IdleOnExit::new(&state, broadcaster.clone(), &last_activity);
             process_utterance(&pipeline, broadcaster, &last_timings, &samples, None, None);
             idle_on_exit.terminal_sent.set(true);
         }
@@ -4520,5 +4571,43 @@ mod tests {
         let r = dispatch(&daemon, Request::Reload);
 
         assert!(r.ok, "reload refused with no pipeline: {:?}", r.err);
+    }
+
+    #[test]
+    fn a_recording_refreshes_the_idle_deadline_before_it_changes_state() {
+        // Ordering matters: `unload_models` re-checks the deadline under
+        // `load_lock`, so a press that bumps `last_activity` before storing
+        // RECORDING can never be unloaded out from under.
+        let daemon = fake_daemon(IDLE);
+        *lock_ignoring_poison(&daemon.last_activity) = Instant::now() - Duration::from_secs(3600);
+
+        touch_activity(&daemon);
+
+        assert!(
+            lock_ignoring_poison(&daemon.last_activity).elapsed() < Duration::from_secs(1),
+            "the deadline was not refreshed"
+        );
+    }
+
+    #[test]
+    fn an_utterance_ending_refreshes_the_idle_deadline_even_on_a_panic() {
+        // `IdleOnExit` already recovers `state` when the utterance thread
+        // unwinds; the deadline must ride along, or a panicking utterance leaves
+        // a stale deadline and the models are unloaded early.
+        let daemon = fake_daemon(TRANSCRIBING);
+        let stale = Instant::now() - Duration::from_secs(3600);
+        *lock_ignoring_poison(&daemon.last_activity) = stale;
+
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _guard = IdleOnExit::new(&daemon.state, daemon.broadcaster(), &daemon.last_activity);
+            panic!("pipeline blew up");
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(daemon.state.load(Ordering::SeqCst), IDLE);
+        assert!(
+            lock_ignoring_poison(&daemon.last_activity).elapsed() < Duration::from_secs(1),
+            "the deadline was not refreshed on unwind"
+        );
     }
 }
