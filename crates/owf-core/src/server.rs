@@ -924,9 +924,22 @@ fn load_models(cfg: Config, daemon: &Arc<Daemon>) -> Result<(Pipeline, Option<Ll
 /// next restart. That is a side effect, not a promise -- `schema.ts`'s
 /// `RESTART_SECTIONS` is unchanged because it is still correct whenever the
 /// models happen to be resident.
+///
+/// The read happens inside `load`'s closure body, not above it, so it runs
+/// only on the path that actually loads: `ensure_models_loaded_with`'s
+/// `models_loaded` fast path returns before `load` is ever called. Hoisting
+/// it back out and passing an already-parsed `Config` in would put a
+/// fallible disk read and TOML parse on every single utterance on an
+/// already-warm daemon, and -- worse than the wasted work -- would make a
+/// `config.toml` broken by a hand-edit (invariant 4: even one unknown key is
+/// a hard parse failure) turn every later press into a dropped,
+/// untranscribed recording, on a daemon whose pipeline was already resident
+/// and would have transcribed it fine.
 fn ensure_models_loaded(daemon: &Arc<Daemon>) -> Result<(), String> {
-    let cfg = Config::load_from(&daemon.config_path).map_err(|e| format!("config error: {e}"))?;
-    let mut load = || load_models(cfg.clone(), daemon);
+    let mut load = || {
+        let cfg = Config::load_from(&daemon.config_path).context("config error")?;
+        load_models(cfg, daemon)
+    };
     ensure_models_loaded_with(daemon, &mut load)
 }
 
@@ -4517,6 +4530,36 @@ mod tests {
         assert_eq!(daemon.state.load(Ordering::SeqCst), IDLE, "must not latch FAILED");
     }
 
+    /// Review finding on this task: `ensure_models_loaded` used to read
+    /// `Config::load_from` *before* delegating to `ensure_models_loaded_with`,
+    /// so that fallible read ran even when the daemon was already warm and
+    /// `ensure_models_loaded_with`'s `models_loaded` fast path was about to
+    /// return `Ok(())` unconditionally. A `config.toml` broken by a hand-edit
+    /// (invariant 4: `deny_unknown_fields` makes even one unknown key a hard
+    /// parse failure) turned every later press into a dropped, untranscribed
+    /// recording -- on a daemon whose pipeline was already resident and would
+    /// have transcribed it fine. The read now lives inside `load`'s closure,
+    /// so it only ever runs on the path that actually loads.
+    #[test]
+    fn an_already_warm_daemon_ignores_a_config_that_no_longer_parses() {
+        let dir = std::env::temp_dir()
+            .join(format!("owf-daemon-cfg-broken-warm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        // `deny_unknown_fields` (invariant 4) makes this a hard parse
+        // failure, the same failure mode a hand-edit typo produces.
+        std::fs::write(&path, "not_a_real_key = true\n").unwrap();
+        let daemon = fake_daemon_at(IDLE, false, path);
+        daemon.models_loaded.store(true, Ordering::SeqCst);
+
+        let result = ensure_models_loaded(&daemon);
+
+        assert!(
+            result.is_ok(),
+            "an already-warm daemon must not care that config.toml stopped parsing: {result:?}"
+        );
+    }
+
     #[test]
     fn status_reports_model_residency_rather_than_startup_completion() {
         let daemon = fake_daemon(IDLE);
@@ -4573,11 +4616,18 @@ mod tests {
         assert!(r.ok, "reload refused with no pipeline: {:?}", r.err);
     }
 
+    /// Pins `touch_activity`'s own body only -- not the ordering in
+    /// `start_recording` that calls it before the `RECORDING` store.
+    /// `start_recording` needs a real `Recorder`, which needs live audio
+    /// hardware to construct (`ensure_recorder` -> `Recorder::new`), so that
+    /// ordering cannot be driven through this suite or CI, the same reason
+    /// `spawn_safety_valve`'s body was pulled out to a named function so
+    /// *that* could be tested directly. The ordering itself is enforced by
+    /// reading `start_recording`'s source (`touch_activity(daemon);` is its
+    /// first statement, before the `RECORDING` store), not by this test --
+    /// hence the name naming only what this test actually covers.
     #[test]
-    fn a_recording_refreshes_the_idle_deadline_before_it_changes_state() {
-        // Ordering matters: `unload_models` re-checks the deadline under
-        // `load_lock`, so a press that bumps `last_activity` before storing
-        // RECORDING can never be unloaded out from under.
+    fn touch_activity_refreshes_the_idle_deadline() {
         let daemon = fake_daemon(IDLE);
         *lock_ignoring_poison(&daemon.last_activity) = Instant::now() - Duration::from_secs(3600);
 
