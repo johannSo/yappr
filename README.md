@@ -27,9 +27,12 @@ One dictation goes through this pipeline:
 By default, `llama-server` (and the ASR/VAD models) load lazily, on the first
 press, and unload again after a minute without a dictation — see
 [Speicherverbrauch](#speicherverbrauch). `[models] preload_at_startup = true`
-restores the old behaviour: `llama-server` starts once, supervised, when the
-app starts, and stays warm for as long as the app runs, so normalization only
-pays a network round-trip to `localhost`, not a model load, per dictation.
+**together with** `idle_unload_seconds = 0` restores the old behaviour:
+`llama-server` starts once, supervised, when the app starts, and stays warm
+for as long as the app runs, so normalization only pays a network round-trip
+to `localhost`, not a model load, per dictation. `preload_at_startup` alone
+still unloads after the configured idle timeout (60 s by default) — both
+settings are needed together.
 
 There is no second press that ends a recording on its own the way releasing a
 key used to. If you forget to press again, a watchdog ends the recording after
@@ -252,6 +255,7 @@ The config file lives at `$XDG_CONFIG_HOME/openwhisprflow/config.toml`
 commented defaults on first run. The main knobs:
 
 - **`[audio]`** — `device`, `max_seconds` (ends a forgotten recording — under press/press toggle nothing else does; see "How it works" above), `vad_padding_ms` (silence kept around trimmed speech).
+- **`[models]`** — `preload_at_startup` and `idle_unload_seconds`, controlling whether the models load at app start or lazily on the first press, and how long after the last dictation they unload again; see [Speicherverbrauch](#speicherverbrauch).
 - **`[asr]`** — `num_threads` for Parakeet.
 - **`[normalize]`** — `enabled` (set `false` to skip S1-mini entirely and type rule-based-cleaned raw ASR text), `port`/`timeout_ms`/`llama_server_path`/`context_size`/`threads` for the supervised `llama-server`.
 - **`[guardrail]`** — `min_word_ratio`/`max_word_ratio`, `min_overlap_english`/`min_overlap_other`, `short_input_words` (below this many raw words, the ratio/overlap checks are skipped — see Known limitations), `ngram_size`/`ngram_max_repeats` (loop detection).
@@ -323,7 +327,7 @@ Zwei Einstellungen unter **Erweitert → Modelle & Speicher** steuern das:
 
 | Einstellung | Standard | Bedeutung |
 |---|---|---|
-| Modelle beim Start laden | aus | Lädt alles schon beim Programmstart. Erstes Diktat ohne Wartezeit, dafür ist der Speicher ab dem Anmelden belegt. |
+| Modelle beim Start laden | aus | Lädt alles schon beim Programmstart. Erstes Diktat ohne Wartezeit, dafür ist der Speicher ab dem Programmstart belegt. |
 | Modelle entladen nach | 60 s | Ruhezeit, nach der die Modelle freigegeben werden. `0` heißt: nie entladen. |
 
 Wer das alte Verhalten will — alles beim Start laden, nie entladen — setzt die

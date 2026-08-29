@@ -272,3 +272,13 @@ Invariant 12 in CLAUDE.md is the part to read before editing `server.rs`.
     deterministic handshake. It can only ever produce a false negative
     (missing a regression on a loaded machine), never a flaky failure, but a
     handshake would be strictly better.
+  - **A stale RSS figure survives in one test comment.**
+    `server.rs:5087`'s comment on
+    `the_supervisor_is_skipped_entirely_while_the_models_are_unloaded` still
+    says "a fresh 697 MB llama-server" — an earlier estimate, predating the
+    measurement above. `~955 MB` is the measured figure and the one used
+    everywhere else in this document and in CLAUDE.md's invariant 12. Left
+    alone because it's comment-only staleness with no functional or test
+    impact, same class as the `warm_up`-naming fix this task already made
+    elsewhere in this file — flagging here so the next person editing that
+    test doesn't propagate the wrong number.
