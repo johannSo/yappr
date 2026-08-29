@@ -24,9 +24,12 @@ One dictation goes through this pipeline:
 6. **Guardrail** — a set of cheap, deterministic checks (word-count ratio, token overlap, n-gram loop detection, template-bleed detection) decides whether S1-mini's rewrite is trustworthy. If not, the pipeline falls back to the raw ASR text (or a light rule-based cleanup of it) instead of typing something S1-mini invented. Every rejection is appended to `rejections.jsonl` for later review.
 7. **Injection** — `wtype` types the result into the focused window; if that fails, the text is copied to the clipboard with `wl-copy` instead, and a notification says so. `[inject] backend = "ydotool"` swaps in `ydotool` for windows `wtype` cannot reach (see below).
 
-`llama-server` is started once, supervised, when the app starts, and stays warm
-for as long as the app runs — normalization only pays a network round-trip to
-`localhost`, not a model load, per dictation.
+By default, `llama-server` (and the ASR/VAD models) load lazily, on the first
+press, and unload again after a minute without a dictation — see
+[Speicherverbrauch](#speicherverbrauch). `[models] preload_at_startup = true`
+restores the old behaviour: `llama-server` starts once, supervised, when the
+app starts, and stays warm for as long as the app runs, so normalization only
+pays a network round-trip to `localhost`, not a model load, per dictation.
 
 There is no second press that ends a recording on its own the way releasing a
 key used to. If you forget to press again, a watchdog ends the recording after
@@ -44,8 +47,8 @@ Measured on an i7-10510U (4 threads), release build:
 | S1-mini normalization, 8-word transcript | 438 ms |
 | S1-mini normalization, 26-word transcript | 585 ms |
 | S1-mini normalization, 58-word transcript | 1,313 ms |
-| `llama-server` cold start (once, at app start) | 751 ms |
-| ASR model load (once, at app start) | 3,497 ms |
+| `llama-server` cold start (once, at first press by default; at app start with `preload_at_startup`) | 751 ms |
+| ASR model load (once, at first press by default; at app start with `preload_at_startup`) | 3,497 ms |
 
 A typical ~10 s dictation, once the app is warm, is roughly **2 seconds
 end to end** — second press to text appearing.
@@ -303,6 +306,29 @@ Note that `keystroke_delay_ms` means something slightly different here:
 `ydotool` applies it per key event, so a character costs twice the configured
 delay.
 
+## Speicherverbrauch
+
+Standardmäßig werden die Modelle erst beim ersten Tastendruck geladen und eine
+Minute nach dem letzten Diktat wieder entladen. Im Leerlauf belegt das Programm
+damit einen Bruchteil dessen, was Spracherkennung und Sprachmodell zusammen
+brauchen — auf dem Entwicklungsrechner rund 1,4 GB, die sonst dauerhaft belegt
+blieben.
+
+Der Preis: das erste Diktat nach dem Start (und nach jeder Ruhephase) wartet
+einmalig darauf, dass die Modelle geladen sind. Die Aufnahme selbst beginnt
+sofort — das Laden läuft parallel zum Sprechen —, aber bei einem sehr kurzen
+Diktat kann der Einfügevorgang ein paar Sekunden später kommen.
+
+Zwei Einstellungen unter **Erweitert → Modelle & Speicher** steuern das:
+
+| Einstellung | Standard | Bedeutung |
+|---|---|---|
+| Modelle beim Start laden | aus | Lädt alles schon beim Programmstart. Erstes Diktat ohne Wartezeit, dafür ist der Speicher ab dem Anmelden belegt. |
+| Modelle entladen nach | 60 s | Ruhezeit, nach der die Modelle freigegeben werden. `0` heißt: nie entladen. |
+
+Wer das alte Verhalten will — alles beim Start laden, nie entladen — setzt die
+erste Einstellung auf an und die zweite auf `0`.
+
 ## Known limitations
 
 Found during development, not yet fixed — worth knowing before relying on this:
@@ -320,7 +346,7 @@ The following has **not** been performed on real hardware and is not
 claimed to work; it requires a human speaking into a microphone and
 watching the result. Treat dictation as unverified until this is done:
 
-- [ ] `openwhisprflow --status` reports `warm: true` ~45 s after the app starts
+- [ ] `openwhisprflow --status` reports `warm: true` right after a first `--toggle`, and `warm: false` again once `idle_unload_seconds` after that has passed — `warm` now means "models are resident right now", not "startup finished" (see [Speicherverbrauch](#speicherverbrauch); under the default lazy config, `warm` stays `false` until the first press)
 - [ ] Dictation into Alacritty, Firefox's address bar, an Electron app (VS Code/Slack), and an XWayland window (`xterm` or a Wine app)
 - [ ] Pressing `SUPER+D` and pressing it again immediately without speaking types nothing and logs "no speech detected"
 - [ ] `SUPER+ALT+D` while a recording is in progress cancels cleanly

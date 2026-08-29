@@ -5094,10 +5094,10 @@ mod tests {
     }
 
     #[test]
-    fn the_supervisor_still_stays_inert_during_warm_up() {
-        // The pre-existing half of this gate, kept: `warm_up` has not settled
-        // `daemon.llama` yet, so acting now could spawn a second llama-server
-        // racing its own.
+    fn the_supervisor_still_stays_inert_during_load_models() {
+        // The pre-existing half of this gate, kept: `load_models` has not
+        // settled `daemon.llama` yet, so acting now could spawn a second
+        // llama-server racing its own.
         assert!(!should_supervise_llama(WARMING, false));
         assert!(!should_supervise_llama(WARMING, true));
     }

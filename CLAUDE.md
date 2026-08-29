@@ -35,7 +35,7 @@ bun run tauri dev                         # dev: Vite on :1420 + the Tauri windo
 bun run build                             # frontend only (tsc && vite build -> dist/)
 #   ^ builds BOTH pages: index.html (overlay) and settings.html (settings window).
 
-# Tests (377 passed, 0 failed, 4 #[ignore]d because they need downloaded models)
+# Tests (410 passed, 0 failed, 4 #[ignore]d because they need downloaded models)
 cargo test --workspace
 cargo test --workspace -- --ignored       # needs models already on disk (Settings' Setup pane, or --update-lock)
 cargo test -p owf-core guardrail::        # one module
@@ -126,9 +126,20 @@ The server's state machine is an `AtomicU8` with consts at the top of `server.rs
 arrives, never against a client-side memory of the last press — the client is a fresh
 process every time. A single utterance runs through `pipeline::Pipeline::process_with_capture`.
 
-`llama-server` is spawned once when the app starts and supervised (`spawn_housekeeping` /
-`supervise_llama_once`: 10 s health poll, 1→30 s backoff restart, zombie reaping). A dead
-`llama-server` degrades to `UnavailableNormalizer` rather than failing the app.
+`llama-server` is spawned by `load_models` — at startup only when `[models]
+preload_at_startup` is on, otherwise on the first `ptt-start` — and supervised
+while it lives (`spawn_housekeeping` / `supervise_llama_once`: 10 s health poll,
+1→30 s backoff restart, zombie reaping). That supervision is gated on
+`daemon.models_loaded`, so a child killed deliberately by `unload_models` stays
+dead instead of being restarted (invariant 12). A dead `llama-server` degrades
+to `UnavailableNormalizer` rather than failing the app.
+
+`[models]` owns the model lifetime: `preload_at_startup` (default `false`) and
+`idle_unload_seconds` (default `60`, `0` = never). `ensure_models_loaded` reads
+the config from disk at load time, so `[asr]`/`[normalize]` changes take effect
+on the next dictation for a lazily-loaded daemon — `schema.ts`'s
+`RESTART_SECTIONS` is unchanged because it is still correct whenever the models
+happen to be resident.
 
 ## Invariants worth knowing before editing
 
@@ -224,6 +235,28 @@ process every time. A single utterance runs through `pipeline::Pipeline::process
     deliberately rather than inherit silently; `config_write.rs`'s annotated fixture and
     the Settings GUI describe it as ending "a forgotten recording" (Sicherheitsnetz), not
     a stuck key, for the same reason.
+12. **The models are not resident by default, and `load_lock` is always taken
+    before `pipeline`.** `[models] preload_at_startup` defaults to `false`, so
+    an idle daemon routinely has `pipeline: None` and no `llama-server` child
+    at all — a state that used to be reachable only during warm-up and is now
+    ordinary. Three consequences that are easy to break:
+    - **Never lock `pipeline` to ask whether the models are loaded.**
+      `process_utterance` holds that mutex for the whole `process` call, so a
+      reader that locks it blocks for the length of a transcription. `Status`
+      and the housekeeping thread read `daemon.models_loaded` instead — the
+      same reason `normalize_available` exists.
+    - **The `llama-server` supervisor must stay gated on `models_loaded`.**
+      Without that gate it respawns a ~955 MB child seconds after every unload,
+      and the whole feature silently does nothing.
+    - **A lazy load failure is retryable, not fatal.** `run_utterance`
+      broadcasts `Error` and returns to `IDLE`; only the `preload_at_startup`
+      path still latches `FAILED` with a stored `fatal_error`. On a fresh
+      install this is what lets the Setup pane's download be followed by a
+      press rather than a restart.
+    `preload_at_startup = true` with `idle_unload_seconds = 0` reproduces the
+    pre-2026-08-29 behaviour exactly, and is what to point a user at if the
+    lazy path misbehaves. See
+    `docs/superpowers/specs/2026-08-29-lazy-model-lifecycle-design.md`.
 
 ## Conventions
 
