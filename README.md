@@ -1,101 +1,102 @@
+<div align="center">
+
 # yappr
 
-Press-to-start, press-to-stop dictation for Hyprland. Press `SUPER+D`, speak,
-press `SUPER+D` again: the audio is transcribed, cleaned up, and typed into
-whatever window has focus. `SUPER+ALT+D` cancels a recording in progress.
-Everything runs locally — no network calls at dictation time.
+**Local dictation for Wayland.** Press `SUPER+D`, speak, press `SUPER+D` again —
+what you said is typed into whatever window has focus, punctuated and tidied up.
+No cloud, no account, no network calls while you dictate.
 
-## How it works
+</div>
 
-`yappr` is the only binary. Launching it with no arguments starts
-everything: a tray icon (no window), the pipeline, and a Unix socket. A
-shortcut you bind yourself (see below) runs the same binary with `--toggle` or
-`--cancel` — that invocation is a thin client that talks to the running app
-over the socket and exits immediately, so pressing the shortcut does not pay
-the cost of starting a whole app.
+---
 
-One dictation goes through this pipeline:
-
-1. **Capture** — the microphone records at 16 kHz mono from the first press until the second.
-2. **VAD** — Silero VAD trims leading and trailing silence from the recording.
-3. **ASR** — [Parakeet TDT 0.6b v3](https://github.com/k2-fsa/sherpa-onnx) (int8, via `sherpa-onnx`) transcribes the trimmed audio.
-4. **Language ID** — `whatlang` tags the transcript's language, which selects the guardrail's overlap threshold below.
-5. **Normalization** — **S1-mini** by **Superwhisper**, served locally through a supervised `llama-server`, rewrites the raw transcript into cleaned, punctuated prose (or a list, depending on style).
-6. **Guardrail** — a set of cheap, deterministic checks (word-count ratio, token overlap, n-gram loop detection, template-bleed detection) decides whether S1-mini's rewrite is trustworthy. If not, the pipeline falls back to the raw ASR text (or a light rule-based cleanup of it) instead of typing something S1-mini invented. Every rejection is appended to `rejections.jsonl` for later review.
-7. **Injection** — `wtype` types the result into the focused window; if that fails, the text is copied to the clipboard with `wl-copy` instead, and a notification says so. `[inject] backend = "ydotool"` swaps in `ydotool` for windows `wtype` cannot reach (see below).
-
-By default, `llama-server` (and the ASR/VAD models) load lazily, on the first
-press, and unload again after a minute without a dictation — see
-[Speicherverbrauch](#speicherverbrauch). `[models] preload_at_startup = true`
-**together with** `idle_unload_seconds = 0` restores the old behaviour:
-`llama-server` starts once, supervised, when the app starts, and stays warm
-for as long as the app runs, so normalization only pays a network round-trip
-to `localhost`, not a model load, per dictation. `preload_at_startup` alone
-still unloads after the configured idle timeout (60 s by default) — both
-settings are needed together.
-
-There is no second press that ends a recording on its own the way releasing a
-key used to. If you forget to press again, a watchdog ends the recording after
-`audio.max_seconds` (120 s by default) and transcribes whatever it captured —
-it does not discard it. See [Configuration](#configuration) if you want that
-number lower.
-
-## Measured performance
-
-Measured on an i7-10510U (4 threads), release build:
-
-| Stage | Latency |
+| | |
 |---|---|
-| ASR (11.5 s of audio) | 1,700 ms (RTF 0.147) |
-| S1-mini normalization, 8-word transcript | 438 ms |
-| S1-mini normalization, 26-word transcript | 585 ms |
-| S1-mini normalization, 58-word transcript | 1,313 ms |
-| `llama-server` cold start (once, at first press by default; at app start with `preload_at_startup`) | 751 ms |
-| ASR model load (once, at first press by default; at app start with `preload_at_startup`) | 3,497 ms |
+| **Start / stop dictating** | `SUPER+D` |
+| **Cancel the current recording** | `SUPER+ALT+D` |
+| **Settings** | left-click the tray icon |
+| **Everything else** | right-click the tray icon |
 
-A typical ~10 s dictation, once the app is warm, is roughly **2 seconds
-end to end** — second press to text appearing.
+**Jump to:** [Install](#install) · [First run](#first-run) · [Using it](#using-it) ·
+[Settings](#settings) · [Troubleshooting](#troubleshooting) ·
+[How it works](#how-it-works) · [Limitations](#known-limitations)
 
-## Prerequisites
+## What it is
 
-- [`rustup`](https://rustup.rs/) (to build from source)
-- `llama-cpp` — provides `llama-server`, used for S1-mini normalization
-- **`ggml-cpu`** — Arch's `llama-cpp` package depends only on the base `ggml`
-  package, which ships `libggml-base.so` but **no compute backend**. Without
-  one, `llama-server` fails to load any model with ggml's own opaque *"no
-  backends are loaded"* error. Install the CPU backend explicitly:
-  ```bash
-  sudo pacman -S ggml-cpu
-  ```
-  (Use `ggml-vulkan`, `ggml-cuda`, etc. instead/as well if you have the
-  matching hardware and want it used — `yappr-core` does not pass any backend
-  selection flags, so `llama-server` picks the best one it finds.)
-- **`gtk-layer-shell`** — needed to *build* the app at all, not just to run it:
-  the overlay positions and unfocuses itself via `wlr-layer-shell` on Hyprland
-  and other wlroots compositors, and the Rust binding to that library links
-  against it at compile time. Without it, `cargo build` fails outright before
-  producing a binary. Install it first:
-  ```bash
-  sudo pacman -S gtk-layer-shell
-  ```
-- `wtype` — types the cleaned transcript into the focused window
-- `wl-clipboard` (provides `wl-copy`) — clipboard fallback when typing fails
-- `ydotool` — optional; only if you switch `[inject] backend` to it (see below). Not needed otherwise.
-- Hyprland (`hyprctl`) — optional; used to look up the focused window's class for per-application style rules, and for `wlr-layer-shell` overlay placement. Everything else works without it, including on GNOME, with a plainer (unpositioned) overlay.
+One binary, `yappr`, and one process. Start it and you get a tray icon and nothing
+else — no window in your way. Your dictation shortcut runs the *same* binary with
+`--toggle`, which is a thin client: it hands the running app a one-line message over
+a Unix socket and exits, so pressing the key costs nothing.
+
+Everything happens on your machine: speech recognition (Parakeet), silence trimming
+(Silero VAD), and the clean-up pass that adds punctuation and casing (S1-mini, run
+locally through `llama-server`). About 1.1 GB of models are downloaded once, on first
+run, and — by default — loaded only while you are actually dictating.
+
+Tested on Hyprland; works on GNOME and other Wayland desktops with one extra step
+(see [Desktop notes](#desktop-notes)).
 
 ## Install
 
+### 1. Install the system packages
+
+**Arch / Omarchy:**
+
 ```bash
+sudo pacman -S llama-cpp ggml-cpu wtype wl-clipboard gtk-layer-shell
+```
+
+| Package | Why |
+|---|---|
+| `llama-cpp` | provides `llama-server`, which runs the clean-up model |
+| **`ggml-cpu`** | **easy to miss.** Arch's `llama-cpp` pulls in base `ggml`, which has *no compute backend*. Without this, `llama-server` fails with the opaque *"no backends are loaded"*. Use `ggml-vulkan` / `ggml-cuda` instead (or as well) if you have the hardware — yappr passes no backend flags, so `llama-server` picks the best one it finds. |
+| `wtype` | types the finished text into the focused window |
+| `wl-clipboard` | provides `wl-copy`, the fallback when typing fails |
+| **`gtk-layer-shell`** | **build-time dependency.** The overlay places and un-focuses itself via `wlr-layer-shell`, and the Rust binding links against this library at compile time. Without it `cargo build` fails before it produces a binary — there is no runtime fallback for its absence. |
+
+Optional:
+
+| Package | Why |
+|---|---|
+| `ydotool` | a second typing backend, for windows `wtype` cannot reach — **required on GNOME**, see [Desktop notes](#desktop-notes) |
+| `hyprland` (`hyprctl`) | lets per-application style rules see the focused window's class |
+| `libnotify` (`notify-send`) | desktop notifications for "typing failed — copied to clipboard" and similar |
+
+yappr re-checks this list itself during setup and names the exact missing package,
+so you can also just skip ahead and let the wizard tell you.
+
+### 2. Build and install `yappr`
+
+You need [`rustup`](https://rustup.rs/) and [`bun`](https://bun.sh/).
+
+```bash
+bun install                 # frontend dependencies
+bun run build               # builds both windows into dist/ — required before the next line
 cargo build --release -p yappr --features custom-protocol
+
 mkdir -p ~/.local/bin
 install -m755 target/release/yappr ~/.local/bin/
 ```
 
 Make sure `~/.local/bin` is on your `PATH`.
 
-To find it in an app launcher (rofi, wofi, GNOME Shell, …), add a launcher
-entry — this is the same `.desktop` shape and the same bare, `PATH`-relative
-`Exec=` line the autostart toggle below writes for itself:
+Two things that bite if skipped:
+
+- **`bun run build` first.** The web assets are compiled *into* the binary, so
+  `cargo build` fails outright with `` the `frontendDist` configuration is set to
+  "../dist" but this path doesn't exist `` if you haven't built them.
+- **`--features custom-protocol` is not a default.** Without it the binary embeds a
+  `localhost:1420` dev URL instead of the built assets, and every window comes up
+  blank unless a Vite dev server happens to be running.
+
+Check it worked — both of these run locally, without the app started:
+
+```bash
+which -a yappr            # exactly one path, in ~/.local/bin
+yappr --print-shortcuts   # prints the config block for your compositor
+```
+
+### 3. Add it to your app launcher
 
 ```bash
 mkdir -p ~/.local/share/applications
@@ -110,193 +111,200 @@ Categories=Utility;AudioVideo;
 EOF
 ```
 
-### Upgrading from an older, multi-binary build
-
-This project used to be called **openwhisprflow**, and before that it shipped as
-several binaries. Every one of those names is now dead. Delete them — a stale one
-on your `PATH` keeps working and keeps running the *old* code, which is the worst
-possible failure mode:
-
-```bash
-rm -f ~/.local/bin/owf-ctl ~/.local/bin/owf-daemon ~/.local/bin/owf-bench \
-      ~/.local/bin/openwhisprflow ~/.local/bin/openwhisprflow-settings
-```
-
-`~/.local/bin/openwhisprflow` is the one that matters, and it is on that list only
-because of the rename. The one-process rewrite kept the old overlay's name, so the
-new build and the pre-rewrite overlay-only Tauri app were the same filename and
-either could shadow the other — the most dangerous leftover of the lot, because it
-fails silently rather than loudly. That app parses no arguments at all: run it as
-`openwhisprflow --toggle` and it never touches the socket, it opens *its own*
-overlay window, subscribes to whatever daemon is listening, and draws a second
-overlay from the same events. Both pills show the same waveform and the same
-timer, because they are the same events; one of them is a ghost.
-
-`yappr` cannot collide with it, so deleting the old name is now a plain cleanup
-rather than a rescue. Install the new build and confirm the old name is gone:
-
-```bash
-install -m755 target/release/yappr ~/.local/bin/
-which -a yappr                # expect exactly one path
-which -a openwhisprflow       # expect nothing
-yappr --status                # expect one line of JSON
-```
-
-That last line is the cheap test: the current binary answers `--status` on stdout
-and exits. If you run the AppImage rather than installing, point
-`~/.local/bin/yappr` at it (`ln -s`) — and if a shortcut, a `.desktop` entry or an
-autostart line still names `openwhisprflow` by bare name or by absolute path, it
-now points at nothing. Rebind it (next section) rather than leaving it to fail
-quietly.
-
-Then see [Migrating an existing Hyprland config](#migrating-an-existing-hyprland-config)
-below — this is a breaking change for your shortcuts and window rules too, not
-just for which binaries exist.
+(Same shape and the same bare, `PATH`-relative `Exec=` line the autostart toggle in
+Settings writes for itself.)
 
 ## First run
 
-Launch it — from the app launcher, or `yappr &`. It starts with no
-window, just a tray icon. If the models aren't downloaded yet, left-click the
-tray icon (or run `yappr --settings`) to open Settings; a **Setup**
-pane appears automatically. It checks the same prerequisites listed above
-(naming the exact `pacman` package if one is missing) and, once they're
-satisfied, downloads and verifies (~1.1 GB total):
+Launch yappr — from your app launcher, or `yappr &`. A **setup wizard** opens
+automatically and walks you through four steps:
 
-- Parakeet TDT 0.6b v3 (int8) — the ASR model
-- Silero VAD
-- S1-mini by Superwhisper (GGUF, q4_k_m)
+1. **Willkommen** — what you're about to do.
+2. **Modelle laden** — checks the packages above (naming the missing `pacman` package
+   if there is one) and downloads ~1.1 GB of models: Parakeet TDT 0.6b v3 (speech
+   recognition), Silero VAD, and S1-mini by Superwhisper (clean-up). Each file is
+   verified against a pinned sha256. The download doesn't block you — hit **Weiter**
+   and read on while it runs.
+3. **Kurzbefehl einrichten** — detects your desktop and shows the exact lines to paste
+   for it, with a copy button. Wayland has no global keyboard grab, so yappr cannot
+   register the shortcut itself, and it deliberately never edits your desktop config
+   for you. This step also tells you which typing backend your desktop needs.
+4. **Fertig** — press `SUPER+D` and start talking.
 
-into `models_dir()` (`$XDG_DATA_HOME/yappr/models`, typically
-`~/.local/share/yappr/models`), pinned by sha256 in
-`models.lock.toml`, with per-model progress shown in the pane. Until this
-finishes, the tray shows "warming" and `--toggle` is refused with a stated
-reason. Run `yappr --update-lock` (not part of normal first run) to
-re-resolve and re-pin the lock file, e.g. after an upstream model update.
+Models land in `~/.local/share/yappr/models`. Finishing the wizard writes a marker at
+`~/.local/state/yappr/wizard-done`.
 
-## Bind your shortcuts
+**The wizard comes back if the install stops being usable** — if a model file goes
+missing, you get the wizard at the models step rather than a failed dictation days
+later. You can also reopen it any time: tray → **Einrichtung…**, or `yappr --wizard`.
 
-```bash
-yappr --print-shortcuts
-```
+## Using it
 
-This detects whether your Hyprland is configured in Lua (as Omarchy is) or
-classic `.conf` and prints the matching block — never applied for you; paste
-it yourself. Hyprland 0.56+ configured in Lua rejects the legacy keyword
-parser entirely, so the two formats are not interchangeable.
+### The gesture
 
-**Lua config** (`~/.config/hypr/hyprland.lua` exists) — add to
-`~/.config/hypr/bindings.lua`:
+Press `SUPER+D` to start recording. Speak. Press `SUPER+D` again to stop — the text
+appears in the focused window a moment later. `SUPER+ALT+D` throws the recording away.
+
+There is **no key to release**: a recording keeps going until you press again. If you
+forget, a watchdog ends it after `audio.max_seconds` (120 s by default) and *transcribes
+what it captured* rather than discarding it. If 120 seconds of open microphone isn't a
+trade you want, lower it in Settings → Allgemein → Mikrofon & Aufnahme.
+
+### What the overlay shows
+
+A small pill at the bottom of the screen, visible only while something is happening:
+
+| It shows | Meaning |
+|---|---|
+| `loading models` | first dictation since startup (or since an idle unload) — recording has already started, this runs in parallel |
+| a red dot, a level meter, a timer | recording |
+| `transcribing` → `cleaning` → `typing` | the three stages after you press again |
+| a checkmark and a preview | done — that text just got typed |
+| a warning and a reason | something failed; the reason is on screen |
+
+The overlay never takes keyboard focus — if it did, `wtype` would type your dictation
+into the overlay instead of your editor.
+
+### The tray
+
+Left-click opens Settings. Right-click gives you:
+
+- **Status** — what the app is doing right now
+- **Einstellungen** — the settings window
+- **Einrichtung…** — reopen the setup wizard
+- **Diktat pausieren** — refuse `SUPER+D` entirely until you un-pause (never interrupts
+  a dictation already in flight)
+- **Beenden** — quit
+
+### If typing fails
+
+The text is copied to your clipboard instead and you get a notification saying so. A
+transcript is never silently lost: once speech has been recognised, you get text, even
+if the clean-up model is down, times out, or produces something the guardrail rejects
+(then you get the raw transcript instead).
+
+### Start it at login
+
+Settings → Allgemein → **"Beim Anmelden starten"**. It writes
+`~/.config/autostart/yappr.desktop`. No Hyprland `exec-once` line to add, no systemd
+unit to install — `xdg-autostart-generator` handles that. Off by default.
+
+## Desktop notes
+
+### Hyprland
+
+`yappr --print-shortcuts` prints the block for your config — it detects Lua (as Omarchy
+uses) versus classic `.conf` and prints the matching one. They are not interchangeable:
+Hyprland 0.56+ with a Lua config rejects the legacy keyword parser outright.
+
+**Lua** — add to `~/.config/hypr/bindings.lua`:
 
 ```lua
 o.bind("SUPER + D", "Dictation: toggle", "yappr --toggle")
 o.bind("SUPER + ALT + D", "Dictation: cancel", "yappr --cancel")
 ```
 
-**Classic config** — add to `~/.config/hypr/hyprland.conf`:
+**Classic** — add to `~/.config/hypr/hyprland.conf`:
 
-```
+```ini
 bind  = SUPER, D,     exec, yappr --toggle
 bind  = SUPER ALT, D, exec, yappr --cancel
 ```
 
-Check first that those keys are free — `omarchy menu keybindings --print` on
-Omarchy — and unbind anything you are replacing. Then validate:
+Check the keys are free first (`omarchy menu keybindings --print` on Omarchy), then:
 
 ```bash
 hyprctl reload && hyprctl configerrors
 ```
 
-That's it: two lines, one file, no daemon to start and no autostart line to
-add by hand (see [Autostart](#autostart)). Unlike the old hold-to-talk
-bindings, there is no release-edge counterpart to pair either one with, so
-every desktop gets identical behaviour — on GNOME, add two custom shortcuts
-in Settings → Keyboard running the same two commands.
+**You don't need a window rule.** The overlay positions and un-focuses itself through
+`wlr-layer-shell`. `--print-shortcuts` still emits a title-matched fallback rule for
+compositors without layer-shell; it's inert on Hyprland, so paste it or don't.
 
-**On Hyprland you don't need a window rule either.** The overlay positions
-and unfocuses itself automatically via `wlr-layer-shell`. `--print-shortcuts`
-still emits one as a fallback, title-matched rather than class-matched, for
-compositors without layer-shell (GNOME/Mutter); paste that block too if
-you're on one of those, or if you'd rather have the belt-and-braces version.
-It's inert everywhere else.
+### GNOME
 
-### Migrating an existing Hyprland config
+Two differences:
 
-If you set this up before this rewrite, your config still has the old lines:
-`exec-once = owf-ctl daemon`, `exec-once = openwhisprflow`, a `bind`/`bindr`
-pair calling `owf-ctl ptt-start`/`ptt-stop`, and a window rule matched on
-`class:^(openwhisprflow)$`. If you set it up after the rewrite but before the
-rename, you instead have binds calling `openwhisprflow --toggle`/`--cancel` and
-rules matched on `title:^(openwhisprflow overlay)$`. All of it is now dead weight,
-and all of it fails in the worst way available — silently. Neither `owf-ctl` nor
-`openwhisprflow` exists any more, so those shortcuts simply do nothing, and a
-window rule matching a title no window carries is inert. Worse, if you still have
-the *class*-matched rule: it now also matches the *settings* window, since that
-became a window of this same app, so until you delete it you cannot type into the
-Settings form at all.
+- **Use the `ydotool` backend.** Mutter doesn't implement the virtual-keyboard protocol
+  `wtype` types through, so `wtype` silently does nothing. The wizard detects GNOME and
+  sets `[inject] backend = "ydotool"` for you on a first run — see
+  [Typing with ydotool](#typing-with-ydotool) for the one-time setup.
+- **Add the shortcuts in Settings → Keyboard → Custom Shortcuts**, running
+  `yappr --toggle` and `yappr --cancel`. The wizard also offers a `gsettings` script
+  that *appends* to your existing custom shortcuts — never use a plain
+  `gsettings set ... custom-keybindings`, which replaces the whole list and destroys
+  every custom shortcut you already had.
 
-`yappr --print-shortcuts`'s output leads with exactly what to
-delete, before the lines to add — paste the whole thing and follow it.
+Mutter has no `wlr-layer-shell`, so the overlay falls back to an ordinary borderless
+window and lands wherever Mutter puts it. It still refuses keyboard focus (that part is
+enforced by the window itself, not by the compositor), so it can't swallow your
+dictation — it just isn't pinned to the bottom of the screen the way it is on wlroots
+compositors.
 
-## Autostart
+### Other Wayland desktops
 
-A **"Beim Anmelden starten"** toggle in Settings writes or removes
-`~/.config/autostart/yappr.desktop`. There is no Hyprland
-`exec-once` line to add by hand, and this project installs no systemd unit —
-`xdg-autostart-generator` turns the `.desktop` entry into one automatically.
-Off by default.
+Nothing is desktop-specific except shortcut registration. Bind `yappr --toggle` and
+`yappr --cancel` however your desktop does that, and try `wtype` first.
 
 ## Settings
 
-Left-click the tray icon, or run `yappr --settings`. Everything in
-`config.toml` is editable there, including the microphone and the dictation
-vocabulary. Saving writes the file in place: comments and layout survive, a
-save that changes nothing leaves the file byte-identical, and a config that
-would not load is rejected before anything is written. Changes to `[asr]` and
-`[normalize]` need restarting the app (`--quit`, then launch again); the
-window says so. Everything else, the microphone included, takes effect at the
-next dictation.
+Left-click the tray icon, or `yappr --settings`. Everything in `config.toml` is
+editable there — microphone, dictation vocabulary, styles, thresholds — across five
+panes: **Allgemein**, **Sprache**, **Stil**, **Erweitert**, **Diagnose**. There's a
+search box; it matches German labels, help text, *and* the raw `config.toml` key names.
 
-## Configuration
+There is no Save button. Toggles and dropdowns save immediately, text and number fields
+700 ms after you stop typing. Saving rewrites `config.toml` in place: your comments and
+formatting survive, a save that changes nothing leaves the file byte-identical, and a
+config that wouldn't load is rejected before anything is written. Every row has a reset
+button that appears only when the value isn't the default.
 
-The config file lives at `$XDG_CONFIG_HOME/yappr/config.toml`
-(typically `~/.config/yappr/config.toml`) and is created with
-commented defaults on first run. The main knobs:
+**`[asr]` and `[normalize]` changes need a restart** (`yappr --quit`, then launch
+again); the window says so on those rows. Everything else — the microphone included —
+applies at your next dictation, or immediately with `yappr --reload`.
 
-- **`[audio]`** — `device`, `max_seconds` (ends a forgotten recording — under press/press toggle nothing else does; see "How it works" above), `vad_padding_ms` (silence kept around trimmed speech).
-- **`[models]`** — `preload_at_startup` and `idle_unload_seconds`, controlling whether the models load at app start or lazily on the first press, and how long after the last dictation they unload again; see [Speicherverbrauch](#speicherverbrauch).
-- **`[asr]`** — `num_threads` for Parakeet.
-- **`[normalize]`** — `enabled` (set `false` to skip S1-mini entirely and type rule-based-cleaned raw ASR text), `port`/`timeout_ms`/`llama_server_path`/`context_size`/`threads` for the supervised `llama-server`.
-- **`[guardrail]`** — `min_word_ratio`/`max_word_ratio`, `min_overlap_english`/`min_overlap_other`, `short_input_words` (below this many raw words, the ratio/overlap checks are skipped — see Known limitations), `ngram_size`/`ngram_max_repeats` (loop detection).
-- **`[inject]`** — `backend` (`wtype`, `ydotool` or `clipboard`), `trailing_space`, `keystroke_delay_ms`.
-- **`[style_default]`** and **`[[style_rules]]`** — the default `styling`/`structure`/`context` axes S1-mini is prompted with, and per-application overrides matched by focused window class (regex).
-- **`[debug]`** — `enabled` (off by default), `dir` (default `~/yappr`), `save_audio`. When enabled, every utterance writes a WAV of the raw capture and the post-VAD-trim buffer under `<dir>/audio/`, plus a JSON diagnostic record (capture stats — device, native rate, samples captured vs. expected, stream error count — audio RMS/peak, VAD span, ASR/normalize/guardrail/inject results, and timings) under `<dir>/logs/`. The app's own log is also mirrored to `<dir>/logs/daemon.log` (append) while enabled. Run `yappr --debug` to print a summary of the most recent record and the paths to its files.
+## config.toml
 
-`yappr --reload` re-validates `config.toml` against the running app
-and applies every reloadable section to the live pipeline immediately —
-`[guardrail]`, `[inject]`, `[style_default]`/`[[style_rules]]`, the
-vocabulary, and more. Only `[asr]` and `[normalize]` still need a restart (see
-Settings above); `--reload` refuses outright rather than silently leaving the
-old normalizer in place if you try to change those without one.
+Lives at `~/.config/yappr/config.toml`, created with commented defaults on first run.
+You can edit it by hand; the GUI is careful not to trample it.
+
+| Section | What's in it |
+|---|---|
+| `[audio]` | `device`, `max_seconds` (the only thing that ends a forgotten recording), `vad_padding_ms` |
+| `[models]` | `preload_at_startup`, `idle_unload_seconds` — see [Memory use](#memory-use) |
+| `[asr]` | `num_threads` for Parakeet |
+| `[normalize]` | `enabled` (`false` skips S1-mini and types rule-cleaned raw text), plus `port`, `timeout_ms`, `llama_server_path`, `context_size`, `threads` |
+| `[guardrail]` | `min_word_ratio`/`max_word_ratio`, `min_overlap_english`/`min_overlap_other`, `short_input_words`, `ngram_size`/`ngram_max_repeats` |
+| `[inject]` | `backend` (`wtype`, `ydotool`, `clipboard`), `trailing_space`, `keystroke_delay_ms` |
+| `[vocabulary]` | terms and replacements applied to the raw transcript before clean-up — put short acronyms in `replacements`, not `terms` |
+| `[style_default]`, `[[style_rules]]` | the `styling`/`structure`/`context` axes S1-mini is prompted with, and per-application overrides matched on window class (regex) |
+| `[debug]` | `enabled` (off), `dir` (default `~/yappr`), `save_audio` — see [Troubleshooting](#troubleshooting) |
+| `[overlay]` | `position`, `width`, `height` — read, but inert: under Wayland a window can't place itself, so this changes nothing today |
+
+> **Unknown keys are a hard error.** Every section is `deny_unknown_fields`: a typo'd
+> key stops the app from starting rather than being silently ignored.
+
+`yappr --reload` re-validates the file against the running app and applies every
+reloadable section live. It refuses outright — rather than half-applying — if you
+changed `[asr]` or `[normalize]`.
 
 ### Typing with `ydotool`
 
-`wtype` is the default and needs no setup: it types through the compositor's
-own virtual-keyboard protocol. It is also known to drop or ignore keystrokes in
-some XWayland and Electron windows. `[inject] backend = "ydotool"` types
-through the kernel's `/dev/uinput` instead, which those windows cannot tell
-apart from a real keyboard — at the cost of some setup, which is why it is not
-the default:
+`wtype` is the default and needs no setup: it types through the compositor's own
+virtual-keyboard protocol. But it does nothing on GNOME, and it's known to drop
+keystrokes in some XWayland and Electron windows. `ydotool` types through the kernel's
+`/dev/uinput` instead, which no window can tell apart from a real keyboard — at the cost
+of some setup, which is why it isn't the default.
 
 ```bash
 sudo pacman -S ydotool
-systemctl --user enable --now ydotool.service   # the unit is named for the
-                                                # package, not for ydotoold
+systemctl --user enable --now ydotool.service   # the unit is named for the package,
+                                                # not for ydotoold
 ```
 
-On Arch that is the whole of it. The package already ships
-`/usr/lib/udev/rules.d/80-uinput.rules`, which gives the `input` group write
-access to `/dev/uinput` (`crw-rw---- root input`), and Arch already puts a
-desktop user in `input`. Confirm both before reaching for `sudo`:
+On Arch that's usually all of it — the package ships a udev rule giving the `input`
+group write access to `/dev/uinput`, and Arch already puts desktop users in `input`.
+Confirm before reaching for `sudo`:
 
 ```bash
 ls -l /dev/uinput     # want: crw-rw---- 1 root input
@@ -304,86 +312,204 @@ id -nG | grep input   # want: your user is in the input group
 ```
 
 Only if the group is missing do you need `sudo usermod -aG input "$USER"` and a
-re-login; only if the device is `crw------- root root` do you need the udev rule
-by hand. On a distribution that ships neither, both steps apply.
+re-login; only if the device shows `crw------- root root` do you need the udev rule by
+hand. On a distro that ships neither, do both.
 
-`ydotool` talks to `ydotoold` over a socket. Client and daemon both default to
-`$XDG_RUNTIME_DIR/.ydotool_socket` (falling back to `/tmp/.ydotool_socket` when
-that is unset), so a systemd user unit and a session app agree without any
-configuration. Only if you run `ydotoold` with `--socket-path` do you need to
-export `YDOTOOL_SOCKET` — and then it has to be exported in the session
-environment yappr itself starts in, since a value set only in your
-shell's rc file will not reach a tray app started by the session.
-
-Then set the backend in Settings → Allgemein → Texteingabe → Verfahren, or in
-`config.toml`:
+Then set it in Settings → Allgemein → Texteingabe → Verfahren, or:
 
 ```toml
 [inject]
 backend = "ydotool"
 ```
 
-If any of that is missing, `ydotool` exits non-zero, and the clipboard fallback
-carries the transcript exactly as it does for a failing `wtype` — you get a
-"typing failed — copied to clipboard" notification rather than a lost dictation.
-Note that `keystroke_delay_ms` means something slightly different here:
-`ydotool` applies it per key event, so a character costs twice the configured
-delay.
+Notes: client and daemon both default to `$XDG_RUNTIME_DIR/.ydotool_socket`, so a
+systemd user unit and yappr agree without configuration — you only need
+`YDOTOOL_SOCKET` if you run `ydotoold --socket-path`, and then it must be exported in
+the *session* environment, not just your shell rc. And `keystroke_delay_ms` means
+something slightly different here: `ydotool` applies it per key *event*, so each
+character costs twice the configured delay. If `ydotool` fails, the clipboard fallback
+catches the transcript exactly as it does for a failing `wtype`.
 
-## Speicherverbrauch
+## Memory use
 
-Standardmäßig werden die Modelle erst beim ersten Tastendruck geladen und eine
-Minute nach dem letzten Diktat wieder entladen. Im Leerlauf belegt das Programm
-damit einen Bruchteil dessen, was Spracherkennung und Sprachmodell zusammen
-brauchen — auf dem Entwicklungsrechner rund 1,4 GB, die sonst dauerhaft belegt
-blieben.
+By default the models load on your first key press and unload again a minute after your
+last dictation. An idle yappr therefore holds a fraction of what speech recognition and
+the language model need together — about 1.4 GB that would otherwise stay resident on
+the development machine.
 
-Der Preis: das erste Diktat nach dem Start (und nach jeder Ruhephase) wartet
-einmalig darauf, dass die Modelle geladen sind. Die Aufnahme selbst beginnt
-sofort — das Laden läuft parallel zum Sprechen —, aber bei einem sehr kurzen
-Diktat kann der Einfügevorgang ein paar Sekunden später kommen.
+The price: the first dictation after a pause waits once for the models to load.
+Recording starts instantly and loading happens while you speak, so you only notice it on
+a very short dictation, where the text may arrive a couple of seconds late.
 
-Zwei Einstellungen unter **Erweitert → Modelle & Speicher** steuern das:
+Two settings under **Erweitert → Modelle & Speicher**:
 
-| Einstellung | Standard | Bedeutung |
+| Setting | Default | Meaning |
 |---|---|---|
-| Modelle beim Start laden | aus | Lädt alles schon beim Programmstart. Erstes Diktat ohne Wartezeit, dafür ist der Speicher ab dem Programmstart belegt. |
-| Modelle entladen nach | 60 s | Ruhezeit, nach der die Modelle freigegeben werden. `0` heißt: nie entladen. |
+| Modelle beim Start laden (`preload_at_startup`) | off | Load everything at app start. No wait on the first dictation, but the memory is held from launch. |
+| Modelle entladen nach (`idle_unload_seconds`) | 60 s | Idle time after which the models are released. `0` means never. |
 
-Wer das alte Verhalten will — alles beim Start laden, nie entladen — setzt die
-erste Einstellung auf an und die zweite auf `0`.
+Want them always warm? Turn the first **on** *and* set the second to `0`. Both are
+needed — `preload_at_startup` alone still unloads after the idle timeout.
+
+## Troubleshooting
+
+| Symptom | Likely cause |
+|---|---|
+| **Nothing happens when I press `SUPER+D`** | The app isn't running (check for the tray icon), or the shortcut isn't bound. Run `yappr --toggle` in a terminal: with no app running it exits non-zero and raises a notification. |
+| **Nothing gets typed, but the overlay says it worked** | `wtype` can't reach that window — you're on GNOME, or it's an XWayland/Electron window. Switch to [`ydotool`](#typing-with-ydotool). Check the clipboard: the text is probably there. |
+| **`llama-server` fails with "no backends are loaded"** | Missing ggml compute backend: `sudo pacman -S ggml-cpu`. |
+| **`cargo build` fails in `gtk-layer-shell-sys`** | `sudo pacman -S gtk-layer-shell`. |
+| **Blank windows after building** | Built without `--features custom-protocol`, or without `bun run build` first. |
+| **The first dictation of the day is slow** | Expected — the models load lazily. See [Memory use](#memory-use). |
+| **The setup wizard keeps reappearing** | A model file is missing or its hash doesn't match. The models step says which one. |
+| **My clean-up rewrote something wrongly** | Every guardrail rejection is logged to `~/.local/state/yappr/rejections.jsonl`. Set `[normalize] enabled = false` to bypass S1-mini entirely. |
+| **Two overlays on screen** | An old pre-rename binary is still installed and bound. See [Upgrading](#upgrading-from-an-older-build). |
+
+Digging deeper: set `[debug] enabled = true`, dictate once, then run `yappr --debug`.
+It prints a summary of the last utterance — capture stats, audio levels, the VAD span,
+raw transcript, vocabulary substitutions, guardrail verdict, timings — and the paths to
+the WAV files and JSON record it wrote under `~/yappr`. Those are yours to delete when
+you're done; `--purge-logs` does *not* touch them — it deletes only
+`rejections.jsonl`, the guardrail dataset, which holds raw/cleaned transcript pairs and
+never leaves your machine either.
+
+Other useful commands:
+
+```bash
+yappr --status            # one line of JSON: state, whether models are resident
+yappr --subscribe         # live event stream, one JSON object per line
+yappr --reload            # re-read config.toml into the running app
+yappr --print-shortcuts   # the config block for your compositor
+yappr --bench             # ASR latency table
+yappr --purge-logs        # delete rejections.jsonl
+yappr --update-lock       # re-resolve and re-pin models.lock.toml (after an upstream
+                          # model update — not part of a normal first run)
+yappr --quit              # shut down
+```
+
+`yappr` with no arguments starts the app; every other invocation is either a message to
+a running instance or a local utility, and both exit before any window or model is
+touched.
+
+## How it works
+
+One dictation runs through this pipeline:
+
+1. **Capture** — 16 kHz mono from the first press to the second.
+2. **VAD** — Silero trims leading and trailing silence.
+3. **ASR** — [Parakeet TDT 0.6b v3](https://github.com/k2-fsa/sherpa-onnx) (int8, via `sherpa-onnx`) transcribes it.
+4. **Vocabulary** — your `[vocabulary]` corrections are applied to the raw transcript.
+5. **Language ID** — `whatlang` tags the language, which picks the guardrail threshold.
+6. **Normalization** — S1-mini, served locally by a supervised `llama-server`, rewrites the transcript into punctuated prose (or a list, depending on the style axes).
+7. **Guardrail → Injection** — cheap deterministic checks (word-count ratio, token overlap, n-gram loop detection, template-bleed detection) decide whether to trust the rewrite. If not, you get the raw transcript or a rule-based clean-up of it instead of something the model invented; the rejection is appended to `rejections.jsonl`. Then `wtype` types it into the focused window.
+
+If `llama-server` dies mid-session, it's restarted automatically (10 s health poll,
+backoff from 1 s to 30 s) and dictation degrades to raw ASR text in the meantime rather
+than failing.
+
+### Measured performance
+
+On an i7-10510U (4 threads), release build:
+
+| Stage | Latency |
+|---|---|
+| ASR (11.5 s of audio) | 1,700 ms (RTF 0.147) |
+| S1-mini clean-up, 8-word transcript | 438 ms |
+| S1-mini clean-up, 26-word transcript | 585 ms |
+| S1-mini clean-up, 58-word transcript | 1,313 ms |
+| `llama-server` cold start (once, at first press) | 751 ms |
+| ASR model load (once, at first press) | 3,497 ms |
+
+A typical ~10 s dictation, warm, is roughly **2 seconds** from the second press to text
+appearing.
 
 ## Known limitations
 
 Found during development, not yet fixed — worth knowing before relying on this:
 
-- **Short utterances are effectively unguarded.** Below `guardrail.short_input_words` raw words (4 by default), the ratio and overlap checks are skipped entirely, so a short S1-mini rewrite that inverts the meaning of what was said could be typed verbatim. Longer dictations are checked normally.
-- **Dense digit sequences get rejected back to raw ASR text.** Dictating a phone number as separate digits ("five five five one two three four") normalizes to a much shorter token count ("555-1234"), which trips `min_word_ratio` before the (faithful) rewrite is ever evaluated for overlap. The fallback is safe — you get the raw ASR text, not silence or garbage — but not the cleaned-up form you'd expect. This is pinned by a test named `known_limitation_dense_digit_sequences_trip_word_ratio` in `crates/yappr-core/src/guardrail.rs`.
-- **Nothing physically ends a recording under press/press toggle.** A missed second press keeps the microphone open until `audio.max_seconds` (see "How it works"); the only warning before then is on screen. This is the price of dropping hold-to-talk, not a bug.
+- **Short utterances are effectively unguarded.** Below `guardrail.short_input_words`
+  raw words (4 by default), the ratio and overlap checks are skipped, so a short rewrite
+  that inverts what you said could be typed verbatim. Longer dictations are checked
+  normally.
+- **Dense digit sequences fall back to raw ASR text.** Dictating a phone number as
+  separate digits normalizes to far fewer tokens ("555-1234"), which trips
+  `min_word_ratio` before the (faithful) rewrite is ever checked for overlap. Safe, but
+  not the cleaned-up form you'd expect.
+- **Nothing physically ends a recording.** A missed second press keeps the microphone
+  open until `audio.max_seconds`; the only warning before then is on screen. That's the
+  price of press/press instead of hold-to-talk.
 
-Both of the first two are slated for guardrail threshold tuning against real
-`rejections.jsonl` data in a later milestone.
+Both of the first two await guardrail threshold tuning against real `rejections.jsonl`
+data.
 
-## Manual end-to-end verification — not yet run
+### Not yet verified end to end
 
-The following has **not** been performed on real hardware and is not
-claimed to work; it requires a human speaking into a microphone and
-watching the result. Treat dictation as unverified until this is done:
+**No one has spoken into this build yet.** The pipeline is covered by tests and replay
+runs, but real dictation — microphone to typed text — has never been performed on real
+hardware. Treat claims about dictation quality, timing under load, and per-application
+injection behaviour as design intent, not results. `HANDOVER.md` records what else could
+not be verified and why.
 
-- [ ] `yappr --status` reports `warm: true` right after a first `--toggle`, and `warm: false` again once `idle_unload_seconds` after that has passed — `warm` now means "models are resident right now", not "startup finished" (see [Speicherverbrauch](#speicherverbrauch); under the default lazy config, `warm` stays `false` until the first press)
+<details>
+<summary>The checklist a first human user should work through</summary>
+
 - [ ] Dictation into Alacritty, Firefox's address bar, an Electron app (VS Code/Slack), and an XWayland window (`xterm` or a Wine app)
-- [ ] Pressing `SUPER+D` and pressing it again immediately without speaking types nothing and logs "no speech detected"
-- [ ] `SUPER+ALT+D` while a recording is in progress cancels cleanly
+- [ ] `yappr --status` reports `warm: true` right after a first `--toggle`, and `warm: false` again once `idle_unload_seconds` has passed — `warm` means "models are resident right now", not "startup finished", so under the default lazy config it stays `false` until the first press
+- [ ] Pressing `SUPER+D` twice without speaking types nothing and logs "no speech detected"
+- [ ] `SUPER+ALT+D` mid-recording cancels cleanly
 - [ ] Two dictations back-to-back without a pause don't run together
 - [ ] Killing `llama-server` mid-session still types raw ASR text (with a logged warning) instead of failing
 - [ ] A German dictation, and whether the guardrail fires for it (check `rejections.jsonl`)
 - [ ] `~/.local/state/yappr/rejections.jsonl` contains valid JSON, one object per line
 - [ ] A second `yappr` instance refuses to start with "already running"
-- [ ] `yappr --toggle` with no instance running exits non-zero and raises a visible desktop notification, rather than doing nothing silently
-- [ ] Forgetting the second press: the watchdog ends the recording at `audio.max_seconds` and types what it captured, rather than losing it
-- [ ] Stopwatch timing from the second press to text appearing, for comparison against the estimate above
+- [ ] `yappr --toggle` with no instance running exits non-zero and raises a visible notification, rather than doing nothing silently
+- [ ] Forgetting the second press: the watchdog ends the recording at `audio.max_seconds` and types what it captured
+- [ ] Stopwatch timing from the second press to text appearing, against the table above
 
-This machine's own build has never had a human speak into it either — see
-`HANDOVER.md` — so treat every claim in this file about dictation quality,
-timing under load, or per-application injection behaviour as design intent,
-not a verified result.
+</details>
+
+## Upgrading from an older build
+
+<details>
+<summary>This project was called <b>openwhisprflow</b> until 2026-08-29, and before that
+shipped several binaries. Expand if you ever installed one of those.</summary>
+
+Delete every old binary — a stale one on your `PATH` keeps working, and keeps running
+the *old* code:
+
+```bash
+rm -f ~/.local/bin/owf-ctl ~/.local/bin/owf-daemon ~/.local/bin/owf-bench \
+      ~/.local/bin/openwhisprflow ~/.local/bin/openwhisprflow-settings
+```
+
+`~/.local/bin/openwhisprflow` is the dangerous one. The pre-rename one-process build
+kept the old overlay's name, so it and the *previous* overlay-only app were the same
+filename and either could shadow the other. That old app parses no arguments at all:
+run it as `openwhisprflow --toggle` and it never touches the socket — it opens *its own*
+overlay, subscribes to whatever is listening, and draws a second pill from the same
+events. Same waveform, same timer, no error anywhere. (Observed on real hardware.)
+
+`yappr` can't collide with it, so this is now plain cleanup:
+
+```bash
+install -m755 target/release/yappr ~/.local/bin/
+which -a yappr                # expect exactly one path
+which -a openwhisprflow       # expect nothing
+```
+
+If you run the AppImage instead of installing, symlink `~/.local/bin/yappr` at it.
+
+**Then fix your desktop config — this is a breaking change for shortcuts too.** Old
+setups have `exec-once = owf-ctl daemon`, `exec-once = openwhisprflow`, a `bind`/`bindr`
+pair calling `owf-ctl ptt-start`/`ptt-stop`, and a window rule on
+`class:^(openwhisprflow)$`. Post-rewrite, pre-rename setups have binds calling
+`openwhisprflow --toggle`/`--cancel` and a rule on `title:^(openwhisprflow overlay)$`.
+All of it now fails silently. The class-matched rule is worse than dead weight: the
+settings window is a window of this same app now, so that rule also matches it, and you
+cannot type into the settings form until you delete it.
+
+`yappr --print-shortcuts` leads with exactly which lines to delete, before the ones to
+add. Paste the whole thing and follow it. Autostart is now the Settings toggle, not an
+`exec-once` line.
+
+</details>
