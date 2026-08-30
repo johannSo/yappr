@@ -386,11 +386,13 @@ mod tests {
 
     #[test]
     fn every_missing_kind_is_reported_together_when_both_are_missing() {
-        let status = build_status(vec!["llama-cpp", "ggml-cpu"], vec!["parakeet".to_string()]);
+        // Real packages `check_prerequisites` can still report -- it no
+        // longer reports `llama-cpp`/`ggml-cpu`, which used to stand in here.
+        let status = build_status(vec!["wtype", "wl-clipboard"], vec!["parakeet".to_string()]);
         assert_eq!(status["ready"], false);
         assert_eq!(
             status["missing_prerequisites"],
-            serde_json::json!(["llama-cpp", "ggml-cpu"])
+            serde_json::json!(["wtype", "wl-clipboard"])
         );
         assert_eq!(status["missing_models"][0]["name"], "parakeet");
     }

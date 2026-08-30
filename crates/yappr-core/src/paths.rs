@@ -51,10 +51,6 @@ pub fn runtime_lock() -> PathBuf {
     xdg_runtime().join("yappr.lock")
 }
 
-pub fn runtime_port() -> PathBuf {
-    xdg_runtime().join("yappr.port")
-}
-
 /// The XDG autostart entry (design doc §9, task 16). Deliberately **not**
 /// built on [`config_dir`]: `~/.config/autostart/` is a directory shared by
 /// every autostart-capable app on the system (on this machine it already
@@ -99,6 +95,5 @@ mod tests {
         // which the daemon and ctl must agree on exactly.
         assert_eq!(runtime_socket().file_name().unwrap(), "yappr.sock");
         assert_eq!(runtime_lock().file_name().unwrap(), "yappr.lock");
-        assert_eq!(runtime_port().file_name().unwrap(), "yappr.port");
     }
 }

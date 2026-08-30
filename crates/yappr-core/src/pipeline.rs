@@ -187,7 +187,7 @@ impl Pipeline {
     /// replaces already said.
     ///
     /// R15: that restriction used to be applied inconsistently. Every other
-    /// `[normalize]` field (`port`, `llama_server_path`, `context_size`, ...)
+    /// `[normalize]` field (`context_size`, `threads`, ...)
     /// really does need a restart and this function already left them alone
     /// by never reading them again -- but `cfg` was still swapped in
     /// *wholesale*, so `[normalize].enabled` silently changed anyway even
@@ -204,7 +204,7 @@ impl Pipeline {
     /// applied.
     ///
     /// Rebuilding the normalizer instead -- spawning a fresh `llama-server`
-    /// and connecting an `S1MiniClient` to it, the way `owf-daemon.rs`'s
+    /// and loading S1-mini into it, the way `server.rs`'s
     /// Task 3 supervisor already does in `supervise_llama_once` -- was
     /// considered and rejected here: that supervisor runs on its own
     /// background thread precisely so a slow health-wait (15 s for a

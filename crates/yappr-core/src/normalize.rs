@@ -1,6 +1,12 @@
 /// Characters per token, empirically about right for English on a Qwen3
-/// tokenizer. Used only to size `max_tokens`; a local estimate avoids a second
-/// round trip to /tokenize on the critical path. See spec 8.2.
+/// tokenizer. Used only to size `max_tokens`. See spec 8.2.
+///
+/// An estimate, even though the real tokenizer is now in this process and
+/// could count exactly: `max_tokens_for` is called before the engine is
+/// reached (and must work when normalization is disabled and no model is
+/// loaded at all), and the number it produces is a generation *budget*, not
+/// a correctness boundary -- `LlamaEngine::generate` treats hitting it as a
+/// truncated answer for the guardrail to judge, not an error.
 const CHARS_PER_TOKEN: f64 = 3.5;
 
 /// S1-mini's model card sizes generation at roughly 1.3x input plus a margin.
@@ -10,153 +16,90 @@ pub fn max_tokens_for(raw: &str) -> u32 {
     want.clamp(32, 1024) as u32
 }
 
-use anyhow::{anyhow, bail, Result};
-use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use anyhow::Result;
 
 /// Reproduced verbatim from the S1-mini model card. Paraphrasing it changes
 /// the model's behaviour; do not edit. See spec 8.2.
 pub const SYSTEM_PROMPT: &str = "You are a text normalizer for speech-to-text transcripts. The input begins with a control line specifying the styling, structure, and context settings; clean the transcript to match those settings and output only the cleaned text.";
 
+/// Renders the chat prompt exactly as S1-mini's own jinja template would,
+/// for the only shape this crate ever sends: one system message, one user
+/// message, `add_generation_prompt`, `enable_thinking = false`, no tools.
+///
+/// Hand-rendered rather than run through a jinja engine, and that is a
+/// deliberate trade. `llama.cpp`'s C-level `llama_chat_apply_template` was
+/// not an option: it cannot take template kwargs, so it has no way to
+/// express `enable_thinking = false`, which is load-bearing here. Embedding
+/// minijinja to render the model's real template would work, but for a
+/// two-message prompt it buys nothing over this -- and this way the exact
+/// bytes handed to the tokenizer are visible in one function and pinned by
+/// `the_rendered_prompt_matches_the_models_own_chat_template`.
+///
+/// Read off `s1-mini-q4_k_m.gguf`'s `tokenizer.chat_template` metadata, whose
+/// relevant branches are:
+///
+/// ```text
+/// {{- '<|im_start|>system\n' + messages[0].content + '<|im_end|>\n' }}   (system)
+/// {{- '<|im_start|>' + message.role + '\n' + content }} ... '<|im_end|>\n'  (user)
+/// {%- if add_generation_prompt %}{{- '<|im_start|>assistant\n' }}
+///     {%- if enable_thinking is defined and enable_thinking is false %}
+///         {{- '<think>\n\n</think>\n\n' }}
+/// ```
+///
+/// If the model is ever re-pinned to a build with a different template, this
+/// is the function that has to change with it -- the test above is what makes
+/// that a failure rather than a silent quality regression.
+pub fn render_chat_prompt(control_line: &str, raw: &str) -> String {
+    format!(
+        "<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n\
+         <|im_start|>user\n{control_line}\n{raw}<|im_end|>\n\
+         <|im_start|>assistant\n<think>\n\n</think>\n\n"
+    )
+}
+
 pub trait Normalizer: Send + Sync {
     fn normalize(&self, control_line: &str, raw: &str) -> Result<String>;
-}
-
-#[derive(Serialize)]
-struct ChatMessage {
-    role: &'static str,
-    content: String,
-}
-
-/// Passed per-request as well as on the `llama-server` command line: either
-/// alone has been a reported source of blank output (the model card's
-/// documented `enable_thinking` failure mode).
-#[derive(Serialize)]
-struct ThinkingFlag {
-    enable_thinking: bool,
-}
-
-#[derive(Serialize)]
-struct ChatRequest {
-    messages: Vec<ChatMessage>,
-    // An integer literal, not `0.0`: serde_json serializes an `f32`/`f64` as
-    // a float (`0.0`), which is a different JSON-diff leaf than the plain
-    // `0` real llama-server clients send. Wire-format JSON numbers don't
-    // otherwise distinguish "int" from "float", so this loses nothing.
-    temperature: i32,
-    top_k: u32,
-    stream: bool,
-    max_tokens: u32,
-    chat_template_kwargs: ThinkingFlag,
-}
-
-#[derive(Deserialize)]
-struct ChatResponse {
-    choices: Vec<Choice>,
-}
-
-#[derive(Deserialize)]
-struct Choice {
-    message: ChoiceMessage,
-}
-
-#[derive(Deserialize)]
-struct ChoiceMessage {
-    content: String,
-}
-
-/// Blocking HTTP client for S1-mini by Superwhisper's OpenAI-compatible
-/// `/v1/chat/completions` endpoint, as served by a supervised `llama-server`
-/// (see `crate::llama::LlamaServer`).
-pub struct S1MiniClient {
-    base_url: String,
-    timeout: Duration,
-}
-
-impl S1MiniClient {
-    pub fn new(base_url: String, timeout_ms: u64) -> Self {
-        Self {
-            base_url: base_url.trim_end_matches('/').to_string(),
-            timeout: Duration::from_millis(timeout_ms),
-        }
-    }
-}
-
-impl Normalizer for S1MiniClient {
-    fn normalize(&self, control_line: &str, raw: &str) -> Result<String> {
-        let body = ChatRequest {
-            messages: vec![
-                ChatMessage { role: "system", content: SYSTEM_PROMPT.to_string() },
-                ChatMessage { role: "user", content: format!("{control_line}\n{raw}") },
-            ],
-            temperature: 0,
-            top_k: 1,
-            stream: false,
-            max_tokens: max_tokens_for(raw),
-            chat_template_kwargs: ThinkingFlag { enable_thinking: false },
-        };
-
-        let url = format!("{}/v1/chat/completions", self.base_url);
-
-        // The *authoritative* timeout is `self.timeout`, enforced below by
-        // racing the worker against `recv_timeout` -- that stays exactly as
-        // it was, per spec 8.2. But `ureq` 3.4's own `Timeouts::default()` is
-        // all `None` (verified), so without a timeout configured on the
-        // request itself, a `llama-server` that accepts the connection and
-        // then never replies parks the worker thread -- and its socket --
-        // forever: `recv_timeout` gives up on *waiting* for that thread, but
-        // nothing ever stops the thread itself, so one such utterance leaks
-        // a thread and an fd, unbounded (I2). Configuring `timeout_global`
-        // at roughly double the caller's budget means the worker can always
-        // eventually finish (with an error) and exit cleanly on its own,
-        // even on a request `recv_timeout` has already stopped waiting for.
-        let ureq_timeout = self.timeout * 2;
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let result = (|| -> Result<String> {
-                let mut resp = ureq::post(&url)
-                    .config()
-                    .timeout_global(Some(ureq_timeout))
-                    .build()
-                    .send_json(&body)
-                    .map_err(|e| anyhow!("request to llama-server failed: {e}"))?;
-                if resp.status() != 200 {
-                    bail!("llama-server returned status {}", resp.status());
-                }
-                resp.body_mut()
-                    .read_to_string()
-                    .map_err(|e| anyhow!("reading llama-server response body: {e}"))
-            })();
-            let _ = tx.send(result);
-        });
-
-        let text = match rx.recv_timeout(self.timeout) {
-            Ok(r) => r?,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                bail!("normalization timeout after {:?}", self.timeout)
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                bail!("normalization worker thread died without a reply")
-            }
-        };
-
-        let parsed: ChatResponse = serde_json::from_str(&text)
-            .map_err(|e| anyhow!("malformed response body from llama-server: {e}"))?;
-        let content = parsed
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("llama-server response contained no choices"))?
-            .message
-            .content;
-        Ok(content.trim().to_string())
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_rendered_prompt_matches_the_models_own_chat_template() {
+        // Pinned against the jinja template read out of
+        // `s1-mini-q4_k_m.gguf`'s own `tokenizer.chat_template` metadata for
+        // the exact case this crate ever renders: one system message, one
+        // user message, `add_generation_prompt`, no tools. Every newline
+        // here is one the template emits.
+        let got = render_chat_prompt("[Styling: casual]", "hello there");
+
+        assert_eq!(
+            got,
+            format!(
+                "<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n\
+                 <|im_start|>user\n[Styling: casual]\nhello there<|im_end|>\n\
+                 <|im_start|>assistant\n<think>\n\n</think>\n\n"
+            )
+        );
+    }
+
+    #[test]
+    fn the_rendered_prompt_disables_thinking() {
+        // The whole of what `--jinja --chat-template-kwargs
+        // {"enable_thinking":false}` used to buy on the `llama-server`
+        // command line: the template's `enable_thinking is false` branch
+        // emits a pre-closed, empty think block, so the model has nothing
+        // left to open. Without it S1-mini emits a reasoning trace that the
+        // guardrail then sees as template bleed -- the model card's
+        // documented blank-output failure mode.
+        let got = render_chat_prompt("[Styling: casual]", "hi");
+
+        assert!(
+            got.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+            "generation prompt must pre-close the think block, got:\n{got}"
+        );
+    }
 
     #[test]
     fn system_prompt_matches_the_model_card_verbatim() {

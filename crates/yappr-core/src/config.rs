@@ -193,12 +193,29 @@ impl Default for ModelsConfig {
 pub struct NormalizeConfig {
     #[serde(default = "d_true")]
     pub enabled: bool,
+    /// Accepted and ignored.
+    ///
+    /// S1-mini runs in this process now; there is no `llama-server` to
+    /// listen on a port. The field stays because every `config.toml`
+    /// written before that change has this key in it, and `[normalize]` is
+    /// `deny_unknown_fields` (invariant 4) -- deleting it here would turn
+    /// an existing, valid config into a hard startup failure. New configs
+    /// do not get it: it is gone from the annotated default below.
+    ///
+    /// Hidden in the settings GUI by `schema.ts`'s `OBSOLETE_FIELDS`, which
+    /// exists for exactly these two keys -- showing a control that changes
+    /// nothing would be worse than showing nothing.
     #[serde(default = "d_port")]
     pub port: u16,
     #[serde(default = "d_timeout")]
     pub timeout_ms: u64,
+    /// Accepted and ignored, for the same reason and on the same terms as
+    /// [`NormalizeConfig::port`].
     #[serde(default = "d_llama_path")]
     pub llama_server_path: String,
+    /// `n_ctx` for the in-process context, and still load-bearing: the
+    /// prompt plus the reply budget must fit inside it or
+    /// `LlamaEngine::generate` refuses the utterance.
     #[serde(default = "d_ctx")]
     pub context_size: u32,
     #[serde(default = "d_threads_u32")]
@@ -639,9 +656,7 @@ idle_unload_seconds = 60
 [normalize]
 # Cleanup runs on S1-mini by Superwhisper.
 enabled = true
-port = 8730
 timeout_ms = 6000
-llama_server_path = "llama-server"
 context_size = 2048
 threads = 4
 

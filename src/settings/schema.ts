@@ -77,9 +77,7 @@ export const LABELS: Record<string, string> = {
   "models.preload_at_startup": "Modelle beim Start laden",
   "models.idle_unload_seconds": "Modelle entladen nach",
   "normalize.enabled": "Nachbearbeitung aktiv",
-  "normalize.port": "Port",
   "normalize.timeout_ms": "Zeitlimit",
-  "normalize.llama_server_path": "Pfad zu llama-server",
   "normalize.context_size": "Kontextgröße",
   "normalize.threads": "Threads",
   "guardrail.min_word_ratio": "Minimales Wortverhältnis",
@@ -149,15 +147,11 @@ export const HELP: Record<string, string> = {
     "So lange nach dem letzten Diktat bleiben die Modelle im Speicher. Danach werden sie entladen und beim nächsten Tastendruck neu geladen. 0 heißt: nie entladen.",
   "normalize.enabled":
     "Lässt das lokale Sprachmodell den erkannten Text glätten. Aus heißt: der Text wird nur nach Regeln bereinigt und sofort eingefügt.",
-  "normalize.port":
-    "Lokaler Port, auf dem llama-server lauscht. Nur ändern, wenn der Port schon belegt ist.",
   "normalize.timeout_ms":
     "Wie lange auf das Sprachmodell gewartet wird. Läuft die Zeit ab, wird der reine Erkennungstext eingefügt — verloren geht nichts.",
-  "normalize.llama_server_path":
-    "Programm oder vollständiger Pfad zu llama-server. Bleibt es beim bloßen Namen, wird er in $PATH gesucht.",
   "normalize.context_size":
     "Wie viel Text das Sprachmodell auf einmal sieht. Größer kostet Speicher, kleiner schneidet lange Diktate ab.",
-  "normalize.threads": "Rechenkerne für llama-server.",
+  "normalize.threads": "Rechenkerne für die Nachbearbeitung.",
   "guardrail.min_word_ratio":
     "Untergrenze für die Wortzahl nach der Nachbearbeitung im Verhältnis zu davor. 0,55 verwirft eine Fassung, die fast die Hälfte weggekürzt hat.",
   "guardrail.max_word_ratio":
@@ -242,20 +236,33 @@ export const COLUMN_LABELS: Record<string, string> = {
 /// `context_size`. A section reads top to bottom as "what is this, then how
 /// does it behave", so that order is stated here rather than inherited.
 ///
+/// Keys that `Config` still accepts but no longer acts on.
+///
+/// The one and only exception to "nothing here can hide a setting", and it
+/// is not really an exception: these are not settings. S1-mini moved
+/// in-process, so there is no `llama-server` to give a path to and no port
+/// for it to listen on -- but `[normalize]` is `deny_unknown_fields`, so the
+/// Rust struct has to keep accepting both keys or every `config.toml`
+/// written before that change would stop the app from starting (invariant
+/// 4). See `NormalizeConfig::port`'s own comment.
+///
+/// A key belongs here only when the Rust side has documented it as accepted
+/// and ignored. A *real* setting must never be added to this set: the
+/// property that a setting can become unlabelled but never unreachable is
+/// what makes `schema.ts` safe to leave alone when Rust gains a field.
+export const OBSOLETE_FIELDS = new Set([
+  "normalize.port",
+  "normalize.llama_server_path",
+]);
+
 /// Only an ordering hint: a key missing from this table still renders, after
-/// the listed ones. Nothing here can hide a setting.
+/// the listed ones. Nothing here can hide a setting -- see
+/// `OBSOLETE_FIELDS` for the one thing that can, and why it is not one.
 export const FIELD_ORDER: Record<string, string[]> = {
   audio: ["device", "max_seconds", "vad_padding_ms"],
   asr: ["num_threads"],
   inject: ["backend", "trailing_space", "keystroke_delay_ms"],
-  normalize: [
-    "enabled",
-    "llama_server_path",
-    "port",
-    "timeout_ms",
-    "context_size",
-    "threads",
-  ],
+  normalize: ["enabled", "timeout_ms", "context_size", "threads"],
   guardrail: [
     "min_word_ratio",
     "max_word_ratio",
@@ -275,10 +282,15 @@ export const FIELD_ORDER: Record<string, string[]> = {
 /// whatever order the daemon sent for everything else -- so a key added in Rust
 /// and named nowhere here lands at the bottom of its section rather than
 /// nowhere at all.
+///
+/// The single filter applied here is `OBSOLETE_FIELDS`, and `search()` goes
+/// through this function precisely so a key hidden from a pane is not still
+/// reachable through the search box.
 export function orderedFields(section: string, value: Section): [string, Json][] {
   const declared = FIELD_ORDER[section] ?? [];
-  const listed = declared.filter((k) => k in value);
-  const rest = Object.keys(value).filter((k) => !declared.includes(k));
+  const live = (k: string) => !OBSOLETE_FIELDS.has(`${section}.${k}`);
+  const listed = declared.filter((k) => k in value && live(k));
+  const rest = Object.keys(value).filter((k) => !declared.includes(k) && live(k));
   return [...listed, ...rest].map((k) => [k, value[k]]);
 }
 

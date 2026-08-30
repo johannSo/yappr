@@ -1,270 +1,351 @@
-use anyhow::{bail, Context, Result};
-use std::net::TcpListener;
-use std::process::{Child, Command, Stdio};
+//! S1-mini, in-process.
+//!
+//! This module used to spawn and supervise a `llama-server` child: pick a
+//! port, poll `/health`, restart it with backoff when it died, reap it on
+//! shutdown. All of that is gone. The model is loaded into this process
+//! through `llama-cpp-2`, which links llama.cpp and a ggml CPU backend
+//! statically -- `ldd` on the built binary resolves no `libllama` or
+//! `libggml` at all -- so the `llama-cpp` and `ggml-cpu` system packages are
+//! no longer prerequisites, and ggml's opaque "no backends are loaded"
+//! failure is no longer reachable.
+//!
+//! What that trade costs, stated plainly: a crash inside llama.cpp now takes
+//! the whole app down, where a crashing child process used to degrade to
+//! `UnavailableNormalizer` and leave dictation working on raw ASR text.
+//! `sherpa-onnx` has always had exactly this property on the ASR side, which
+//! runs on *every* utterance rather than only the cleanup pass, so this adds
+//! no new class of risk -- but it does widen an existing one.
+//!
+//! What it buys, beyond the packages: the model is resident in ~440 ms
+//! rather than the ~1050 ms a spawn-and-wait-for-`/health` took, which is
+//! paid on every lazy load (invariant 12); the normalization timeout is a
+//! deadline check inside the decode loop rather than a worker thread raced
+//! against `recv_timeout`, so a slow generation can no longer leak a thread
+//! and a socket; and the model's lifetime is exactly the pipeline's, so
+//! there is no longer a child process to keep in step with `models_loaded`.
+
+use anyhow::{anyhow, bail, Context, Result};
+use std::num::NonZeroU32;
+use std::path::Path;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::llama_backend::LlamaBackend;
+use llama_cpp_2::llama_batch::LlamaBatch;
+use llama_cpp_2::model::params::LlamaModelParams;
+use llama_cpp_2::model::{AddBos, LlamaModel};
+use llama_cpp_2::sampling::LlamaSampler;
+
 use crate::config::NormalizeConfig;
-use crate::paths;
+use crate::normalize::{max_tokens_for, render_chat_prompt, Normalizer};
 
-/// A supervised `llama-server` child running S1-mini by Superwhisper.
+/// The one model file this engine loads, pinned by sha256 in
+/// `models.lock.toml` alongside Parakeet and Silero.
+pub const MODEL_FILE: &str = "s1-mini-q4_k_m.gguf";
+
+/// The process-global llama.cpp backend.
 ///
-/// The child is killed when this value is dropped, so a daemon crash cannot
-/// leave a ~600 MB model resident.
-pub struct LlamaServer {
-    child: Child,
-    port: u16,
+/// `llama_backend_init` is process-global and the crate enforces that with a
+/// one-shot flag: a second `LlamaBackend::init()` returns
+/// `BackendAlreadyInitialized` rather than a second handle. Because
+/// `[models] idle_unload_seconds` makes load-unload-load an ordinary cycle
+/// (invariant 12), a per-engine `init()` would fail on the *second*
+/// dictation of any session that had gone idle -- so it is initialised once
+/// here and never dropped. Dropping it would call `llama_backend_free` while
+/// a later engine might still want it.
+///
+/// The stored value is a `Result` rather than the backend itself because
+/// `OnceLock` has no fallible initialiser on stable: a failure is cached and
+/// re-reported to every later caller, which is correct -- if the backend
+/// could not come up once, it will not come up later either.
+fn backend() -> Result<&'static LlamaBackend> {
+    static BACKEND: OnceLock<std::result::Result<LlamaBackend, String>> = OnceLock::new();
+    match BACKEND.get_or_init(|| {
+        LlamaBackend::init()
+            .map(|mut b| {
+                // llama.cpp is chatty on stderr -- model metadata, tensor
+                // tables, timings -- and this process shares stderr with
+                // `tracing`. Silence it at the source rather than filtering
+                // it downstream.
+                b.void_logs();
+                b
+            })
+            .map_err(|e| e.to_string())
+    }) {
+        Ok(b) => Ok(b),
+        Err(e) => Err(anyhow!("llama.cpp backend failed to initialise: {e}")),
+    }
 }
 
-/// Tries the configured port, then the next nine, per spec 8.1.
+/// A loaded S1-mini, ready to normalize.
 ///
-/// This only proves a port was free at the moment of the check: the listener
-/// is dropped immediately afterward so `llama-server` itself can bind it,
-/// leaving a narrow TOCTOU window if something else grabs the port in
-/// between. That's an inherent limit of "ask the OS for a free port, then
-/// hand it to a child process" and not something a retry loop here can fully
-/// close.
-fn pick_port(preferred: u16) -> Result<u16> {
-    for port in preferred..preferred.saturating_add(10) {
-        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return Ok(port);
-        }
-    }
-    // `.saturating_add(10)`, matching the loop above: `preferred + 10` here
-    // would overflow (and panic in a debug/test build) for a `preferred`
-    // within 10 of `u16::MAX`, even though the loop itself was already
-    // overflow-safe -- the bail message just needs to describe the same
-    // range the loop actually checked.
-    bail!("no free port in {}..{}", preferred, preferred.saturating_add(10))
+/// Owns the ~480 MB of weights. There is no explicit unload: dropping this
+/// frees them, and because the engine is owned by the `Pipeline`'s
+/// normalizer, `unload_models` setting `pipeline = None` is what releases
+/// the model. That is the whole of the lifetime management the supervised
+/// child used to need `daemon.llama`, `kill_llama` and a `Drop` impl for.
+pub struct LlamaEngine {
+    model: LlamaModel,
+    n_ctx: u32,
+    n_threads: i32,
+    timeout: Duration,
 }
 
-/// A single `/health` request, bounded to a couple of seconds.
-///
-/// Without a request-level timeout here, a `llama-server` that accepts the
-/// TCP connection but never writes a response would hang this call forever
-/// -- which would in turn defeat `wait_healthy`'s own deadline loop (the
-/// `Instant::now() >= deadline` check is never reached if this call never
-/// returns). This is the same class of bug I2 fixes in `normalize.rs`,
-/// applied here so C1's "fail fast on a dead llama-server" guarantee holds
-/// even when the child is alive but wedged rather than exited.
-fn health_probe(url: &str) -> bool {
-    ureq::get(url)
-        .config()
-        .timeout_global(Some(Duration::from_secs(2)))
-        .build()
-        .call()
-        .map(|r| r.status() == 200)
-        .unwrap_or(false)
-}
-
-impl LlamaServer {
-    pub fn spawn(cfg: &NormalizeConfig) -> Result<Self> {
-        let model = paths::models_dir().join("s1-mini-q4_k_m.gguf");
-        anyhow::ensure!(model.exists(), "missing {}", model.display());
-
-        let port = pick_port(cfg.port)?;
-
-        let child = Command::new(&cfg.llama_server_path)
-            .arg("-m").arg(&model)
-            .arg("--host").arg("127.0.0.1")
-            .arg("--port").arg(port.to_string())
-            .arg("-c").arg(cfg.context_size.to_string())
-            .arg("-t").arg(cfg.threads.to_string())
-            .arg("--jinja")
-            .arg("--chat-template-kwargs").arg(r#"{"enable_thinking":false}"#)
-            .arg("--temp").arg("0")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .with_context(|| format!("spawning {}", cfg.llama_server_path))?;
-
-        std::fs::write(paths::runtime_port(), port.to_string()).ok();
-        tracing::info!(port, "llama-server spawned");
-        Ok(Self { child, port })
-    }
-
-    /// Wraps an already-spawned child under the same supervision `spawn`
-    /// gives a real `llama-server`: this is what makes `Drop`'s kill-and-reap
-    /// behaviour testable with a stub process (`sleep 300`, a tiny script)
-    /// instead of a real `llama-server`, which needs a model file on disk and
-    /// a working ggml compute backend to even start.
-    #[cfg(any(test, feature = "test-util"))]
-    pub fn from_child(child: Child, port: u16) -> Self {
-        Self { child, port }
-    }
-
-    pub fn port(&self) -> u16 {
-        self.port
-    }
-
-    pub fn base_url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.port)
-    }
-
-    /// Polls `/health` until the model is loaded and serving, or the timeout
-    /// elapses.
+impl LlamaEngine {
+    /// Loads the model at `path`.
     ///
-    /// Takes `&mut self` (not `&self`, as before C1) so it can call
-    /// `Child::try_wait` between polls: a `llama-server` that fails to spawn
-    /// at all with a working model (missing ggml compute backend, a bad
-    /// model path, etc.) typically exits within milliseconds, and without
-    /// this check the caller would otherwise learn that only after the full
-    /// `timeout` elapsed -- up to 120 s of polling a corpse before reporting
-    /// what was knowable almost immediately. See C1.
-    pub fn wait_healthy(&mut self, timeout: Duration) -> Result<()> {
-        let url = format!("{}/health", self.base_url());
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Ok(Some(status)) = self.child.try_wait() {
-                bail!("llama-server exited during startup ({status})");
-            }
-            if health_probe(&url) {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(250));
+    /// The existence check is not merely a nicer error: `LlamaModel::
+    /// load_from_file` carries a `debug_assert!` on the path existing, so in
+    /// a debug or test build a missing file would abort the process before
+    /// it could return `Err`. Checking first is what makes a missing model a
+    /// recoverable error in every profile.
+    pub fn load(path: &Path, cfg: &NormalizeConfig) -> Result<Self> {
+        if !path.exists() {
+            bail!("missing model file {}", path.display());
         }
-        bail!("llama-server did not become healthy within {timeout:?}")
+        let backend = backend()?;
+        let model = LlamaModel::load_from_file(backend, path, &LlamaModelParams::default())
+            .with_context(|| format!("loading {}", path.display()))?;
+        tracing::info!(path = %path.display(), "S1-mini loaded in-process");
+        Ok(Self {
+            model,
+            n_ctx: cfg.context_size,
+            n_threads: cfg.threads as i32,
+            timeout: Duration::from_millis(cfg.timeout_ms),
+        })
     }
 
-    /// A single, non-blocking-retry health probe (used by the daemon's
-    /// ongoing supervision loop, unlike `wait_healthy`'s startup poll).
-    pub fn is_healthy(&self) -> bool {
-        health_probe(&format!("{}/health", self.base_url()))
+    /// Greedily decodes a completion for `prompt`, stopping at an
+    /// end-of-generation token, at `max_tokens`, or at `deadline`.
+    ///
+    /// Greedy, not sampled, because that is what `temperature: 0` plus
+    /// `top_k: 1` meant on the HTTP request this replaces: for a normalizer,
+    /// reproducibility matters more than variety.
+    ///
+    /// A fresh context per call, rather than one cached on `self`: a
+    /// `LlamaContext` borrows its model, so holding both in one struct would
+    /// make it self-referential, and a context is neither `Send` nor `Sync`
+    /// while `Normalizer` requires both. It costs about 75 ms against a
+    /// call that runs for several hundred, and it means the KV cache is
+    /// released between utterances instead of held for the life of the
+    /// daemon.
+    pub fn generate(&self, prompt: &str, max_tokens: u32, deadline: Instant) -> Result<String> {
+        let tokens = self
+            .model
+            .str_to_token(prompt, AddBos::Never)
+            .map_err(|e| anyhow!("tokenizing the prompt failed: {e}"))?;
+
+        // Both halves have to fit: llama.cpp will not grow the context, and
+        // a prompt that only just fits would leave no room to answer in.
+        // `max_tokens_for` caps at 1024 and the default context is 2048, so
+        // reaching this needs a genuinely long dictation against a shrunken
+        // `context_size`.
+        let needed = tokens.len() as u64 + u64::from(max_tokens);
+        if needed > u64::from(self.n_ctx) {
+            bail!(
+                "prompt ({} tokens) plus reply ({max_tokens}) exceeds normalize.context_size ({})",
+                tokens.len(),
+                self.n_ctx
+            );
+        }
+
+        let mut ctx = self
+            .model
+            .new_context(
+                backend()?,
+                LlamaContextParams::default()
+                    .with_n_ctx(NonZeroU32::new(self.n_ctx))
+                    .with_n_threads(self.n_threads)
+                    .with_n_threads_batch(self.n_threads),
+            )
+            .map_err(|e| anyhow!("creating a llama context failed: {e}"))?;
+
+        let mut batch = LlamaBatch::new(tokens.len().max(1), 1);
+        let last = tokens.len().saturating_sub(1);
+        for (i, token) in tokens.iter().enumerate() {
+            batch
+                .add(*token, i as i32, &[0], i == last)
+                .map_err(|e| anyhow!("building the prompt batch failed: {e}"))?;
+        }
+        ctx.decode(&mut batch).map_err(|e| anyhow!("prefill failed: {e}"))?;
+
+        let mut sampler = LlamaSampler::chain_simple([LlamaSampler::greedy()]);
+        // One decoder for the whole generation, deliberately: a BPE
+        // tokenizer can split a multi-byte codepoint across two tokens, and
+        // a decoder created per token would turn each half into U+FFFD.
+        // German dictation -- umlauts and eszett -- is exactly where that
+        // shows up.
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+
+        let mut out = String::new();
+        for generated in 0..max_tokens {
+            // Where the token about to be sampled will sit in the context:
+            // the prompt occupies `0..tokens.len()`, and each accepted token
+            // extends that by one.
+            let pos = tokens.len() as i32 + generated as i32;
+            if Instant::now() >= deadline {
+                bail!("normalization timeout after {:?}", self.timeout);
+            }
+            let token = sampler.sample(&ctx, batch.n_tokens() - 1);
+            sampler.accept(token);
+            if self.model.is_eog_token(token) {
+                return Ok(out.trim().to_string());
+            }
+            out.push_str(
+                &self
+                    .model
+                    .token_to_piece(token, &mut decoder, false, None)
+                    .map_err(|e| anyhow!("detokenizing failed: {e}"))?,
+            );
+            batch.clear();
+            batch
+                .add(token, pos, &[0], true)
+                .map_err(|e| anyhow!("building the decode batch failed: {e}"))?;
+            ctx.decode(&mut batch).map_err(|e| anyhow!("decode failed: {e}"))?;
+        }
+        // Hit `max_tokens` without an end-of-generation token. Not an
+        // error: the budget is an estimate (`max_tokens_for`), and a
+        // truncated cleanup is still a cleanup -- the guardrail is what
+        // decides whether it is trustworthy, and a truncation is exactly
+        // the kind of damage its word-ratio check exists to catch.
+        Ok(out.trim().to_string())
     }
 }
 
-impl Drop for LlamaServer {
-    fn drop(&mut self) {
-        // `Child::kill` sends SIGKILL on Unix: immediate, not graceful, which
-        // is exactly what we want here -- this exists to guarantee the model
-        // is never left resident, not to give llama-server a chance to clean
-        // up.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = std::fs::remove_file(paths::runtime_port());
-        tracing::info!(port = self.port, "llama-server stopped");
+impl Normalizer for LlamaEngine {
+    fn normalize(&self, control_line: &str, raw: &str) -> Result<String> {
+        // The deadline is checked between tokens rather than enforced by
+        // racing a worker thread against `recv_timeout`, which is what the
+        // HTTP client had to do. Nothing to leak: when this gives up, the
+        // decode loop it gives up inside is this same thread.
+        self.generate(
+            &render_chat_prompt(control_line, raw),
+            max_tokens_for(raw),
+            Instant::now() + self.timeout,
+        )
     }
 }
 
 #[cfg(test)]
-mod tests {
+mod engine_tests {
     use super::*;
 
+    /// The load/unload cycle invariant 12 makes ordinary would hit
+    /// `LlamaCppError::BackendAlreadyInitialized` on the *second* load if
+    /// the backend were initialised per-engine: `llama_backend_init` is a
+    /// process-global that the crate guards with a one-shot `AtomicBool`.
+    /// An idle unload followed by the next press is exactly that second
+    /// load, so this is the first thing that would break in normal use, not
+    /// an edge case.
     #[test]
-    fn pick_port_returns_the_preferred_port_when_free() {
-        // Bind and release first so the exact port is very likely free again
-        // by the time pick_port checks it (best-effort: a genuinely flake-
-        // proof version would need a mock listener, which isn't worth it
-        // here).
-        let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = l.local_addr().unwrap().port();
-        drop(l);
+    fn the_backend_can_be_obtained_more_than_once_in_one_process() {
+        let first = backend().expect("first backend init");
+        let second = backend().expect("second backend init");
 
-        assert_eq!(pick_port(port).unwrap(), port);
-    }
-
-    #[test]
-    fn pick_port_skips_a_port_that_is_already_bound() {
-        let held = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let held_port = held.local_addr().unwrap().port();
-
-        let got = pick_port(held_port).unwrap();
-
-        assert_ne!(got, held_port);
         assert!(
-            (held_port..held_port.saturating_add(10)).contains(&got),
-            "expected a port within 10 of {held_port}, got {got}"
-        );
-        drop(held);
-    }
-
-    #[test]
-    fn pick_port_fails_when_the_whole_range_is_held() {
-        let mut held = Vec::new();
-        let base = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let base_port = base.local_addr().unwrap().port();
-        held.push(base);
-        for p in base_port..base_port.saturating_add(10) {
-            if let Ok(l) = TcpListener::bind(("127.0.0.1", p)) {
-                held.push(l);
-            }
-        }
-
-        assert!(pick_port(base_port).is_err());
-    }
-
-    #[test]
-    fn pick_port_error_message_does_not_overflow_near_the_top_of_the_range() {
-        // `preferred + 10` (unsaturated) would overflow `u16` arithmetic --
-        // and panic in this debug/test build -- for a `preferred` this close
-        // to `u16::MAX`. Hold every port the loop actually checks so
-        // `pick_port` is forced down the `bail!` path that builds the
-        // message.
-        let preferred = u16::MAX - 3;
-        let mut held = Vec::new();
-        for p in preferred..preferred.saturating_add(10) {
-            if let Ok(l) = TcpListener::bind(("127.0.0.1", p)) {
-                held.push(l);
-            }
-        }
-
-        let err = pick_port(preferred).unwrap_err();
-        assert!(
-            err.to_string().contains(&preferred.saturating_add(10).to_string()),
-            "message should describe the saturated range, got: {err}"
-        );
-    }
-
-    /// C1: proves `wait_healthy` reports a dead child almost immediately
-    /// instead of polling it for the rest of the (potentially 120 s) budget.
-    /// A real `llama-server` can't run here (no ggml compute backend on this
-    /// machine), so this stubs the supervised child with a process that
-    /// exits on its own right away -- `LlamaServer::from_child` is the same
-    /// test seam `kill_llama_terminates_a_stub_child_and_is_idempotent`
-    /// (owf-daemon.rs) uses for the same reason.
-    #[test]
-    fn wait_healthy_fails_fast_when_the_child_has_already_exited() {
-        let child = std::process::Command::new("false")
-            .spawn()
-            .expect("spawning a stub child (`false`) for this test");
-        // Give the child a moment to actually exit before asking; `false`
-        // exits essentially instantly, but this keeps the test robust
-        // against scheduling jitter without inflating the timing assertion
-        // below.
-        std::thread::sleep(Duration::from_millis(100));
-        let mut server = LlamaServer::from_child(child, 0);
-
-        let t0 = Instant::now();
-        let err = server.wait_healthy(Duration::from_secs(120)).unwrap_err();
-        let elapsed = t0.elapsed();
-
-        assert!(err.to_string().contains("exited"), "got: {err}");
-        assert!(
-            elapsed < Duration::from_secs(5),
-            "should fail fast rather than polling the full 120 s budget, took {elapsed:?}"
+            std::ptr::eq(first, second),
+            "both calls must hand back the one process-global backend"
         );
     }
 
     #[test]
-    fn spawn_fails_fast_when_the_model_file_is_missing() {
-        // Exercise the ensure!() guard without touching the real, already-
-        // downloaded model: point llama_server_path at a directory that
-        // cannot possibly contain "s1-mini-q4_k_m.gguf" isn't possible since
-        // models_dir() isn't configurable per-call, so instead this asserts
-        // the guard's error message shape against the *actual* models_dir(),
-        // which on a correctly provisioned machine will already exist -- so
-        // this test only meaningfully fails closed (missing model -> error,
-        // never a panic) rather than asserting the model is absent.
-        let cfg = NormalizeConfig {
-            llama_server_path: "/nonexistent/llama-server-binary".to_string(),
-            ..NormalizeConfig::default()
+    fn loading_a_model_that_is_not_there_fails_instead_of_panicking() {
+        let cfg = NormalizeConfig::default();
+
+        let err = match LlamaEngine::load(Path::new("/nonexistent/s1-mini-q4_k_m.gguf"), &cfg) {
+            Ok(_) => panic!("a missing model file must be an error"),
+            Err(e) => e,
         };
-        // Either the model is missing (ensure! fires) or the model is
-        // present and spawning the bogus binary fails (with_context fires).
-        // Both are `Result::Err`, never a panic -- that's the behaviour under
-        // test.
-        assert!(LlamaServer::spawn(&cfg).is_err());
+
+        assert!(
+            err.to_string().contains("/nonexistent/s1-mini-q4_k_m.gguf"),
+            "the error should name the path it looked for, got: {err}"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs the downloaded S1-mini model"]
+    fn generate_normalizes_a_raw_transcript() {
+        let cfg = NormalizeConfig::default();
+        let engine = LlamaEngine::load(&model_path(), &cfg).expect("loading S1-mini");
+        let raw = "kannst du mir bitte bescheid geben ob das so passt";
+        let prompt = render_chat_prompt("[Styling: casual]", raw);
+
+        let out = engine
+            .generate(&prompt, max_tokens_for(raw), Instant::now() + Duration::from_secs(60))
+            .expect("generation");
+
+        // Not an exact-string assertion: the point is that a real cleanup
+        // came back, not that this particular model build words it one way.
+        // What must hold is that the think block never leaks (spec 8.2's
+        // blank-output failure mode) and the text is recognisably the input.
+        assert!(!out.contains("<think>"), "think block leaked into output: {out}");
+        assert!(!out.contains("<|im_"), "chat markup leaked into output: {out}");
+        assert!(out.to_lowercase().contains("bescheid"), "unrecognisable output: {out}");
+    }
+
+    #[test]
+    #[ignore = "needs the downloaded S1-mini model"]
+    fn generate_gives_up_when_the_deadline_has_passed() {
+        let cfg = NormalizeConfig::default();
+        let engine = LlamaEngine::load(&model_path(), &cfg).expect("loading S1-mini");
+        let prompt = render_chat_prompt("[Styling: casual]", "hallo welt");
+
+        let err = engine
+            .generate(&prompt, 512, Instant::now())
+            .expect_err("an already-passed deadline must abort generation");
+
+        assert!(err.to_string().contains("timeout"), "got: {err}");
+    }
+
+    /// The umlaut case the shared `encoding_rs` decoder in `generate`
+    /// exists for. Pinned as a round trip through the real tokenizer rather
+    /// than asserted about the decoder directly, because what matters is
+    /// that German survives tokenize -> detokenize intact.
+    #[test]
+    #[ignore = "needs the downloaded S1-mini model"]
+    fn detokenizing_preserves_german_multibyte_characters() {
+        let cfg = NormalizeConfig::default();
+        let engine = LlamaEngine::load(&model_path(), &cfg).expect("loading S1-mini");
+        let text = "Grüße für Jörg, die Straße ist gesperrt.";
+
+        let tokens = engine.model.str_to_token(text, AddBos::Never).expect("tokenizing");
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        let mut back = String::new();
+        for t in tokens {
+            back.push_str(&engine.model.token_to_piece(t, &mut decoder, false, None).unwrap());
+        }
+
+        assert_eq!(back, text);
+    }
+
+    /// The integration point the two tests above each cover half of:
+    /// `Normalizer::normalize` is what `Pipeline` actually calls, and it is
+    /// what wires `render_chat_prompt`, `max_tokens_for` and the configured
+    /// `timeout_ms` together into one `generate`. A mistake in that wiring
+    /// -- the wrong control line, a budget of zero, a deadline already in
+    /// the past -- would leave both of the tests above passing.
+    #[test]
+    #[ignore = "needs the downloaded S1-mini model"]
+    fn the_normalizer_trait_cleans_up_a_transcript_end_to_end() {
+        let cfg = NormalizeConfig::default();
+        let engine = LlamaEngine::load(&model_path(), &cfg).expect("loading S1-mini");
+
+        let out = Normalizer::normalize(
+            &engine,
+            "[Styling: casual] [Structure: prose] [Context: general]",
+            "also das meeting ist morgen um zehn uhr",
+        )
+        .expect("normalizing through the trait");
+
+        assert!(!out.is_empty(), "the normalizer returned nothing");
+        assert!(!out.contains("<think>"), "think block leaked: {out}");
+        assert!(!out.contains("<|im_"), "chat markup leaked: {out}");
+        assert!(out.to_lowercase().contains("meeting"), "unrecognisable output: {out}");
+    }
+
+    fn model_path() -> std::path::PathBuf {
+        crate::paths::models_dir().join(MODEL_FILE)
     }
 }

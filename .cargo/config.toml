@@ -1,0 +1,28 @@
+# Why this file exists: sherpa-onnx and llama.cpp must agree on the C++ ABI.
+#
+# `sherpa-onnx` links a prebuilt `libonnxruntime.a` that was compiled with the
+# *old* libstdc++ ABI (`_GLIBCXX_USE_CXX11_ABI=0`) -- 11,675 old-ABI
+# `std::string` symbols in it and not one new-ABI symbol. `llama-cpp-sys-2`
+# builds llama.cpp here from source, and cmake defaults to the *new* ABI.
+#
+# Both libraries instantiate `std::regex`'s `_Compiler` (82 copies in
+# onnxruntime, 265 in libllama). Those are weak template symbols, so the
+# linker keeps exactly one of the two -- and then ONNX Runtime's
+# `DeviceDiscovery::DiscoverDevicesForPlatform`, which builds a `std::regex`
+# while creating its `OrtEnv`, runs against an instantiation whose
+# `std::string` has a different layout than the one it was compiled for. The
+# result is `free(): invalid pointer` and SIGABRT, inside `SileroTrimmer::new`
+# -- i.e. VAD, on every single utterance. It is not a subtle degradation; the
+# process aborts.
+#
+# Building llama.cpp with the old ABI too makes both instantiations
+# identical, which is what makes deduplicating them safe. Verified by
+# `cargo test --workspace -- --ignored`, whose `vad::` tests abort without
+# this and pass with it.
+#
+# `force = true` deliberately: without it, a `CXXFLAGS` already set in the
+# environment silently wins and produces a binary that corrupts memory at
+# runtime. A build that ignores this flag is not a build worth producing, so
+# it takes precedence over an inherited value rather than losing to one.
+[env]
+CXXFLAGS = { value = "-D_GLIBCXX_USE_CXX11_ABI=0", force = true }

@@ -3,7 +3,9 @@
 //! `send()` and `open_settings()` used to live here too; `client::dispatch`
 //! replaces both directly, so they were deleted rather than moved.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
@@ -194,9 +196,15 @@ fn status_line(label: &str, name: &str, why: &str) {
 /// ones, like `hyprctl`, may still be absent).
 ///
 /// Spec 14.3 requires `setup` to report missing prerequisites rather than
-/// failing obscurely later -- e.g. `wtype` missing at dictation time, or
-/// (see below) `llama-server` starting but refusing every model with
-/// ggml's "no backends are loaded" error.
+/// failing obscurely later -- e.g. `wtype` missing at dictation time.
+///
+/// This list used to be longer. `llama-server` was on it, and so was a
+/// bespoke ggml-compute-backend probe (`ggml_backend_present`, which parsed
+/// `ldconfig` output to find `libggml-base.so` and then looked for a sibling
+/// backend library) that existed purely to catch ggml's opaque "no backends
+/// are loaded" before a user hit it mid-dictation. S1-mini is linked into
+/// this binary now, so neither the program nor the backend can be missing:
+/// if the app started, they are present.
 ///
 /// `pub(crate)`: the Setup pane's `setup_status` command (`provision.rs`)
 /// reports this alongside model presence, which is a separate question
@@ -205,7 +213,6 @@ fn status_line(label: &str, name: &str, why: &str) {
 pub(crate) fn check_prerequisites() -> Vec<&'static str> {
     // (binary, why it is needed, pacman package that provides it, fatal)
     let checks = [
-        ("llama-server", "S1-mini normalization", "llama-cpp", true),
         ("wtype", "typing into the focused window", "wtype", true),
         ("wl-copy", "clipboard fallback when typing fails", "wl-clipboard", true),
         // Optional, not fatal: `wtype` is the default injector and needs no
@@ -235,20 +242,6 @@ pub(crate) fn check_prerequisites() -> Vec<&'static str> {
         }
     }
 
-    // `llama-server` being on PATH is not sufficient: on Arch, `llama-cpp`
-    // depends only on the base `ggml` package, which ships `libggml-base.so`
-    // but no compute backend at all. Without one (`ggml-cpu`, `ggml-blas`,
-    // `ggml-cuda`, ...), model loading fails at runtime with ggml's own
-    // opaque "no backends are loaded" error -- reproduced on this machine,
-    // not a hypothetical. Catch it here instead of leaving the user to debug
-    // a cryptic failure the first time they actually dictate.
-    if ggml_backend_present() {
-        status_line("ok", "ggml backend", "llama-server model loading");
-    } else {
-        status_line("MISSING", "ggml backend", "llama-server model loading");
-        missing_pkgs.push("ggml-cpu");
-    }
-
     // Absent, not fatal: `paths::xdg_runtime()` falls back to
     // `std::env::temp_dir()` when unset, so the daemon and `owf-ctl` still
     // agree on a socket location -- just a less conventional one.
@@ -260,79 +253,6 @@ pub(crate) fn check_prerequisites() -> Vec<&'static str> {
     );
 
     missing_pkgs
-}
-
-/// Directories `ggml_backend_load_all()` would search for compute-backend
-/// shared libraries by default: wherever `libggml-base.so` actually resolves
-/// to (found via `ldconfig`, which is what the dynamic linker itself uses to
-/// resolve `llama-server`'s `NEEDED libggml-base.so.0`), plus a `ggml/`
-/// subdirectory next to it -- the layout Arch's `ggml-cpu`/`ggml-blas`/...
-/// packages install into (the base `ggml` package does not create that
-/// subdirectory itself). Falls back to the conventional library directories
-/// if `ldconfig` is missing or has not indexed it.
-fn libggml_base_dirs() -> Vec<PathBuf> {
-    let output = std::process::Command::new("ldconfig")
-        .arg("-p")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default();
-    let mut dirs = parse_ldconfig_dirs("libggml-base.so", &output);
-    if dirs.is_empty() {
-        dirs = ["/usr/lib", "/usr/lib64", "/usr/local/lib"].map(PathBuf::from).into();
-    }
-    dirs
-}
-
-/// Parses `ldconfig -p` output for the directories containing lines whose
-/// library name contains `needle`, deduplicated.
-fn parse_ldconfig_dirs(needle: &str, ldconfig_output: &str) -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = ldconfig_output
-        .lines()
-        .filter(|line| line.contains(needle))
-        .filter_map(|line| line.split("=> ").nth(1))
-        .filter_map(|path| Path::new(path.trim()).parent().map(PathBuf::from))
-        .collect();
-    dirs.sort();
-    dirs.dedup();
-    dirs
-}
-
-/// Prefixes of the shared libraries ggml's compute backends install as.
-/// `libggml.so` (no dash) and `libggml-base.so` are deliberately excluded --
-/// neither performs any computation, so their presence says nothing about
-/// whether `llama-server` can actually load a model.
-const GGML_BACKEND_PREFIXES: [&str; 7] = [
-    "libggml-cpu",
-    "libggml-blas",
-    "libggml-cuda",
-    "libggml-vulkan",
-    "libggml-hip",
-    "libggml-sycl",
-    "libggml-openvino",
-];
-
-/// True when `dir` directly contains at least one ggml compute-backend
-/// library.
-fn dir_has_backend(dir: &Path) -> bool {
-    std::fs::read_dir(dir)
-        .map(|entries| {
-            entries.flatten().any(|entry| {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                GGML_BACKEND_PREFIXES.iter().any(|prefix| name.starts_with(prefix))
-            })
-        })
-        .unwrap_or(false)
-}
-
-/// True when a ggml compute backend is installed somewhere `llama-server`
-/// would find it at startup.
-fn ggml_backend_present() -> bool {
-    libggml_base_dirs()
-        .iter()
-        .any(|dir| dir_has_backend(dir) || dir_has_backend(&dir.join("ggml")))
 }
 
 pub fn setup(update_lock: bool) -> Result<()> {
@@ -416,62 +336,6 @@ mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("yappr-ctl-test-{tag}-{}-{n}", std::process::id()))
-    }
-
-    #[test]
-    fn dir_has_backend_is_false_for_a_missing_or_empty_directory() {
-        let dir = scratch_dir("missing");
-        assert!(!dir_has_backend(&dir), "directory does not even exist yet");
-
-        std::fs::create_dir_all(&dir).unwrap();
-        assert!(!dir_has_backend(&dir), "empty directory has no backend");
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn dir_has_backend_ignores_base_and_umbrella_libs() {
-        let dir = scratch_dir("base-only");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("libggml-base.so"), b"").unwrap();
-        std::fs::write(dir.join("libggml-base.so.0"), b"").unwrap();
-        std::fs::write(dir.join("libggml.so"), b"").unwrap();
-        assert!(
-            !dir_has_backend(&dir),
-            "base and umbrella libs alone must not count as a compute backend"
-        );
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn dir_has_backend_true_once_a_compute_backend_is_present() {
-        let dir = scratch_dir("cpu-backend");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("libggml-base.so"), b"").unwrap();
-        // The exact filename Arch's `ggml-cpu` package installs, one per
-        // supported microarchitecture.
-        std::fs::write(dir.join("libggml-cpu-haswell.so"), b"").unwrap();
-        assert!(dir_has_backend(&dir));
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn parse_ldconfig_dirs_extracts_the_directory_after_the_arrow() {
-        // A trimmed real `ldconfig -p` excerpt from this machine.
-        let output = "\tlibggml.so.0 (libc6,x86-64) => /usr/lib/libggml.so.0\n\
-                       \tlibggml.so (libc6,x86-64) => /usr/lib/libggml.so\n\
-                       \tlibggml-base.so.0 (libc6,x86-64) => /usr/lib/libggml-base.so.0\n\
-                       \tlibggml-base.so (libc6,x86-64) => /usr/lib/libggml-base.so\n";
-        let dirs = parse_ldconfig_dirs("libggml-base.so", output);
-        assert_eq!(dirs, vec![PathBuf::from("/usr/lib")]);
-    }
-
-    #[test]
-    fn parse_ldconfig_dirs_is_empty_when_the_needle_is_absent() {
-        let output = "\tlibc.so.6 (libc6,x86-64) => /usr/lib/libc.so.6\n";
-        assert!(parse_ldconfig_dirs("libggml-base.so", output).is_empty());
     }
 
     #[test]

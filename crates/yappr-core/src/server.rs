@@ -19,12 +19,12 @@ use std::time::{Duration, Instant};
 
 use crate::asr::SherpaTranscriber;
 use crate::capture::{CaptureStats, Recorder};
-use crate::config::{AudioConfig, Config, DebugConfig, ModelsConfig, NormalizeConfig};
+use crate::config::{AudioConfig, Config, DebugConfig, ModelsConfig};
 use crate::config_write;
 use crate::inject;
 use crate::lang::WhatlangDetector;
-use crate::llama::LlamaServer;
-use crate::normalize::{Normalizer, S1MiniClient};
+use crate::llama::{LlamaEngine, MODEL_FILE};
+use crate::normalize::Normalizer;
 use crate::paths;
 use crate::pipeline::{Pipeline, Timings};
 use crate::proto::{OverlayEvent, Request, Response, State};
@@ -200,8 +200,8 @@ pub trait EventSink: Send + Sync + 'static {
     /// `show_settings`'s is: only `TauriSink` owns a window to show.
     fn show_wizard(&self) {}
     /// Unregisters the tray item, spec §8 step 3 -- called once from
-    /// [`shutdown`], between killing `llama-server` (step 2) and removing
-    /// the runtime socket/lock (step 4). A no-op default for the same
+    /// [`shutdown`], before removing the runtime socket/lock (step 4).
+    /// A no-op default for the same
     /// reason `show_settings`'s is: the standalone daemon and every test
     /// sink in this file own no tray to unregister. Only `TauriSink`
     /// (Task 12, `src-tauri/src/tray.rs`) overrides it.
@@ -269,15 +269,6 @@ pub struct Daemon {
     /// `[models]`, mirrored here so a Settings change takes effect without a
     /// restart -- the same reason, and the same shape, as `audio_cfg`.
     models_cfg: Mutex<ModelsConfig>,
-    /// Owns the supervised `llama-server` child (R3): storing it here, rather
-    /// than leaking it with `mem::forget`, keeps `LlamaServer::drop` reachable
-    /// for the lifetime of the daemon instead of permanently severing it.
-    /// `None` for the whole run when `[normalize].enabled = false` (R9): no
-    /// child is ever spawned in that case, and also transiently `None`
-    /// whenever `spawn_housekeeping`'s supervision loop (Task 3) has just
-    /// killed an unhealthy/exited child and hasn't yet installed its
-    /// replacement.
-    llama: Mutex<Option<LlamaServer>>,
     window_class: Mutex<Option<String>>,
     /// Where `get-config`/`set-config` read and write. A field rather than a
     /// call to `paths::config_file()` at each use site so tests can point it
@@ -336,7 +327,6 @@ pub struct Daemon {
     /// running on the same machine as the test suite.
     runtime_socket_path: PathBuf,
     runtime_lock_path: PathBuf,
-    runtime_port_path: PathBuf,
     /// The single-instance guard (see `start`'s doc comment): an exclusive,
     /// non-blocking `flock` on a runtime file. Held for the life of the
     /// daemon only because this `File` lives here -- `start` used to keep it
@@ -411,7 +401,7 @@ fn reap_dead_subscribers(subscribers: &Mutex<Vec<Subscriber>>) {
 /// thus live audio hardware, just to exist. Every *production* broadcast
 /// goes through [`Broadcaster::broadcast`] instead, which calls this and
 /// then the in-process sink: calling this directly from production code,
-/// the way `IdleOnExit`/`process_utterance`/`supervise_llama_once` used to,
+/// the way `IdleOnExit`/`process_utterance` used to,
 /// is exactly the bug a code review caught after Task 6 first added the
 /// sink -- `Done`, both `Error` variants, the panic-recovery `Idle`, and
 /// `NormalizeDegraded`/`NormalizeRecovered` all reached socket subscribers
@@ -455,8 +445,7 @@ impl Daemon {
 
     /// Whether a subscriber connecting *right now* should be told
     /// normalization is degraded -- the connect-time counterpart of the live
-    /// `NormalizeDegraded`/`NormalizeRecovered` broadcasts `supervise_llama_once`
-    /// sends on a transition.
+    /// `NormalizeDegraded` broadcast a failed load sends.
     ///
     /// Requires model residency, not just `!normalize_available`: before lazy
     /// loading, `normalize_enabled && !normalize_available` alone was a
@@ -651,11 +640,6 @@ pub fn start(sink: Arc<dyn EventSink>) -> Result<(Arc<Daemon>, UnixListener)> {
     // quit. `ensure_recorder` retries construction lazily on the next
     // `ptt-start` regardless of whether warm-up's own attempt succeeded, so
     // nothing is lost by deferring it but the timing of one log line.
-    //
-    // Cloned before `cfg` is moved into the warm-up thread's closure below;
-    // `None` when `[normalize].enabled = false` (R9), which is also exactly
-    // when `spawn_housekeeping`'s llama-supervision half must stay inert.
-    let normalize_cfg: Option<NormalizeConfig> = cfg.normalize.enabled.then(|| cfg.normalize.clone());
 
     let daemon = Arc::new(Daemon {
         state: AtomicU8::new(WARMING),
@@ -667,7 +651,6 @@ pub fn start(sink: Arc<dyn EventSink>) -> Result<(Arc<Daemon>, UnixListener)> {
         models_loaded: AtomicBool::new(false),
         last_activity: Mutex::new(Instant::now()),
         models_cfg: Mutex::new(cfg.models.clone()),
-        llama: Mutex::new(None),
         window_class: Mutex::new(None),
         config_path: paths::config_file(),
         recording_epoch: AtomicU64::new(0),
@@ -680,7 +663,6 @@ pub fn start(sink: Arc<dyn EventSink>) -> Result<(Arc<Daemon>, UnixListener)> {
         sink,
         runtime_socket_path: sock_path,
         runtime_lock_path: lock_path,
-        runtime_port_path: paths::runtime_port(),
         _runtime_lock: lock,
     });
 
@@ -703,15 +685,13 @@ pub fn start(sink: Arc<dyn EventSink>) -> Result<(Arc<Daemon>, UnixListener)> {
             }
 
             match load_models(cfg, &daemon) {
-                Ok((pipeline, server)) => {
-                    let available = server.is_some();
+                Ok((pipeline, available)) => {
                     *lock_ignoring_poison(&daemon.pipeline) = Some(pipeline);
-                    *lock_ignoring_poison(&daemon.llama) = server;
-                    // Populated immediately (accuracy for `status` from the
-                    // moment warm-up resolves), independent of when
-                    // `spawn_housekeeping`'s own loop next wakes up and
-                    // re-confirms the same thing to decide whether a
-                    // `NormalizeDegraded`/`NormalizeRecovered` broadcast is due.
+                    // Settled once, here, and not revisited: an in-process
+                    // engine either loaded or it didn't. There is no health
+                    // to poll and nothing that can die underneath us, which
+                    // is what removed the supervision loop that used to
+                    // re-confirm this every 10 s.
                     daemon.normalize_available.store(available, Ordering::SeqCst);
                     daemon.models_loaded.store(true, Ordering::SeqCst);
                     daemon.state.store(IDLE, Ordering::SeqCst);
@@ -720,7 +700,7 @@ pub fn start(sink: Arc<dyn EventSink>) -> Result<(Arc<Daemon>, UnixListener)> {
                 }
                 Err(e) => {
                     // The only way `load_models` returns `Err`: ASR/VAD failed
-                    // to load. A `llama-server` failure never reaches here (see
+                    // to load. An S1-mini load failure never reaches here (see
                     // `load_models`'s doc comment) -- it's absorbed into
                     // `UnavailableNormalizer` and the daemon still comes up
                     // `Idle`. This is a permanent, fatal failure (Task 3, Work
@@ -742,18 +722,13 @@ pub fn start(sink: Arc<dyn EventSink>) -> Result<(Arc<Daemon>, UnixListener)> {
         });
     }
 
-    // Reaps dead subscribers (Task 3, Work Item 2), attempts the idle-unload
-    // deadline on the same tick (Task 6, `unload_models`), and, when
-    // normalization is enabled, supervises the `llama-server` child (Task 3,
-    // Work Item 1 / spec 15, 5.1). Spawned unconditionally and immediately --
-    // not gated on warm-up finishing -- so subscriber hygiene starts from the
-    // very first connection; the llama-specific half stays inert until
-    // warm-up has settled `daemon.llama` (see `should_supervise_llama`'s
-    // gate, inside `spawn_housekeeping`), which is what stops it from ever
-    // racing warm-up's own initial spawn into starting a second
-    // `llama-server`.
+    // Reaps dead subscribers (Task 3, Work Item 2) and attempts the
+    // idle-unload deadline on the same tick (Task 6, `unload_models`).
+    // Spawned unconditionally and immediately -- not gated on warm-up
+    // finishing -- so subscriber hygiene starts from the very first
+    // connection.
     {
-        let handle = spawn_housekeeping(Arc::clone(&daemon), normalize_cfg, true);
+        let handle = spawn_housekeeping(Arc::clone(&daemon));
         *lock_ignoring_poison(&daemon.housekeeping) = Some(handle);
     }
 
@@ -861,60 +836,66 @@ fn warm_up_recorder(cfg: &Config, daemon: &Arc<Daemon>) {
     }
 }
 
-/// Builds the pipeline and, when normalization is enabled, the supervised
-/// `llama-server` behind it.
+/// Builds the pipeline and, when normalization is enabled, loads S1-mini
+/// into this process behind it.
 ///
 /// Called at startup only when `[models] preload_at_startup` is on; otherwise
 /// called on demand by `ensure_models_loaded`, off the press that needs it.
 /// It therefore must not assume it is running exactly once, or at startup.
 ///
-/// R9: when `cfg.normalize.enabled` is `false`, `llama-server` is never
-/// spawned at all -- not spawned-then-ignored. On this machine the system
-/// `ggml` package ships no compute backend, so a real `llama-server` cannot
-/// load any model; running with `[normalize] enabled = false` is how the
-/// rest of the daemon (capture -> VAD -> ASR -> guardrail-fallback -> wtype)
-/// is verified without it.
+/// R9: when `cfg.normalize.enabled` is `false`, S1-mini is never loaded at
+/// all -- not loaded-then-ignored. Running with `[normalize] enabled = false`
+/// is how the rest of the daemon (capture -> VAD -> ASR -> guardrail-fallback
+/// -> wtype) is verified without it, and it now also saves the ~480 MB the
+/// weights occupy.
 ///
-/// C1: a `llama-server` that fails to spawn, or spawns but never becomes
-/// healthy, no longer fails this function. Before this fix, either failure
-/// propagated out via `?`, the caller (`main`'s warm-up thread) logged it and
-/// left `daemon.state` at `WARMING` forever, and every subsequent
-/// `ptt-start` answered `{"ok":false,"err":"warming"}` -- permanently, with
-/// no retry -- even though ASR, VAD, and the guardrail's raw-text fallback
-/// were completely unaffected and spec 15 explicitly calls for exactly that
-/// degraded path ("`llama-server` down / unhealthy -> skip normalization,
-/// inject raw + rule pass"). Only spawning the ASR/VAD models can still fail
-/// this function: there is no raw-fallback path for a missing ASR the way
-/// there is for a missing normalizer, so failing loudly there is correct.
-fn load_models(cfg: Config, daemon: &Arc<Daemon>) -> Result<(Pipeline, Option<LlamaServer>)> {
+/// C1: a model that fails to load does not fail this function. Before that
+/// fix the failure propagated out via `?`, the caller left `daemon.state` at
+/// `WARMING` forever, and every subsequent `ptt-start` answered
+/// `{"ok":false,"err":"warming"}` -- permanently, with no retry -- even
+/// though ASR, VAD, and the guardrail's raw-text fallback were completely
+/// unaffected and spec 15 explicitly calls for exactly that degraded path.
+/// Only the ASR/VAD models can still fail this function: there is no
+/// raw-fallback path for a missing ASR the way there is for a missing
+/// normalizer, so failing loudly there is correct.
+///
+/// Returns whether normalization is actually available, which the caller
+/// stores into `normalize_available`. That used to be `server.is_some()` on
+/// a returned child handle; there is no handle any more, because the engine
+/// is owned by the `Pipeline`'s normalizer and lives exactly as long as it.
+fn load_models(cfg: Config, daemon: &Arc<Daemon>) -> Result<(Pipeline, bool)> {
     let models = paths::models_dir();
 
-    let (server, base_url) = if cfg.normalize.enabled {
-        match spawn_and_wait_healthy(&cfg.normalize, STARTUP_HEALTH_TIMEOUT) {
-            Ok(server) => {
-                let base_url = server.base_url();
-                (Some(server), base_url)
-            }
+    // ASR and VAD first, deliberately: they are the only loads that can
+    // fail this function, and failing before spending ~480 MB and ~440 ms
+    // on S1-mini is the cheaper order. The previous ordering existed to get
+    // `llama-server`'s cold start overlapping the ASR build; with both loads
+    // in this process and on this thread there is nothing left to overlap.
+    let asr = SherpaTranscriber::new(&models, cfg.asr.num_threads)?;
+    let trimmer = SileroTrimmer::new(&models)?;
+
+    let engine = if cfg.normalize.enabled {
+        match LlamaEngine::load(&models.join(MODEL_FILE), &cfg.normalize) {
+            Ok(engine) => Some(engine),
             Err(e) => {
                 tracing::warn!(
                     error = ?e,
-                    "llama-server did not come up; continuing with normalization disabled \
+                    "S1-mini did not load; continuing with normalization disabled \
                      for this run (ASR + guardrail raw-text fallback only)"
                 );
-                (None, String::new())
+                None
             }
         }
     } else {
-        tracing::info!("normalize.enabled = false; not spawning llama-server");
-        (None, String::new())
+        tracing::info!("normalize.enabled = false; not loading S1-mini");
+        None
     };
 
-    let asr = SherpaTranscriber::new(&models, cfg.asr.num_threads)?;
-    let trimmer = SileroTrimmer::new(&models)?;
-    let normalizer: Box<dyn Normalizer> = match &server {
-        Some(_) => Box::new(S1MiniClient::new(base_url, cfg.normalize.timeout_ms)),
+    let available = engine.is_some();
+    let normalizer: Box<dyn Normalizer> = match engine {
+        Some(engine) => Box::new(engine),
         None if cfg.normalize.enabled => {
-            Box::new(UnavailableNormalizer("llama-server failed to start".to_string()))
+            Box::new(UnavailableNormalizer("S1-mini failed to load".to_string()))
         }
         None => Box::new(UnavailableNormalizer("normalize.enabled = false".to_string())),
     };
@@ -947,7 +928,7 @@ fn load_models(cfg: Config, daemon: &Arc<Daemon>) -> Result<(Pipeline, Option<Ll
         injector,
     )
     .with_stage_events(stage_events);
-    Ok((pipeline, server))
+    Ok((pipeline, available))
 }
 
 /// Brings the models up if they are not already, and does nothing if they
@@ -984,7 +965,7 @@ fn ensure_models_loaded(daemon: &Arc<Daemon>) -> Result<(), String> {
 /// [`ensure_models_loaded`] with the loader and the shutdown flag injected --
 /// the seam a test uses to exercise the locking, the idempotence and the
 /// failure path without an ASR model on disk, in the same shape
-/// `supervise_llama_once`'s `respawn` parameter already establishes.
+/// the injected loader already establishes.
 ///
 /// `shutting_down` is `&SHUTTING_DOWN` in production, and the sole reason it
 /// is a parameter is that `SHUTTING_DOWN` is a process-global static: a test
@@ -1007,7 +988,7 @@ fn ensure_models_loaded(daemon: &Arc<Daemon>) -> Result<(), String> {
 /// `llama-server`.
 fn ensure_models_loaded_with(
     daemon: &Arc<Daemon>,
-    load: &mut dyn FnMut() -> Result<(Pipeline, Option<LlamaServer>)>,
+    load: &mut dyn FnMut() -> Result<(Pipeline, bool)>,
     shutting_down: &AtomicBool,
 ) -> Result<(), String> {
     let _guard = lock_ignoring_poison(&daemon.load_lock);
@@ -1015,58 +996,34 @@ fn ensure_models_loaded_with(
         return Ok(());
     }
     match load() {
-        Ok((pipeline, server)) => {
-            let available = server.is_some();
+        Ok((pipeline, available)) => {
             *lock_ignoring_poison(&daemon.pipeline) = Some(pipeline);
-            *lock_ignoring_poison(&daemon.llama) = server;
             daemon.normalize_available.store(available, Ordering::SeqCst);
-            // Last, and only on the success path: this is what the
-            // housekeeping thread's supervisor gate and `Status` both read,
-            // so it must never be true before the pipeline is installed.
+            // Last, and only on the success path: this is what `Status`
+            // reads, so it must never be true before the pipeline is
+            // installed.
             daemon.models_loaded.store(true, Ordering::SeqCst);
             // Re-checked here, *after* the install, still holding
-            // `load_lock`. `load_models` spawns `llama-server` first and
-            // returns it only once `SherpaTranscriber`/`SileroTrimmer` have
-            // finished, so on every cold press there is a multi-second window
-            // in which a live ~955 MB child exists in a local that
-            // `daemon.llama` knows nothing about. `shutdown` deliberately
-            // does *not* take `load_lock` (that would hang Beenden for up to
-            // `STARTUP_HEALTH_TIMEOUT` behind an in-flight load), so its
-            // `kill_llama` finds `None`, `Request::Quit`'s
-            // `std::process::exit(0)` follows, and -- `LlamaServer` sets no
-            // `PR_SET_PDEATHSIG`, and `Drop` never runs through `exit` -- the
-            // child is orphaned. Silently: the next start's `pick_port` just
-            // walks past it, so the only symptom is the memory this whole
-            // feature exists to reclaim never coming back. Press SUPER+D,
-            // cancel with SUPER+ALT+D, click Beenden: `wait_for_busy_to_clear`
-            // returns at once (`IDLE` is not `is_busy`) while this thread is
-            // still loading.
+            // `load_lock`: a load that finished after teardown began must
+            // release what it just built rather than leave it resident.
             //
-            // Install-then-check, rather than check-then-install, closes the
-            // window between `kill_llama` and the `std::process::exit(0)`
-            // that follows every route into `shutdown` (see `shutdown`'s own
-            // call sites) -- it is not airtight against the leak described
-            // above. Everything here and in `shutdown` is `SeqCst`, and
-            // `shutdown` sets `SHUTTING_DOWN` *before* it calls `kill_llama`:
-            // either that store precedes this load and we tear the child
-            // down ourselves, or `kill_llama` runs after the install above
-            // and finds it. No interleaving *that reaches this re-check*
-            // lets both miss it -- but `exit(0)` follows `shutdown` within
-            // milliseconds, and nothing joins the detached thread
-            // `start_recording` spawns to run this load (`ensure_models_loaded`
-            // via `std::thread::spawn`), so a load that is still inside
-            // `load_models` -- anywhere in the ~3.5 s window between
-            // `llama-server`'s cold start and the ASR model finishing its
-            // own load -- never reaches this code at all: the process is
-            // gone first, and the `llama-server` child it already spawned is
-            // orphaned exactly as before this re-check existed. A real fix
-            // needs one of: installing the `LlamaServer` into `daemon.llama`
-            // immediately after `spawn_and_wait_healthy` returns, rather than
-            // after the ASR build finishes (the supervisor's `models_loaded`
-            // gate already keeps it inert until then, so this is safe); or
-            // setting `PR_SET_PDEATHSIG` on the child so the kernel reaps it
-            // when this process dies regardless of where `shutdown` finds it.
-            // Both are design changes, deliberately out of scope here.
+            // This used to carry a much longer argument about an orphaned
+            // `llama-server`. A load spawned the child several seconds
+            // before it returned, `shutdown` deliberately does not take
+            // `load_lock` (that would hang Beenden behind an in-flight
+            // load), and `std::process::exit(0)` follows `shutdown` within
+            // milliseconds -- so a load still inside `load_models` never
+            // reached this re-check at all, and the ~955 MB child it had
+            // already spawned survived the daemon that started it. Silently:
+            // the only symptom was the memory this feature exists to
+            // reclaim never coming back.
+            //
+            // An in-process engine cannot be orphaned. There is no child to
+            // outlive us; the weights are this process's own heap, and the
+            // kernel reclaims them at `exit` whether or not this arm ever
+            // runs. What remains here is the ordinary case -- freeing
+            // promptly rather than sitting on half a gigabyte until the
+            // process actually goes away.
             //
             // `SHUTTING_DOWN`, not `Daemon::quitting`: `quitting` is set only
             // by the `Request::Quit` arm, so it would miss `SIGTERM` at
@@ -1074,12 +1031,9 @@ fn ensure_models_loaded_with(
             // `shutdown` directly. `SHUTTING_DOWN` is set by `shutdown`
             // itself -- the one point all four teardown routes converge on.
             if shutting_down.load(Ordering::SeqCst) {
-                // Same order, and the same steps, as `unload_models`:
-                // `models_loaded` cleared first because it is what the
-                // supervisor gate reads, then the pipeline, then the child.
+                // Same order, and the same steps, as `unload_models`.
                 daemon.models_loaded.store(false, Ordering::SeqCst);
                 *lock_ignoring_poison(&daemon.pipeline) = None;
-                kill_llama(&daemon.llama);
                 daemon.normalize_available.store(false, Ordering::SeqCst);
                 tracing::info!("models finished loading during shutdown; released again");
                 return Err("shutting down".to_string());
@@ -1089,23 +1043,6 @@ fn ensure_models_loaded_with(
         }
         Err(e) => Err(format!("{e:#}")),
     }
-}
-
-/// Startup's health-wait budget: a cold model load can genuinely take this
-/// long on first run (disk read plus ggml init), so `load_models`'s one-time
-/// initial spawn gets the full 120 s. A background *restart* is different --
-/// see `RESTART_HEALTH_TIMEOUT`.
-const STARTUP_HEALTH_TIMEOUT: Duration = Duration::from_secs(120);
-
-/// Spawns `llama-server` and waits for it to report healthy, as one
-/// `Result` -- the seam `load_models` above matches on to fall back to
-/// [`UnavailableNormalizer`] instead of failing outright (C1), and
-/// `supervise_llama_once` (Task 3) uses the same way with a shorter
-/// `timeout` for a background restart attempt.
-fn spawn_and_wait_healthy(cfg: &NormalizeConfig, timeout: Duration) -> Result<LlamaServer> {
-    let mut server = LlamaServer::spawn(cfg)?;
-    server.wait_healthy(timeout)?;
-    Ok(server)
 }
 
 /// Guards `shutdown` against running its cleanup twice.
@@ -1160,36 +1097,25 @@ pub fn shutdown(daemon: &Daemon) {
         return;
     }
     tracing::info!("shutting down");
-    // Stopped *before* `kill_llama`, and joined (not just signalled): once
-    // this returns, the housekeeping thread has fully exited and will never
-    // touch `daemon.llama` again, so `kill_llama` immediately afterward
-    // cannot race a fresh restart into double-spawning, deadlocking, or
-    // leaving an orphan (Task 3's shutdown-vs-backoff-wait requirement). A
-    // backoff *wait* is interrupted immediately (see
-    // `HousekeepingHandle::stop`); the only way this blocks at all is an
-    // in-flight restart attempt actually running, bounded by
-    // `RESTART_HEALTH_TIMEOUT` (Task 6's idle-unload attempt on the same
-    // loop is gated on `models_loaded` specifically so it can never be the
-    // thing holding this up -- see the comment at that gate).
+    // Joined, not just signalled: once this returns the housekeeping thread
+    // has fully exited. With the `llama-server` supervisor gone, this loop
+    // only reaps subscribers and attempts the idle-unload deadline, so
+    // there is no longer a restart attempt that could hold it up -- a stop
+    // signal is acted on as soon as the current tick's work finishes.
     stop_housekeeping(&daemon.housekeeping);
-    kill_llama(&daemon.llama);
     if let Some(r) = lock_ignoring_poison(&daemon.recorder).as_ref() {
         let _ = r.stop();
     }
-    // Spec §8 step 3, between killing `llama-server` (step 2) and removing
-    // the runtime socket/lock (step 4). A no-op for every sink but
+    // Spec §8 step 3, before removing the runtime socket/lock (step 4).
+    // A no-op for every sink but
     // `TauriSink`, and idempotent the same way the rest of this function is
     // -- ksni's own `Handle::shutdown` is just an atomic flag set.
     daemon.sink.unregister_tray();
-    remove_runtime_files(
-        &daemon.runtime_socket_path,
-        &daemon.runtime_lock_path,
-        &daemon.runtime_port_path,
-    );
+    remove_runtime_files(&daemon.runtime_socket_path, &daemon.runtime_lock_path);
 }
 
-/// Stops the housekeeping thread, if one was ever installed. Split out for
-/// the same reason `kill_llama` is: testable directly with a scratch
+/// Stops the housekeeping thread, if one was ever installed. Split out so it
+/// is testable directly with a scratch
 /// `Mutex<Option<HousekeepingHandle>>` instead of a full `Daemon`.
 /// `Option::take` leaves `None` behind, so a second call is a no-op -- half
 /// of `shutdown`'s idempotence, matching `kill_llama`'s own.
@@ -1199,35 +1125,19 @@ fn stop_housekeeping(housekeeping: &Mutex<Option<HousekeepingHandle>>) {
     }
 }
 
-/// Kills and reaps the supervised `llama-server` child, if any is running.
-///
-/// Split out from `shutdown` so it is testable with a stub child process
-/// (e.g. `sleep 300`) instead of a real `Daemon`, which would otherwise
-/// require live audio hardware just to construct its `Recorder` (see
-/// `capture::Recorder::new`). `Option::take` leaves `None` behind, so a
-/// second call has nothing to do -- that is this function's half of
-/// `shutdown`'s idempotence.
-fn kill_llama(llama: &Mutex<Option<LlamaServer>>) {
-    // Dropping the `LlamaServer` -- not just signalling it -- is what runs
-    // its `Drop` impl: kill, then wait (reap), then remove the port file.
-    drop(lock_ignoring_poison(llama).take());
-}
-
-/// Removes the socket, lock, and port files this daemon owns, so a fresh
-/// `owf-daemon` can start immediately afterward instead of finding a stale
-/// socket or being told the (now-dead) lock is still held. Best-effort: a
-/// file that is already gone (a second call, or it was never created) is not
-/// an error.
+/// Removes the socket and lock files this daemon owns, so a fresh daemon can
+/// start immediately afterward instead of finding a stale socket or being
+/// told the (now-dead) lock is still held. Best-effort: a file that is
+/// already gone (a second call, or it was never created) is not an error.
 ///
 /// Takes explicit paths -- rather than calling `paths::runtime_*()` itself --
 /// so `shutdown` can be exercised in a test against `Daemon::runtime_*_path`
 /// scratch values instead of always resolving to
 /// `$XDG_RUNTIME_DIR/yappr.sock`, which a real daemon elsewhere on
 /// the same machine may be holding open at the moment the test suite runs.
-fn remove_runtime_files(socket: &Path, lock: &Path, port: &Path) {
+fn remove_runtime_files(socket: &Path, lock: &Path) {
     let _ = std::fs::remove_file(socket);
     let _ = std::fs::remove_file(lock);
-    let _ = std::fs::remove_file(port);
 }
 
 // -- Request::Quit (Task 10 / spec §8) --------------------------------------
@@ -1307,33 +1217,18 @@ fn wait_for_busy_to_clear_then_shutdown_with(daemon: &Daemon, timeout: Duration,
     shutdown(daemon);
 }
 
-// -- llama-server supervision (Task 3 / spec 15, 5.1) and subscriber
-// housekeeping (Task 3, Work Item 2) ----------------------------------------
+// -- subscriber housekeeping (Task 3, Work Item 2) and the idle-unload
+// deadline (Task 6) --------------------------------------------------------
+//
+// This block used to also carry `llama-server` supervision: a 10 s health
+// poll, a 1 -> 30 s restart backoff, and the zombie reaping that went with
+// them. An in-process engine has no health to poll and no child to reap, so
+// all of it is gone -- along with `HEALTH_POLL_INTERVAL`, `INITIAL_BACKOFF`,
+// `MAX_BACKOFF`, `RESTART_HEALTH_TIMEOUT`, `next_backoff`,
+// `supervise_llama_once` and `should_supervise_llama`.
 
-/// Spec 5.1's poll cadence for a currently-healthy child.
-const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(10);
-/// Spec 15's backoff: restart attempts start here and double after each
-/// failure, capped below.
-const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-const MAX_BACKOFF: Duration = Duration::from_secs(30);
-/// How often the housekeeping loop wakes purely to reap dead subscribers
-/// when there is no `llama-server` to supervise at all
-/// (`[normalize].enabled = false`) -- matches `HEALTH_POLL_INTERVAL` so a
-/// disabled normalizer doesn't change subscriber-cleanup latency.
+/// How often the housekeeping loop wakes to reap dead subscribers.
 const SUBSCRIBER_REAP_INTERVAL: Duration = Duration::from_secs(10);
-/// A restart attempt's health-wait budget -- shorter than `load_models`'s 120 s
-/// `STARTUP_HEALTH_TIMEOUT` (see that constant's doc comment): a background
-/// retry behind exponential backoff should fail fast and let backoff retry
-/// rather than tying up this thread -- and, via `HousekeepingHandle::stop`,
-/// a shutdown racing it -- for up to two minutes per attempt.
-const RESTART_HEALTH_TIMEOUT: Duration = Duration::from_secs(15);
-
-/// Spec 15/5.1's backoff: doubles from `INITIAL_BACKOFF`, capped at
-/// `MAX_BACKOFF`. A free, pure function so "backoff grows and caps" is
-/// provable without any real sleeping.
-fn next_backoff(current: Duration) -> Duration {
-    current.saturating_mul(2).min(MAX_BACKOFF)
-}
 
 struct HousekeepingHandle {
     stop_tx: mpsc::Sender<()>,
@@ -1343,92 +1238,19 @@ struct HousekeepingHandle {
 impl HousekeepingHandle {
     /// Signals the loop to stop and waits for it to actually exit.
     ///
-    /// A backoff *wait* is interrupted immediately: the loop sleeps via
+    /// The wait is interrupted immediately: the loop sleeps via
     /// `stop_rx.recv_timeout`, which this wakes the instant `stop_tx` sends,
     /// well before the wait would otherwise time out on its own -- it is
     /// this, not the eventual `std::process::exit` in `main`'s signal
-    /// handler, that makes "shutdown during a backoff wait terminates
-    /// promptly" true, and provable in a test that never calls
-    /// `std::process::exit`. The only way `join` blocks for any real time is
-    /// an in-flight restart attempt actually running, bounded by
-    /// `RESTART_HEALTH_TIMEOUT` -- Task 6's idle-unload attempt on the same
-    /// loop is gated on `models_loaded` for exactly this reason, so it is
-    /// never a second way for `join` to block.
+    /// handler, that makes "shutdown during a long wait terminates promptly"
+    /// true, and provable in a test that never calls `std::process::exit`.
+    /// Nothing else can block `join` for any real time: the only work a tick
+    /// does is reaping subscribers and an idle unload, both of which are
+    /// prompt.
     fn stop(self) {
         let _ = self.stop_tx.send(());
         let _ = self.join.join();
     }
-}
-
-/// One llama-server supervision cycle: does nothing at all -- never touches
-/// `llama` -- if the current occupant already answers `/health`; otherwise
-/// kills whatever's there (this is what reaps a zombie, the incident this
-/// exists to prevent) and tries a replacement via `respawn`. On a successful
-/// replacement, also swaps a fresh `S1MiniClient` into `pipeline`'s
-/// normalizer, and either way updates `normalize_available` and broadcasts
-/// `NormalizeDegraded`/`NormalizeRecovered` exactly on the transitions
-/// (never on every poll or every failed retry). Returns the resulting
-/// availability.
-///
-/// A free function taking exactly the pieces of `Daemon` it needs, rather
-/// than `&Daemon`, for the same reason `kill_llama`/`process_utterance` do:
-/// it's unit-testable with a scratch `Mutex<Option<LlamaServer>>` and a stub
-/// child (`LlamaServer::from_child`) instead of a full `Daemon`, which would
-/// need live audio hardware to construct. `respawn` is likewise injected --
-/// production wraps `spawn_and_wait_healthy`; tests hand back a stub child
-/// so this never touches a real `llama-server`.
-///
-/// Never holds `pipeline`'s mutex for longer than the plain field assignment
-/// `Pipeline::set_normalizer` performs -- an utterance in flight is never
-/// blocked behind a health poll.
-fn supervise_llama_once(
-    llama: &Mutex<Option<LlamaServer>>,
-    pipeline: &Mutex<Option<Pipeline>>,
-    normalize_available: &AtomicBool,
-    broadcaster: Broadcaster<'_>,
-    last_known_available: bool,
-    normalize_timeout_ms: u64,
-    respawn: &mut dyn FnMut() -> Result<LlamaServer>,
-) -> bool {
-    let currently_healthy = {
-        let guard = lock_ignoring_poison(llama);
-        guard.as_ref().map(LlamaServer::is_healthy).unwrap_or(false)
-    };
-
-    let healthy_now = if currently_healthy {
-        true
-    } else {
-        // Missing or unhealthy: kill whatever's there and try a
-        // replacement. `Option::take` dropping the old value (if any) is
-        // what runs `LlamaServer::drop` -- kill, then wait (reap) -- before
-        // a replacement is even attempted.
-        drop(lock_ignoring_poison(llama).take());
-        match respawn() {
-            Ok(server) => {
-                let base_url = server.base_url();
-                *lock_ignoring_poison(llama) = Some(server);
-                if let Some(p) = lock_ignoring_poison(pipeline).as_mut() {
-                    p.set_normalizer(Box::new(S1MiniClient::new(base_url, normalize_timeout_ms)));
-                }
-                tracing::info!("llama-server restarted");
-                true
-            }
-            Err(e) => {
-                tracing::warn!(error = ?e, "llama-server restart attempt failed; backing off");
-                false
-            }
-        }
-    };
-
-    normalize_available.store(healthy_now, Ordering::SeqCst);
-    if healthy_now && !last_known_available {
-        broadcaster.broadcast(OverlayEvent::NormalizeRecovered);
-    } else if !healthy_now && last_known_available {
-        broadcaster.broadcast(OverlayEvent::NormalizeDegraded {
-            reason: "llama-server is down or unhealthy".to_string(),
-        });
-    }
-    healthy_now
 }
 
 /// The floor on an unload-derived housekeeping tick.
@@ -1463,7 +1285,7 @@ fn state_permits_unload(state: u8) -> bool {
 /// daemon is in a state no unload may act on.
 ///
 /// This is what makes `idle_unload_seconds = 60` mean 60 seconds rather than
-/// "somewhere in 60-70" at the mercy of `HEALTH_POLL_INTERVAL`: the
+/// "somewhere in 60-70" at the mercy of `SUBSCRIBER_REAP_INTERVAL`: the
 /// housekeeping loop takes the smaller of its own wait and this.
 ///
 /// The state is part of the answer, not just the deadline, and that is the
@@ -1536,28 +1358,6 @@ fn should_unload(
     now.duration_since(last_activity) >= Duration::from_secs(idle_seconds as u64)
 }
 
-/// Whether this housekeeping tick should touch `llama-server` at all.
-///
-/// Pure and unit-testable, for the same reason `should_unload` is. It folds
-/// in the pre-existing `WARMING` check rather than sitting beside it: both
-/// arms answer the same question -- "is there a `llama-server` of ours to
-/// supervise right now" -- and splitting them across a named function and an
-/// inline `if` would leave half the gate untested.
-fn should_supervise_llama(state: u8, models_loaded: bool) -> bool {
-    if state == WARMING {
-        // `load_models` hasn't settled `daemon.llama` yet -- acting now
-        // could spawn a second llama-server racing `load_models`'s own.
-        return false;
-    }
-    // Models are unloaded, or a load is still in flight. Either way there is
-    // no child of ours to supervise, and respawning one here would undo every
-    // unload seconds after it happened. `models_loaded` is set only *after* a
-    // load installs the pipeline, so an in-flight `load_models` -- which owns
-    // its own `spawn_and_wait_healthy` child -- is never raced, exactly as
-    // `load_models`'s initial spawn never was.
-    models_loaded
-}
-
 /// Releases the models, if the deadline still says to. Returns whether it
 /// actually did.
 ///
@@ -1593,12 +1393,13 @@ fn unload_models(daemon: &Daemon) -> bool {
         return false;
     }
 
-    // Cleared first: it is what the supervisor's gate reads, and it must
-    // never still say "loaded" while the pipeline is being torn out.
+    // Cleared first: it is what `Status` reads, and it must never still say
+    // "loaded" while the pipeline is being torn out.
     daemon.models_loaded.store(false, Ordering::SeqCst);
+    // Dropping the pipeline is what frees S1-mini's ~480 MB: the engine is
+    // owned by the pipeline's normalizer, so there is no separate teardown
+    // step -- this line replaces the `kill_llama` that used to follow it.
     *lock_ignoring_poison(&daemon.pipeline) = None;
-    // The same kill-then-reap path `shutdown` uses; a `None` llama is fine.
-    kill_llama(&daemon.llama);
     // Not `NormalizeDegraded`: normalization is not degraded, it is not
     // currently loaded, and the overlay's degraded badge means the former.
     daemon.normalize_available.store(false, Ordering::SeqCst);
@@ -1606,101 +1407,48 @@ fn unload_models(daemon: &Daemon) -> bool {
     true
 }
 
-/// Reaps dead subscribers on a periodic tick (Task 3, Work Item 2), attempts
-/// the idle-unload deadline on the same tick (Task 6, `unload_models`), and,
-/// when `normalize_cfg` is `Some`, supervises the `llama-server` child on the
-/// same tick (Task 3, Work Item 1 / spec 15, 5.1): restarts a missing or
-/// unhealthy child with exponential backoff, polls a healthy one every 10 s,
-/// and never touches a child that's already healthy.
+/// Reaps dead subscribers on a periodic tick (Task 3, Work Item 2) and
+/// attempts the idle-unload deadline on the same tick (Task 6,
+/// `unload_models`).
 ///
 /// Spawned unconditionally and immediately from `main` -- not gated on
-/// `load_models` finishing -- so subscriber reaping starts right away; the
-/// llama-specific half stays inert (see `should_supervise_llama`'s gate,
-/// below) until `load_models` has settled `daemon.llama`/
-/// `daemon.normalize_available`, which is what stops this loop from ever
-/// racing `load_models`'s own initial spawn into starting a second
-/// `llama-server`.
-fn spawn_housekeeping(
-    daemon: Arc<Daemon>,
-    normalize_cfg: Option<NormalizeConfig>,
-    initial_last_known_available: bool,
-) -> HousekeepingHandle {
+/// `load_models` finishing -- so subscriber reaping starts right away.
+///
+/// It used to take a `NormalizeConfig` and supervise the `llama-server`
+/// child here too: restart a missing or unhealthy one with exponential
+/// backoff, poll a healthy one every 10 s, never touch one already healthy.
+/// With S1-mini in this process there is no child, so the parameter and the
+/// whole second half of the loop are gone; what is left never needs to know
+/// anything about normalization.
+fn spawn_housekeeping(daemon: Arc<Daemon>) -> HousekeepingHandle {
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
-    let join = std::thread::spawn(move || {
-        let mut backoff = INITIAL_BACKOFF;
-        // Optimistic baseline: assume healthy until this loop's own first
-        // real check (once warm-up has settled) says otherwise, so a daemon
-        // that starts up fine never gets a spurious "recovered" broadcast on
-        // its very first check -- only an actual true -> false -> true round
-        // trip counts as a degrade-then-recover. A daemon whose *initial*
-        // spawn already failed is handled correctly too: this loop's first
-        // real check finds it unhealthy, `last_known_available` (still
-        // `true` here) makes `supervise_llama_once` broadcast
-        // `NormalizeDegraded` exactly once, matching reality.
-        //
-        // Always `true` in production (see `main`'s call site) -- the only
-        // reason this is a parameter at all, rather than a hardcoded `let
-        // mut last_known_available = true;`, is so a test can start it
-        // `false` instead and skip straight past the first, always-10s
-        // `HEALTH_POLL_INTERVAL` wait into a genuine backoff wait (see
-        // `shutdown_during_a_backoff_wait_terminates_promptly_without_spawning`).
-        let mut last_known_available = initial_last_known_available;
-        loop {
-            let wait = match &normalize_cfg {
-                None => SUBSCRIBER_REAP_INTERVAL,
-                Some(_) if last_known_available => HEALTH_POLL_INTERVAL,
-                Some(_) => backoff,
-            };
-            // Wake for whichever comes first: this loop's own business, or
-            // the idle-unload deadline. Without this, a 60 s timeout would
-            // fire whenever `HEALTH_POLL_INTERVAL` next happened to come
-            // round.
-            let wait = time_until_unload(&daemon).map_or(wait, |d| wait.min(d));
-            match stop_rx.recv_timeout(wait) {
-                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-            }
+    let join = std::thread::spawn(move || loop {
+        // Wake for whichever comes first: this loop's own business, or the
+        // idle-unload deadline. Without this, a 60 s timeout would fire
+        // whenever `SUBSCRIBER_REAP_INTERVAL` next happened to come round.
+        let wait = time_until_unload(&daemon)
+            .map_or(SUBSCRIBER_REAP_INTERVAL, |d| SUBSCRIBER_REAP_INTERVAL.min(d));
+        match stop_rx.recv_timeout(wait) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
 
-            reap_dead_subscribers(&daemon.subscribers);
+        reap_dead_subscribers(&daemon.subscribers);
 
-            // Gated on the atomic, not called unconditionally: `unload_models`
-            // itself would happily re-check and decline, but it does that
-            // *after* unconditionally acquiring `load_lock` -- and a lazy
-            // load holds that same lock for as long as `load_models` takes
-            // (up to `STARTUP_HEALTH_TIMEOUT`, ~3.5s typical), with
-            // `models_loaded` false for the whole of it. Without this
-            // pre-check, a tick landing during that window would block this
-            // thread on `load_lock` until the load finished -- delaying
-            // `reap_dead_subscribers` and, via `HousekeepingHandle::stop`,
-            // shutdown itself, for the load's duration. Reading the atomic
-            // first keeps this thread off `load_lock` entirely whenever
-            // nothing is loaded, which is exactly when a load could be the
-            // thing holding it.
-            if daemon.models_loaded.load(Ordering::SeqCst) {
-                unload_models(&daemon);
-            }
-
-            let Some(cfg) = &normalize_cfg else { continue };
-            if !should_supervise_llama(
-                daemon.state.load(Ordering::SeqCst),
-                daemon.models_loaded.load(Ordering::SeqCst),
-            ) {
-                continue;
-            }
-
-            let cfg_for_respawn = cfg.clone();
-            let mut respawn = move || spawn_and_wait_healthy(&cfg_for_respawn, RESTART_HEALTH_TIMEOUT);
-            let healthy_now = supervise_llama_once(
-                &daemon.llama,
-                &daemon.pipeline,
-                &daemon.normalize_available,
-                daemon.broadcaster(),
-                last_known_available,
-                cfg.timeout_ms,
-                &mut respawn,
-            );
-            backoff = if healthy_now { INITIAL_BACKOFF } else { next_backoff(backoff) };
-            last_known_available = healthy_now;
+        // Gated on the atomic, not called unconditionally: `unload_models`
+        // itself would happily re-check and decline, but it does that
+        // *after* unconditionally acquiring `load_lock` -- and a lazy load
+        // holds that same lock for as long as `load_models` takes, with
+        // `models_loaded` false for the whole of it. Without this
+        // pre-check, a tick landing during that window would block this
+        // thread on `load_lock` until the load finished -- delaying
+        // `reap_dead_subscribers` and, via `HousekeepingHandle::stop`,
+        // shutdown itself, for the load's duration. Reading the atomic
+        // first keeps this thread off `load_lock` entirely whenever
+        // nothing is loaded, which is exactly when a load could be the
+        // thing holding it.
+        if daemon.models_loaded.load(Ordering::SeqCst) {
+            unload_models(&daemon);
         }
     });
     HousekeepingHandle { stop_tx, join }
@@ -2970,31 +2718,6 @@ mod tests {
         assert_eq!(last_ms["inject_ms"], serde_json::json!(5));
     }
 
-    /// Fix 2: proves the mechanism that guarantees no `llama-server` process
-    /// survives shutdown. A real `llama-server` can't be started on this
-    /// machine (no ggml compute backend), so this stubs the supervised child
-    /// with a plain `sleep 300` via the test-only `LlamaServer::from_child`
-    /// -- the same `Drop` impl (kill, then wait/reap) runs either way.
-    #[test]
-    fn kill_llama_terminates_a_stub_child_and_is_idempotent() {
-        let child = std::process::Command::new("sleep")
-            .arg("300")
-            .spawn()
-            .expect("spawning a stub child (`sleep 300`) for this test");
-        let pid = child.id();
-        let llama = Mutex::new(Some(LlamaServer::from_child(child, 0)));
-
-        kill_llama(&llama);
-        // A second call must be a no-op, not a double-kill or a panic --
-        // `Option::take` on an already-`None` mutex is exactly that.
-        kill_llama(&llama);
-
-        assert!(
-            !process_is_alive(pid),
-            "child process {pid} survived kill_llama: no llama-server may outlive shutdown"
-        );
-    }
-
     /// I7: `ensure_recorder` is the retry mechanism behind "a missing
     /// microphone at startup must not kill the daemon" -- this exercises it
     /// with a fake `u32` "recorder" and a call counter instead of a real
@@ -3293,7 +3016,7 @@ mod tests {
     /// The seam the config handlers need: `set-config` writes, so a test must
     /// never be pointed at the real `paths::config_file()`.
     fn fake_daemon_at(initial_state: u8, normalize_enabled: bool, config_path: PathBuf) -> Arc<Daemon> {
-        let (runtime_socket_path, runtime_lock_path, runtime_port_path) = fake_runtime_files();
+        let (runtime_socket_path, runtime_lock_path) = fake_runtime_files();
         Arc::new(Daemon {
             state: AtomicU8::new(initial_state),
             quitting: AtomicBool::new(false),
@@ -3304,7 +3027,6 @@ mod tests {
             models_loaded: AtomicBool::new(false),
             last_activity: Mutex::new(Instant::now()),
             models_cfg: Mutex::new(ModelsConfig::default()),
-            llama: Mutex::new(None),
             window_class: Mutex::new(None),
             config_path: config_path.clone(),
             recording_epoch: AtomicU64::new(0),
@@ -3317,7 +3039,6 @@ mod tests {
             sink: Arc::new(DropSink),
             runtime_socket_path,
             runtime_lock_path,
-            runtime_port_path,
             _runtime_lock: fake_runtime_lock(),
         })
     }
@@ -3368,25 +3089,27 @@ mod tests {
     /// does call `shutdown`, and a real daemon on this same machine may be
     /// holding `$XDG_RUNTIME_DIR/yappr.sock` open at that exact
     /// moment. These paths must never be able to collide with that.
-    fn fake_runtime_files() -> (PathBuf, PathBuf, PathBuf) {
-        let dir = std::env::temp_dir().join("yappr-core-tests-fake-runtime-files");
-        (dir.join("yappr.sock"), dir.join("yappr.lock"), dir.join("yappr.port"))
-    }
-
-    /// Whether a process with this pid still exists, checked the
-    /// straightforward Linux way -- matching this codebase's one target
-    /// platform (CLAUDE.md: "for Hyprland/Wayland"). Used by the
-    /// `kill_llama`/`shutdown` tests to prove a killed child is actually
-    /// gone (reaped, not just signalled and left a zombie).
-    fn process_is_alive(pid: u32) -> bool {
-        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    fn fake_runtime_files() -> (PathBuf, PathBuf) {
+        // A fresh directory per call, not one shared path. Three tests
+        // (`quit_removes_the_runtime_files` and the two
+        // `wait_for_busy_to_clear_then_shutdown_*`) now *create* these files
+        // and assert `shutdown` removed them, and `cargo test` runs them in
+        // parallel -- on one shared path they would delete each other's
+        // evidence and fail by scheduling accident.
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "yappr-core-tests-fake-runtime-files-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst)
+        ));
+        (dir.join("yappr.sock"), dir.join("yappr.lock"))
     }
 
     /// `fake_daemon_at` and `fake_daemon_with_normalize` keep their
     /// signatures and pass a sink that drops events, so no existing test
     /// changes. Only the test asserting on the second consumer needs this.
     fn fake_daemon_with_sink(initial_state: u8, sink: Arc<dyn EventSink>) -> Arc<Daemon> {
-        let (runtime_socket_path, runtime_lock_path, runtime_port_path) = fake_runtime_files();
+        let (runtime_socket_path, runtime_lock_path) = fake_runtime_files();
         Arc::new(Daemon {
             state: AtomicU8::new(initial_state),
             quitting: AtomicBool::new(false),
@@ -3397,7 +3120,6 @@ mod tests {
             models_loaded: AtomicBool::new(false),
             last_activity: Mutex::new(Instant::now()),
             models_cfg: Mutex::new(ModelsConfig::default()),
-            llama: Mutex::new(None),
             window_class: Mutex::new(None),
             config_path: PathBuf::from("/nonexistent/yappr-test/config.toml"),
             recording_epoch: AtomicU64::new(0),
@@ -3410,7 +3132,6 @@ mod tests {
             sink,
             runtime_socket_path,
             runtime_lock_path,
-            runtime_port_path,
             _runtime_lock: fake_runtime_lock(),
         })
     }
@@ -4153,163 +3874,6 @@ mod tests {
 
     // -- Task 3, Work Item 1: llama-server supervision (spec 15, 5.1) -----
 
-    #[test]
-    fn next_backoff_doubles_and_caps_at_thirty_seconds() {
-        let mut b = INITIAL_BACKOFF;
-        for want in [2u64, 4, 8, 16, 30, 30, 30] {
-            b = next_backoff(b);
-            assert_eq!(b, Duration::from_secs(want));
-        }
-    }
-
-    /// A tiny, always-200-OK HTTP responder for a `LlamaServer::from_child`
-    /// stub's `/health` -- `LlamaServer::is_healthy` makes a real HTTP
-    /// request, so proving "a healthy child is never restarted" needs
-    /// something real listening, not just a bound port. The stub *process*
-    /// (`sleep 300`) is still never a real `llama-server`; only the HTTP
-    /// response is faked, entirely within this test.
-    struct FakeHealthServer {
-        port: u16,
-        _thread: std::thread::JoinHandle<()>,
-    }
-
-    impl FakeHealthServer {
-        fn start() -> Self {
-            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-            let port = listener.local_addr().unwrap().port();
-            let thread = std::thread::spawn(move || {
-                for stream in listener.incoming() {
-                    let Ok(mut stream) = stream else { break };
-                    let mut buf = [0u8; 512];
-                    let _ = std::io::Read::read(&mut stream, &mut buf);
-                    let _ = std::io::Write::write_all(
-                        &mut stream,
-                        b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n",
-                    );
-                }
-            });
-            Self { port, _thread: thread }
-        }
-    }
-
-    /// Proves "a healthy child must never be restarted": `respawn` panics if
-    /// ever called, so any restart attempt at all fails this test loudly.
-    #[test]
-    fn supervise_llama_once_never_touches_an_already_healthy_child() {
-        let health_server = FakeHealthServer::start();
-        let child = std::process::Command::new("sleep")
-            .arg("300")
-            .spawn()
-            .expect("spawning a stub child (`sleep 300`) for this test");
-        let llama = Mutex::new(Some(LlamaServer::from_child(child, health_server.port)));
-        let pipeline: Mutex<Option<Pipeline>> = Mutex::new(None);
-        let normalize_available = AtomicBool::new(true);
-        let subscribers: Mutex<Vec<Subscriber>> = Mutex::new(Vec::new());
-        let mut respawn = || -> Result<LlamaServer> {
-            panic!("must not be called: a healthy child must never be restarted");
-        };
-
-        let healthy = supervise_llama_once(
-            &llama,
-            &pipeline,
-            &normalize_available,
-            dropping_broadcaster(&subscribers),
-            true,
-            6000,
-            &mut respawn,
-        );
-
-        assert!(healthy);
-        assert!(normalize_available.load(Ordering::SeqCst));
-        // Cleans up the stub child (kill + reap) via `LlamaServer::drop`.
-        drop(lock_ignoring_poison(&llama).take());
-    }
-
-    /// Proves the incident this whole feature exists to prevent: a dead (or
-    /// zombie) child is reaped and replaced. `false` exits immediately and
-    /// is never bound to any real HTTP server, so `is_healthy` sees it as
-    /// down without needing a fake server at all.
-    #[test]
-    fn supervise_llama_once_reaps_a_dead_child_and_installs_a_healthy_replacement() {
-        let dead_child = std::process::Command::new("false")
-            .spawn()
-            .expect("spawning a stub child (`false`) for this test");
-        let dead_pid = dead_child.id();
-        std::thread::sleep(Duration::from_millis(100)); // let it actually exit
-        let llama = Mutex::new(Some(LlamaServer::from_child(dead_child, 0)));
-        let pipeline: Mutex<Option<Pipeline>> = Mutex::new(None);
-        let normalize_available = AtomicBool::new(false);
-        let subscribers: Mutex<Vec<Subscriber>> = Mutex::new(Vec::new());
-        let (tx, rx) = mpsc::channel();
-        subscribers.lock().unwrap().push(Subscriber { tx, alive: Arc::new(AtomicBool::new(true)) });
-
-        let mut respawn_calls = 0u32;
-        let mut respawn = || -> Result<LlamaServer> {
-            respawn_calls += 1;
-            let stub = std::process::Command::new("sleep")
-                .arg("300")
-                .spawn()
-                .expect("spawning a replacement stub child for this test");
-            Ok(LlamaServer::from_child(stub, 0))
-        };
-
-        let healthy = supervise_llama_once(
-            &llama,
-            &pipeline,
-            &normalize_available,
-            dropping_broadcaster(&subscribers),
-            false,
-            6000,
-            &mut respawn,
-        );
-
-        assert!(healthy, "a successful respawn must report healthy");
-        assert_eq!(respawn_calls, 1, "a dead child must trigger exactly one restart attempt");
-        assert!(normalize_available.load(Ordering::SeqCst));
-        assert_eq!(rx.try_recv(), Ok(OverlayEvent::NormalizeRecovered));
-        assert!(
-            !std::path::Path::new(&format!("/proc/{dead_pid}")).exists(),
-            "the dead child must be reaped (no zombie left behind), not just abandoned"
-        );
-
-        // Cleans up the replacement stub child via `LlamaServer::drop`.
-        drop(lock_ignoring_poison(&llama).take());
-    }
-
-    /// The other half of the same fix: a restart attempt that also fails
-    /// must broadcast `NormalizeDegraded` exactly once (on the transition),
-    /// report unavailable, and leave `llama` empty rather than storing
-    /// anything -- there is nothing healthy to store.
-    #[test]
-    fn supervise_llama_once_reports_degraded_when_a_restart_attempt_also_fails() {
-        let llama: Mutex<Option<LlamaServer>> = Mutex::new(None);
-        let pipeline: Mutex<Option<Pipeline>> = Mutex::new(None);
-        let normalize_available = AtomicBool::new(true);
-        let subscribers: Mutex<Vec<Subscriber>> = Mutex::new(Vec::new());
-        let (tx, rx) = mpsc::channel();
-        subscribers.lock().unwrap().push(Subscriber { tx, alive: Arc::new(AtomicBool::new(true)) });
-
-        let mut respawn = || -> Result<LlamaServer> { anyhow::bail!("no ggml compute backend") };
-
-        let healthy = supervise_llama_once(
-            &llama,
-            &pipeline,
-            &normalize_available,
-            dropping_broadcaster(&subscribers),
-            true,
-            6000,
-            &mut respawn,
-        );
-
-        assert!(!healthy);
-        assert!(!normalize_available.load(Ordering::SeqCst));
-        assert!(lock_ignoring_poison(&llama).is_none());
-        assert_eq!(
-            rx.try_recv(),
-            Ok(OverlayEvent::NormalizeDegraded { reason: "llama-server is down or unhealthy".to_string() })
-        );
-    }
-
     /// Task 3's shutdown-vs-backoff requirement, proven with the real
     /// threaded loop (`spawn_housekeeping`/`HousekeepingHandle`): a bogus
     /// `llama_server_path` makes every restart attempt fail near-instantly
@@ -4325,36 +3889,28 @@ mod tests {
     /// wait `HEALTH_POLL_INTERVAL` (10s), not a backoff wait at all -- the
     /// 1200ms sleep below never got anywhere near even the first real health
     /// check, let alone a second backoff wait, so this test could never
-    /// actually fail for the reason its name and doc comment claimed
-    /// (deleting the stop-signal wakeup entirely would still have passed,
-    /// since `stop()` returns promptly during the 10s health-poll wait too).
-    /// Passing `false` here starts the loop already "unhealthy", so its
-    /// first wait is genuinely `backoff` (1s, per `INITIAL_BACKOFF`) and its
-    /// second is the doubled 2s this test's timing was always written
-    /// against.
+    /// F6: `stop()` must interrupt the loop's `recv_timeout` rather than
+    /// wait it out. The loop is asleep in a full `SUBSCRIBER_REAP_INTERVAL`
+    /// (10 s) here, so a `stop()` that returned only when the wait expired
+    /// on its own would blow the assertion by an order of magnitude.
     ///
-    /// `models_loaded` must be `true` here (Task 6): `should_supervise_llama`
-    /// gates `supervise_llama_once` on it, and `fake_daemon`'s default is
-    /// `false`. Without this store the supervisor is never reached at all,
-    /// so `backoff` never doubles and the loop's second wait never becomes
-    /// the 2s this test's timing depends on -- `stop()` returning inside 1s
-    /// would then pass even with the stop-signal wakeup deleted entirely,
-    /// which is the exact regression (F6, above) this test exists to catch.
+    /// This used to be `shutdown_during_a_backoff_wait_...`, and had to
+    /// arrange for the loop to be inside its *second*, doubled backoff wait
+    /// to be meaningful. With `llama-server` supervision gone there is no
+    /// backoff and only one wait, which makes the same property simpler to
+    /// state and no weaker: the loop is provably asleep for 10 s, and
+    /// `stop()` returns in well under one.
     #[test]
-    fn shutdown_during_a_backoff_wait_terminates_promptly_without_spawning() {
+    fn stopping_housekeeping_interrupts_its_wait_instead_of_waiting_it_out() {
         let daemon = fake_daemon(IDLE);
         daemon.models_loaded.store(true, Ordering::SeqCst);
-        let normalize_cfg = Some(NormalizeConfig {
-            llama_server_path: "/nonexistent/yappr-test-llama-server-binary".to_string(),
-            ..NormalizeConfig::default()
-        });
 
-        let handle = spawn_housekeeping(Arc::clone(&daemon), normalize_cfg, false);
+        let handle = spawn_housekeeping(Arc::clone(&daemon));
 
-        // Past the first (1s) backoff wait, so the loop is now asleep inside
-        // its *second* wait (2s) -- genuinely "during a backoff wait", not
-        // just before the first one has even started.
-        std::thread::sleep(Duration::from_millis(1200));
+        // Long enough that the loop is certainly parked inside
+        // `recv_timeout`, short enough that the 10 s wait is nowhere near
+        // expiring on its own.
+        std::thread::sleep(Duration::from_millis(200));
 
         let t0 = Instant::now();
         handle.stop();
@@ -4362,9 +3918,10 @@ mod tests {
 
         assert!(
             elapsed < Duration::from_secs(1),
-            "stop() should return almost immediately, not wait out the backoff; took {elapsed:?}"
+            "stop() should return almost immediately, not wait out the tick; took {elapsed:?}"
         );
     }
+
 
     // -- Task 7: Request::Toggle -------------------------------------------
 
@@ -4679,21 +4236,33 @@ mod tests {
     /// `$XDG_RUNTIME_DIR/yappr.sock` -- this machine may have a real
     /// daemon holding that file open while this suite runs, and `shutdown`
     /// really does call `remove_file` on whatever paths it's given.
+    ///
+    /// The observable used to be a `sleep 300` stub child that `shutdown`
+    /// had to reap. With S1-mini in-process there is no child to observe,
+    /// so the runtime files `shutdown` removes are the observable instead --
+    /// which is the more direct test of this path anyway: it asserts on
+    /// `shutdown`'s own last step rather than on a side effect of it.
     #[test]
-    fn quit_reaps_the_llama_child_and_removes_the_runtime_files() {
+    fn quit_removes_the_runtime_files() {
         with_a_fresh_shutting_down_guard(|| {
             let d = fake_daemon_at(IDLE, false, PathBuf::from("/nonexistent/yappr-test/config.toml"));
-            let child = std::process::Command::new("sleep")
-                .arg("300")
-                .spawn()
-                .expect("spawning a stub child (`sleep 300`) for this test");
-            let pid = child.id();
-            *lock_ignoring_poison(&d.llama) = Some(LlamaServer::from_child(child, 0));
+            create_runtime_files(&d);
 
             shutdown(&d);
 
-            assert!(!process_is_alive(pid), "llama-server survived shutdown");
+            assert!(!d.runtime_socket_path.exists(), "the socket file survived shutdown");
+            assert!(!d.runtime_lock_path.exists(), "the lock file survived shutdown");
         });
+    }
+
+    /// Creates the scratch socket/lock files `shutdown` is expected to
+    /// remove, so their absence afterwards is evidence rather than the
+    /// default state.
+    fn create_runtime_files(d: &Daemon) {
+        let dir = d.runtime_socket_path.parent().expect("scratch runtime dir");
+        std::fs::create_dir_all(dir).expect("creating the scratch runtime dir");
+        std::fs::write(&d.runtime_socket_path, b"").expect("creating the scratch socket file");
+        std::fs::write(&d.runtime_lock_path, b"").expect("creating the scratch lock file");
     }
 
     /// Closes the gap a reviewer found in the first pass: `wait_for_busy_to_
@@ -4702,23 +4271,17 @@ mod tests {
     /// calls) -- so a regression that shuffled the two calls into `shutdown`
     /// running *before* the wait would have kept every existing test in this
     /// file green while reintroducing the exact defect this task exists to
-    /// fix. Proves both halves of the real sequencing end to end, using the
-    /// same `sleep 300` stub `LlamaServer::from_child` gives every other
-    /// `shutdown` test in this file: the child must survive while the
-    /// pipeline is still `TRANSCRIBING`, and must be reaped once the state
+    /// fix. Proves both halves of the real sequencing end to end, observed
+    /// through the runtime files `shutdown` removes: they must still be
+    /// there while the pipeline is `TRANSCRIBING`, and gone once the state
     /// clears and `shutdown` finally runs. No `std::process::exit` anywhere
     /// near this test -- only `wait_for_busy_to_clear_then_shutdown_with`,
     /// never the `Request::Quit` dispatch arm itself.
     #[test]
-    fn wait_for_busy_to_clear_then_shutdown_keeps_llama_alive_until_the_state_clears_then_reaps_it() {
+    fn wait_for_busy_to_clear_then_shutdown_waits_for_the_state_to_clear() {
         with_a_fresh_shutting_down_guard(|| {
             let d = fake_daemon_at(TRANSCRIBING, false, PathBuf::from("/nonexistent/yappr-test/config.toml"));
-            let child = std::process::Command::new("sleep")
-                .arg("300")
-                .spawn()
-                .expect("spawning a stub child (`sleep 300`) for this test");
-            let pid = child.id();
-            *lock_ignoring_poison(&d.llama) = Some(LlamaServer::from_child(child, 0));
+            create_runtime_files(&d);
 
             let d2 = Arc::clone(&d);
             let handle = std::thread::spawn(move || {
@@ -4726,14 +4289,17 @@ mod tests {
             });
 
             std::thread::sleep(Duration::from_millis(100));
-            assert!(process_is_alive(pid), "shutdown must not run while still TRANSCRIBING");
+            assert!(
+                d.runtime_socket_path.exists(),
+                "shutdown must not run while still TRANSCRIBING"
+            );
 
             d.state.store(IDLE, Ordering::SeqCst);
             handle.join().expect("wait/shutdown thread panicked");
 
             assert!(
-                !process_is_alive(pid),
-                "llama-server must be reaped once the state clears and shutdown runs"
+                !d.runtime_socket_path.exists(),
+                "shutdown must run once the state clears"
             );
         });
     }
@@ -4748,17 +4314,12 @@ mod tests {
     fn wait_for_busy_to_clear_then_shutdown_gives_up_at_the_bound_and_shuts_down_anyway() {
         with_a_fresh_shutting_down_guard(|| {
             let d = fake_daemon_at(TRANSCRIBING, false, PathBuf::from("/nonexistent/yappr-test/config.toml"));
-            let child = std::process::Command::new("sleep")
-                .arg("300")
-                .spawn()
-                .expect("spawning a stub child (`sleep 300`) for this test");
-            let pid = child.id();
-            *lock_ignoring_poison(&d.llama) = Some(LlamaServer::from_child(child, 0));
+            create_runtime_files(&d);
 
             wait_for_busy_to_clear_then_shutdown_with(&d, Duration::from_millis(60), Duration::from_millis(5));
 
             assert!(
-                !process_is_alive(pid),
+                !d.runtime_socket_path.exists(),
                 "must shut down anyway once the bound elapses, even while still busy"
             );
         });
@@ -4882,10 +4443,10 @@ mod tests {
     /// idempotence is observable.
     fn counting_loader(
         calls: Arc<AtomicU64>,
-    ) -> impl FnMut() -> anyhow::Result<(Pipeline, Option<LlamaServer>)> {
+    ) -> impl FnMut() -> anyhow::Result<(Pipeline, bool)> {
         move || {
             calls.fetch_add(1, Ordering::SeqCst);
-            Ok((stub_pipeline(), None))
+            Ok((stub_pipeline(), false))
         }
     }
 
@@ -4915,34 +4476,28 @@ mod tests {
     /// is the same shape.
     ///
     /// The flag is flipped *inside* the loader, which is the moment that
-    /// matters: `load_lock` is held, the caller is committed, and
-    /// `daemon.llama` is still `None` for any concurrent `shutdown` to find.
-    /// A real load cannot run in this suite (no ASR model, no ggml backend),
-    /// so `stub_pipeline` and `stub_llama`'s `sleep 300` child stand in --
-    /// the same substitution `unloading_drops_the_pipeline_and_reaps_llama`
-    /// already makes.
+    /// matters: `load_lock` is held and the caller is committed.
+    /// A real load cannot run in this suite (no ASR model on the test path),
+    /// so `stub_pipeline` stands in -- the same substitution
+    /// `unloading_drops_the_pipeline_and_with_it_the_model` already makes.
     ///
-    /// The assertion that carries the fix is `process_is_alive`: clearing
-    /// `pipeline` and `models_loaded` would satisfy the other three while
-    /// still orphaning the child.
+    /// This test used to also assert, via `process_is_alive`, that the
+    /// `llama-server` child the load had spawned was killed rather than
+    /// orphaned -- that assertion was the one carrying the fix, because
+    /// clearing `pipeline` and `models_loaded` satisfied everything else
+    /// while still leaving a ~955 MB child behind. There is no child now:
+    /// the engine is owned by the pipeline's normalizer, so dropping the
+    /// pipeline *is* releasing the model, and the three assertions below
+    /// are the whole of the property.
     #[test]
-    fn a_load_finishing_during_shutdown_releases_llama_instead_of_installing_it() {
+    fn a_load_finishing_during_shutdown_releases_it_instead_of_installing_it() {
         let daemon = fake_daemon(IDLE);
-        let child = std::process::Command::new("sleep")
-            .arg("300")
-            .spawn()
-            .expect("spawning a stub child (`sleep 300`) for this test");
-        let pid = child.id();
-        // `Option::take`, so the closure stays `FnMut` -- it is called once,
-        // but the seam's type does not know that.
-        let mut server = Some(LlamaServer::from_child(child, 0));
         let shutting_down = AtomicBool::new(false);
         let mut load = || {
             // Beenden lands here: `shutdown` runs to completion on its own
-            // thread while this load is still in flight, finding
-            // `daemon.llama` empty.
+            // thread while this load is still in flight.
             shutting_down.store(true, Ordering::SeqCst);
-            Ok((stub_pipeline(), server.take()))
+            Ok((stub_pipeline(), true))
         };
 
         let err = ensure_models_loaded_with(&daemon, &mut load, &shutting_down)
@@ -4951,13 +4506,7 @@ mod tests {
         assert!(err.contains("shutting down"), "unexpected reason: {err}");
         assert!(!daemon.models_loaded.load(Ordering::SeqCst));
         assert!(lock_ignoring_poison(&daemon.pipeline).is_none());
-        assert!(lock_ignoring_poison(&daemon.llama).is_none());
         assert!(!daemon.normalize_available.load(Ordering::SeqCst));
-        assert!(
-            !process_is_alive(pid),
-            "child process {pid} survived a load that finished during shutdown: \
-             no llama-server may outlive the process that spawned it"
-        );
     }
 
     /// The other half, and the one that stops the re-check above from being
@@ -4966,25 +4515,13 @@ mod tests {
     #[test]
     fn a_load_finishing_normally_still_installs_what_it_produced() {
         let daemon = fake_daemon(IDLE);
-        let child = std::process::Command::new("sleep")
-            .arg("300")
-            .spawn()
-            .expect("spawning a stub child (`sleep 300`) for this test");
-        let pid = child.id();
-        let mut server = Some(LlamaServer::from_child(child, 0));
-        let mut load = || Ok((stub_pipeline(), server.take()));
+        let mut load = || Ok((stub_pipeline(), true));
 
         ensure_models_loaded_with(&daemon, &mut load, &NOT_SHUTTING_DOWN).unwrap();
 
         assert!(daemon.models_loaded.load(Ordering::SeqCst));
         assert!(lock_ignoring_poison(&daemon.pipeline).is_some());
-        assert!(lock_ignoring_poison(&daemon.llama).is_some());
         assert!(daemon.normalize_available.load(Ordering::SeqCst));
-        assert!(process_is_alive(pid), "an ordinary load must keep its llama-server");
-
-        // This test spawned it, so this test reaps it: a `sleep 300` left
-        // behind would outlive the suite.
-        kill_llama(&daemon.llama);
     }
 
     #[test]
@@ -5197,18 +4734,6 @@ mod tests {
         );
     }
 
-    /// A stand-in for the supervised `llama-server` child. A real one cannot run
-    /// on this machine (no ggml compute backend), so every test that needs one
-    /// uses `sleep 300` through the test-only `LlamaServer::from_child`, exactly
-    /// as `kill_llama_terminates_a_stub_child_and_is_idempotent` already does.
-    fn stub_llama() -> LlamaServer {
-        let child = std::process::Command::new("sleep")
-            .arg("300")
-            .spawn()
-            .expect("spawning a stub child (`sleep 300`) for this test");
-        LlamaServer::from_child(child, 0)
-    }
-
     #[test]
     fn should_unload_waits_for_the_full_idle_timeout() {
         let now = Instant::now();
@@ -5249,19 +4774,19 @@ mod tests {
     }
 
     #[test]
-    fn unloading_drops_the_pipeline_and_reaps_llama() {
+    fn unloading_drops_the_pipeline_and_with_it_the_model() {
         let daemon = fake_daemon(IDLE);
         let mut load = counting_loader(Arc::new(AtomicU64::new(0)));
         ensure_models_loaded_with(&daemon, &mut load, &NOT_SHUTTING_DOWN).unwrap();
-        *lock_ignoring_poison(&daemon.llama) = Some(stub_llama());
         daemon.normalize_available.store(true, Ordering::SeqCst);
         *lock_ignoring_poison(&daemon.last_activity) = Instant::now() - Duration::from_secs(3600);
 
         assert!(unload_models(&daemon));
 
         assert!(!daemon.models_loaded.load(Ordering::SeqCst));
+        // Dropping the pipeline is what frees the ~480 MB: the engine is the
+        // pipeline's normalizer, so there is nothing else left to assert on.
         assert!(lock_ignoring_poison(&daemon.pipeline).is_none());
-        assert!(lock_ignoring_poison(&daemon.llama).is_none());
         assert!(!daemon.normalize_available.load(Ordering::SeqCst));
     }
 
@@ -5445,33 +4970,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_supervisor_is_skipped_entirely_while_the_models_are_unloaded() {
-        // Without this gate the supervisor spawns a fresh 697 MB llama-server
-        // seconds after every unload, forever, and the whole feature is undone.
-        assert!(!should_supervise_llama(IDLE, false), "unloaded: must not supervise");
-        assert!(!should_supervise_llama(PAUSED, false));
-        // A load still in flight owns its own `spawn_and_wait_healthy` child and
-        // has not set `models_loaded` yet, so it is covered by the same arm.
-        assert!(!should_supervise_llama(RECORDING, false));
-    }
-
-    #[test]
-    fn the_supervisor_still_stays_inert_during_load_models() {
-        // The pre-existing half of this gate, kept: `load_models` has not
-        // settled `daemon.llama` yet, so acting now could spawn a second
-        // llama-server racing its own.
-        assert!(!should_supervise_llama(WARMING, false));
-        assert!(!should_supervise_llama(WARMING, true));
-    }
-
-    #[test]
-    fn the_supervisor_runs_once_the_models_are_loaded() {
-        for s in [IDLE, PAUSED, RECORDING, TRANSCRIBING, NORMALIZING, INJECTING, FAILED] {
-            assert!(should_supervise_llama(s, true), "state {s} should supervise");
-        }
-    }
-
     /// The second reader `models_loaded` exists for: this runs on the thread
     /// that also reaps dead subscribers, so blocking it behind a
     /// transcription would stall that unrelated work for the whole utterance.
@@ -5493,10 +4991,6 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let _ = time_until_unload(&d);
-            let _ = should_supervise_llama(
-                d.state.load(Ordering::SeqCst),
-                d.models_loaded.load(Ordering::SeqCst),
-            );
             let _ = tx.send(());
         });
 
@@ -5505,72 +4999,4 @@ mod tests {
         assert_eq!(answered, Ok(()), "the tick blocked on the pipeline lock");
     }
 
-    /// Task 6 review, Important 2: the 8 tests above this one all exercise
-    /// `should_unload`/`should_supervise_llama` as pure predicates -- delete
-    /// the call sites that actually wire them into `spawn_housekeeping`'s
-    /// loop and every one of them still passes. This test runs the real,
-    /// threaded loop instead, against the reference bug that motivated the
-    /// gate in the first place: the pre-Task-6 loop checked only
-    /// `state == WARMING` and knew nothing about `models_loaded`, so an idle
-    /// unload was always followed, within one `HEALTH_POLL_INTERVAL`, by
-    /// `supervise_llama_once` finding `daemon.llama == None` and calling
-    /// `respawn()` -- which, with `last_known_available` still `true` from
-    /// before the unload, broadcasts a spurious `NormalizeDegraded` the
-    /// instant that first respawn attempt fails. Removing the
-    /// `should_supervise_llama` gate (reverting to the old inline `WARMING`
-    /// check) makes this test observe exactly that broadcast; with the gate,
-    /// silence.
-    ///
-    /// `models_loaded` starts `true`, not the `false` a daemon that has
-    /// already finished unloading would show: `idle_unload_seconds = 1` and
-    /// a stale `last_activity` make `should_unload` fire on this loop's
-    /// very first tick, so `unload_models` clears `models_loaded` to `false`
-    /// in the *same* tick the (would-be) supervisor gate is checked --
-    /// pinning that the unload and the gate are wired to run together, not
-    /// merely that each exists. Starting `models_loaded` already `false`
-    /// would leave `time_until_unload` returning `None` for the whole test,
-    /// forcing a wait on the full, un-shrunk `HEALTH_POLL_INTERVAL` (10s) for
-    /// the first tick to land at all -- correct eventually, but far slower
-    /// than the ~1s this setup needs.
-    ///
-    /// `initial_last_known_available: true` (production's own default) is
-    /// load-bearing, not incidental: it is what makes an ungated
-    /// `supervise_llama_once` call broadcast on its first failure, rather
-    /// than starting from an already-degraded state that would stay silent
-    /// either way. The `llama_server_path` is deliberately bogus, so any
-    /// respawn attempt this test triggers -- gate regression or not -- fails
-    /// on `ENOENT` in milliseconds and never touches a real `llama-server`.
-    #[test]
-    fn the_supervisor_gate_is_actually_wired_into_the_loop_not_just_the_predicate() {
-        struct RecordingSink(Arc<Mutex<Vec<OverlayEvent>>>);
-        impl EventSink for RecordingSink {
-            fn emit(&self, event: &OverlayEvent) {
-                self.0.lock().unwrap().push(event.clone());
-            }
-        }
-        let seen: Arc<Mutex<Vec<OverlayEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        let daemon = fake_daemon_with_sink(IDLE, Arc::new(RecordingSink(Arc::clone(&seen))));
-        daemon.models_loaded.store(true, Ordering::SeqCst);
-        lock_ignoring_poison(&daemon.models_cfg).idle_unload_seconds = 1;
-        *lock_ignoring_poison(&daemon.last_activity) = Instant::now() - Duration::from_secs(3600);
-
-        let normalize_cfg = Some(NormalizeConfig {
-            llama_server_path: "/nonexistent/yappr-test-llama-server-binary".to_string(),
-            ..NormalizeConfig::default()
-        });
-        let handle = spawn_housekeeping(Arc::clone(&daemon), normalize_cfg, true);
-
-        std::thread::sleep(Duration::from_millis(2500));
-        handle.stop();
-
-        assert!(
-            !daemon.models_loaded.load(Ordering::SeqCst),
-            "the idle unload this test depends on never happened"
-        );
-        let broadcasts = seen.lock().unwrap();
-        assert!(
-            !broadcasts.iter().any(|e| matches!(e, OverlayEvent::NormalizeDegraded { .. })),
-            "a spurious NormalizeDegraded reached the sink after an idle unload: {broadcasts:?}"
-        );
-    }
 }

@@ -99,6 +99,20 @@ impl Trimmer for SileroTrimmer {
 
 #[cfg(test)]
 mod tests {
+    //! The `#[ignore]`d tests below are the only thing that catches a
+    //! C++ ABI mismatch between sherpa-onnx and llama.cpp (see
+    //! `.cargo/config.toml`): with the wrong `CXXFLAGS`, constructing the
+    //! VAD aborts the process with `free(): invalid pointer`.
+    //!
+    //! Two cheaper guards were tried and neither works, so do not
+    //! reintroduce them. A *missing* model path returns `Err` from
+    //! `ensure!(model.exists())` without ever creating the `OrtEnv` that
+    //! aborts, so it passes while the bug is live. A *garbage* model file
+    //! gets past that check, but then onnxruntime throws a C++ exception
+    //! across the FFI boundary and Rust aborts on it -- so that one fails
+    //! whether or not the ABI is right. Catching this needs a model that
+    //! actually loads, which is exactly what `--ignored` gates on.
+
     use super::*;
 
     #[test]

@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Press-to-start, press-to-stop dictation for Hyprland/Wayland. Press `SUPER+D`, speak,
 press `SUPER+D` again; the audio is captured, VAD-trimmed, transcribed (Parakeet TDT via
-`sherpa-onnx`), rewritten by a local S1-mini `llama-server`, checked by a guardrail, and
+`sherpa-onnx`), rewritten by S1-mini (llama.cpp, in-process), checked by a guardrail, and
 typed into the focused window with `wtype` (or `ydotool`, if `[inject] backend` selects
 it). Fully local at dictation time. `SUPER+ALT+D`
 cancels a recording in progress; nothing else can end one deliberately — see invariant 11.
@@ -47,8 +47,11 @@ bun run tauri dev                         # dev: Vite on :1420 + the Tauri windo
 bun run build                             # frontend only (tsc && vite build -> dist/)
 #   ^ builds BOTH pages: index.html (overlay) and settings.html (settings window).
 
-# Tests (415 passed, 0 failed, 4 #[ignore]d because they need downloaded models)
+# Tests (399 passed, 0 failed, 8 #[ignore]d because they need downloaded models)
 cargo test --workspace
+# NOT optional. These are the only tests that catch a C++ ABI mismatch between
+# sherpa-onnx and llama.cpp -- see the gotcha at the bottom of this file. A wrong
+# `CXXFLAGS` aborts the process inside the VAD, and the default run notices nothing.
 cargo test --workspace -- --ignored       # needs models already on disk (Settings' Setup pane, or --update-lock)
 cargo test -p yappr-core guardrail::        # one module
 cargo test -p yappr-core --test pipeline_e2e a_good_cleanup_is_injected
@@ -66,8 +69,9 @@ yappr --settings | --wizard | --toggle | --cancel | --quit
 yappr --print-shortcuts | --purge-logs | --update-lock
 ```
 
-There is no CI. `cargo test --workspace && cargo clippy --workspace --all-targets` is the
-gate. Tags `known-good-m1` / `known-good-m2` predate this one-process rewrite (16 tasks of
+There is no CI. `cargo test --workspace && cargo test --workspace -- --ignored && cargo
+clippy --workspace --all-targets` is the gate -- the `--ignored` half included, for the
+ABI reason above. Tags `known-good-m1` / `known-good-m2` predate this one-process rewrite (16 tasks of
 it, on this branch) — they are safety points for the M1/M2 milestone they were cut at, not
 a "recent work" undo button; nothing on this branch has added an equivalent tag yet.
 
@@ -141,13 +145,36 @@ The server's state machine is an `AtomicU8` with consts at the top of `server.rs
 arrives, never against a client-side memory of the last press — the client is a fresh
 process every time. A single utterance runs through `pipeline::Pipeline::process_with_capture`.
 
-`llama-server` is spawned by `load_models` — at startup only when `[models]
-preload_at_startup` is on, otherwise on the first `ptt-start` — and supervised
-while it lives (`spawn_housekeeping` / `supervise_llama_once`: 10 s health poll,
-1→30 s backoff restart, zombie reaping). That supervision is gated on
-`daemon.models_loaded`, so a child killed deliberately by `unload_models` stays
-dead instead of being restarted (invariant 12). A dead `llama-server` degrades
-to `UnavailableNormalizer` rather than failing the app.
+S1-mini is loaded by `load_models` — at startup only when `[models]
+preload_at_startup` is on, otherwise on the first `ptt-start` — into this same
+process, via `llama-cpp-2` (`llama.rs`'s `LlamaEngine`). llama.cpp and a ggml
+CPU backend are linked statically; `ldd target/release/yappr` resolves no
+`libllama` or `libggml`. A model that fails to load degrades to
+`UnavailableNormalizer` rather than failing the app, and the next dictation
+retries.
+
+This replaced a spawned, supervised `llama-server` child, and took a lot with
+it: `LlamaServer`, port picking, `/health` polling, the 10 s poll and 1→30 s
+backoff restart in `spawn_housekeeping`, `supervise_llama_once`,
+`should_supervise_llama`, `kill_llama`, the `daemon.llama` mutex, the
+`$XDG_RUNTIME_DIR/yappr.port` file, and `setup.rs`'s ggml-backend probe. The
+engine's lifetime is now exactly the `Pipeline`'s — it *is* the pipeline's
+normalizer — so `unload_models` setting `pipeline = None` is the whole of
+releasing the model, and a load finishing during shutdown can no longer orphan
+a child. `spawn_housekeeping` now only reaps subscribers and runs the
+idle-unload deadline.
+
+The trade, stated where it will be seen: a crash inside llama.cpp now takes the
+app down, where a crashing child used to degrade to raw ASR text.
+`sherpa-onnx` already had that property, on a hotter path.
+
+Two `[normalize]` keys are **accepted and ignored**: `port` and
+`llama_server_path`. There is no server to point them at, but the section is
+`deny_unknown_fields` (invariant 4), so deleting them from `NormalizeConfig`
+would turn every pre-existing `config.toml` into a hard startup failure. They
+are gone from the annotated default and hidden from the settings GUI by
+`schema.ts`'s `OBSOLETE_FIELDS` — the one thing in that file that can hide a
+row, and only because these are not settings.
 
 `[models]` owns the model lifetime: `preload_at_startup` (default `false`) and
 `idle_unload_seconds` (default `60`, `0` = never). `ensure_models_loaded` reads
@@ -255,7 +282,7 @@ happen to be resident.
     a stuck key, for the same reason.
 12. **The models are not resident by default, and `load_lock` is always taken
     before `pipeline`.** `[models] preload_at_startup` defaults to `false`, so
-    an idle daemon routinely has `pipeline: None` and no `llama-server` child
+    an idle daemon routinely has `pipeline: None` and no model resident
     at all — a state that used to be reachable only during warm-up and is now
     ordinary. Three consequences that are easy to break:
     - **Never lock `pipeline` to ask whether the models are loaded.** Not
@@ -270,10 +297,9 @@ happen to be resident.
       on the same thread — which is UB-or-deadlock, not a wait — every time
       the user presses twice without speaking. `Status` and the housekeeping
       thread read `daemon.models_loaded` instead, the same reason
-      `normalize_available` exists.
-    - **The `llama-server` supervisor must stay gated on `models_loaded`.**
-      Without that gate it respawns a ~955 MB child seconds after every unload,
-      and the whole feature silently does nothing.
+      `normalize_available` exists. (The `llama-server` supervisor that used
+      to be the other reader of this flag is gone; the deadlock it would have
+      caused is not.)
     - **A lazy load failure is retryable, not fatal.** `run_utterance`
       broadcasts `Error` and returns to `IDLE`; only the `preload_at_startup`
       path still latches `FAILED` with a stored `fatal_error`. On a fresh
@@ -321,12 +347,11 @@ happen to be resident.
   `with_recovery_dir`, `with_fallback_injector`, `with_stage_events`), not new positional
   parameters on `new`. `rejections_file()` is a live guardrail-tuning dataset — tests must
   redirect writes to it or they poison real data.
-- `yappr-core`'s `test-util` feature exposes `LlamaServer::from_child` (test-only child-process
-  construction) so a crate testing the server can stub a process that cannot run here (a
-  real `llama-server` needs a model file and a working `ggml` backend). Since `server.rs`
-  moved into `yappr-core` itself, its own `#[cfg(test)]` builds already satisfy
-  `cfg(any(test, feature = "test-util"))` without the feature flag — it now matters only if
-  a crate *outside* `yappr-core` ever needs the same seam, which none currently does.
+- `yappr-core` no longer has a `test-util` feature. It existed to expose
+  `LlamaServer::from_child`, a seam for stubbing the supervised child with `sleep 300`;
+  with no child process left there is nothing to stub, so it was deleted rather than
+  left declared and unused. The tests that relied on it now observe `shutdown` through
+  the runtime files it removes.
 - All filesystem locations come from `yappr-core/src/paths.rs` (XDG): config
   `~/.config/yappr/config.toml`, models `~/.local/share/yappr/models`
   (pinned by sha256 in `crates/yappr-core/models.lock.toml`), `rejections.jsonl` in the
@@ -346,16 +371,36 @@ happen to be resident.
 
 ## Environment gotchas
 
-- **`llama-server` needs an explicit ggml compute backend.** Arch's `llama-cpp` pulls only
-  base `ggml`, which has no backend, and fails with ggml's opaque "no backends are loaded".
-  `ggml-cpu` (or `ggml-vulkan`/`ggml-cuda`) must be installed. The Settings window's Setup
-  pane checks this on first run, the same check `owf-ctl setup` used to run.
+- **sherpa-onnx and llama.cpp must be built with the same C++ ABI, and `.cargo/config.toml`
+  is what makes that true.** The most dangerous thing about linking both into one binary,
+  and it fails at runtime rather than at link time. `sherpa-onnx` ships a prebuilt
+  `libonnxruntime.a` compiled with the *old* libstdc++ ABI (`_GLIBCXX_USE_CXX11_ABI=0`:
+  11,675 old-ABI `std::string` symbols in it, zero new-ABI); `llama-cpp-sys-2` builds
+  llama.cpp here, and cmake defaults to the *new* ABI. Both instantiate `std::regex`'s
+  `_Compiler` as a weak symbol, the linker keeps one, and ONNX Runtime's
+  `DeviceDiscovery::DiscoverDevicesForPlatform` — which builds a `std::regex` while
+  creating its `OrtEnv` — then runs against a `std::string` with the wrong layout. The
+  process aborts with `free(): invalid pointer` inside `SileroTrimmer::new`: in the VAD,
+  on every utterance.
+
+  `.cargo/config.toml` forces `CXXFLAGS=-D_GLIBCXX_USE_CXX11_ABI=0`, with `force = true`
+  so an inherited `CXXFLAGS` cannot silently win and produce a memory-corrupting binary.
+  Do not remove it, and do not add another C++ dependency without checking its ABI:
+
+  ```bash
+  nm libwhatever.a | grep -c NSt7__cxx1112basic_string        # new ABI
+  nm libwhatever.a | grep -cE 'Ss[0-9EC]|SbIcSt11char_traits' # old ABI
+  ```
+
+  Only `cargo test --workspace -- --ignored` catches a regression here. Two cheaper
+  guards were tried and both are useless — read the note at the top of `vad.rs`'s test
+  module before writing a third.
 - **`gtk-layer-shell` is a build-time link dependency, not a runtime check.** `src-tauri`'s
   `Cargo.toml` pulls in `gtk-layer-shell = { version = "0.8", features = ["v0_6"] }` for
   `layer.rs`. Without the system library, `cargo build` (or `cargo test`/`cargo clippy` —
   anything touching this crate) fails outright in `gtk-layer-shell-sys`'s build script,
   unable to find `gtk-layer-shell-0` via `pkg-config`. On Arch: `sudo pacman -S
-  gtk-layer-shell`. Unlike the `ggml-cpu` gotcha above, there is no way to defer this to a
+  gtk-layer-shell`. Unlike the ABI gotcha above, there is no way to defer this to a
   runtime check or a Setup-pane warning — the binary simply does not exist without it.
 - **Building an AppImage on current Arch needs two environment fixes, and fails with only
   "failed to run linuxdeploy" if either is missing.** Both failures produce that same
