@@ -41,10 +41,15 @@ pub static ARTIFACTS: [Artifact; 3] = [
     },
     Artifact {
         name: "s1-mini",
-        url: "https://huggingface.co/superwhisper/s1-mini-GGUF/resolve/main/s1-mini-q4_k_m.gguf",
+        // The German de-v3 finetune of upstream S1-mini
+        // (https://huggingface.co/superwhisper/s1-mini-GGUF), published from
+        // this repo's own training pipeline. Same qwen3 architecture and
+        // chat template as upstream, so `normalize::render_chat_prompt`
+        // needed no change.
+        url: "https://huggingface.co/Joni000000000/s1-mini-de-v3/resolve/main/s1-mini-q4_k_m-de-v3.gguf",
         // License-mandated capitalization: "S1-mini" by "Superwhisper", exactly.
-        display: "S1-mini by Superwhisper",
-        rel_path: "s1-mini-q4_k_m.gguf",
+        display: "S1-mini by Superwhisper (de-v3 Finetune)",
+        rel_path: "s1-mini-q4_k_m-de-v3.gguf",
         archive: false,
     },
 ];
@@ -589,11 +594,13 @@ mod tests {
     #[test]
     fn s1_mini_display_name_matches_the_license_text() {
         // The S1-mini license requires this exact capitalization in
-        // user-facing text: "S1-mini" by "Superwhisper". `name` (the
-        // committed lock-file key) stays lowercase and is never shown to a
-        // user directly.
+        // user-facing text: "S1-mini" by "Superwhisper" — which a finetune's
+        // display name must still carry verbatim. `name` (the committed
+        // lock-file key) stays lowercase and is never shown to a user
+        // directly.
         let s1 = ARTIFACTS.iter().find(|a| a.name == "s1-mini").unwrap();
-        assert_eq!(s1.display, "S1-mini by Superwhisper");
+        assert_eq!(s1.display, "S1-mini by Superwhisper (de-v3 Finetune)");
+        assert!(s1.display.contains("S1-mini by Superwhisper"));
         assert_eq!(s1.name, "s1-mini", "lock-file key must not change");
     }
 

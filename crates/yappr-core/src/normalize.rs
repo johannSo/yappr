@@ -35,7 +35,9 @@ pub const SYSTEM_PROMPT: &str = "You are a text normalizer for speech-to-text tr
 /// bytes handed to the tokenizer are visible in one function and pinned by
 /// `the_rendered_prompt_matches_the_models_own_chat_template`.
 ///
-/// Read off `s1-mini-q4_k_m.gguf`'s `tokenizer.chat_template` metadata, whose
+/// Read off `s1-mini-q4_k_m.gguf`'s `tokenizer.chat_template` metadata (the
+/// de-v3 finetune, `s1-mini-q4_k_m-de-v3.gguf`, carries the identical
+/// template -- checked against its HF metadata when it was pinned), whose
 /// relevant branches are:
 ///
 /// ```text
@@ -68,7 +70,8 @@ mod tests {
     #[test]
     fn the_rendered_prompt_matches_the_models_own_chat_template() {
         // Pinned against the jinja template read out of
-        // `s1-mini-q4_k_m.gguf`'s own `tokenizer.chat_template` metadata for
+        // `s1-mini-q4_k_m.gguf`'s own `tokenizer.chat_template` metadata
+        // (unchanged in the de-v3 finetune now shipped) for
         // the exact case this crate ever renders: one system message, one
         // user message, `add_generation_prompt`, no tools. Every newline
         // here is one the template emits.

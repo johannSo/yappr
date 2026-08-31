@@ -42,7 +42,7 @@ use crate::normalize::{max_tokens_for, render_chat_prompt, Normalizer};
 
 /// The one model file this engine loads, pinned by sha256 in
 /// `models.lock.toml` alongside Parakeet and Silero.
-pub const MODEL_FILE: &str = "s1-mini-q4_k_m.gguf";
+pub const MODEL_FILE: &str = "s1-mini-q4_k_m-de-v3.gguf";
 
 /// The process-global llama.cpp backend.
 ///
@@ -253,13 +253,13 @@ mod engine_tests {
     fn loading_a_model_that_is_not_there_fails_instead_of_panicking() {
         let cfg = NormalizeConfig::default();
 
-        let err = match LlamaEngine::load(Path::new("/nonexistent/s1-mini-q4_k_m.gguf"), &cfg) {
+        let err = match LlamaEngine::load(Path::new("/nonexistent/s1-mini-q4_k_m-de-v3.gguf"), &cfg) {
             Ok(_) => panic!("a missing model file must be an error"),
             Err(e) => e,
         };
 
         assert!(
-            err.to_string().contains("/nonexistent/s1-mini-q4_k_m.gguf"),
+            err.to_string().contains("/nonexistent/s1-mini-q4_k_m-de-v3.gguf"),
             "the error should name the path it looked for, got: {err}"
         );
     }

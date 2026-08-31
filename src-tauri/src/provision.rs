@@ -370,7 +370,7 @@ mod tests {
         assert_eq!(models[0]["name"], "silero");
         assert_eq!(models[0]["display"], "Silero VAD");
         assert_eq!(models[1]["name"], "s1-mini");
-        assert_eq!(models[1]["display"], "S1-mini by Superwhisper");
+        assert_eq!(models[1]["display"], "S1-mini by Superwhisper (de-v3 Finetune)");
     }
 
     /// A name `models::verify` never actually returns in practice (every one
