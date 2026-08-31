@@ -1,0 +1,565 @@
+{
+ "legend": {
+  "F1": "Aufzählung mit elidiertem Subjekt (Gapping)",
+  "F2": "Worttreue: kein Verfälschen korrekter Wörter",
+  "F3": "Komposita und Bindestriche",
+  "F4": "Endlosschleife bei derben Bewertungswörtern",
+  "F5": "Zahlwörter, Uhrzeiten, Beträge",
+  "F6": "Styling-Achse formal (du -> Sie)",
+  "F7": "Sonstige Randfälle"
+ },
+ "cases": [
+  {
+   "id": "A1",
+   "styling": "casual",
+   "structure": "lists",
+   "context": "general",
+   "raw": "Wir haben die Migration durchgezogen, haben das Backup geprüft und sind dann früher nach Hause.",
+   "class": "F1"
+  },
+  {
+   "id": "A10",
+   "styling": "casual",
+   "structure": "lists",
+   "context": "general",
+   "raw": "Der Server ist neu gestartet, hat einmal kurz gehangen und läuft jetzt wieder stabil.",
+   "class": "F1"
+  },
+  {
+   "id": "A2",
+   "styling": "semi-casual",
+   "structure": "lists",
+   "context": "general",
+   "raw": "Ich hab den Branch gemerged, hab die Tests laufen lassen, hab die Doku angepasst und bin danach ins Meeting.",
+   "class": "F1"
+  },
+  {
+   "id": "A3",
+   "styling": "semi-casual",
+   "structure": "lists",
+   "context": "general",
+   "raw": "Der Kunde hat angerufen, hat sich über die Rechnung beschwert und will jetzt eine Gutschrift.",
+   "class": "F1"
+  },
+  {
+   "id": "A4",
+   "styling": "formal",
+   "structure": "lists",
+   "context": "email",
+   "raw": "Wir haben den Vorgang geprüft, haben die Unterlagen nachgefordert und sind zu dem Ergebnis gekommen, dass die Frist gewahrt wurde.",
+   "class": "F1"
+  },
+  {
+   "id": "A5",
+   "styling": "casual",
+   "structure": "lists",
+   "context": "general",
+   "raw": "Gestern haben wir das Konzept besprochen, haben Feedback eingesammelt, haben das Mockup überarbeitet, haben die Preise kalkuliert und sind dann noch was trinken gegangen.",
+   "class": "F1"
+  },
+  {
+   "id": "A6",
+   "styling": "semi-casual",
+   "structure": "prose",
+   "context": "general",
+   "raw": "Wir haben die Migration durchgezogen, haben das Backup geprüft und sind dann früher nach Hause.",
+   "class": "F1"
+  },
+  {
+   "id": "A7",
+   "styling": "semi-formal",
+   "structure": "lists",
+   "context": "general",
+   "raw": "Das Ticket ist eskaliert, ist an das zweite Level übergeben worden und wird morgen früh bearbeitet.",
+   "class": "F1"
+  },
+  {
+   "id": "A8",
+   "styling": "casual",
+   "structure": "lists",
+   "context": "general",
+   "raw": "Ich war beim Zahnarzt, war danach kurz einkaufen und hab dann noch die Steuer gemacht.",
+   "class": "F1"
+  },
+  {
+   "id": "A9",
+   "styling": "semi-casual",
+   "structure": "lists",
+   "context": "email",
+   "raw": "Hi Anna, ich hab die Folien gebaut, hab die Zahlen eingepflegt und schick dir das gleich rüber.",
+   "class": "F1"
+  },
+  {
+   "id": "F1-repro-caps",
+   "class": "F1",
+   "styling": "casual",
+   "structure": "lists",
+   "context": "general",
+   "raw": "Hey Leute, ich habe die Sachen von gestern mal runtergeschrieben, also: Wir haben KI Modelle trainiert, haben Suppe gegessen, haben gelernt und sind essen gegangen."
+  },
+  {
+   "id": "user-repro",
+   "raw": "Hey leute, ich habe die sachen von gestern mal runtergeschrieben, also: Wir haben KI modelle trainiert, haben suppe gegessen, haben gelernt und sind essen gegangen",
+   "styling": "casual",
+   "structure": "lists",
+   "context": "general",
+   "class": "F1"
+  },
+  {
+   "id": "B1",
+   "styling": "casual",
+   "structure": "prose",
+   "context": "general",
+   "raw": "Ich hab mir das gestern Abend nochmal durchgelesen und dann alles runtergeschrieben.",
+   "class": "F2"
+  },
+  {
+   "id": "B2",
+   "styling": "casual",
+   "structure": "prose",
+   "context": "general",
+   "raw": "Ich hab die Sachen von gestern mal aufgeschrieben, das waren echt viele Sachen.",
+   "class": "F2"
+  },
+  {
+   "id": "B3",
+   "styling": "semi-casual",
+   "structure": "prose",
+   "context": "general",
+   "raw": "Ich hab mich da gestern richtig reingehauen und die halbe Nacht durchgeklickt.",
+   "class": "F2"
+  },
+  {
+   "id": "B4",
+   "styling": "semi-casual",
+   "structure": "prose",
+   "context": "general",
+   "raw": "Die Rechnung von Frau Kowalczyk ist noch offen, ich hak da morgen nach.",
+   "class": "F2"
+  },
+  {
+   "id": "B5",
+   "styling": "casual",
+   "structure": "prose",
+   "context": "general",
+   "raw": "Das Deployment ist durchgerauscht, keine Ahnung warum das diesmal so schnell ging.",
+   "class": "F2"
+  },
+  {
+   "id": "B6",
+   "styling": "semi-casual",
+   "structure": "prose",
+   "context": "general",
+   "raw": "Wir haben drei Angebote reinbekommen, zwei davon sind zu teuer.",
+   "class": "F2"
+  },
+  {
+   "id": "B7",
+   "styling": "casual",
+   "structure": "prose",
+   "context": "general",
+   "raw": "Ich schmeiß das gleich mal in den Ordner und sag dir dann Bescheid.",
+   "class": "F2"
+  },
+  {
+   "id": "B8",
+   "styling": "semi-formal",
+   "structure": "prose",
+   "context": "email",
+   "raw": "Die Unterlagen für den Kollegen Grzeszczyk liegen bei mir auf dem Schreibtisch.",
+   "class": "F2"
+  },
+  {
+   "id": "C1",
+   "styling": "semi-casual",
+   "structure": "prose",
+   "context": "general",
+   "raw": "Wir müssen die KI Modelle nochmal nachtrainieren, die API Doku ist auch veraltet.",
+   "class": "F3"
+  },
+  {
+   "id": "C2",
+   "styling": "semi-casual",
+   "structure": "prose",
+   "context": "general",
+   "raw": "Der CSV Export bricht ab, sobald ein Umlaut im Kunden Namen steht.",
+   "class": "F3"
+  },
+  {
+   "id": "C3",
+   "styling": "semi-casual",
+   "structure": "lists",
+   "context": "general",
+   "raw": "Offen sind noch der PDF Anhang, die CI Pipeline und das Rate Limit im Gateway.",
+   "class": "F3"
+  },
+  {
+   "id": "C4",
+   "styling": "formal",
+   "structure": "prose",
+   "context": "email",
+   "raw": "Die Preis Anpassung zum Jahres Wechsel beträgt sieben Prozent auf alle Wartungs Verträge.",
+   "class": "F3"
+  },
+  {
+   "id": "C5",
+   "styling": "casual",
+   "structure": "prose",
+   "context": "general",
+   "raw": "Der Chat Bot antwortet wieder Müll, das Sprach Modell ist glaub ich zu klein.",
+   "class": "F3"
+  },
+  {
+   "id": "C6",
+   "styling": "semi-casual",
+   "structure": "prose",
+   "context": "general",
+   "raw": "Bitte einmal den VPN Zugang und den SSH Schlüssel für die neue Werk Studentin anlegen.",
+   "class": "F3"
+  },
+  {
+   "id": "K1",
+   "styling": "semi-casual",
+   "structure": "prose",
+   "context": "general",
+   "raw": "Der Kunden Name wird beim Import abgeschnitten, der Rechnungs Betrag stimmt aber.",
+   "class": "F3"
+  },
+  {
+   "id": "K2",
+   "styling": "semi-casual",
+   "structure": "prose",
+   "context": "general",
+   "raw": "Die Zugangs Daten für den Test Server schick ich dir per Mail.",
+   "class": "F3"
+  },
+  {
+   "id": "K3",
+   "styling": "semi-casual",
+   "structure": "prose",
+   "context": "general",
+   "raw": "Bitte den Urlaubs Antrag noch diese Woche einreichen, sonst geht das nicht mehr durch.",
+   "class": "F3"
+  },
+  {
+   "id": "R1",
+   "styling": "semi-casual",
+   "structure": "prose",
+   "context": "general",
+   "raw": "Der Chat Bot antwortet wieder Müll.",
+   "class": "F4"
+  },
+  {
+   "id": "R2",
+   "styling": "semi-casual",
+   "structure": "prose",
+   "context": "general",
+   "raw": "Das Sprach Modell ist glaub ich zu klein.",
+   "class": "F4"
+  },
+  {
+   "id": "R3",
+   "styling": "semi-casual",
+   "structure": "prose",
+   "context": "general",
+   "raw": "Der Chatbot antwortet wieder Müll, das Sprachmodell ist glaub ich zu klein.",
+   "class": "F4"
+  },
+  {
+   "id": "R4",
+   "styling": "casual",
+   "structure": "prose",
+   "context": "general",
+   "raw": "Das Ding antwortet wieder Müll, keine Ahnung was da los ist.",
+   "class": "F4"
+  },
+  {
+   "id": "R5",
+   "styling": "semi-casual",
+   "structure": "prose",
+   "context": "general",
+   "raw": "Der Chat Bot antwortet wieder Unsinn, das Sprach Modell ist zu klein.",
+   "class": "F4"
+  },
+  {
+   "id": "R6",
+   "styling": "semi-casual",
+   "structure": "prose",
+   "context": "general",
+   "raw": "Der Sprach Assistent versteht mich nicht, das Mikro ist glaub ich zu leise.",
+   "class": "F4"
+  },
+  {
+   "id": "R7",
+   "class": "F4",
+   "styling": "semi-casual",
+   "structure": "prose",
+   "context": "general",
+   "raw": "Die Suchfunktion antwortet wieder Müll, seit dem letzten Update ist das so."
+  },
+  {
+   "id": "R8",
+   "class": "F4",
+   "styling": "semi-casual",
+   "structure": "prose",
+   "context": "general",
+   "raw": "Der Bot liefert wieder Müll zurück, wir müssen den Index neu bauen."
+  },
+  {
+   "id": "N1",
+   "styling": "semi-casual",
+   "structure": "prose",
+   "context": "general",
+   "raw": "Der Termin ist um vierzehn Uhr dreißig im großen Raum.",
+   "class": "F5"
+  },
+  {
+   "id": "N2",
+   "styling": "semi-casual",
+   "structure": "prose",
+   "context": "general",
+   "raw": "Wir starten um acht Uhr fünfundvierzig und sind um sechzehn Uhr durch.",
+   "class": "F5"
+  },
+  {
+   "id": "N3",
+   "styling": "semi-casual",
+   "structure": "prose",
+   "context": "general",
+   "raw": "Die Miete beträgt ein tausend zwei hundert Euro warm.",
+   "class": "F5"
+  },
+  {
+   "id": "N4",
+   "styling": "formal",
+   "structure": "prose",
+   "context": "email",
+   "raw": "Der Rechnungsbetrag von vier tausend neun hundert fünfzig Euro ist bis zum einunddreißigsten März zu begleichen.",
+   "class": "F5"
+  },
+  {
+   "id": "N5",
+   "styling": "semi-casual",
+   "structure": "prose",
+   "context": "general",
+   "raw": "Wir haben im Jahr zwei tausend zwanzig angefangen und sind jetzt bei sechs Leuten.",
+   "class": "F5"
+  },
+  {
+   "id": "N6",
+   "styling": "semi-casual",
+   "structure": "prose",
+   "context": "general",
+   "raw": "Das Meeting geht von elf bis zwölf Uhr dreißig, danach hab ich noch bis fünfzehn Uhr Zeit.",
+   "class": "F5"
+  },
+  {
+   "id": "N7",
+   "styling": "semi-casual",
+   "structure": "prose",
+   "context": "general",
+   "raw": "Die Auslastung liegt bei siebenundachtzig Prozent, das ist zu hoch.",
+   "class": "F5"
+  },
+  {
+   "id": "N8",
+   "styling": "semi-casual",
+   "structure": "prose",
+   "context": "general",
+   "raw": "Ich brauche noch zweihundertfünfzig Gramm Butter und drei Eier.",
+   "class": "F5"
+  },
+  {
+   "id": "S1",
+   "styling": "formal",
+   "structure": "prose",
+   "context": "email",
+   "raw": "Hey du, kannst du mir die Zahlen bis morgen schicken, das wäre echt super.",
+   "class": "F6"
+  },
+  {
+   "id": "S2",
+   "styling": "formal",
+   "structure": "prose",
+   "context": "general",
+   "raw": "Kannst du das bitte nochmal checken, ich komm da nicht weiter.",
+   "class": "F6"
+  },
+  {
+   "id": "S3",
+   "styling": "semi-formal",
+   "structure": "prose",
+   "context": "email",
+   "raw": "Hi Max, ich brauch das bis Freitag, sonst wird das nix mit dem Termin.",
+   "class": "F6"
+  },
+  {
+   "id": "S4",
+   "styling": "formal",
+   "structure": "prose",
+   "context": "email",
+   "raw": "Der Vorgang wurde geprüft, eine Erstattung ist leider nicht möglich.",
+   "class": "F6"
+  },
+  {
+   "id": "S5",
+   "class": "F6",
+   "styling": "formal",
+   "structure": "prose",
+   "context": "email",
+   "raw": "Hi Frau Reuter, kannst du mir bis Donnerstag die Auswertung vom letzten Monat schicken, ich brauch die Zahlen für das Gespräch mit der Geschäftsführung am Freitag."
+  },
+  {
+   "id": "S6",
+   "class": "F6",
+   "styling": "formal",
+   "structure": "prose",
+   "context": "general",
+   "raw": "Hast du die Unterlagen vom Notar schon durchgelesen, wir müssten dem bis Ende der Woche eine Rückmeldung geben, sonst platzt der Termin."
+  },
+  {
+   "id": "D1",
+   "styling": "semi-casual",
+   "structure": "lists",
+   "context": "general",
+   "raw": "Für den Umzug brauche ich Kartons, Klebeband, Luftpolsterfolie, einen Transporter, zwei Helfer, einen Parkplatz vor der Tür und eine Halteverbotszone.",
+   "class": "F7"
+  },
+  {
+   "id": "D2",
+   "styling": "casual",
+   "structure": "lists",
+   "context": "general",
+   "raw": "Einkaufen: Milch, Brot, Butter, Eier, Käse, Tomaten, Zwiebeln und Kaffee.",
+   "class": "F7"
+  },
+  {
+   "id": "D3",
+   "styling": "semi-formal",
+   "structure": "lists",
+   "context": "email",
+   "raw": "Zu klären sind die Laufzeit des Vertrages, die Kündigungsfrist, der Leistungsumfang, die Reaktionszeit im Störungsfall, die Vergütung und der Gerichtsstand.",
+   "class": "F7"
+  },
+  {
+   "id": "E1",
+   "styling": "semi-casual",
+   "structure": "prose",
+   "context": "general",
+   "raw": "Wir sehen uns am Dienstag, nein Quatsch, am Mittwoch um vierzehn Uhr dreißig.",
+   "class": "F7"
+  },
+  {
+   "id": "E10",
+   "styling": "semi-casual",
+   "structure": "prose",
+   "context": "general",
+   "raw": "Das Angebot liegt bei zwei tausend acht hundert Euro netto, also ca. drei tausend drei hundert brutto.",
+   "class": "F7"
+  },
+  {
+   "id": "E11",
+   "styling": "casual",
+   "structure": "prose",
+   "context": "general",
+   "raw": "I think we should ship it, äh, also ich mein, wir sollten das rausbringen.",
+   "class": "F7"
+  },
+  {
+   "id": "E12",
+   "styling": "semi-casual",
+   "structure": "prose",
+   "context": "general",
+   "raw": "Wegen der wegen der Sache mit dem Vertrag, da müssen wir nochmal ran.",
+   "class": "F7"
+  },
+  {
+   "id": "E13",
+   "styling": "formal",
+   "structure": "lists",
+   "context": "email",
+   "raw": "Guten Tag Herr Berger, anbei die Punkte aus unserem Gespräch, die Lieferzeit beträgt sechs Wochen, die Montage ist inklusive und die Zahlung erfolgt in zwei Raten.",
+   "class": "F7"
+  },
+  {
+   "id": "E14",
+   "styling": "semi-casual",
+   "structure": "prose",
+   "context": "general",
+   "raw": "Kannst du das bitte nochmal prüfen? Danke!",
+   "class": "F7"
+  },
+  {
+   "id": "E15",
+   "styling": "casual",
+   "structure": "lists",
+   "context": "general",
+   "raw": "Todo für heute: Mails checken, dann der Call mit Sven, danach die Rechnungen und abends noch das Deployment.",
+   "class": "F7"
+  },
+  {
+   "id": "E2",
+   "styling": "semi-casual",
+   "structure": "prose",
+   "context": "general",
+   "raw": "Das ist nicht das Problem, das Problem ist die Datenbank.",
+   "class": "F7"
+  },
+  {
+   "id": "E3",
+   "styling": "casual",
+   "structure": "prose",
+   "context": "general",
+   "raw": "Kommst du morgen mit",
+   "class": "F7"
+  },
+  {
+   "id": "E4",
+   "styling": "semi-casual",
+   "structure": "lists",
+   "context": "general",
+   "raw": "Der Bug ist gefixt.",
+   "class": "F7"
+  },
+  {
+   "id": "E5",
+   "styling": "semi-casual",
+   "structure": "prose",
+   "context": "general",
+   "raw": "Ähm, also, ja, ich meine, wir könnten das quasi halt einfach so lassen, ne.",
+   "class": "F7"
+  },
+  {
+   "id": "E6",
+   "styling": "formal",
+   "structure": "prose",
+   "context": "email",
+   "raw": "Hey du, kannst du mir das bis morgen schicken, wäre echt super.",
+   "class": "F7"
+  },
+  {
+   "id": "E7",
+   "styling": "casual",
+   "structure": "prose",
+   "context": "email",
+   "raw": "Sehr geehrte Damen und Herren, hiermit kündige ich meinen Vertrag fristgerecht zum Ende des Monats.",
+   "class": "F7"
+  },
+  {
+   "id": "E8",
+   "styling": "semi-casual",
+   "structure": "lists",
+   "context": "general",
+   "raw": "Ich glaube der Zug fährt um sieben, aber ich bin mir nicht sicher, ich guck nochmal nach.",
+   "class": "F7"
+  },
+  {
+   "id": "E9",
+   "styling": "semi-casual",
+   "structure": "prose",
+   "context": "general",
+   "raw": "Wir treffen uns um neun Uhr fünfzehn am Haupt Eingang, bring bitte den Ausweis mit.",
+   "class": "F7"
+  }
+ ]
+}
