@@ -265,7 +265,17 @@ export default function Overlay() {
         case "injecting":
           clearHideTimer();
           setView({ kind: "injecting" });
-          showOnce();
+          // Deliberately no showOnce(), and the visibility bookkeeping is
+          // dropped: on a compositor without layer-shell (GNOME/Mutter) the
+          // backend hides this window natively the moment it holds keyboard
+          // focus at injection time (invariant 2 -- a focus-following
+          // injector would otherwise type the transcript into this very
+          // window), and nothing here may re-map it while the injector is
+          // typing. On layer-shell compositors the window is already
+          // visible from the states before this one, so not showing changes
+          // nothing there -- and resetting `visible` only costs the next
+          // state one redundant, idempotent showAndPosition().
+          visible.current = false;
           break;
 
         case "done":

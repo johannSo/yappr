@@ -133,12 +133,38 @@ struct TauriSink {
     tray: tray::Handle,
 }
 
+/// How long injection is delayed after hiding an overlay that had keyboard
+/// focus, giving the compositor time to unmap it and return focus to the
+/// previously focused window -- the dictation's actual target. Mutter
+/// refocuses well inside this on 2026 hardware; generous on purpose, since
+/// the cost is a one-off pause before typing starts and the alternative is
+/// the transcript landing in the overlay.
+const FOCUS_RETURN_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Invariant 2's failure detector: true when the overlay holds keyboard
+/// focus at the moment that matters -- `Injecting`, right before the
+/// injector spawns. On a layer-shell compositor this can never be true
+/// (`KeyboardMode::None` refuses focus at the protocol level); on
+/// GNOME/Mutter it is routinely true, because `focusable: false` reaches
+/// GTK's `accept_focus` -- an X11 mechanism with no Wayland counterpart --
+/// and Mutter focuses the freshly mapped toplevel. A focus-following
+/// injector (ydotool via uinput, and wtype alike) would then type the
+/// transcript into the overlay itself.
+fn overlay_hijacks_injection(event: &OverlayEvent, overlay_focused: bool) -> bool {
+    overlay_focused && matches!(event, OverlayEvent::Injecting)
+}
+
 impl EventSink for TauriSink {
     fn emit(&self, event: &OverlayEvent) {
         if let Err(e) = self.app.emit("overlay-event", event) {
             eprintln!("overlay: failed to emit event to the frontend: {e}");
         }
         self.refresh_tray_icon(event);
+        // Last, so the frontend has already been told about `Injecting` --
+        // its handler deliberately stops calling `show()` for that state
+        // (see `Overlay.tsx`), so nothing re-maps the window while this
+        // blocks the pipeline thread.
+        self.hide_overlay_if_it_hijacks_injection(event);
     }
 
     /// `Request::ShowSettings` (spec §8, the CLI's `--settings` flag).
@@ -190,6 +216,45 @@ impl TauriSink {
         if let Some(state) = tray::icon_state_for(event, status) {
             self.tray.set_state(state);
         }
+    }
+
+    /// Invariant 2's last line of defense, for compositors where neither
+    /// layer-shell (`layer.rs`) nor a pasted window rule (`hypr.rs`) exists
+    /// to keep the overlay unfocused -- GNOME/Mutter in practice. If the
+    /// overlay holds keyboard focus when `Injecting` is broadcast, it is
+    /// hidden natively and the broadcast blocks [`FOCUS_RETURN_DELAY`] so
+    /// the compositor can hand focus back to the target window before the
+    /// injector spawns. The pipeline calls this sink synchronously right
+    /// before `inject_with_recovery`, which is exactly what makes blocking
+    /// here effective -- and safe: `Injecting` is only ever broadcast from
+    /// the pipeline's own worker thread, never the GTK main thread this
+    /// would otherwise freeze.
+    ///
+    /// The early `matches!` keeps the per-event cost at one enum check for
+    /// the ~20 Hz `Recording` stream; `is_focused` (one IPC round trip to
+    /// the main loop) runs once per dictation at most.
+    fn hide_overlay_if_it_hijacks_injection(&self, event: &OverlayEvent) {
+        if !matches!(event, OverlayEvent::Injecting) {
+            return;
+        }
+        let Some(window) = self.app.get_webview_window(OVERLAY_LABEL) else {
+            return;
+        };
+        let focused = window.is_focused().unwrap_or(false);
+        if !overlay_hijacks_injection(event, focused) {
+            return;
+        }
+        tracing::warn!(
+            delay_ms = FOCUS_RETURN_DELAY.as_millis() as u64,
+            "invariant 2 failed: the overlay holds keyboard focus at injection time \
+             (compositor without layer-shell?); hiding it and waiting for focus to \
+             return to the target window"
+        );
+        if let Err(e) = window.hide() {
+            tracing::error!(error = %e, "could not hide the focused overlay before injection");
+            return;
+        }
+        std::thread::sleep(FOCUS_RETURN_DELAY);
     }
 }
 
@@ -252,12 +317,22 @@ pub fn run() {
             // realized, so this runs before anything else touches `window`.
             // `anchor_overlay` returns `Err` when the compositor doesn't
             // implement wlr-layer-shell (Mutter) -- the window then stays
-            // an ordinary toplevel. Invariant 2 (never take keyboard focus)
-            // still holds on that path: `tauri.conf.json`'s
-            // `focusable: false` applies regardless of which path this
-            // takes, and `yappr_core::hypr::shortcut_config`'s emitted
-            // title-matched `nofocus`/`noinitialfocus` window rule is the
-            // compositor-side belt-and-braces for exactly this fallback.
+            // an ordinary toplevel, and invariant 2 (never take keyboard
+            // focus) is NOT enforceable up front on that path, despite what
+            // this comment used to claim: `tauri.conf.json`'s
+            // `focusable: false` reaches GTK's `accept_focus`, an X11
+            // mechanism with no Wayland counterpart (xdg_shell offers a
+            // toplevel no way to refuse focus -- that gap is the whole
+            // reason layer-shell's KeyboardMode exists), and
+            // `yappr_core::hypr::shortcut_config`'s title-matched
+            // `nofocus` rule is Hyprland config, which does not exist on
+            // the very compositors that lack layer-shell. Verified on
+            // Fedora/GNOME: Mutter focuses the overlay the moment it maps,
+            // and the injector then types the transcript into it. The
+            // enforcement on this path is therefore at injection time
+            // instead: `TauriSink::hide_overlay_if_it_hijacks_injection`
+            // hides a focused overlay on `Injecting` and delays the
+            // injector until focus has returned to the target window.
             if let Err(e) = layer::anchor_overlay(&window) {
                 eprintln!("overlay: layer-shell unavailable ({e}); falling back to a toplevel");
             }
@@ -492,4 +567,24 @@ fn position_bottom_center(window: &tauri::WebviewWindow) {
     // `position_overlay` and the report for what actually controls
     // placement there (a compositor-side window rule, Task 6's territory).
     let _ = window.set_position(PhysicalPosition::new(x, y));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_focused_overlay_hijacks_injection_only_at_the_injecting_event() {
+        // Invariant 2's failure mode on GNOME/Mutter: no layer-shell, so the
+        // overlay toplevel takes keyboard focus and a focus-following
+        // injector (ydotool via uinput, wtype alike) types the transcript
+        // into the overlay itself. The moment that matters is Injecting.
+        assert!(overlay_hijacks_injection(&OverlayEvent::Injecting, true));
+        assert!(!overlay_hijacks_injection(&OverlayEvent::Injecting, false));
+        assert!(!overlay_hijacks_injection(&OverlayEvent::Idle, true));
+        assert!(!overlay_hijacks_injection(
+            &OverlayEvent::Error { reason: "x".to_string() },
+            true
+        ));
+    }
 }
