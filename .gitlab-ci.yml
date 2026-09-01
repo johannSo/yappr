@@ -70,6 +70,19 @@ build-appimage:
     # window) and runs `bun run build` as beforeBuildCommand.
     - bun install --frozen-lockfile
     - bun run tauri build --bundles appimage
+    # The linuxdeploy build Tauri pins (1-alpha) symlinks the AppDir root icon
+    # to whichever hicolor size it happens to list first — 32x32 in practice —
+    # and that root icon/.DirIcon is what desktop integrators (Gear Lever,
+    # appimaged) extract for the app menu. Repack with the 256x256 at the
+    # root, per the AppImage spec's .DirIcon recommendation.
+    - bash scripts/fix-appimage-icon.sh target/release/bundle/appimage/*.AppImage
+    # linuxdeploy-plugin-gtk forces GDK_BACKEND=x11 (killing layer-shell, so
+    # the overlay loses its protocol-level focus refusal) and bundles this
+    # distro's libwayland, which breaks the host mesa's EGL vendor load on
+    # any rolling-release host ("Could not create default EGL display").
+    # Repack defaulting to the Wayland backend with libwayland dropped —
+    # see the script header for the full verified diagnosis.
+    - bash scripts/fix-appimage-wayland.sh target/release/bundle/appimage/*.AppImage
     - ls -lh target/release/bundle/appimage/
     # --- attach to the release ----------------------------------------------
     # Not `glab release upload`: that calls POST /projects/:id/uploads, which
