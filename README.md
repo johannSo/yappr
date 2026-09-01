@@ -4,7 +4,7 @@
 
 # yappr
 
-**Local dictation for Wayland.** Press `SUPER+D`, speak, press `SUPER+D` again —
+**Local dictation.** Press a button, speak, press again —
 what you said is typed into whatever window has focus, punctuated and tidied up.
 No cloud, no account, no network calls while you dictate.
 
@@ -353,22 +353,3 @@ On an i7-10510U (4 threads), release build:
 
 A typical ~10 s dictation, warm, is roughly **2 seconds** from the second press to text
 appearing.
-
-## Known limitations
-
-Found during development, not yet fixed — worth knowing before relying on this:
-
-- **Short utterances are effectively unguarded.** Below `guardrail.short_input_words`
-  raw words (4 by default), the ratio and overlap checks are skipped, so a short rewrite
-  that inverts what you said could be typed verbatim. Longer dictations are checked
-  normally.
-- **Dense digit sequences fall back to raw ASR text.** Dictating a phone number as
-  separate digits normalizes to far fewer tokens ("555-1234"), which trips
-  `min_word_ratio` before the (faithful) rewrite is ever checked for overlap. Safe, but
-  not the cleaned-up form you'd expect.
-- **Nothing physically ends a recording.** A missed second press keeps the microphone
-  open until `audio.max_seconds`; the only warning before then is on screen. That's the
-  price of press/press instead of hold-to-talk.
-
-Both of the first two await guardrail threshold tuning against real `rejections.jsonl`
-data.
