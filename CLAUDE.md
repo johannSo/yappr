@@ -189,24 +189,37 @@ happen to be resident.
    or being rejected by the guardrail all fall back to the raw transcript (or a rule-based
    cleanup of it). See `pipeline.rs`'s module doc and spec §15. Never add a path that can
    lose a transcribed utterance.
-2. **The overlay must never take keyboard focus** — a focused overlay means `wtype` types
-   the dictation into the overlay instead of the target window. Enforced twice, on two
-   mechanisms that both apply unconditionally, not chosen between at runtime:
+2. **The overlay must never take keyboard focus** — a focused overlay means the injector
+   (`wtype` and `ydotool` alike — both follow keyboard focus) types the dictation into
+   the overlay instead of the target window. Enforcement is per-compositor, and only the
+   layer-shell mechanism is airtight:
    - The **overlay** always carries Tauri's `focus: false` / `focusable: false`
-     (`tauri.conf.json`), regardless of compositor. The settings window is
+     (`tauri.conf.json`) — but know what that buys: it reaches GTK's `accept_focus`, an
+     **X11 mechanism that is inert on Wayland** (xdg_shell gives a toplevel no way to
+     refuse focus). It protects X11/XWayland only. The settings window is
      `focus: true` / `focusable: true` and must stay that way -- it hosts a
      form and the setup wizard, neither of which could take a keystroke
      otherwise. That asymmetry is why the fallback rule below matches title.
    - On a compositor implementing `wlr-layer-shell` (every wlroots compositor, including
-     Hyprland; not Mutter), `src-tauri/src/layer.rs`'s `anchor_overlay` additionally puts
+     Hyprland; not Mutter), `src-tauri/src/layer.rs`'s `anchor_overlay` puts
      the overlay on a layer-shell surface with `KeyboardMode::None` — focus refused at the
-     protocol level, no compositor window rule involved.
-   - Where layer-shell is unavailable (GNOME/Mutter, or `anchor_overlay` failing for any
-     other reason), `hypr.rs`'s emitted window rule is the fallback — now keyed on the
+     protocol level, no compositor window rule involved. This is the real protection on
+     Wayland.
+   - On Hyprland, `hypr.rs`'s emitted window rule is belt-and-braces — keyed on the
      overlay's **title** (`"yappr overlay"`), not its class. The settings window
      became a window of this same app, so a class-matched rule would reach it too and it
      could no longer take a keystroke — exactly the regression the previous two-Tauri-app
      split existed to avoid, now fixed by matching title instead.
+   - Where layer-shell is unavailable (GNOME/Mutter, or `anchor_overlay` failing for any
+     other reason), **none of the above holds** — verified on Fedora/GNOME: Mutter
+     focuses the overlay when it maps, and the whole dictation was typed into the HUD.
+     The enforcement there is at injection time instead:
+     `TauriSink::hide_overlay_if_it_hijacks_injection` (`src-tauri/src/lib.rs`) checks
+     `is_focused()` on the `Injecting` broadcast, hides a focused overlay natively, and
+     blocks the pipeline thread `FOCUS_RETURN_DELAY` (300 ms) so the compositor returns
+     focus to the target before the injector spawns. `Overlay.tsx`'s `injecting` case
+     deliberately never calls `showOnce()` and resets its `visible` ref to match — do
+     not "fix" either back.
 3. **`OverlayEvent` exists in two hand-maintained copies**: `yappr-core/src/proto.rs` (source
    of truth) and the TS union in `src/Overlay.tsx`. `src-tauri/src/wire.rs`'s separate
    mirror is gone — the overlay now links `yappr-core` directly (same process as the server),
@@ -430,6 +443,39 @@ happen to be resident.
   matching warning about keeping compile flags identical across two runs — is no longer
   necessary. `NO_STRIP=1` was not previously documented and is the likelier cause if a
   build fails today with the shadow `.pc` already in place.
+- **An AppImage built directly on this (Arch) machine runs on rolling-release hosts
+  only — a portable one is built in the `yappr-build` distrobox.** glibc is backwards-
+  but never forwards-compatible, so a binary linked against Arch's glibc demands symbol
+  versions Fedora/Debian/Ubuntu don't have yet; the release CI builds in `ubuntu:22.04`
+  (glibc 2.35, the oldest base that still ships webkit2gtk-4.1 — Tauri's own
+  recommendation) for exactly this reason. The local equivalent is a distrobox on the
+  same image (docker backend), sharing `$HOME`, so the host's rustup toolchain and
+  mise-installed bun are used as-is:
+
+  ```bash
+  distrobox create --yes --name yappr-build --image ubuntu:22.04
+  distrobox enter yappr-build -- sudo apt-get install -y --no-install-recommends \
+      build-essential pkg-config cmake clang libclang-dev curl wget ca-certificates \
+      git file unzip xz-utils xdg-utils libwebkit2gtk-4.1-dev libgtk-3-dev \
+      libgtk-layer-shell-dev librsvg2-dev libssl-dev libxdo-dev \
+      libayatana-appindicator3-dev libasound2-dev     # same list as .gitlab-ci.yml
+  distrobox enter yappr-build -- sh -c 'cd ~/Work/JS_TS/OpenWhisprFlow \
+      && export PATH="$HOME/.cargo/bin:$HOME/.local/share/mise/installs/bun/latest/bin:$PATH" \
+      && CARGO_TARGET_DIR=$PWD/target-portable NO_STRIP=1 APPIMAGE_EXTRACT_AND_RUN=1 \
+         bun run tauri build --bundles appimage'
+  # then, on the HOST, both fix scripts against
+  # target-portable/release/bundle/appimage/*.AppImage
+  ```
+
+  Three things in there are load-bearing. `CARGO_TARGET_DIR=target-portable`: cargo does
+  not fingerprint the C/C++ toolchain, so sharing `target/` with host builds silently
+  reuses Arch-compiled llama.cpp/sherpa-onnx objects and produces a "portable" binary
+  that still needs Arch's glibc. `APPIMAGE_EXTRACT_AND_RUN=1`: no FUSE inside the
+  container, same as CI. `NO_STRIP=1`: as documented below. The gdk-pixbuf `.pc` shadow
+  hack is NOT needed in the box — that breakage is Arch-specific; Ubuntu 22.04's `.pc`
+  still tells the truth. Verified 2026-09-01: worst symbol requirement across every
+  bundled ELF is `GLIBC_2.35` (check: extract the AppImage, `objdump -T` everything,
+  grep `GLIBC_[0-9.]+`, `sort -uV`).
 - **A freshly built AppImage has a 32×32 root icon; run `scripts/fix-appimage-icon.sh`
   on it after every build.** The linuxdeploy build Tauri pins (1-alpha, 659c9db) has no
   icon size preference: it overwrites the root `yappr.png` Tauri placed (the 512×512)

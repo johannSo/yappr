@@ -25,3 +25,6 @@ dist-ssr
 
 # Rust
 /target
+# the yappr-build distrobox's separate cargo target dir — see CLAUDE.md's
+# portable-AppImage gotcha for why it must not share /target
+/target-portable
