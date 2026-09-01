@@ -430,6 +430,15 @@ happen to be resident.
   matching warning about keeping compile flags identical across two runs — is no longer
   necessary. `NO_STRIP=1` was not previously documented and is the likelier cause if a
   build fails today with the shadow `.pc` already in place.
+- **A freshly built AppImage has a 32×32 root icon; run `scripts/fix-appimage-icon.sh`
+  on it after every build.** The linuxdeploy build Tauri pins (1-alpha, 659c9db) has no
+  icon size preference: it overwrites the root `yappr.png` Tauri placed (the 512×512)
+  with a symlink to the first hicolor icon it lists — the 32×32 — and `.DirIcon` points
+  there. That root icon is what desktop integrators (Gear Lever, appimaged) extract for
+  the app menu, so without the fix every user gets a 32 px menu icon scaled up. The
+  script repacks the AppImage in place with the 256×256 at the root (the AppImage spec's
+  recommended `.DirIcon` size), reusing the original runtime; verified 2026-09-01. The
+  release CI runs it after `tauri build` — a locally built AppImage needs it run by hand.
 - **Do not trust `cpal`'s advertised sample-rate range.** It advertised 16 kHz on hardware
   that rejected the stream build; `capture.rs` now probes by building a throwaway stream and
   falls back to 48 kHz plus `rubato` resampling.
