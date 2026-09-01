@@ -145,18 +145,145 @@ fn run_typer(
     argv: Vec<String>,
     timeout: Duration,
 ) -> Result<(), InjectError> {
+    tracing::debug!(backend, ?argv, ?timeout, "spawning injection backend");
     let mut cmd = Command::new(backend);
-    cmd.args(argv);
-    let out = procutil::run_with_timeout(cmd, timeout, None)
-        .map_err(|e| map_proc_error(backend, timeout, e))?;
-    if !out.status.success() {
-        return Err(InjectError::Failed {
+    cmd.args(&argv);
+    let started = std::time::Instant::now();
+    let out = procutil::run_with_timeout(cmd, timeout, None).map_err(|e| {
+        let mapped = map_proc_error(backend, timeout, e);
+        tracing::warn!(
             backend,
-            status: out.status.to_string(),
-            stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
-        });
+            ?argv,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            error = %mapped,
+            "injection backend did not run"
+        );
+        mapped
+    })?;
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if !out.status.success() {
+        // `ExitStatus`'s Display spells out death-by-signal, so a SIGSEGV in
+        // the backend is distinguishable from a nonzero exit in the log.
+        tracing::warn!(
+            backend,
+            ?argv,
+            status = %out.status,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            stdout = %stdout,
+            stderr = %stderr,
+            "injection backend failed"
+        );
+        return Err(InjectError::Failed { backend, status: out.status.to_string(), stderr });
     }
+    if !stdout.is_empty() || !stderr.is_empty() {
+        // ydotool in particular prints notices to stderr while still exiting
+        // 0 (e.g. socket-permission grumbles) -- that is real diagnostic
+        // signal, not noise, so it is surfaced at info rather than debug.
+        tracing::info!(backend, stdout = %stdout, stderr = %stderr,
+            "injection backend succeeded but printed output");
+    }
+    tracing::debug!(
+        backend,
+        status = %out.status,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "injection backend succeeded"
+    );
     Ok(())
+}
+
+/// One `path`'s existence, permissions and ownership, for
+/// [`ydotool_env_report_at`] -- the three fields that decide whether the
+/// ydotool client (this uid) may open a socket / device node.
+fn stat_line(path: &std::path::Path) -> String {
+    use std::os::unix::fs::MetadataExt as _;
+    match std::fs::symlink_metadata(path) {
+        Ok(m) => {
+            format!("exists, mode {:04o}, uid {}, gid {}", m.mode() & 0o7777, m.uid(), m.gid())
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => "missing".to_string(),
+        Err(e) => format!("stat failed: {e}"),
+    }
+}
+
+/// Scans `proc_dir` (i.e. `/proc`) for a process whose `comm` is `name`.
+/// Reading `/proc` directly instead of shelling out to `pgrep` keeps the
+/// probe subprocess-free -- nothing here can hang, so I3 needs no timeout.
+fn find_process(proc_dir: &std::path::Path, name: &str) -> Option<u32> {
+    let entries = std::fs::read_dir(proc_dir).ok()?;
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else { continue };
+        let Ok(comm) = std::fs::read_to_string(entry.path().join("comm")) else { continue };
+        if comm.trim() == name {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+/// The testable core of [`ydotool_env_report`]: every input the report
+/// depends on is a parameter, so tests can fabricate a socket, a uinput
+/// node, a `/proc` table and a `$PATH` in a scratch directory.
+fn ydotool_env_report_at(
+    socket_env: Option<&str>,
+    xdg_runtime_dir: Option<&str>,
+    uinput_path: &std::path::Path,
+    proc_dir: &std::path::Path,
+    path_env: Option<&str>,
+) -> String {
+    let mut lines = Vec::new();
+    match socket_env {
+        Some(v) => {
+            lines.push(format!("YDOTOOL_SOCKET={v}: {}", stat_line(std::path::Path::new(v))))
+        }
+        None => {
+            // Which default the client uses varies by ydotool version
+            // ($XDG_RUNTIME_DIR/.ydotool_socket on current builds,
+            // /tmp/.ydotool_socket on older ones), so report both.
+            lines.push("YDOTOOL_SOCKET unset; default socket candidates:".to_string());
+            let mut candidates = Vec::new();
+            if let Some(xdg) = xdg_runtime_dir {
+                candidates.push(std::path::PathBuf::from(xdg).join(".ydotool_socket"));
+            }
+            candidates.push(std::path::PathBuf::from("/tmp/.ydotool_socket"));
+            for c in candidates {
+                lines.push(format!("  {}: {}", c.display(), stat_line(&c)));
+            }
+        }
+    }
+    lines.push(format!("uinput device {}: {}", uinput_path.display(), stat_line(uinput_path)));
+    lines.push(match find_process(proc_dir, "ydotoold") {
+        Some(pid) => format!("ydotoold: running (pid {pid})"),
+        None => "ydotoold: not found in the process table".to_string(),
+    });
+    let binary = path_env.and_then(|p| {
+        std::env::split_paths(p).map(|d| d.join("ydotool")).find(|c| {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::metadata(c)
+                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        })
+    });
+    lines.push(match binary {
+        Some(b) => format!("ydotool binary: {}", b.display()),
+        None => "ydotool binary: not found on PATH".to_string(),
+    });
+    lines.join("\n")
+}
+
+/// Fingerprints the three classic ydotool failure modes -- no `ydotoold`
+/// running, a socket the client may not open, `/dev/uinput` the daemon may
+/// not open -- from the live environment. Called (and logged) only when a
+/// ydotool injection has just failed; every probe is a read-only stat or
+/// `/proc` read, never a subprocess.
+pub(crate) fn ydotool_env_report() -> String {
+    ydotool_env_report_at(
+        std::env::var("YDOTOOL_SOCKET").ok().as_deref(),
+        std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
+        std::path::Path::new("/dev/uinput"),
+        std::path::Path::new("/proc"),
+        std::env::var("PATH").ok().as_deref(),
+    )
 }
 
 pub struct ClipboardInjector;
@@ -206,6 +333,13 @@ impl MockInjector {
     /// or the fallback had actually run.
     pub fn named(name: &'static str) -> Self {
         Self { calls: Mutex::new(Vec::new()), fail: false, name: Some(name) }
+    }
+
+    /// A failing mock that reports `name` -- for tests that need a failure
+    /// attributed to a specific backend (e.g. the ydotool environment
+    /// report, which keys on the failing primary's name).
+    pub fn failing_named(name: &'static str) -> Self {
+        Self { calls: Mutex::new(Vec::new()), fail: true, name: Some(name) }
     }
 
     pub fn injected(&self) -> Vec<String> {
@@ -262,6 +396,21 @@ fn write_recovery_file_inner(state_dir: &std::path::Path, text: &str) -> std::io
     writeln!(f, "[{ts}] {text}")
 }
 
+/// What [`inject_with_recovery`] actually did: which backend carried the
+/// text, and -- when that was the fallback -- why the primary failed and (for
+/// ydotool) what its environment looked like at that moment. The failure
+/// detail exists so the per-utterance debug record can answer "why did this
+/// machine fall back?" after the fact, instead of only the daemon log.
+#[derive(Debug)]
+pub(crate) struct InjectOutcome {
+    pub backend: &'static str,
+    pub primary_backend: &'static str,
+    /// `Some` iff the fallback ran.
+    pub primary_error: Option<String>,
+    /// `Some` iff the failing primary was ydotool -- see [`ydotool_env_report`].
+    pub env_report: Option<String>,
+}
+
 /// Injects via `primary`; on failure copies to the clipboard and notifies.
 ///
 /// A transcript is never silently lost — see spec 10.4. If the clipboard
@@ -272,6 +421,7 @@ pub fn inject_with_fallback(
     text: &str,
 ) -> anyhow::Result<&'static str> {
     inject_with_recovery(primary, &ClipboardInjector, text, &paths::state_dir())
+        .map(|out| out.backend)
 }
 
 /// The testable core of [`inject_with_fallback`]: the clipboard fallback and
@@ -290,18 +440,38 @@ pub(crate) fn inject_with_recovery(
     fallback: &dyn TextInjector,
     text: &str,
     state_dir: &std::path::Path,
-) -> anyhow::Result<&'static str> {
+) -> anyhow::Result<InjectOutcome> {
     match primary.inject(text) {
-        Ok(()) => Ok(primary.name()),
+        Ok(()) => Ok(InjectOutcome {
+            backend: primary.name(),
+            primary_backend: primary.name(),
+            primary_error: None,
+            env_report: None,
+        }),
         Err(primary_err) => {
-            tracing::warn!(error = %primary_err, "primary injector failed; falling back to clipboard");
+            tracing::warn!(error = %primary_err, backend = primary.name(),
+                "primary injector failed; falling back to clipboard");
+            // Fingerprint the environment the moment ydotool fails: whether
+            // ydotoold runs, and who may open the socket and /dev/uinput --
+            // the questions that separate "works on this distro" from
+            // "fails on that one".
+            let env_report = (primary.name() == "ydotool").then(|| {
+                let report = ydotool_env_report();
+                tracing::warn!("ydotool environment at time of failure:\n{report}");
+                report
+            });
             match fallback.inject(text) {
                 Ok(()) => {
                     procutil::notify_send(
                         "yappr",
                         "Typing failed — transcript copied to clipboard",
                     );
-                    Ok(fallback.name())
+                    Ok(InjectOutcome {
+                        backend: fallback.name(),
+                        primary_backend: primary.name(),
+                        primary_error: Some(primary_err.to_string()),
+                        env_report,
+                    })
                 }
                 Err(fallback_err) => {
                     // Spec 10.4: once transcribed, the user gets the text --
@@ -433,6 +603,191 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_primary_records_its_error_and_the_fallback_backend_in_the_outcome() {
+        let dir = scratch_dir("outcome-error");
+        let primary = MockInjector::failing();
+        let fallback = MockInjector::named("fallback-mock");
+
+        let out = inject_with_recovery(&primary, &fallback, "hello", &dir).unwrap();
+        assert_eq!(out.backend, "fallback-mock");
+        assert_eq!(out.primary_backend, "mock");
+        let err = out.primary_error.expect("must record why the primary failed");
+        assert!(err.contains("mock"), "the error should name its cause, got: {err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_successful_primary_leaves_no_failure_detail_in_the_outcome() {
+        let dir = scratch_dir("outcome-clean");
+        let primary = MockInjector::default();
+        let fallback = MockInjector::named("fallback-mock");
+
+        let out = inject_with_recovery(&primary, &fallback, "hello", &dir).unwrap();
+        assert_eq!(out.backend, "mock");
+        assert_eq!(out.primary_backend, "mock");
+        assert!(out.primary_error.is_none());
+        assert!(out.env_report.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_env_report_is_attached_only_when_the_failing_primary_is_ydotool() {
+        let dir = scratch_dir("outcome-env");
+        let fallback = MockInjector::named("fallback-mock");
+
+        let ydotool_like = MockInjector::failing_named("ydotool");
+        let out = inject_with_recovery(&ydotool_like, &fallback, "hello", &dir).unwrap();
+        let report = out.env_report.expect("a ydotool failure must carry the environment report");
+        assert!(report.contains("ydotoold"), "got: {report}");
+
+        let wtype_like = MockInjector::failing_named("wtype");
+        let out = inject_with_recovery(&wtype_like, &fallback, "hello", &dir).unwrap();
+        assert!(
+            out.env_report.is_none(),
+            "wtype needs no ydotoold/uinput diagnosis; the report is ydotool-specific"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn env_report_shows_the_socket_env_value_and_whether_that_socket_exists() {
+        let dir = scratch_dir("env-sock");
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("custom.sock");
+        let sock_str = sock.to_str().unwrap();
+
+        let report = ydotool_env_report_at(
+            Some(sock_str),
+            None,
+            &dir.join("no-uinput"),
+            &dir.join("no-proc"),
+            None,
+        );
+        assert!(report.contains("YDOTOOL_SOCKET"), "got: {report}");
+        assert!(report.contains(sock_str), "got: {report}");
+        assert!(report.contains("missing"), "an absent socket must be called out, got: {report}");
+
+        std::fs::write(&sock, b"").unwrap();
+        let report = ydotool_env_report_at(
+            Some(sock_str),
+            None,
+            &dir.join("no-uinput"),
+            &dir.join("no-proc"),
+            None,
+        );
+        assert!(
+            report.contains("mode"),
+            "an existing socket must report its permissions, got: {report}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn env_report_names_the_default_socket_candidates_when_the_env_var_is_unset() {
+        let dir = scratch_dir("env-sock-unset");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let report = ydotool_env_report_at(
+            None,
+            Some("/run/user/12345"),
+            &dir.join("no-uinput"),
+            &dir.join("no-proc"),
+            None,
+        );
+        assert!(report.contains("unset"), "got: {report}");
+        assert!(report.contains("/run/user/12345/.ydotool_socket"), "got: {report}");
+        assert!(report.contains("/tmp/.ydotool_socket"), "got: {report}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn env_report_reports_uinput_permissions_or_its_absence() {
+        let dir = scratch_dir("env-uinput");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let missing = ydotool_env_report_at(
+            None,
+            None,
+            &dir.join("no-uinput"),
+            &dir.join("no-proc"),
+            None,
+        );
+        assert!(missing.contains("uinput"), "got: {missing}");
+        assert!(missing.contains("missing"), "got: {missing}");
+
+        let uinput = dir.join("uinput");
+        std::fs::write(&uinput, b"").unwrap();
+        let present = ydotool_env_report_at(None, None, &uinput, &dir.join("no-proc"), None);
+        assert!(
+            present.contains("mode"),
+            "an existing uinput must report its permissions, got: {present}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn env_report_finds_a_running_ydotoold_in_the_proc_table() {
+        let dir = scratch_dir("env-proc");
+        let proc_dir = dir.join("proc");
+        std::fs::create_dir_all(proc_dir.join("1234")).unwrap();
+        std::fs::write(proc_dir.join("1234").join("comm"), "ydotoold\n").unwrap();
+        std::fs::create_dir_all(proc_dir.join("99")).unwrap();
+        std::fs::write(proc_dir.join("99").join("comm"), "bash\n").unwrap();
+
+        let report =
+            ydotool_env_report_at(None, None, &dir.join("no-uinput"), &proc_dir, None);
+        assert!(report.contains("ydotoold: running (pid 1234)"), "got: {report}");
+
+        let empty_proc = dir.join("empty-proc");
+        std::fs::create_dir_all(&empty_proc).unwrap();
+        let report =
+            ydotool_env_report_at(None, None, &dir.join("no-uinput"), &empty_proc, None);
+        assert!(report.contains("ydotoold: not found"), "got: {report}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn env_report_resolves_the_ydotool_binary_from_path() {
+        let dir = scratch_dir("env-bin");
+        let bin_dir = dir.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let exe = bin_dir.join("ydotool");
+        std::fs::write(&exe, b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let report = ydotool_env_report_at(
+            None,
+            None,
+            &dir.join("no-uinput"),
+            &dir.join("no-proc"),
+            Some(bin_dir.to_str().unwrap()),
+        );
+        assert!(report.contains(exe.to_str().unwrap()), "got: {report}");
+
+        let report = ydotool_env_report_at(
+            None,
+            None,
+            &dir.join("no-uinput"),
+            &dir.join("no-proc"),
+            Some(dir.join("empty-bin").to_str().unwrap()),
+        );
+        assert!(report.contains("not found on PATH"), "got: {report}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_working_fallback_never_touches_the_recovery_file() {
         let dir = scratch_dir("no-recovery");
         let primary = MockInjector::failing();
@@ -442,8 +797,8 @@ mod tests {
         // one ran).
         let fallback = MockInjector::named("fallback-mock");
 
-        let backend = inject_with_recovery(&primary, &fallback, "hello", &dir).unwrap();
-        assert_eq!(backend, "fallback-mock", "must report that the fallback, not the primary, ran");
+        let out = inject_with_recovery(&primary, &fallback, "hello", &dir).unwrap();
+        assert_eq!(out.backend, "fallback-mock", "must report that the fallback, not the primary, ran");
         assert_eq!(fallback.injected(), vec!["hello".to_string()]);
         assert!(!dir.join("unsent.txt").exists());
 

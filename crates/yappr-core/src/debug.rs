@@ -174,10 +174,24 @@ impl GuardrailDebug {
 }
 
 /// The injector backend used, and exactly what it was handed.
+///
+/// The three optional fields exist only on records where the primary
+/// injector failed and the fallback carried the text: which backend failed,
+/// what it said, and (ydotool only) what its environment looked like at
+/// that moment. `#[serde(default)]` for the same reason `vocab` has it --
+/// `--debug` reads whatever record is newest on disk, which may predate
+/// these fields; `skip_serializing_if` keeps happy-path records free of
+/// three `null`s.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InjectDebug {
     pub backend: String,
     pub final_text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_report: Option<String>,
 }
 
 /// One utterance's full diagnostic record, written as
@@ -486,6 +500,9 @@ mod tests {
             inject: Some(InjectDebug {
                 backend: "wtype".to_string(),
                 final_text: "Hello there. ".to_string(),
+                primary_backend: None,
+                primary_error: None,
+                env_report: None,
             }),
             timings: Timings { vad_ms: 1, asr_ms: 2, normalize_ms: 3, inject_ms: 4 },
         };
@@ -502,6 +519,18 @@ mod tests {
         assert_eq!(round_tripped.ts, record.ts);
         assert_eq!(round_tripped.asr_raw, record.asr_raw);
         assert_eq!(round_tripped.timings.asr_ms, 2);
+    }
+
+    #[test]
+    fn inject_debug_written_before_the_failure_fields_existed_still_deserializes() {
+        // Records on disk predate primary_error/env_report -- `--debug` reads
+        // whatever is newest, which may be an old record.
+        let json = r#"{"backend":"clipboard","final_text":"Hallo. "}"#;
+        let d: InjectDebug = serde_json::from_str(json).unwrap();
+        assert_eq!(d.backend, "clipboard");
+        assert!(d.primary_backend.is_none());
+        assert!(d.primary_error.is_none());
+        assert!(d.env_report.is_none());
     }
 
     #[test]
@@ -564,6 +593,9 @@ mod tests {
                 inject: Some(InjectDebug {
                     backend: "mock".to_string(),
                     final_text: "Hi. ".to_string(),
+                    primary_backend: None,
+                    primary_error: None,
+                    env_report: None,
                 }),
                 timings: Timings::default(),
             },

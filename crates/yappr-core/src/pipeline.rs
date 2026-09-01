@@ -423,14 +423,26 @@ impl Pipeline {
             sink(OverlayEvent::Injecting);
         }
         let t = Instant::now();
-        let backend = inject::inject_with_recovery(
+        let outcome = inject::inject_with_recovery(
             self.injector.as_ref(),
             self.fallback_injector.as_ref(),
             &text,
             &self.recovery_dir(),
         )?; // dbg drops here if both injectors fail: writes a record with everything up to (not including) injection -- the gap review flagged.
         dbg.timings.inject_ms = t.elapsed().as_millis();
-        dbg.inject = Some(debug::InjectDebug { backend: backend.to_string(), final_text: text.clone() });
+        let backend = outcome.backend;
+        dbg.inject = Some(debug::InjectDebug {
+            backend: backend.to_string(),
+            final_text: text.clone(),
+            // Failure detail only when the fallback actually ran: on the
+            // happy path primary_backend would just repeat `backend`.
+            primary_backend: outcome
+                .primary_error
+                .is_some()
+                .then(|| outcome.primary_backend.to_string()),
+            primary_error: outcome.primary_error,
+            env_report: outcome.env_report,
+        });
 
         tracing::info!(
             timings = ?dbg.timings,

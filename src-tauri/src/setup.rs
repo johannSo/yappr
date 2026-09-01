@@ -93,7 +93,21 @@ fn print_debug_summary(
     }
 
     match &record.inject {
-        Some(i) => println!("  final text ({}): {:?}", i.backend, i.final_text),
+        Some(i) => {
+            println!("  final text ({}): {:?}", i.backend, i.final_text);
+            if let Some(err) = &i.primary_error {
+                println!(
+                    "  primary injector {} failed: {err}",
+                    i.primary_backend.as_deref().unwrap_or("?"),
+                );
+            }
+            if let Some(report) = &i.env_report {
+                println!("  ydotool environment at time of failure:");
+                for line in report.lines() {
+                    println!("    {line}");
+                }
+            }
+        }
         None => println!("  final text: (nothing was injected)"),
     }
 

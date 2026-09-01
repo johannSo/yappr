@@ -358,6 +358,35 @@ fn debug_record_is_written_when_both_injectors_fail() {
 }
 
 #[test]
+fn debug_record_captures_why_the_primary_injector_failed_when_the_fallback_carried_the_text() {
+    let dir = scratch_debug_dir("primary-fails-fallback-carries");
+    let p = Pipeline::new(
+        debug_config(&dir, false),
+        Box::new(FixedAsr("send the invoice on friday".into())),
+        Box::new(WholeBuffer),
+        Box::new(AlwaysEnglish),
+        Box::new(FixedNormalizer("Send the invoice on Friday.".into())),
+        Box::new(MockInjector::failing()),
+    )
+    .with_fallback_injector(Box::new(MockInjector::named("fallback-mock")));
+
+    let outcome = p.process(&samples(), None).unwrap().expect("speech was found");
+    assert_eq!(outcome.backend, "fallback-mock");
+
+    let logs_dir = dir.join("logs");
+    let json_path = yappr_core::debug::latest_record_path(&logs_dir).unwrap();
+    let record: yappr_core::debug::DebugRecord =
+        serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
+    let inject = record.inject.expect("injection ran");
+    assert_eq!(inject.backend, "fallback-mock");
+    assert_eq!(inject.primary_backend.as_deref(), Some("mock"));
+    let err = inject.primary_error.expect("the record must say why the primary failed");
+    assert!(err.contains("mock"), "got: {err}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_good_cleanup_is_injected() {
     let injector = MockInjector::default();
     let p = Pipeline::new(
