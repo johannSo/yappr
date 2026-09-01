@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="public/yappr.png" alt="yappr logo" width="128" height="128">
+
 # yappr
 
 **Local dictation for Wayland.** Press `SUPER+D`, speak, press `SUPER+D` again —
