@@ -206,10 +206,10 @@ panes: **Allgemein**, **Sprache**, **Stil**, **Erweitert**, **Diagnose**. There'
 search box; it matches German labels, help text, *and* the raw `config.toml` key names.
 
 There is no Save button. Toggles and dropdowns save immediately, text and number fields
-700 ms after you stop typing. Saving rewrites `config.toml` in place: your comments and
-formatting survive, a save that changes nothing leaves the file byte-identical, and a
-config that wouldn't load is rejected before anything is written. Every row has a reset
-button that appears only when the value isn't the default.
+700 ms after you stop typing. Saving rewrites `config.toml` from scratch; a save that
+changes nothing leaves the file byte-identical, and a config that wouldn't load is
+rejected before anything is written. Every row has a reset button that appears only when
+the value isn't the default.
 
 **`[asr]` and `[normalize]` changes need a restart** (`yappr --quit`, then launch
 again); the window says so on those rows. Everything else — the microphone included —
@@ -217,8 +217,16 @@ applies at your next dictation, or immediately with `yappr --reload`.
 
 ## config.toml
 
-Lives at `~/.config/yappr/config.toml`, created with commented defaults on first run.
-You can edit it by hand; the GUI is careful not to trample it.
+Lives at `~/.local/state/yappr/config.toml`, written on first run.
+
+**This file belongs to the app.** The settings window is how you change things; the file
+is generated from scratch on every save, so anything you type into it is overwritten the
+next time you touch a setting — comments included. It is documented here because it is
+useful to read (in a bug report, say), not because it is meant to be edited.
+
+If you used yappr before 2026-09-02 your settings are moved across automatically on the
+first start, and the old `~/.config/yappr/config.toml` is left behind as
+`config.toml.migrated`.
 
 | Section | What's in it |
 |---|---|
@@ -233,12 +241,20 @@ You can edit it by hand; the GUI is careful not to trample it.
 | `[debug]` | `enabled` (off), `dir` (default `~/yappr`), `save_audio` — see [Troubleshooting](#troubleshooting) |
 | `[overlay]` | `position`, `width`, `height` — read, but inert: under Wayland a window can't place itself, so this changes nothing today |
 
-> **Unknown keys are a hard error.** Every section is `deny_unknown_fields`: a typo'd
-> key stops the app from starting rather than being silently ignored.
+> **A config that won't load is moved aside, not ignored.** Every section is
+> `deny_unknown_fields`, so an unrecognised key is still caught rather than silently
+> dropped — but instead of stopping the app it renames the file to
+> `config.toml.broken-<timestamp>`, starts on defaults, and tells you so in the settings
+> window, naming the file it moved. The app has to keep starting: the settings window
+> lives in the same process, so a config that stopped it would take the only tool for
+> fixing it down too.
 
 `yappr --reload` re-validates the file against the running app and applies every
 reloadable section live. It refuses outright — rather than half-applying — if you
-changed `[asr]` or `[normalize]`.
+changed `[asr]` or `[normalize]`, and it reports a file it cannot read rather than
+resetting it, which is the one place the app will not quietly replace your config.
+Settings saved from the window already apply live; `--reload` is for a config that
+changed some other way, such as one restored from a backup.
 
 ### Pasting with `ydotool`
 

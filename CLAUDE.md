@@ -22,7 +22,8 @@ no `owf-ctl`, no separate daemon binary, and no systemd unit.
 
 The app was called **OpenWhisprFlow** until 2026-08-29, and the rename reached the
 binary, the crate (`owf-core` → `yappr-core`), the Tauri identifier, and the whole
-XDG namespace (`~/.config/yappr`, `~/.local/share/yappr/models`, `yappr.sock`,
+XDG namespace (`~/.config/yappr`, which the config file has since left for
+`~/.local/state/yappr` — see invariant 9; `~/.local/share/yappr/models`, `yappr.sock`,
 `~/yappr` for debug capture). Two places deliberately still say `openwhisprflow`,
 and both are correct: the design docs and SDD logs described below, which are dated
 records of what was decided under the old name, and the migration text in `hypr.rs`
@@ -231,9 +232,24 @@ happen to be resident.
    `src-tauri/fixtures/replay-full.ndjson` — two tests cross-check drift mechanically
    (`the_overlay_replay_fixture_parses_as_this_crates_overlay_event` in `proto.rs`,
    `checked_in_fixture_covers_every_event_kind` in `replay.rs`).
-4. **Config uses `#[serde(deny_unknown_fields)]` everywhere**, so an unrecognised key or
-   section is a hard startup failure. Documenting a `config.toml` section without
-   adding the matching struct bricks boot — that is what `OverlayConfig` exists to prevent.
+4. **Config uses `#[serde(deny_unknown_fields)]` everywhere, and an unrecognised key
+   is quarantined rather than fatal.** Documenting a `config.toml` section without
+   adding the matching struct still costs the user their settings — that is what
+   `OverlayConfig` exists to prevent — but it no longer bricks boot.
+   `config::load_or_quarantine` is used by `server::start` and by nothing else: it
+   renames the unreadable file to `config.toml.broken-<unix seconds>`, writes a fresh
+   default, and hands the reason back so `Status` and `GetConfig` can report it as
+   `Response::config_notice` and the settings window can show it. Two bad starts in
+   the same second get distinct names; that file is the user's only copy.
+   Every *other* `Config::load_from` caller — `Reload`, `GetConfig`, `SetConfig`,
+   `ensure_models_loaded`, `setup.rs`, `wizard.rs` — stays strict on purpose. They
+   have a user who asked and a socket to answer on, and a `Reload` that silently reset
+   someone's settings would be the worst possible reading of "never fail"
+   (`reload_reports_a_broken_config_instead_of_quarantining_it`).
+   Why this changed: `server::start` `?`d on the load and `setup()` calls it, so one
+   typo meant no tray and no settings window — leaving a text editor as the only
+   repair tool for the one file the app has stopped inviting anyone to edit. See
+   `docs/superpowers/specs/2026-09-02-app-owned-config-design.md`.
 5. **Client-side window positioning is a no-op under Hyprland's `xdg_shell` — superseded for
    the overlay on any compositor with `wlr-layer-shell`.** The overlay frontend still calls
    the `position_overlay` Tauri command (`src-tauri/src/lib.rs`) unconditionally on mount,
@@ -267,13 +283,28 @@ happen to be resident.
    The guardrail cannot catch that: `guardrail::tokenize` lowercases and strips
    punctuation before comparing, so case damage is invisible to it by construction.
    `finish` is idempotent; keep it that way and the choke point stays safe.
-9. **The settings GUI writes `config.toml` through `config_write`, never
-   `toml::to_string`.** It merges into the existing document with `toml_edit`,
-   skips leaves whose value is unchanged, validates the rendered result with
-   `Config::from_str` *before* touching the file, and replaces it by atomic
-   rename. `config.toml` is a file the user is invited to edit by hand: a save
-   that changes nothing must leave it byte-identical, and one that changes a
-   setting must produce a one-line diff. This is what lets the GUI autosave at
+9. **`config.toml` is the app's file, and the settings GUI is how it changes.**
+   It lives at `~/.local/state/yappr/config.toml` (not `~/.config`) and is
+   rendered whole from `Config` by `config::render` — a fixed two-line header plus
+   `toml::to_string_pretty`. Nothing is invited to edit it by hand; a hand edit
+   loads fine and is overwritten by the next save.
+   The no-op guarantee survives, and is now free: `render` is a pure function of
+   `Config`, so an unchanged config cannot produce two different files. That
+   replaced ~400 lines of `toml_edit` merging, comment `decor` carrying and
+   unchanged-leaf skipping which existed only to protect a hand-written file.
+   **`config_write::save_config` still has to apply a *patch*, not just render.**
+   `Request::SetConfig` passes its JSON straight through and `wizard_finish`'s
+   `backend_patch` is a single leaf, so `incoming` is routinely partial: the base
+   is loaded as a `Config` and the patch merged into it as JSON (objects recurse,
+   arrays replace wholesale, `null` removes a key — which is how a `StyleRule`'s
+   unset axes stay expressible in a format with no null). Render `incoming`
+   directly and the first wizard-driven save blanks the whole config. Then
+   validate-then-atomic-rename, unchanged: that property is about crash-safety,
+   not hand-editing.
+   `[normalize]`'s two accepted-and-ignored keys (`port`, `llama_server_path`) are
+   `#[serde(skip_serializing)]`: read so a pre-existing file still loads, never
+   written, so a canonical dump does not push them into every user's file.
+   This is what lets the GUI autosave at
    all: it has no Save button, and writes a toggle or dropdown immediately and a
    text or number field 700 ms after the last keystroke (`DEBOUNCE_MS`), with one
    write in flight at a time and later edits coalesced into a single follow-up.
@@ -376,7 +407,10 @@ happen to be resident.
   left declared and unused. The tests that relied on it now observe `shutdown` through
   the runtime files it removes.
 - All filesystem locations come from `yappr-core/src/paths.rs` (XDG): config
-  `~/.config/yappr/config.toml`, models `~/.local/share/yappr/models`
+  `~/.local/state/yappr/config.toml` (moved out of `~/.config` on 2026-09-02, with a
+  one-time `config::migrate_from_legacy`; `paths::legacy_config_file()` is the old
+  location and is read once per start and never written), models
+  `~/.local/share/yappr/models`
   (pinned by sha256 in `crates/yappr-core/models.lock.toml`), `rejections.jsonl` in the
   state dir, socket/lock/port in `$XDG_RUNTIME_DIR`, autostart entry at
   `~/.config/autostart/yappr.desktop`. Debug capture writes to `~/yappr` by default.
