@@ -12,11 +12,14 @@
 //! worker thread against `recv_timeout` (contrast `normalize.rs`'s HTTP
 //! call, which blocks inside `ureq` where nothing but `ureq`'s own timeout
 //! can interrupt it -- see I2): a child process, unlike a blocked network
-//! read, can always be killed outright from the outside, so there is no
-//! thread left to leak here.
+//! read, can always be killed outright from the outside. The only threads
+//! here drain the child's pipes; they end when the last holder of a pipe
+//! closes it, and a grandchild that keeps one open is what
+//! [`PIPE_DRAIN_GRACE`] exists for.
 
 use std::io::{self, Read, Write};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -50,19 +53,46 @@ pub fn run_with_timeout(
     wait_with_timeout(child, timeout)
 }
 
+/// Drains one of the child's output pipes on its own thread. Bytes are
+/// appended under the mutex as they arrive, so the caller can take what has
+/// been read so far without waiting for EOF -- which never comes while a
+/// grandchild that inherited the pipe is alive.
+fn drain_on_thread(pipe: impl Read + Send + 'static) -> Arc<Mutex<Vec<u8>>> {
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&buf);
+    std::thread::spawn(move || {
+        let mut pipe = pipe;
+        let mut chunk = [0u8; 4096];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => sink.lock().unwrap().extend_from_slice(&chunk[..n]),
+            }
+        }
+    });
+    buf
+}
+
+/// After the child has exited, everything it wrote is already in the pipe
+/// buffers and the drain threads pick it up in microseconds; this is how
+/// long they are given before the output is taken as-is. It is a bound on
+/// the *drain*, not a wait for EOF: `wl-copy` (and anything else that forks
+/// a daemon) leaves a grandchild holding the pipes open for as long as it
+/// lives, and `read_to_end` on that pipe used to block the pipeline thread
+/// at `INJECTING` until the clipboard was next replaced.
+const PIPE_DRAIN_GRACE: Duration = Duration::from_millis(50);
+
 fn wait_with_timeout(mut child: Child, timeout: Duration) -> io::Result<Output> {
+    let stdout = child.stdout.take().map(drain_on_thread);
+    let stderr = child.stderr.take().map(drain_on_thread);
+    let take = |buf: &Option<Arc<Mutex<Vec<u8>>>>| {
+        buf.as_ref().map(|b| b.lock().unwrap().clone()).unwrap_or_default()
+    };
     let start = Instant::now();
     loop {
         if let Some(status) = child.try_wait()? {
-            let mut stdout = Vec::new();
-            let mut stderr = Vec::new();
-            if let Some(mut o) = child.stdout.take() {
-                let _ = o.read_to_end(&mut stdout);
-            }
-            if let Some(mut e) = child.stderr.take() {
-                let _ = e.read_to_end(&mut stderr);
-            }
-            return Ok(Output { status, stdout, stderr });
+            std::thread::sleep(PIPE_DRAIN_GRACE);
+            return Ok(Output { status, stdout: take(&stdout), stderr: take(&stderr) });
         }
         if start.elapsed() >= timeout {
             // Best-effort: kill and reap so the child never outlives this
@@ -136,6 +166,29 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(2),
             "should return promptly after the timeout, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_child_that_exits_but_leaves_a_grandchild_holding_its_pipes_does_not_block() {
+        // wl-copy's shape: the process exits 0 at once, but a background
+        // fork it left behind inherits stdout/stderr and keeps them open
+        // (for the clipboard's lifetime, in wl-copy's case). Reading the
+        // pipes to EOF after the exit would block until that grandchild
+        // dies -- with no timeout, since the timeout only bounds the exit.
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("printf out; printf err >&2; sleep 5 & exit 0");
+
+        let t0 = Instant::now();
+        let out = run_with_timeout(cmd, Duration::from_secs(3), None).unwrap();
+        let elapsed = t0.elapsed();
+
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "out");
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "err");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "must return once the child itself has exited, took {elapsed:?}"
         );
     }
 
