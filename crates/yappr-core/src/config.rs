@@ -199,19 +199,25 @@ pub struct NormalizeConfig {
     /// listen on a port. The field stays because every `config.toml`
     /// written before that change has this key in it, and `[normalize]` is
     /// `deny_unknown_fields` (invariant 4) -- deleting it here would turn
-    /// an existing, valid config into a hard startup failure. New configs
-    /// do not get it: it is gone from the annotated default below.
+    /// an existing, valid config into a hard startup failure.
+    ///
+    /// `skip_serializing` is what actually retires it (spec §2.1). While the
+    /// writer merged into the user's own document, a key it never touched
+    /// simply stayed where it was; a canonical dump would instead write this
+    /// into *every* file, which is the opposite of retiring it. Now the first
+    /// save drops it, and once no file on disk still names it the field can
+    /// go too.
     ///
     /// Hidden in the settings GUI by `schema.ts`'s `OBSOLETE_FIELDS`, which
     /// exists for exactly these two keys -- showing a control that changes
     /// nothing would be worse than showing nothing.
-    #[serde(default = "d_port")]
+    #[serde(default = "d_port", skip_serializing)]
     pub port: u16,
     #[serde(default = "d_timeout")]
     pub timeout_ms: u64,
     /// Accepted and ignored, for the same reason and on the same terms as
-    /// [`NormalizeConfig::port`].
-    #[serde(default = "d_llama_path")]
+    /// [`NormalizeConfig::port`] -- `skip_serializing` included.
+    #[serde(default = "d_llama_path", skip_serializing)]
     pub llama_server_path: String,
     /// `n_ctx` for the in-process context, and still load-bearing: the
     /// prompt plus the reply budget must fit inside it or
@@ -355,9 +361,9 @@ fn d_keydelay() -> u32 {
 }
 /// The window classes of the terminals a Wayland user plausibly runs, as the
 /// compositor reports them (matching is case-insensitive, so "Alacritty" and
-/// "org.gnome.Terminal" are covered by their lowercase spellings). Kept in
-/// sync with DEFAULT_CONFIG_TOML by `default_config_toml_parses_and_matches_
-/// the_compiled_defaults`.
+/// "org.gnome.Terminal" are covered by their lowercase spellings). This list is
+/// the only copy: a written `config.toml` is rendered *from* it (spec §2), so
+/// there is no shipped template left for it to drift against.
 fn d_terminal_classes() -> Vec<String> {
     [
         "alacritty",
@@ -563,7 +569,7 @@ impl Config {
         Ok(c)
     }
 
-    /// Loads the config, writing a commented default file if none exists.
+    /// Loads the config, writing a default file if none exists.
     pub fn load() -> Result<Self> {
         Self::load_from(&paths::config_file())
     }
@@ -578,14 +584,17 @@ impl Config {
     pub fn load_from(p: &std::path::Path) -> Result<Self> {
         if !p.exists() {
             std::fs::create_dir_all(p.parent().unwrap())?;
-            std::fs::write(p, DEFAULT_CONFIG_TOML)?;
+            std::fs::write(p, render(&Config::default()))?;
         }
         let s = std::fs::read_to_string(p)
             .with_context(|| format!("reading {}", p.display()))?;
         Self::from_str(&s)
     }
 
-    fn validate(&self) -> Result<()> {
+    /// `pub(crate)` for `config_write::save_config`, which validates a merged
+    /// patch *before* rendering it so a bad change is reported against the
+    /// change rather than against the generated text.
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.audio.max_seconds == 0 {
             bail!("audio.max_seconds must be greater than 0");
         }
@@ -680,103 +689,29 @@ impl Config {
     }
 }
 
-pub const DEFAULT_CONFIG_TOML: &str = r#"# yappr configuration
+/// What every written `config.toml` starts with. Two lines, fixed: the file is
+/// the app's now (spec §1), and the one thing a human who opens it needs to
+/// know is that editing it is pointless.
+const HEADER: &str = "\
+# Automatisch erzeugt von yappr. Änderungen über die Einstellungen
+# (Tray-Symbol anklicken oder `yappr --settings`) -- Handedits gehen verloren.
+";
 
-[audio]
-device = "default"
-max_seconds = 120
-vad_padding_ms = 200
-
-[asr]
-num_threads = 4
-
-[models]
-# Modelle beim Start laden, statt beim ersten Tastendruck. Aus heißt:
-# das erste Diktat nach dem Start wartet einmalig auf die Modelle.
-preload_at_startup = false
-# Modelle nach dieser Ruhezeit wieder entladen und den Speicher freigeben.
-# 0 = nie entladen.
-idle_unload_seconds = 60
-
-[normalize]
-# Cleanup runs on S1-mini by Superwhisper.
-enabled = true
-timeout_ms = 6000
-context_size = 2048
-threads = 4
-
-[guardrail]
-min_word_ratio = 0.55
-max_word_ratio = 1.80
-min_overlap_english = 0.55
-min_overlap_other = 0.70
-short_input_words = 4
-ngram_size = 6
-ngram_max_repeats = 3
-
-[inject]
-backend = "wtype"          # "wtype" | "ydotool" | "clipboard"
-                           # ydotool needs a running ydotoold and write access
-                           # to /dev/uinput; it reaches windows wtype cannot,
-                           # and it pastes rather than types: wl-copy plus one
-                           # Ctrl+V by raw keycode (Ctrl+Shift+V in the
-                           # terminals listed below), so umlauts and ß survive
-                           # any keyboard layout. clipboard only copies;
-                           # pasting is on you.
-trailing_space = true
-keystroke_delay_ms = 2     # wtype only: pause between simulated keystrokes
-terminal_classes = [       # window classes that paste with Ctrl+Shift+V
-    "alacritty", "kitty", "foot", "footclient", "wezterm",
-    "org.wezfurlong.wezterm", "ghostty", "com.mitchellh.ghostty", "konsole",
-    "org.kde.konsole", "org.gnome.terminal", "gnome-terminal-server",
-    "org.gnome.console", "kgx", "xterm", "urxvt", "st-256color", "terminator",
-    "tilix", "xfce4-terminal",
-]
-
-[overlay]
-position = "bottom-center"  # only "bottom-center" is currently supported
-width = 280
-height = 72
-
-[style_default]
-styling = "semi-casual"    # casual | semi-casual | semi-formal | formal
-structure = "prose"        # prose | lists
-context = "general"        # general | email
-
-# First matching rule wins; unset axes inherit from [style_default].
-# [[style_rules]]
-# match_class = "(?i)thunderbird|^Mail$"
-# styling = "semi-formal"
-# context = "email"
-
-[vocabulary]
-# Names, jargon and acronyms the ASR has never heard, corrected after
-# transcription. `terms` are matched fuzzily, so a term still lands when it was
-# misrecognised slightly; `replacements` are exact.
-#
-# Short strings belong in `replacements`, not `terms`: a three-character term
-# is within two edits of most three-letter words, so matching it loosely enough
-# to catch a mis-heard "SQUI" would also rewrite "gut" and "gib".
-enabled = true
-terms = []
-max_error_ratio = 0.25   # 0.25 = two wrong characters allowed in an eight-character term
-min_term_chars = 5       # shorter terms are matched exactly only
-
-# terms = ["Hyprland", "sherpa-onnx", "Parakeet"]
-
-# [[vocabulary.replacements]]
-# from = "Settings-SQUI"
-# to = "Settings-GUI"
-
-[debug]
-# Diagnostics for tracking down capture/VAD/normalization bugs: per-utterance
-# WAV dumps and a JSON record under `dir`, plus the daemon's tracing output
-# mirrored to `<dir>/logs/daemon.log`. Off by default -- nothing here is on
-# the critical path when disabled.
-enabled = false
-dir = "~/yappr"
-save_audio = true    # only meaningful when enabled = true
-"#;
+/// The config as it is written to disk: a pure function of [`Config`], which is
+/// the whole of invariant 9's no-op-save guarantee now (spec §2). The same
+/// config cannot render two different files, so a save that changes nothing
+/// cannot change the file -- free, where `toml_edit` had to work for it.
+///
+/// `to_string_pretty` cannot fail for this type. `Config` is a plain tree of
+/// structs, `Vec`s and scalars with no map keys that could be anything but
+/// strings, and the value-before-table ordering TOML requires is handled by the
+/// serializer itself rather than by field order here -- both verified against
+/// this tree before the design was written (spec §2.2). An `expect` rather than
+/// a `Result` keeps every caller from carrying an error case that cannot occur.
+pub fn render(cfg: &Config) -> String {
+    let body = toml::to_string_pretty(cfg).expect("Config is always serializable to TOML");
+    format!("{HEADER}{body}")
+}
 
 #[cfg(test)]
 mod tests {
@@ -933,22 +868,98 @@ mod tests {
     }
 
     #[test]
-    fn default_config_toml_round_trips_to_config_default() {
-        // DEFAULT_CONFIG_TOML is the file written to disk on first run and the
-        // file a user actually edits. It must parse, and it must agree exactly
-        // with the compiled-in defaults -- otherwise the shipped file and the
-        // documented behaviour silently diverge.
-        let from_file = Config::from_str(DEFAULT_CONFIG_TOML).unwrap();
-        assert_eq!(from_file, Config::default());
+    fn a_rendered_default_config_parses_back_as_the_default() {
+        // The guard that derived `Default` agrees with the serde `default =
+        // "d_*"` functions -- the only whole-`Config` comparison in the
+        // workspace, and load-bearing beyond this file: `GetConfig` ships
+        // `Config::default()` on the wire as the settings GUI's reset targets
+        // (invariant 9), so a drift here is a reset button that restores the
+        // wrong value. Used to run against the hand-written
+        // `DEFAULT_CONFIG_TOML`; the template is gone, the property is not.
+        let rendered = render(&Config::default());
+        assert_eq!(Config::from_str(&rendered).unwrap(), Config::default());
+
+        // Every section must appear. A `Config` field that rendered to nothing
+        // would be a group of settings the GUI shows as absent -- structural
+        // now that the file is generated, but cheap to keep honest.
+        for section in [
+            "[audio]",
+            "[asr]",
+            "[models]",
+            "[normalize]",
+            "[guardrail]",
+            "[inject]",
+            "[overlay]",
+            "[style_default]",
+            "[vocabulary]",
+            "[debug]",
+        ] {
+            assert!(rendered.contains(section), "{section} missing from the rendered default");
+        }
+    }
+
+    #[test]
+    fn rendering_the_same_config_twice_is_byte_identical() {
+        // What replaces invariant 9's old byte-identical guarantee. The
+        // renderer is a pure function of `Config`, so the same config cannot
+        // produce two different files and a save that changes nothing cannot
+        // change the file. `toml_edit` had to work for that property; purity
+        // gives it away.
+        let cfg = Config::default();
+        assert_eq!(render(&cfg), render(&cfg));
+    }
+
+    #[test]
+    fn a_fully_populated_config_round_trips_through_the_renderer() {
+        // Exercises the array-of-tables and the `Option` axes rather than
+        // assuming them: `StyleRule`'s unset axes must come back absent, since
+        // TOML has no null to write them as.
+        let cfg = Config::from_str(
+            r#"
+[[style_rules]]
+match_class = "term.*"
+styling = "formal"
+
+[vocabulary]
+terms = ["Kubernetes"]
+
+[[vocabulary.replacements]]
+from = "kdd"
+to = "KDD"
+"#,
+        )
+        .unwrap();
+        assert_eq!(Config::from_str(&render(&cfg)).unwrap(), cfg);
+    }
+
+    #[test]
+    fn the_two_obsolete_normalize_keys_are_read_but_never_written() {
+        // Spec §2.1. Under the old comment-preserving merge these survived
+        // only in files that already had them. A canonical dump would write
+        // them into every user's file, which is the opposite of retiring them
+        // -- so they are `skip_serializing`. Reading one must still work: the
+        // section is `deny_unknown_fields`, so a pre-existing file naming them
+        // would otherwise become a hard startup failure.
+        let rendered = render(&Config::default());
+        assert!(!rendered.contains("port"), "normalize.port must not be written any more");
+        assert!(!rendered.contains("llama_server_path"));
+
+        assert!(
+            Config::from_str("[normalize]\nport = 8730\nllama_server_path = \"llama-server\"\n")
+                .is_ok(),
+            "a pre-existing file naming the retired keys must still load"
+        );
     }
 
     #[test]
     fn every_inject_backend_is_spelled_the_way_config_toml_spells_it() {
-        // The GUI dropdown, the `# "wtype" | "ydotool" | "clipboard"` comment
-        // in DEFAULT_CONFIG_TOML and `ENUMS["inject.backend"]` in
-        // `src/settings/schema.ts` all hand-repeat these strings; this pins
-        // what they have to agree with. `deny_unknown_fields` makes a
-        // misspelling a hard startup failure, not a silent fallback.
+        // `ENUMS["inject.backend"]` and `HELP["inject.backend"]` in
+        // `src/settings/schema.ts` both hand-repeat these strings; this pins
+        // what they have to agree with. (There used to be a third copy, the
+        // `# "wtype" | "ydotool" | "clipboard"` annotation in the shipped
+        // template -- generated files carry no annotations, so that one is
+        // gone.) `deny_unknown_fields` makes a misspelling a hard startup
+        // failure, not a silent fallback.
         for (spelling, expected) in [
             ("wtype", InjectBackend::Wtype),
             ("ydotool", InjectBackend::Ydotool),
@@ -1058,12 +1069,4 @@ mod tests {
         assert_eq!(c.models.idle_unload_seconds, 0);
     }
 
-    #[test]
-    fn the_shipped_default_config_declares_the_models_section() {
-        // DEFAULT_CONFIG_TOML is what a first run writes to disk; a section that
-        // exists in Rust but not there is a setting no hand-editor discovers.
-        let c = Config::from_str(DEFAULT_CONFIG_TOML).unwrap();
-        assert_eq!(c.models, ModelsConfig::default());
-        assert!(DEFAULT_CONFIG_TOML.contains("[models]"));
-    }
 }

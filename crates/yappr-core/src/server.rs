@@ -3163,7 +3163,11 @@ mod tests {
             .join(format!("yappr-daemon-cfg-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
-        std::fs::write(&path, "[audio]\ndevice = \"default\"   # kommentiert\n").unwrap();
+        // A hand-shaped fragment on purpose, not a rendered config: these
+        // tests exercise what `dispatch` does with whatever is on disk, and a
+        // file naming one key out of forty is the case where a writer that
+        // rendered the incoming patch directly would destroy the rest.
+        std::fs::write(&path, "[audio]\ndevice = \"default\"\n").unwrap();
         path
     }
 
@@ -3235,9 +3239,13 @@ mod tests {
         assert_eq!(r.restart_required, Some(false));
         let on_disk = Config::load_from(&path).unwrap();
         assert_eq!(on_disk.vocabulary.terms, ["Hyprland"]);
-        // The comment the user wrote survives a GUI save.
-        let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(raw.contains("# kommentiert"), "comment lost:\n{raw}");
+        // Everything the patch did not name keeps its on-disk value. This is
+        // the partial-patch guarantee seen from the socket rather than from
+        // `config_write`'s own tests: `SetConfig` passes its JSON through
+        // untouched, so a writer that rendered it directly would blank the
+        // rest of the file from right here.
+        assert_eq!(on_disk.audio.device, "default");
+        assert_eq!(on_disk.asr.num_threads, Config::default().asr.num_threads);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
