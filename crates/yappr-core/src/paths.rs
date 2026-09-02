@@ -12,7 +12,20 @@ pub fn config_dir() -> PathBuf {
     dirs::config_dir().expect("no config dir").join(APP)
 }
 
+/// Spec §1: the config is written by the app and read by the app, so it lives
+/// with the app's other owned state (`wizard-done`, `rejections.jsonl`) rather
+/// than in `~/.config`, which is the directory a user is invited to edit.
+///
+/// The accepted consequence: dotfile-sync setups that cover `~/.config` and not
+/// `~/.local/state` stop carrying settings between machines.
 pub fn config_file() -> PathBuf {
+    state_dir().join("config.toml")
+}
+
+/// Where the config lived until 2026-09-02. Read exactly once per start, by
+/// `config::migrate_from_legacy`, and never written. [`config_dir`] itself
+/// stays -- `hypr.rs` and [`autostart_desktop_file`] still need it.
+pub fn legacy_config_file() -> PathBuf {
     config_dir().join("config.toml")
 }
 
@@ -75,6 +88,17 @@ mod tests {
         assert!(config_file().ends_with("yappr/config.toml"));
         assert!(models_dir().ends_with("yappr/models"));
         assert!(rejections_file().ends_with("yappr/rejections.jsonl"));
+    }
+
+    /// Spec §1. The two assertions are the whole of the move: the config sits
+    /// with the state this app owns, and the path it came *from* is still
+    /// computable so `config::migrate_from_legacy` can find a pre-2026-09-02
+    /// file exactly once.
+    #[test]
+    fn the_config_lives_in_the_state_dir_and_its_old_home_is_still_reachable() {
+        assert_eq!(config_file().parent(), wizard_marker().parent());
+        assert!(legacy_config_file().starts_with(config_dir()));
+        assert_ne!(config_file(), legacy_config_file());
     }
 
     /// `~/.config/autostart/` is a shared directory, not this app's own

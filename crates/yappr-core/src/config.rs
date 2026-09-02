@@ -1,6 +1,7 @@
 use anyhow::{bail, Context as _, Result};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 use crate::paths;
 
@@ -689,6 +690,47 @@ impl Config {
     }
 }
 
+/// Moves a pre-2026-09-02 config out of `~/.config` and into the state dir
+/// (spec §4).
+///
+/// Returns the path the legacy file was renamed to, or `None` when there was
+/// nothing to do. Both paths are parameters rather than `paths::` calls for the
+/// same reason [`Config::load_from`]'s is: a test that ran this against the
+/// real pair would move the config of whoever ran the suite.
+///
+/// Three rules, and the last one is the one worth stating:
+///
+/// - the state-dir file wins if it already exists, so a legacy file left behind
+///   by a downgrade-and-upgrade cannot silently overwrite newer settings;
+/// - the legacy file is *renamed*, never deleted -- if this migration gets
+///   something wrong, the original is still sitting there;
+/// - a legacy file that will not load is left entirely alone. Migrating it
+///   would only move the problem into the new location, where startup's
+///   quarantine has to deal with it anyway, and it would destroy the evidence
+///   in a place the user knows to look for it.
+pub fn migrate_from_legacy(legacy: &Path, current: &Path) -> Result<Option<PathBuf>> {
+    if current.exists() || !legacy.exists() {
+        return Ok(None);
+    }
+    let Ok(cfg) = Config::load_from(legacy) else {
+        return Ok(None);
+    };
+    if let Some(parent) = current.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(current, render(&cfg))
+        .with_context(|| format!("writing {}", current.display()))?;
+
+    // Built from the file name rather than `with_extension`, which would
+    // replace `.toml` instead of following it.
+    let name = legacy.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let renamed = legacy.with_file_name(format!("{name}.migrated"));
+    std::fs::rename(legacy, &renamed)
+        .with_context(|| format!("renaming {}", legacy.display()))?;
+    Ok(Some(renamed))
+}
+
 /// What every written `config.toml` starts with. Two lines, fixed: the file is
 /// the app's now (spec §1), and the one thing a human who opens it needs to
 /// know is that editing it is pointless.
@@ -865,6 +907,74 @@ mod tests {
         assert_eq!(c.style_rules.len(), 1);
         assert_eq!(c.style_rules[0].context, Some(Context::Email));
         assert_eq!(c.style_rules[0].styling, None);
+    }
+
+    /// A fresh, collision-free scratch directory. Never `paths::config_file()`
+    /// or `paths::legacy_config_file()`: this test module *moves and renames*
+    /// files, and running that against the real pair would migrate the config
+    /// of whoever ran the suite.
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("yappr-config-{tag}-{}-{n}", std::process::id()))
+    }
+
+    /// Spec §4. A user upgrading has a real config in the old place; losing it
+    /// silently would be the worst possible first impression of this change.
+    #[test]
+    fn a_legacy_config_is_migrated_and_the_old_file_is_kept_under_a_new_name() {
+        let dir = scratch_dir("migrate");
+        let legacy = dir.join("old/config.toml");
+        let current = dir.join("new/config.toml");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "[audio]\nmax_seconds = 45\n").unwrap();
+
+        let moved = migrate_from_legacy(&legacy, &current).unwrap();
+
+        assert!(moved.is_some(), "a migration must be reported to the caller");
+        assert_eq!(Config::load_from(&current).unwrap().audio.max_seconds, 45);
+        assert!(!legacy.exists(), "the legacy file is renamed out of the way");
+        assert!(dir.join("old/config.toml.migrated").exists(), "and never deleted");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The state-dir file is the truth once it exists. A legacy file left
+    /// behind by a downgrade-and-upgrade must not overwrite newer settings.
+    #[test]
+    fn migration_is_a_no_op_when_the_new_file_already_exists() {
+        let dir = scratch_dir("migrate-noop");
+        let legacy = dir.join("old/config.toml");
+        let current = dir.join("new/config.toml");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(current.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "[audio]\nmax_seconds = 45\n").unwrap();
+        std::fs::write(&current, "[audio]\nmax_seconds = 99\n").unwrap();
+
+        assert!(migrate_from_legacy(&legacy, &current).unwrap().is_none());
+        assert_eq!(Config::load_from(&current).unwrap().audio.max_seconds, 99);
+        assert!(legacy.exists(), "an ignored legacy file is left exactly as it was");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Spec §4: migrating a broken file would only move the problem, and would
+    /// move it somewhere the user does not know to look. Leave it, and let
+    /// startup's quarantine deal with the new path.
+    #[test]
+    fn an_unloadable_legacy_config_is_left_alone_rather_than_migrated() {
+        let dir = scratch_dir("migrate-broken");
+        let legacy = dir.join("old/config.toml");
+        let current = dir.join("new/config.toml");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "[audio]\nnope = 1\n").unwrap();
+
+        assert!(migrate_from_legacy(&legacy, &current).unwrap().is_none());
+        assert!(!current.exists(), "nothing may be written from a file that will not load");
+        assert!(legacy.exists(), "and the user's file stays where they left it");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
