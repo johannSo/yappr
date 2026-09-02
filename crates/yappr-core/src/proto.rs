@@ -179,6 +179,17 @@ pub struct Response {
     /// `get_config_returns_the_whole_config_and_the_path_it_came_from`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config_path: Option<String>,
+    /// `GetConfig` and `Status`: set when startup found a `config.toml` it
+    /// could not load, moved it aside and came up on defaults instead (spec
+    /// §3). German, because the settings window renders it verbatim in the
+    /// notice banner it already has. `None` on every healthy run.
+    ///
+    /// Deliberately not `err`, and deliberately not `Daemon::fatal_error`: a
+    /// quarantine is not a failure. The daemon is running and dictation works
+    /// -- the user has simply lost their settings and needs telling where the
+    /// old file went.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_notice: Option<String>,
     /// `GetConfig` only: `Config::default()` as JSON, shaped exactly like
     /// `config`. The settings GUI's per-row reset button restores a field to
     /// the value found here, and hides itself on a field that already matches.
@@ -212,6 +223,7 @@ impl Response {
             normalize_available: None,
             config: None,
             config_path: None,
+            config_notice: None,
             defaults: None,
             devices: None,
             restart_required: None,

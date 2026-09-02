@@ -690,6 +690,85 @@ impl Config {
     }
 }
 
+/// What [`load_or_quarantine`] moved aside, and why.
+#[derive(Debug, Clone)]
+pub struct Quarantine {
+    /// Where the unloadable file went. Shown to the user verbatim: it is the
+    /// only way back to whatever they had.
+    pub moved_to: PathBuf,
+    /// The load error as text rather than as an `anyhow::Error`, because this
+    /// is stored behind a `Mutex` for the life of the process and
+    /// `anyhow::Error` is not `Clone`.
+    pub error: String,
+}
+
+/// [`Config::load_from`] for the one caller that must never fail: startup
+/// (spec §3).
+///
+/// `server::start` loads the config eagerly and `?`s it, and `setup()` in
+/// `src-tauri/src/lib.rs` calls that -- so before this existed, one typo'd key
+/// aborted Tauri setup and left the user with no tray, no settings window, and
+/// nothing but a text editor to repair it with. That was defensible while
+/// `config.toml` was a documented human interface. Now that the settings window
+/// is the interface, a config that stops the window from opening is a config
+/// that cannot be fixed at all.
+///
+/// `deny_unknown_fields` (invariant 4) is untouched -- a typo, a downgrade or a
+/// half-written file is still *detected*. Only the consequence changed: the
+/// file is moved aside, a fresh default takes its place, and the reason travels
+/// back to the GUI. Every other caller stays strict on purpose: `Request::Reload`
+/// answering "your file is broken" is the honest answer, where a `Reload` that
+/// silently reset a user's settings would not be.
+pub fn load_or_quarantine(path: &Path) -> (Config, Option<Quarantine>) {
+    match Config::load_from(path) {
+        Ok(cfg) => (cfg, None),
+        Err(e) => {
+            let error = format!("{e:#}");
+            match quarantine_file(path) {
+                Ok(moved_to) => {
+                    // Best-effort: a default file is a convenience, and failing
+                    // to write one still leaves a daemon that runs on the
+                    // in-memory defaults. The next successful save creates it.
+                    let _ = std::fs::write(path, render(&Config::default()));
+                    (Config::default(), Some(Quarantine { moved_to, error }))
+                }
+                // Nothing left to do but carry on: refusing to start is the
+                // exact failure mode this function exists to remove, so a
+                // rename that fails must not resurrect it.
+                Err(rename_err) => (
+                    Config::default(),
+                    Some(Quarantine {
+                        moved_to: path.to_path_buf(),
+                        error: format!(
+                            "{error} (Datei konnte nicht beiseitegelegt werden: {rename_err})"
+                        ),
+                    }),
+                ),
+            }
+        }
+    }
+}
+
+/// Renames `path` to `<name>.broken-<unix seconds>`, adding a counter if that
+/// name is somehow taken -- two quarantines in the same second must not let the
+/// second destroy the first one's evidence.
+fn quarantine_file(path: &Path) -> std::io::Result<PathBuf> {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut candidate = dir.join(format!("{name}.broken-{secs}"));
+    let mut n = 1;
+    while candidate.exists() {
+        candidate = dir.join(format!("{name}.broken-{secs}-{n}"));
+        n += 1;
+    }
+    std::fs::rename(path, &candidate)?;
+    Ok(candidate)
+}
+
 /// Moves a pre-2026-09-02 config out of `~/.config` and into the state dir
 /// (spec §4).
 ///
@@ -918,6 +997,87 @@ mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("yappr-config-{tag}-{}-{n}", std::process::id()))
+    }
+
+    /// Invariant 4 rewritten (spec §3). Before this, one unrecognised key
+    /// aborted Tauri setup: no tray, no settings window, and the only repair
+    /// tool a text editor pointed at the very file the design has stopped
+    /// inviting anyone to open.
+    #[test]
+    fn an_unloadable_config_is_quarantined_and_startup_gets_defaults() {
+        let dir = scratch_dir("quarantine");
+        let path = dir.join("config.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "[audio]\nthis_key_does_not_exist = 1\n").unwrap();
+
+        let (cfg, quarantine) = load_or_quarantine(&path);
+
+        assert_eq!(cfg, Config::default(), "startup continues, on defaults");
+        let q = quarantine.expect("the failure must be reported, never swallowed");
+        assert!(q.moved_to.exists(), "the user's file must survive for inspection");
+        assert!(q.error.contains("this_key_does_not_exist"), "and name what was wrong");
+        assert_eq!(
+            Config::load_from(&path).unwrap(),
+            Config::default(),
+            "a fresh default file takes its place"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `validate` failures are as fatal at startup as parse failures, so they
+    /// take the same path. `max_seconds = 0` is the case worth naming:
+    /// invariant 11 makes it the sole terminator of a forgotten recording.
+    #[test]
+    fn a_semantically_invalid_config_is_quarantined_too() {
+        let dir = scratch_dir("quarantine-validate");
+        let path = dir.join("config.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "[audio]\nmax_seconds = 0\n").unwrap();
+
+        let (cfg, quarantine) = load_or_quarantine(&path);
+
+        assert_eq!(cfg.audio.max_seconds, Config::default().audio.max_seconds);
+        assert!(quarantine.is_some(), "a config that fails validate is quarantined");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The healthy path must stay boring: nothing moved, nothing reported.
+    #[test]
+    fn a_loadable_config_is_returned_untouched_with_no_notice() {
+        let dir = scratch_dir("quarantine-clean");
+        let path = dir.join("config.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "[audio]\nmax_seconds = 45\n").unwrap();
+
+        let (cfg, quarantine) = load_or_quarantine(&path);
+
+        assert_eq!(cfg.audio.max_seconds, 45);
+        assert!(quarantine.is_none());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "nothing was moved aside");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two bad starts in the same second must not let the second one overwrite
+    /// what the first moved aside -- that file is the user's only copy.
+    #[test]
+    fn a_second_quarantine_does_not_destroy_the_first_ones_evidence() {
+        let dir = scratch_dir("quarantine-twice");
+        let path = dir.join("config.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        std::fs::write(&path, "[audio]\nfirst_bad_key = 1\n").unwrap();
+        let first = load_or_quarantine(&path).1.unwrap().moved_to;
+        std::fs::write(&path, "[audio]\nsecond_bad_key = 1\n").unwrap();
+        let second = load_or_quarantine(&path).1.unwrap().moved_to;
+
+        assert_ne!(first, second);
+        assert!(std::fs::read_to_string(&first).unwrap().contains("first_bad_key"));
+        assert!(std::fs::read_to_string(&second).unwrap().contains("second_bad_key"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Spec §4. A user upgrading has a real config in the old place; losing it

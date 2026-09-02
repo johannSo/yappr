@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use crate::asr::SherpaTranscriber;
 use crate::capture::{CaptureStats, Recorder};
-use crate::config::{AudioConfig, Config, DebugConfig, ModelsConfig};
+use crate::config::{self, AudioConfig, Config, DebugConfig, ModelsConfig};
 use crate::config_write;
 use crate::inject;
 use crate::lang::WhatlangDetector;
@@ -301,6 +301,15 @@ pub struct Daemon {
     /// moment it happened -- can still learn *why* the daemon is stuck in
     /// `FAILED` (Task 3, Work Item 3). `None` for the entire run otherwise.
     fatal_error: Mutex<Option<String>>,
+    /// Set at startup when `config::load_or_quarantine` found a `config.toml`
+    /// it could not load and moved it aside (spec §3). Reported by `Status` and
+    /// `GetConfig` so the settings window can tell the user where their old
+    /// file went; `None` for the entire run otherwise.
+    ///
+    /// Separate from `fatal_error` on purpose. That one is only read when the
+    /// state is `FAILED`, and a quarantined config is not a failed daemon --
+    /// reusing it would report a working app as broken.
+    config_quarantine: Mutex<Option<config::Quarantine>>,
     /// The background thread reaping dead subscribers and (when enabled)
     /// supervising `llama-server` -- see `spawn_housekeeping`. `None` until
     /// `main` installs it, and again after `shutdown` stops it.
@@ -605,13 +614,36 @@ pub fn start(sink: Arc<dyn EventSink>) -> Result<(Arc<Daemon>, UnixListener)> {
         std::process::exit(1);
     }
 
-    let cfg = Config::load().context("loading config")?;
+    // Spec §4: a pre-2026-09-02 config in `~/.config` moves here once, before
+    // anything reads the new path. Best-effort -- a migration that fails must
+    // not stop the app; it means the user starts from defaults with their old
+    // file still sitting exactly where they left it.
+    let migrated =
+        config::migrate_from_legacy(&paths::legacy_config_file(), &paths::config_file())
+            .unwrap_or(None);
+
+    // Spec §3: never fatal. This is the only caller that quarantines -- every
+    // other `Config::load_from` in this file stays strict, because `Reload`
+    // and `SetConfig` reporting a broken file is the honest answer where
+    // silently resetting a user's settings would not be.
+    let (cfg, quarantine) = config::load_or_quarantine(&paths::config_file());
 
     // Loaded before tracing is set up so the log destination (stdout, plus
     // `<debug.dir>/logs/daemon.log` when debug capture is enabled) can
     // depend on `cfg.debug`. Nothing above this point ever logs via
     // `tracing`, so nothing is lost by the reordering.
     init_tracing(&cfg.debug);
+
+    if let Some(old_path) = &migrated {
+        tracing::info!(renamed_to = %old_path.display(), "migrated the config out of ~/.config");
+    }
+    if let Some(q) = &quarantine {
+        tracing::error!(
+            moved_to = %q.moved_to.display(),
+            error = %q.error,
+            "config could not be loaded; started on defaults"
+        );
+    }
 
     let sock_path = paths::runtime_socket();
     if let Some(parent) = sock_path.parent() {
@@ -658,6 +690,7 @@ pub fn start(sink: Arc<dyn EventSink>) -> Result<(Arc<Daemon>, UnixListener)> {
         normalize_enabled: cfg.normalize.enabled,
         normalize_available: AtomicBool::new(false),
         fatal_error: Mutex::new(None),
+        config_quarantine: Mutex::new(quarantine),
         housekeeping: Mutex::new(None),
         last_timings: Mutex::new(None),
         sink,
@@ -1674,6 +1707,21 @@ fn toggle_target(state: u8) -> Request {
 /// settings window's three commands run in-process now, not over the
 /// socket, and this is the same request/response handling the socket path
 /// (`handle`, above) already funnels every other request through.
+/// The German sentence the settings window shows when startup had to move a
+/// `config.toml` aside (spec §3.1). Built here rather than in the GUI because
+/// the path and the parser's own message are both server-side facts, and the
+/// window has no business reconstructing either.
+fn quarantine_notice(daemon: &Daemon) -> Option<String> {
+    lock_ignoring_poison(&daemon.config_quarantine).as_ref().map(|q| {
+        format!(
+            "Die Konfigurationsdatei konnte nicht gelesen werden und wurde nach {} \
+             verschoben. yappr läuft mit Standardwerten. Grund: {}",
+            q.moved_to.display(),
+            q.error
+        )
+    })
+}
+
 pub fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
     let current = daemon.state.load(Ordering::SeqCst);
     match req {
@@ -1700,6 +1748,10 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
             if current == FAILED {
                 r.err = lock_ignoring_poison(&daemon.fatal_error).clone();
             }
+            // Not gated on `FAILED`, unlike `fatal_error` above: a quarantined
+            // config is a *running* daemon whose settings were lost, which is
+            // exactly the state a user would otherwise never be told about.
+            r.config_notice = quarantine_notice(daemon);
             r
         }
         Request::PttStart => {
@@ -1900,6 +1952,10 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
                 // would be free to drift from it.
                 r.defaults =
                     Some(serde_json::to_value(Config::default()).expect("Config serializes"));
+                // The settings window reads this one: it is the only surface
+                // that can tell the user their settings are gone and where the
+                // old file went (spec §3.1).
+                r.config_notice = quarantine_notice(daemon);
                 r
             }
             Err(e) => Response::err(format!("config error: {e}")),
@@ -3034,6 +3090,7 @@ mod tests {
             normalize_enabled,
             normalize_available: AtomicBool::new(false),
             fatal_error: Mutex::new(None),
+        config_quarantine: Mutex::new(None),
             housekeeping: Mutex::new(None),
             last_timings: Mutex::new(None),
             sink: Arc::new(DropSink),
@@ -3127,6 +3184,7 @@ mod tests {
             normalize_enabled: false,
             normalize_available: AtomicBool::new(false),
             fatal_error: Mutex::new(None),
+        config_quarantine: Mutex::new(None),
             housekeeping: Mutex::new(None),
             last_timings: Mutex::new(None),
             sink,
@@ -4659,6 +4717,77 @@ mod tests {
     /// Driven with no pipeline installed, which is the ordinary state of a
     /// lazily-loaded idle daemon *and* the branch that had no plausible
     /// excuse for skipping the mirror.
+    /// Spec §3's per-call-site table, at the one site where getting it wrong
+    /// would be silent data loss. `server::start` quarantines a broken config
+    /// because it has no way to report one and no user to report it to yet.
+    /// `Reload` has both: the user asked, and there is a socket to answer on.
+    /// A `Reload` that quietly reset their settings and said "ok" would be the
+    /// worst possible reading of "never fail".
+    #[test]
+    fn reload_reports_a_broken_config_instead_of_quarantining_it() {
+        let path = scratch_config("reload-broken");
+        std::fs::write(&path, "[audio]\nthis_key_does_not_exist = 1\n").unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let daemon = fake_daemon_at(IDLE, false, path.clone());
+
+        let r = dispatch(&daemon, Request::Reload);
+
+        assert!(!r.ok, "a broken config must be reported, not swallowed");
+        assert!(r.err.unwrap().contains("config error"));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "the file must be exactly as the user left it"
+        );
+        let strays: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".broken-"))
+            .collect();
+        assert!(strays.is_empty(), "Reload must not quarantine: {strays:?}");
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Spec §3.1: the settings window is the only surface that can tell a user
+    /// their settings were lost, so the notice has to survive the trip to it.
+    /// `Status` carries it too, and neither is gated on `FAILED` -- a
+    /// quarantined config is a *working* daemon, which is precisely why it
+    /// would otherwise go unmentioned.
+    #[test]
+    fn a_quarantine_is_reported_by_both_get_config_and_status() {
+        let path = scratch_config("quarantine-report");
+        let daemon = fake_daemon_at(IDLE, false, path.clone());
+        *lock_ignoring_poison(&daemon.config_quarantine) = Some(config::Quarantine {
+            moved_to: path.with_file_name("config.toml.broken-1"),
+            error: "parsing config.toml: unknown field `nope`".to_string(),
+        });
+
+        for req in [Request::GetConfig, Request::Status] {
+            let r = dispatch(&daemon, req);
+            assert!(r.ok, "a quarantine is not a failure: {:?}", r.err);
+            let notice = r.config_notice.expect("the notice must reach the GUI");
+            assert!(notice.contains("config.toml.broken-1"), "it must name the file: {notice}");
+            assert!(notice.contains("nope"), "and say what was wrong: {notice}");
+        }
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The healthy path stays silent -- a banner on every launch would train
+    /// the user to dismiss the one that matters.
+    #[test]
+    fn a_healthy_start_reports_no_config_notice() {
+        let path = scratch_config("no-quarantine");
+        let daemon = fake_daemon_at(IDLE, false, path.clone());
+
+        assert!(dispatch(&daemon, Request::GetConfig).config_notice.is_none());
+        assert!(dispatch(&daemon, Request::Status).config_notice.is_none());
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
     #[test]
     fn reload_mirrors_the_models_section_the_way_set_config_does() {
         let path = scratch_config("reload-models");
