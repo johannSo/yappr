@@ -13,11 +13,6 @@ use crate::procutil;
 /// utterance typed at a brisk pace is a few thousand characters, comfortably
 /// inside this bound at the default 2 ms/keystroke delay.
 const WTYPE_TIMEOUT: Duration = Duration::from_secs(15);
-/// Twice `WTYPE_TIMEOUT` for the same text, because the two spell "delay"
-/// differently: `wtype -d` waits once per character, `ydotool --key-delay`
-/// waits once per *key event* -- press and release both -- so the same
-/// configured `inject.keystroke_delay_ms` buys ydotool half the throughput.
-const YDOTOOL_TIMEOUT: Duration = Duration::from_secs(30);
 const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]
@@ -45,7 +40,13 @@ fn map_proc_error(backend: &'static str, timeout: Duration, e: io::Error) -> Inj
 }
 
 pub trait TextInjector: Send + Sync {
-    fn inject(&self, text: &str) -> Result<(), InjectError>;
+    /// Injects `text` into the window that was focused when the recording
+    /// started. `target_class` is that window's class as captured at
+    /// `ptt-start` (`daemon.window_class`, the same value the style rules
+    /// match on), or `None` off Hyprland / when nothing was focused. Only
+    /// the ydotool backend reads it -- terminals paste with Ctrl+Shift+V --
+    /// but it describes the *target*, so it travels with every injection.
+    fn inject(&self, text: &str, target_class: Option<&str>) -> Result<(), InjectError>;
     fn name(&self) -> &'static str;
 }
 
@@ -75,62 +76,8 @@ impl TextInjector for WtypeInjector {
         "wtype"
     }
 
-    fn inject(&self, text: &str) -> Result<(), InjectError> {
+    fn inject(&self, text: &str, _target_class: Option<&str>) -> Result<(), InjectError> {
         run_typer("wtype", wtype_argv(text, self.delay_ms), WTYPE_TIMEOUT)
-    }
-}
-
-/// Builds the ydotool argument vector.
-///
-/// `type` is a subcommand and owns its own `getopt_long` parser, so it has to
-/// come before the options rather than after them. `--key-delay` is the same
-/// idea as `wtype -d` but counted per key event rather than per character
-/// (see [`YDOTOOL_TIMEOUT`]), and `--` terminates option parsing so a
-/// transcript beginning with `-` is typed rather than misread as flags --
-/// `getopt_long`'s own guarantee, not something ydotool documents.
-///
-/// Only the three options ydotool's man page actually documents for `type`
-/// are used (`-d/--key-delay`, `-D/--next-delay`, `-f/--file`). In
-/// particular `--escape`, which some builds accept and others do not, is
-/// left alone: an unknown flag would fail every injection outright, and the
-/// escaping it controls is not something spec 10.2 wants invented anyway.
-fn ydotool_argv(text: &str, delay_ms: u32) -> Vec<String> {
-    vec![
-        "type".to_string(),
-        "--key-delay".to_string(),
-        delay_ms.to_string(),
-        "--".to_string(),
-        text.to_string(),
-    ]
-}
-
-/// Spec 10.3's second injector, for the XWayland and Electron surfaces
-/// `wtype` cannot reach (spec 17.3).
-///
-/// Unlike `wtype` this is not self-contained: it talks to a `ydotoold`
-/// daemon over `$YDOTOOL_SOCKET`, and that daemon needs write access to
-/// `/dev/uinput`. When either is missing, `ydotool` exits non-zero and the
-/// clipboard fallback (spec 10.4) carries the transcript instead -- the user
-/// still gets their text, per invariant 1. Setting that up is the user's
-/// call, not the app's (same reason `hypr.rs` prints a config block rather
-/// than applying one).
-pub struct YdotoolInjector {
-    delay_ms: u32,
-}
-
-impl YdotoolInjector {
-    pub fn new(delay_ms: u32) -> Self {
-        Self { delay_ms }
-    }
-}
-
-impl TextInjector for YdotoolInjector {
-    fn name(&self) -> &'static str {
-        "ydotool"
-    }
-
-    fn inject(&self, text: &str) -> Result<(), InjectError> {
-        run_typer("ydotool", ydotool_argv(text, self.delay_ms), YDOTOOL_TIMEOUT)
     }
 }
 
@@ -192,98 +139,81 @@ fn run_typer(
     Ok(())
 }
 
-/// One `path`'s existence, permissions and ownership, for
-/// [`ydotool_env_report_at`] -- the three fields that decide whether the
-/// ydotool client (this uid) may open a socket / device node.
-fn stat_line(path: &std::path::Path) -> String {
-    use std::os::unix::fs::MetadataExt as _;
-    match std::fs::symlink_metadata(path) {
-        Ok(m) => {
-            format!("exists, mode {:04o}, uid {}, gid {}", m.mode() & 0o7777, m.uid(), m.gid())
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => "missing".to_string(),
-        Err(e) => format!("stat failed: {e}"),
+/// How long the ydotool backend's single paste chord may take -- one key
+/// event round trip to ydotoold, nowhere near what typing a whole
+/// transcript would need.
+const PASTE_KEY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Pause between `wl-copy` returning and the paste chord being pressed.
+/// `wl-copy` has forked and owns the selection when it exits, but the
+/// compositor still has to hand the new offer to the focused client; paste
+/// races that handoff without a small settle.
+const PASTE_SETTLE: Duration = Duration::from_millis(100);
+/// The paste chord for [`YdotoolInjector`], as raw `keycode:state` pairs
+/// for `ydotool key`: LEFTCTRL (29) [+ LEFTSHIFT (42)] + V (47), pressed
+/// and released in nested order. Raw keycodes on purpose -- key *positions*
+/// are identical on QWERTZ and QWERTY, so this is the one ydotool
+/// invocation a keyboard layout cannot mangle (`ydotool type`'s
+/// char->keycode table is US-only, which is why this backend pastes instead
+/// of typing). `terminal` selects Ctrl+Shift+V: terminals reserve plain
+/// Ctrl+V for the application running inside them.
+fn paste_key_argv(terminal: bool) -> Vec<String> {
+    let mut argv = vec!["key".to_string(), "29:1".to_string()];
+    if terminal {
+        argv.push("42:1".to_string());
+    }
+    argv.push("47:1".to_string());
+    argv.push("47:0".to_string());
+    if terminal {
+        argv.push("42:0".to_string());
+    }
+    argv.push("29:0".to_string());
+    argv
+}
+
+/// Whether `class` names a terminal, per the configured
+/// `inject.terminal_classes` list. Case-insensitive: Hyprland reports
+/// "Alacritty" with a capital A, and nobody should have to know that.
+fn is_terminal_class(class: Option<&str>, terminal_classes: &[String]) -> bool {
+    let Some(class) = class else { return false };
+    terminal_classes.iter().any(|t| t.eq_ignore_ascii_case(class))
+}
+
+/// Spec 10.3's second injector, for the surfaces `wtype` cannot reach
+/// (GNOME/Mutter, XWayland, some Electron windows) -- since 2026-09-02 by
+/// pasting rather than typing: `wl-copy` the transcript, then press one
+/// Ctrl+V (Ctrl+Shift+V for terminals) via `ydotool key`. See
+/// `InjectBackend::Ydotool` for why paste replaced `ydotool type` outright
+/// (US-only keymap: z/y swapped, umlauts and ß dropped).
+///
+/// Unlike `wtype` this is not self-contained: it talks to a `ydotoold`
+/// daemon over `$YDOTOOL_SOCKET`, and that daemon needs write access to
+/// `/dev/uinput`. When either is missing, `ydotool` exits non-zero and the
+/// clipboard fallback (spec 10.4) carries the transcript instead -- and
+/// since the transcript was already copied here, that fallback amounts to
+/// exactly the manual-paste story the clipboard backend offers (invariant 1
+/// holds). Setting ydotoold up is the user's call, not the app's (same
+/// reason `hypr.rs` prints a config block rather than applying one).
+pub struct YdotoolInjector {
+    terminal_classes: Vec<String>,
+}
+
+impl YdotoolInjector {
+    pub fn new(cfg: &InjectConfig) -> Self {
+        Self { terminal_classes: cfg.terminal_classes.clone() }
     }
 }
 
-/// Scans `proc_dir` (i.e. `/proc`) for a process whose `comm` is `name`.
-/// Reading `/proc` directly instead of shelling out to `pgrep` keeps the
-/// probe subprocess-free -- nothing here can hang, so I3 needs no timeout.
-fn find_process(proc_dir: &std::path::Path, name: &str) -> Option<u32> {
-    let entries = std::fs::read_dir(proc_dir).ok()?;
-    for entry in entries.flatten() {
-        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else { continue };
-        let Ok(comm) = std::fs::read_to_string(entry.path().join("comm")) else { continue };
-        if comm.trim() == name {
-            return Some(pid);
-        }
+impl TextInjector for YdotoolInjector {
+    fn name(&self) -> &'static str {
+        "ydotool"
     }
-    None
-}
 
-/// The testable core of [`ydotool_env_report`]: every input the report
-/// depends on is a parameter, so tests can fabricate a socket, a uinput
-/// node, a `/proc` table and a `$PATH` in a scratch directory.
-fn ydotool_env_report_at(
-    socket_env: Option<&str>,
-    xdg_runtime_dir: Option<&str>,
-    uinput_path: &std::path::Path,
-    proc_dir: &std::path::Path,
-    path_env: Option<&str>,
-) -> String {
-    let mut lines = Vec::new();
-    match socket_env {
-        Some(v) => {
-            lines.push(format!("YDOTOOL_SOCKET={v}: {}", stat_line(std::path::Path::new(v))))
-        }
-        None => {
-            // Which default the client uses varies by ydotool version
-            // ($XDG_RUNTIME_DIR/.ydotool_socket on current builds,
-            // /tmp/.ydotool_socket on older ones), so report both.
-            lines.push("YDOTOOL_SOCKET unset; default socket candidates:".to_string());
-            let mut candidates = Vec::new();
-            if let Some(xdg) = xdg_runtime_dir {
-                candidates.push(std::path::PathBuf::from(xdg).join(".ydotool_socket"));
-            }
-            candidates.push(std::path::PathBuf::from("/tmp/.ydotool_socket"));
-            for c in candidates {
-                lines.push(format!("  {}: {}", c.display(), stat_line(&c)));
-            }
-        }
+    fn inject(&self, text: &str, target_class: Option<&str>) -> Result<(), InjectError> {
+        ClipboardInjector.inject(text, target_class)?;
+        std::thread::sleep(PASTE_SETTLE);
+        let terminal = is_terminal_class(target_class, &self.terminal_classes);
+        run_typer("ydotool", paste_key_argv(terminal), PASTE_KEY_TIMEOUT)
     }
-    lines.push(format!("uinput device {}: {}", uinput_path.display(), stat_line(uinput_path)));
-    lines.push(match find_process(proc_dir, "ydotoold") {
-        Some(pid) => format!("ydotoold: running (pid {pid})"),
-        None => "ydotoold: not found in the process table".to_string(),
-    });
-    let binary = path_env.and_then(|p| {
-        std::env::split_paths(p).map(|d| d.join("ydotool")).find(|c| {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::metadata(c)
-                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-                .unwrap_or(false)
-        })
-    });
-    lines.push(match binary {
-        Some(b) => format!("ydotool binary: {}", b.display()),
-        None => "ydotool binary: not found on PATH".to_string(),
-    });
-    lines.join("\n")
-}
-
-/// Fingerprints the three classic ydotool failure modes -- no `ydotoold`
-/// running, a socket the client may not open, `/dev/uinput` the daemon may
-/// not open -- from the live environment. Called (and logged) only when a
-/// ydotool injection has just failed; every probe is a read-only stat or
-/// `/proc` read, never a subprocess.
-pub(crate) fn ydotool_env_report() -> String {
-    ydotool_env_report_at(
-        std::env::var("YDOTOOL_SOCKET").ok().as_deref(),
-        std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
-        std::path::Path::new("/dev/uinput"),
-        std::path::Path::new("/proc"),
-        std::env::var("PATH").ok().as_deref(),
-    )
 }
 
 pub struct ClipboardInjector;
@@ -293,7 +223,7 @@ impl TextInjector for ClipboardInjector {
         "clipboard"
     }
 
-    fn inject(&self, text: &str) -> Result<(), InjectError> {
+    fn inject(&self, text: &str, _target_class: Option<&str>) -> Result<(), InjectError> {
         let cmd = Command::new("wl-copy");
         let out = procutil::run_with_timeout(cmd, CLIPBOARD_TIMEOUT, Some(text.as_bytes()))
             .map_err(|e| map_proc_error("wl-copy", CLIPBOARD_TIMEOUT, e))?;
@@ -311,6 +241,8 @@ impl TextInjector for ClipboardInjector {
 #[derive(Default)]
 pub struct MockInjector {
     calls: Mutex<Vec<String>>,
+    /// The `target_class` each call carried, parallel to `calls`.
+    classes: Mutex<Vec<Option<String>>>,
     fail: bool,
     /// `None` reports the default `"mock"` name. See [`MockInjector::named`].
     name: Option<&'static str>,
@@ -318,7 +250,7 @@ pub struct MockInjector {
 
 impl MockInjector {
     pub fn failing() -> Self {
-        Self { calls: Mutex::new(Vec::new()), fail: true, name: None }
+        Self { fail: true, ..Self::default() }
     }
 
     /// A non-failing mock identified by `name` instead of the default
@@ -332,18 +264,24 @@ impl MockInjector {
     /// `assert_eq!(backend, "mock")` passed identically whether the primary
     /// or the fallback had actually run.
     pub fn named(name: &'static str) -> Self {
-        Self { calls: Mutex::new(Vec::new()), fail: false, name: Some(name) }
+        Self { name: Some(name), ..Self::default() }
     }
 
     /// A failing mock that reports `name` -- for tests that need a failure
     /// attributed to a specific backend (e.g. the ydotool environment
     /// report, which keys on the failing primary's name).
     pub fn failing_named(name: &'static str) -> Self {
-        Self { calls: Mutex::new(Vec::new()), fail: true, name: Some(name) }
+        Self { fail: true, name: Some(name), ..Self::default() }
     }
 
     pub fn injected(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
+    }
+
+    /// The `target_class` each successful call carried, parallel to
+    /// [`MockInjector::injected`].
+    pub fn target_classes(&self) -> Vec<Option<String>> {
+        self.classes.lock().unwrap().clone()
     }
 }
 
@@ -352,11 +290,12 @@ impl TextInjector for MockInjector {
         self.name.unwrap_or("mock")
     }
 
-    fn inject(&self, text: &str) -> Result<(), InjectError> {
+    fn inject(&self, text: &str, target_class: Option<&str>) -> Result<(), InjectError> {
         if self.fail {
             return Err(InjectError::Mock);
         }
         self.calls.lock().unwrap().push(text.to_string());
+        self.classes.lock().unwrap().push(target_class.map(str::to_string));
         Ok(())
     }
 }
@@ -364,7 +303,7 @@ impl TextInjector for MockInjector {
 pub fn build(cfg: &InjectConfig) -> Box<dyn TextInjector> {
     match cfg.backend {
         InjectBackend::Wtype => Box::new(WtypeInjector::new(cfg.keystroke_delay_ms)),
-        InjectBackend::Ydotool => Box::new(YdotoolInjector::new(cfg.keystroke_delay_ms)),
+        InjectBackend::Ydotool => Box::new(YdotoolInjector::new(cfg)),
         InjectBackend::Clipboard => Box::new(ClipboardInjector),
     }
 }
@@ -397,18 +336,16 @@ fn write_recovery_file_inner(state_dir: &std::path::Path, text: &str) -> std::io
 }
 
 /// What [`inject_with_recovery`] actually did: which backend carried the
-/// text, and -- when that was the fallback -- why the primary failed and (for
-/// ydotool) what its environment looked like at that moment. The failure
-/// detail exists so the per-utterance debug record can answer "why did this
-/// machine fall back?" after the fact, instead of only the daemon log.
+/// text, and -- when that was the fallback -- why the primary failed. The
+/// failure detail exists so the per-utterance debug record can answer "why
+/// did this machine fall back?" after the fact, instead of only the daemon
+/// log.
 #[derive(Debug)]
 pub(crate) struct InjectOutcome {
     pub backend: &'static str,
     pub primary_backend: &'static str,
     /// `Some` iff the fallback ran.
     pub primary_error: Option<String>,
-    /// `Some` iff the failing primary was ydotool -- see [`ydotool_env_report`].
-    pub env_report: Option<String>,
 }
 
 /// Injects via `primary`; on failure copies to the clipboard and notifies.
@@ -419,8 +356,9 @@ pub(crate) struct InjectOutcome {
 pub fn inject_with_fallback(
     primary: &dyn TextInjector,
     text: &str,
+    target_class: Option<&str>,
 ) -> anyhow::Result<&'static str> {
-    inject_with_recovery(primary, &ClipboardInjector, text, &paths::state_dir())
+    inject_with_recovery(primary, &ClipboardInjector, text, target_class, &paths::state_dir())
         .map(|out| out.backend)
 }
 
@@ -439,28 +377,19 @@ pub(crate) fn inject_with_recovery(
     primary: &dyn TextInjector,
     fallback: &dyn TextInjector,
     text: &str,
+    target_class: Option<&str>,
     state_dir: &std::path::Path,
 ) -> anyhow::Result<InjectOutcome> {
-    match primary.inject(text) {
+    match primary.inject(text, target_class) {
         Ok(()) => Ok(InjectOutcome {
             backend: primary.name(),
             primary_backend: primary.name(),
             primary_error: None,
-            env_report: None,
         }),
         Err(primary_err) => {
             tracing::warn!(error = %primary_err, backend = primary.name(),
                 "primary injector failed; falling back to clipboard");
-            // Fingerprint the environment the moment ydotool fails: whether
-            // ydotoold runs, and who may open the socket and /dev/uinput --
-            // the questions that separate "works on this distro" from
-            // "fails on that one".
-            let env_report = (primary.name() == "ydotool").then(|| {
-                let report = ydotool_env_report();
-                tracing::warn!("ydotool environment at time of failure:\n{report}");
-                report
-            });
-            match fallback.inject(text) {
+            match fallback.inject(text, target_class) {
                 Ok(()) => {
                     procutil::notify_send(
                         "yappr",
@@ -470,7 +399,6 @@ pub(crate) fn inject_with_recovery(
                         backend: fallback.name(),
                         primary_backend: primary.name(),
                         primary_error: Some(primary_err.to_string()),
-                        env_report,
                     })
                 }
                 Err(fallback_err) => {
@@ -498,15 +426,16 @@ mod tests {
     #[test]
     fn mock_injector_records_what_it_was_given() {
         let m = MockInjector::default();
-        m.inject("hello").unwrap();
-        m.inject("world").unwrap();
+        m.inject("hello", None).unwrap();
+        m.inject("world", Some("kitty")).unwrap();
         assert_eq!(m.injected(), vec!["hello".to_string(), "world".to_string()]);
+        assert_eq!(m.target_classes(), vec![None, Some("kitty".to_string())]);
     }
 
     #[test]
     fn mock_injector_can_be_told_to_fail() {
         let m = MockInjector::failing();
-        assert!(m.inject("hello").is_err());
+        assert!(m.inject("hello", None).is_err());
     }
 
     #[test]
@@ -527,36 +456,6 @@ mod tests {
     }
 
     #[test]
-    fn ydotool_argv_ends_option_parsing_before_the_text() {
-        // Same hazard as wtype: a transcript beginning with '-' must be
-        // typed, not parsed as flags. `ydotool type` parses with
-        // getopt_long, so `--` terminates option scanning.
-        let argv = ydotool_argv("-- not a flag", 2);
-        let dashdash = argv.iter().position(|a| a == "--").expect("needs a --");
-        assert_eq!(argv.last().unwrap(), "-- not a flag");
-        assert!(dashdash < argv.len() - 1, "-- must precede the text");
-        assert_eq!(argv.first().unwrap(), "type", "type is a subcommand, not a flag");
-        assert!(argv.contains(&"--key-delay".to_string()));
-        assert!(argv.contains(&"2".to_string()));
-    }
-
-    #[test]
-    fn ydotool_argv_passes_the_text_as_a_single_argument() {
-        let argv = ydotool_argv("hello there friend", 2);
-        assert_eq!(argv.iter().filter(|a| a.contains(' ')).count(), 1);
-    }
-
-    #[test]
-    fn ydotool_argv_puts_the_subcommand_before_its_options() {
-        // `ydotool --key-delay 2 type ...` is not a thing: the subcommand
-        // owns the option parser, so it has to come first.
-        let argv = ydotool_argv("hello", 2);
-        let sub = argv.iter().position(|a| a == "type").unwrap();
-        let delay = argv.iter().position(|a| a == "--key-delay").unwrap();
-        assert!(sub < delay, "got: {argv:?}");
-    }
-
-    #[test]
     fn build_selects_the_configured_backend() {
         let mut cfg = InjectConfig::default();
         assert_eq!(build(&cfg).name(), "wtype");
@@ -567,9 +466,63 @@ mod tests {
     }
 
     #[test]
+    fn the_paste_chord_for_a_normal_window_is_ctrl_v_in_nested_order() {
+        // 29 = KEY_LEFTCTRL, 47 = KEY_V -- raw keycodes, deliberately: key
+        // POSITIONS are the same on QWERTZ and QWERTY, which is the whole
+        // point of pasting (ydotool's own char->keycode table is US-only,
+        // so `type` mangles German text; a single Ctrl+V does not).
+        let argv = paste_key_argv(false);
+        assert_eq!(argv, vec!["key", "29:1", "47:1", "47:0", "29:0"]);
+    }
+
+    #[test]
+    fn the_paste_chord_for_a_terminal_adds_shift_in_nested_order() {
+        // 42 = KEY_LEFTSHIFT. Terminals reserve plain Ctrl+V for the
+        // application running inside them; their paste is Ctrl+Shift+V.
+        let argv = paste_key_argv(true);
+        assert_eq!(argv, vec!["key", "29:1", "42:1", "47:1", "47:0", "42:0", "29:0"]);
+    }
+
+    #[test]
+    fn terminal_detection_matches_the_configured_classes_case_insensitively() {
+        // Hyprland reports "Alacritty" with a capital A; the configured list
+        // is lowercase. Nobody should have to know which spelling wins.
+        let list = vec!["alacritty".to_string(), "org.wezfurlong.wezterm".to_string()];
+        assert!(is_terminal_class(Some("Alacritty"), &list));
+        assert!(is_terminal_class(Some("org.wezfurlong.wezterm"), &list));
+        assert!(!is_terminal_class(Some("firefox"), &list));
+        assert!(!is_terminal_class(None, &list), "no class means no shift");
+    }
+
+    #[test]
+    fn the_target_window_class_travels_to_both_injectors() {
+        // The class captured at ptt-start decides the ydotool backend's
+        // paste chord, so inject_with_recovery must hand it to the primary
+        // -- and to the fallback, which is an injector like any other.
+        let dir = scratch_dir("class-through");
+        let primary = MockInjector::default();
+        let out = inject_with_recovery(
+            &primary,
+            &MockInjector::named("fallback-mock"),
+            "hello",
+            Some("kitty"),
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(out.backend, "mock");
+        assert_eq!(primary.target_classes(), vec![Some("kitty".to_string())]);
+
+        let failing = MockInjector::failing();
+        let fallback = MockInjector::named("fallback-mock");
+        inject_with_recovery(&failing, &fallback, "hello", Some("kitty"), &dir).unwrap();
+        assert_eq!(fallback.target_classes(), vec![Some("kitty".to_string())]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn fallback_reports_the_primary_when_it_succeeds() {
         let m = MockInjector::default();
-        assert_eq!(inject_with_fallback(&m, "hello").unwrap(), "mock");
+        assert_eq!(inject_with_fallback(&m, "hello", None).unwrap(), "mock");
         assert_eq!(m.injected(), vec!["hello".to_string()]);
     }
 
@@ -589,7 +542,7 @@ mod tests {
         let primary = MockInjector::failing();
         let fallback = MockInjector::failing();
 
-        let err = inject_with_recovery(&primary, &fallback, "please do not lose this", &dir)
+        let err = inject_with_recovery(&primary, &fallback, "please do not lose this", None, &dir)
             .unwrap_err();
         assert!(err.to_string().contains("unsent.txt"), "got: {err}");
 
@@ -608,7 +561,7 @@ mod tests {
         let primary = MockInjector::failing();
         let fallback = MockInjector::named("fallback-mock");
 
-        let out = inject_with_recovery(&primary, &fallback, "hello", &dir).unwrap();
+        let out = inject_with_recovery(&primary, &fallback, "hello", None, &dir).unwrap();
         assert_eq!(out.backend, "fallback-mock");
         assert_eq!(out.primary_backend, "mock");
         let err = out.primary_error.expect("must record why the primary failed");
@@ -623,166 +576,10 @@ mod tests {
         let primary = MockInjector::default();
         let fallback = MockInjector::named("fallback-mock");
 
-        let out = inject_with_recovery(&primary, &fallback, "hello", &dir).unwrap();
+        let out = inject_with_recovery(&primary, &fallback, "hello", None, &dir).unwrap();
         assert_eq!(out.backend, "mock");
         assert_eq!(out.primary_backend, "mock");
         assert!(out.primary_error.is_none());
-        assert!(out.env_report.is_none());
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn the_env_report_is_attached_only_when_the_failing_primary_is_ydotool() {
-        let dir = scratch_dir("outcome-env");
-        let fallback = MockInjector::named("fallback-mock");
-
-        let ydotool_like = MockInjector::failing_named("ydotool");
-        let out = inject_with_recovery(&ydotool_like, &fallback, "hello", &dir).unwrap();
-        let report = out.env_report.expect("a ydotool failure must carry the environment report");
-        assert!(report.contains("ydotoold"), "got: {report}");
-
-        let wtype_like = MockInjector::failing_named("wtype");
-        let out = inject_with_recovery(&wtype_like, &fallback, "hello", &dir).unwrap();
-        assert!(
-            out.env_report.is_none(),
-            "wtype needs no ydotoold/uinput diagnosis; the report is ydotool-specific"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn env_report_shows_the_socket_env_value_and_whether_that_socket_exists() {
-        let dir = scratch_dir("env-sock");
-        std::fs::create_dir_all(&dir).unwrap();
-        let sock = dir.join("custom.sock");
-        let sock_str = sock.to_str().unwrap();
-
-        let report = ydotool_env_report_at(
-            Some(sock_str),
-            None,
-            &dir.join("no-uinput"),
-            &dir.join("no-proc"),
-            None,
-        );
-        assert!(report.contains("YDOTOOL_SOCKET"), "got: {report}");
-        assert!(report.contains(sock_str), "got: {report}");
-        assert!(report.contains("missing"), "an absent socket must be called out, got: {report}");
-
-        std::fs::write(&sock, b"").unwrap();
-        let report = ydotool_env_report_at(
-            Some(sock_str),
-            None,
-            &dir.join("no-uinput"),
-            &dir.join("no-proc"),
-            None,
-        );
-        assert!(
-            report.contains("mode"),
-            "an existing socket must report its permissions, got: {report}"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn env_report_names_the_default_socket_candidates_when_the_env_var_is_unset() {
-        let dir = scratch_dir("env-sock-unset");
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let report = ydotool_env_report_at(
-            None,
-            Some("/run/user/12345"),
-            &dir.join("no-uinput"),
-            &dir.join("no-proc"),
-            None,
-        );
-        assert!(report.contains("unset"), "got: {report}");
-        assert!(report.contains("/run/user/12345/.ydotool_socket"), "got: {report}");
-        assert!(report.contains("/tmp/.ydotool_socket"), "got: {report}");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn env_report_reports_uinput_permissions_or_its_absence() {
-        let dir = scratch_dir("env-uinput");
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let missing = ydotool_env_report_at(
-            None,
-            None,
-            &dir.join("no-uinput"),
-            &dir.join("no-proc"),
-            None,
-        );
-        assert!(missing.contains("uinput"), "got: {missing}");
-        assert!(missing.contains("missing"), "got: {missing}");
-
-        let uinput = dir.join("uinput");
-        std::fs::write(&uinput, b"").unwrap();
-        let present = ydotool_env_report_at(None, None, &uinput, &dir.join("no-proc"), None);
-        assert!(
-            present.contains("mode"),
-            "an existing uinput must report its permissions, got: {present}"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn env_report_finds_a_running_ydotoold_in_the_proc_table() {
-        let dir = scratch_dir("env-proc");
-        let proc_dir = dir.join("proc");
-        std::fs::create_dir_all(proc_dir.join("1234")).unwrap();
-        std::fs::write(proc_dir.join("1234").join("comm"), "ydotoold\n").unwrap();
-        std::fs::create_dir_all(proc_dir.join("99")).unwrap();
-        std::fs::write(proc_dir.join("99").join("comm"), "bash\n").unwrap();
-
-        let report =
-            ydotool_env_report_at(None, None, &dir.join("no-uinput"), &proc_dir, None);
-        assert!(report.contains("ydotoold: running (pid 1234)"), "got: {report}");
-
-        let empty_proc = dir.join("empty-proc");
-        std::fs::create_dir_all(&empty_proc).unwrap();
-        let report =
-            ydotool_env_report_at(None, None, &dir.join("no-uinput"), &empty_proc, None);
-        assert!(report.contains("ydotoold: not found"), "got: {report}");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn env_report_resolves_the_ydotool_binary_from_path() {
-        let dir = scratch_dir("env-bin");
-        let bin_dir = dir.join("bin");
-        std::fs::create_dir_all(&bin_dir).unwrap();
-        let exe = bin_dir.join("ydotool");
-        std::fs::write(&exe, b"").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-
-        let report = ydotool_env_report_at(
-            None,
-            None,
-            &dir.join("no-uinput"),
-            &dir.join("no-proc"),
-            Some(bin_dir.to_str().unwrap()),
-        );
-        assert!(report.contains(exe.to_str().unwrap()), "got: {report}");
-
-        let report = ydotool_env_report_at(
-            None,
-            None,
-            &dir.join("no-uinput"),
-            &dir.join("no-proc"),
-            Some(dir.join("empty-bin").to_str().unwrap()),
-        );
-        assert!(report.contains("not found on PATH"), "got: {report}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -797,7 +594,7 @@ mod tests {
         // one ran).
         let fallback = MockInjector::named("fallback-mock");
 
-        let out = inject_with_recovery(&primary, &fallback, "hello", &dir).unwrap();
+        let out = inject_with_recovery(&primary, &fallback, "hello", None, &dir).unwrap();
         assert_eq!(out.backend, "fallback-mock", "must report that the fallback, not the primary, ran");
         assert_eq!(fallback.injected(), vec!["hello".to_string()]);
         assert!(!dir.join("unsent.txt").exists());

@@ -313,12 +313,19 @@ impl Default for GuardrailConfig {
 #[serde(rename_all = "lowercase")]
 pub enum InjectBackend {
     Wtype,
-    /// Spec 10.3, no longer deferred. Types through `/dev/uinput` rather
-    /// than through the compositor's virtual-keyboard protocol, which is
-    /// what makes it work in the XWayland and Electron surfaces `wtype` is
-    /// known to fail in (spec 17.3) -- at the cost of a running `ydotoold`
-    /// and write access to `/dev/uinput`. Not the default for exactly that
-    /// reason: `wtype` needs no setup at all.
+    /// Spec 10.3, no longer deferred -- but no longer `ydotool type` either.
+    /// Since 2026-09-02 this backend pastes: `wl-copy` the transcript, then
+    /// have ydotool press a single Ctrl+V by raw keycode (Ctrl+Shift+V when
+    /// the target window's class is in `terminal_classes`). `ydotool type`
+    /// maps characters through a hard-coded US-QWERTY table -- on a German
+    /// layout it swaps z/y and silently drops umlauts and ß entirely --
+    /// while key *positions* (Ctrl, Shift, V) are layout-independent, and
+    /// the pasted text arrives as whatever UTF-8 the clipboard holds. Still
+    /// the backend for surfaces `wtype` cannot reach (GNOME/Mutter,
+    /// XWayland, some Electron windows), still at the cost of a running
+    /// `ydotoold` with write access to `/dev/uinput` -- plus `wl-copy`,
+    /// which the clipboard fallback needs anyway. Not the default because
+    /// `wtype` needs no setup at all.
     Ydotool,
     Clipboard,
 }
@@ -332,6 +339,12 @@ pub struct InjectConfig {
     pub trailing_space: bool,
     #[serde(default = "d_keydelay")]
     pub keystroke_delay_ms: u32,
+    /// Window classes (matched case-insensitively against the class captured
+    /// at recording start) whose paste chord is Ctrl+Shift+V rather than
+    /// Ctrl+V -- terminals reserve plain Ctrl+V for the applications running
+    /// inside them. Only the `ydotool` backend reads this.
+    #[serde(default = "d_terminal_classes")]
+    pub terminal_classes: Vec<String>,
 }
 
 fn d_backend() -> InjectBackend {
@@ -340,6 +353,37 @@ fn d_backend() -> InjectBackend {
 fn d_keydelay() -> u32 {
     2
 }
+/// The window classes of the terminals a Wayland user plausibly runs, as the
+/// compositor reports them (matching is case-insensitive, so "Alacritty" and
+/// "org.gnome.Terminal" are covered by their lowercase spellings). Kept in
+/// sync with DEFAULT_CONFIG_TOML by `default_config_toml_parses_and_matches_
+/// the_compiled_defaults`.
+fn d_terminal_classes() -> Vec<String> {
+    [
+        "alacritty",
+        "kitty",
+        "foot",
+        "footclient",
+        "wezterm",
+        "org.wezfurlong.wezterm",
+        "ghostty",
+        "com.mitchellh.ghostty",
+        "konsole",
+        "org.kde.konsole",
+        "org.gnome.terminal",
+        "gnome-terminal-server",
+        "org.gnome.console",
+        "kgx",
+        "xterm",
+        "urxvt",
+        "st-256color",
+        "terminator",
+        "tilix",
+        "xfce4-terminal",
+    ]
+    .map(str::to_string)
+    .to_vec()
+}
 
 impl Default for InjectConfig {
     fn default() -> Self {
@@ -347,6 +391,7 @@ impl Default for InjectConfig {
             backend: d_backend(),
             trailing_space: true,
             keystroke_delay_ms: d_keydelay(),
+            terminal_classes: d_terminal_classes(),
         }
     }
 }
@@ -672,9 +717,21 @@ ngram_max_repeats = 3
 [inject]
 backend = "wtype"          # "wtype" | "ydotool" | "clipboard"
                            # ydotool needs a running ydotoold and write access
-                           # to /dev/uinput; it types where wtype cannot.
+                           # to /dev/uinput; it reaches windows wtype cannot,
+                           # and it pastes rather than types: wl-copy plus one
+                           # Ctrl+V by raw keycode (Ctrl+Shift+V in the
+                           # terminals listed below), so umlauts and ß survive
+                           # any keyboard layout. clipboard only copies;
+                           # pasting is on you.
 trailing_space = true
-keystroke_delay_ms = 2
+keystroke_delay_ms = 2     # wtype only: pause between simulated keystrokes
+terminal_classes = [       # window classes that paste with Ctrl+Shift+V
+    "alacritty", "kitty", "foot", "footclient", "wezterm",
+    "org.wezfurlong.wezterm", "ghostty", "com.mitchellh.ghostty", "konsole",
+    "org.kde.konsole", "org.gnome.terminal", "gnome-terminal-server",
+    "org.gnome.console", "kgx", "xterm", "urxvt", "st-256color", "terminator",
+    "tilix", "xfce4-terminal",
+]
 
 [overlay]
 position = "bottom-center"  # only "bottom-center" is currently supported
@@ -724,6 +781,18 @@ save_audio = true    # only meaningful when enabled = true
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inject_defaults_cover_common_terminals() {
+        let c = Config::from_str("").unwrap();
+        for class in ["alacritty", "kitty", "foot", "org.wezfurlong.wezterm", "konsole"] {
+            assert!(
+                c.inject.terminal_classes.iter().any(|t| t == class),
+                "{class} missing from the default terminal list: {:?}",
+                c.inject.terminal_classes
+            );
+        }
+    }
 
     #[test]
     fn empty_toml_yields_documented_defaults() {

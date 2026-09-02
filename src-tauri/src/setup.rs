@@ -101,12 +101,6 @@ fn print_debug_summary(
                     i.primary_backend.as_deref().unwrap_or("?"),
                 );
             }
-            if let Some(report) = &i.env_report {
-                println!("  ydotool environment at time of failure:");
-                for line in report.lines() {
-                    println!("    {line}");
-                }
-            }
         }
         None => println!("  final text: (nothing was injected)"),
     }
@@ -234,7 +228,7 @@ pub(crate) fn check_prerequisites() -> Vec<&'static str> {
         // matters to someone who has switched `inject.backend` to it, and
         // reporting it as MISSING would put a package in the "install these"
         // list that almost nobody needs.
-        ("ydotool", "typing via /dev/uinput when inject.backend = \"ydotool\"", "ydotool", false),
+        ("ydotool", "pasting via /dev/uinput when inject.backend = \"ydotool\"", "ydotool", false),
         ("hyprctl", "per-application style rules", "hyprland", false),
     ];
 

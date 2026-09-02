@@ -427,6 +427,7 @@ impl Pipeline {
             self.injector.as_ref(),
             self.fallback_injector.as_ref(),
             &text,
+            window_class,
             &self.recovery_dir(),
         )?; // dbg drops here if both injectors fail: writes a record with everything up to (not including) injection -- the gap review flagged.
         dbg.timings.inject_ms = t.elapsed().as_millis();
@@ -441,7 +442,6 @@ impl Pipeline {
                 .is_some()
                 .then(|| outcome.primary_backend.to_string()),
             primary_error: outcome.primary_error,
-            env_report: outcome.env_report,
         });
 
         tracing::info!(

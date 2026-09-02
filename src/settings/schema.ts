@@ -90,6 +90,7 @@ export const LABELS: Record<string, string> = {
   "inject.backend": "Verfahren",
   "inject.trailing_space": "Leerzeichen anhängen",
   "inject.keystroke_delay_ms": "Tastenverzögerung",
+  "inject.terminal_classes": "Terminal-Fensterklassen",
   "vocabulary.enabled": "Vokabular aktiv",
   "vocabulary.terms": "Begriffe",
   "vocabulary.replacements": "Feste Ersetzungen",
@@ -166,11 +167,13 @@ export const HELP: Record<string, string> = {
   "guardrail.ngram_max_repeats":
     "Wie oft dieselbe Wortfolge vorkommen darf, bevor die Fassung als Schleife verworfen wird.",
   "inject.backend":
-    "wtype tippt den Text Zeichen für Zeichen ins Fenster. ydotool tippt stattdessen über /dev/uinput und erreicht damit auch Fenster, in denen wtype nichts bewirkt — setzt aber einen laufenden ydotoold voraus. clipboard legt ihn in die Zwischenablage und fügt ihn ein.",
+    "wtype tippt den Text Zeichen für Zeichen ins Fenster und braucht keine Einrichtung. ydotool legt ihn per wl-copy in die Zwischenablage und drückt einmal Strg+V (in Terminals Strg+Umschalt+V) — layoutunabhängig, Umlaute und ß kommen richtig an, und es erreicht auch Fenster, in denen wtype nichts bewirkt; setzt aber einen laufenden ydotoold voraus. clipboard legt ihn nur in die Zwischenablage, einfügen musst du selbst.",
   "inject.trailing_space":
     "Hängt ein Leerzeichen an, damit das nächste Diktat nicht am vorherigen klebt.",
   "inject.keystroke_delay_ms":
-    "Pause zwischen zwei simulierten Tastenanschlägen. Höher setzen, wenn ein Fenster Zeichen verschluckt. ydotool zählt sie je Tastenereignis, also zweimal pro Zeichen.",
+    "Pause zwischen zwei simulierten Tastenanschlägen. Höher setzen, wenn ein Fenster Zeichen verschluckt. Nur das wtype-Verfahren tippt Zeichen für Zeichen; die anderen ignorieren das.",
+  "inject.terminal_classes":
+    "Fensterklassen, in denen das ydotool-Verfahren mit Strg+Umschalt+V einfügt statt Strg+V — Terminals reservieren Strg+V für das Programm darin. Groß-/Kleinschreibung spielt keine Rolle.",
   "vocabulary.enabled":
     "Korrigiert Fachbegriffe und Namen schon im Erkennungstext, bevor die Nachbearbeitung ihn zu sehen bekommt.",
   "vocabulary.terms":

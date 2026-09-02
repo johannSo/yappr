@@ -180,7 +180,7 @@ Two differences:
 - **Use the `ydotool` backend.** Mutter doesn't implement the virtual-keyboard protocol
   `wtype` types through, so `wtype` silently does nothing. The wizard detects GNOME and
   sets `[inject] backend = "ydotool"` for you on a first run — see
-  [Typing with ydotool](#typing-with-ydotool) for the one-time setup.
+  [Pasting with ydotool](#pasting-with-ydotool) for the one-time setup.
 - **Add the shortcuts in Settings → Keyboard → Custom Shortcuts**, running
   `yappr --toggle` and `yappr --cancel`. The wizard also offers a `gsettings` script
   that *appends* to your existing custom shortcuts — never use a plain
@@ -227,7 +227,7 @@ You can edit it by hand; the GUI is careful not to trample it.
 | `[asr]` | `num_threads` for Parakeet |
 | `[normalize]` | `enabled` (`false` skips S1-mini and types rule-cleaned raw text), plus `timeout_ms`, `context_size`, `threads` |
 | `[guardrail]` | `min_word_ratio`/`max_word_ratio`, `min_overlap_english`/`min_overlap_other`, `short_input_words`, `ngram_size`/`ngram_max_repeats` |
-| `[inject]` | `backend` (`wtype`, `ydotool`, `clipboard`), `trailing_space`, `keystroke_delay_ms` |
+| `[inject]` | `backend` (`wtype`, `ydotool`, `clipboard`), `trailing_space`, `keystroke_delay_ms` (wtype only), `terminal_classes` (windows that paste with Ctrl+Shift+V) |
 | `[vocabulary]` | terms and replacements applied to the raw transcript before clean-up — put short acronyms in `replacements`, not `terms` |
 | `[style_default]`, `[[style_rules]]` | the `styling`/`structure`/`context` axes S1-mini is prompted with, and per-application overrides matched on window class (regex) |
 | `[debug]` | `enabled` (off), `dir` (default `~/yappr`), `save_audio` — see [Troubleshooting](#troubleshooting) |
@@ -240,13 +240,21 @@ You can edit it by hand; the GUI is careful not to trample it.
 reloadable section live. It refuses outright — rather than half-applying — if you
 changed `[asr]` or `[normalize]`.
 
-### Typing with `ydotool`
+### Pasting with `ydotool`
 
 `wtype` is the default and needs no setup: it types through the compositor's own
 virtual-keyboard protocol. But it does nothing on GNOME, and it's known to drop
-keystrokes in some XWayland and Electron windows. `ydotool` types through the kernel's
-`/dev/uinput` instead, which no window can tell apart from a real keyboard — at the cost
-of some setup, which is why it isn't the default.
+keystrokes in some XWayland and Electron windows. The `ydotool` backend goes through the
+kernel's `/dev/uinput` instead, which no window can tell apart from a real keyboard — at
+the cost of some setup, which is why it isn't the default.
+
+It doesn't type the transcript, it pastes it: the text goes to the clipboard with
+`wl-copy`, then ydotool presses a single Ctrl+V by raw keycode — or Ctrl+Shift+V when
+the target window's class is in `[inject] terminal_classes`, because terminals reserve
+plain Ctrl+V for the program running inside them. Key *positions* are
+layout-independent, so this works on any keyboard layout, umlauts and ß included —
+`ydotool type` would mangle them through its US-only keymap. The transcript stays in the
+clipboard afterwards, so if the paste keystroke fails you can paste it yourself.
 
 ```bash
 sudo pacman -S ydotool                          # For Arch based distros
@@ -288,7 +296,7 @@ needed — `preload_at_startup` alone still unloads after the idle timeout.
 | Symptom | Likely cause |
 |---|---|
 | **Nothing happens when I press `SUPER+D`** | The app isn't running (check for the tray icon), or the shortcut isn't bound. Run `yappr --toggle` in a terminal: with no app running it exits non-zero and raises a notification. |
-| **Nothing gets typed, but the overlay says it worked** | `wtype` can't reach that window — you're on GNOME, or it's an XWayland/Electron window. Switch to [`ydotool`](#typing-with-ydotool). Check the clipboard: the text is probably there. |
+| **Nothing gets typed, but the overlay says it worked** | `wtype` can't reach that window — you're on GNOME, or it's an XWayland/Electron window. Switch to [`ydotool`](#pasting-with-ydotool). Check the clipboard: the text is probably there. |
 | **`cargo build` fails in `gtk-layer-shell-sys`** | `sudo pacman -S gtk-layer-shell`. |
 | **Blank windows after building** | Built without `--features custom-protocol`, or without `bun run build` first. |
 | **The first dictation of the day is slow** | Expected — the models load lazily. See [Memory use](#memory-use). |

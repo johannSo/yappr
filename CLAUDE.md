@@ -7,8 +7,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Press-to-start, press-to-stop dictation for Hyprland/Wayland. Press `SUPER+D`, speak,
 press `SUPER+D` again; the audio is captured, VAD-trimmed, transcribed (Parakeet TDT via
 `sherpa-onnx`), rewritten by S1-mini (llama.cpp, in-process), checked by a guardrail, and
-typed into the focused window with `wtype` (or `ydotool`, if `[inject] backend` selects
-it). Fully local at dictation time. `SUPER+ALT+D`
+typed into the focused window with `wtype` (or `ydotool` — a *paste* backend since
+2026-09-02: wl-copy plus one layout-independent ydotool Ctrl+V, Ctrl+Shift+V when the
+target window's class is in `[inject] terminal_classes`; the transcript stays in the
+clipboard afterwards — if `[inject] backend` selects it). Fully local at
+dictation time. `SUPER+ALT+D`
 cancels a recording in progress; nothing else can end one deliberately — see invariant 11.
 
 yappr is one binary, `yappr`, and one process. Running it with no
@@ -29,7 +32,7 @@ distinction when editing either — a blanket rename through them makes them fal
 `owf-ctl`, `owf-cli` and `owf-daemon` in comments are the same case: deleted crates
 that genuinely had those names, not stale spellings.
 
-`README.md` is the user-facing setup guide. `HANDOVER.md` is the current state-of-play,
+`README.md` is the user-facing setup guide. `docs/HANDOVER.md` is the current state-of-play,
 including what has and has not been verified on real hardware.
 
 ## Commands
@@ -245,7 +248,14 @@ happen to be resident.
    title-matched compositor rule (invariant 2) — `position_overlay`'s no-op is the whole of
    this fallback path's own contribution, same as before this rewrite.
 6. **Every subprocess call goes through `procutil::run_with_timeout`.** A hung `wtype` or
-   `hyprctl` previously wedged the server's single-threaded accept loop forever.
+   `hyprctl` previously wedged the server's single-threaded accept loop forever. The
+   helper drains stdout/stderr on threads and takes what they have collected
+   `PIPE_DRAIN_GRACE` after the child exits, instead of reading the pipes to EOF: a
+   child that forks a daemon (`wl-copy` does, on every successful copy) leaves a
+   grandchild holding the pipes open, and `read_to_end` on that blocked the pipeline
+   thread at `INJECTING` until the clipboard was next replaced — the ydotool paste
+   backend never reached `ydotool` at all. Pinned by
+   `a_child_that_exits_but_leaves_a_grandchild_holding_its_pipes_does_not_block`.
 7. **Debug records are written from `DebugRecordGuard`'s `Drop`**, not at each return point,
    so a `?` added anywhere in `process_with_capture` still produces a record.
 8. **Capitalisation and terminal punctuation are applied at one choke point**
@@ -493,5 +503,5 @@ happen to be resident.
   `hypr.rs` detects Lua vs classic `.conf`; Hyprland 0.56+ with a Lua config rejects the
   legacy keyword parser outright, so the formats are not interchangeable.
 - **Real dictation is still unverified end to end** (no one has spoken into it; see
-  `HANDOVER.md`). Do not record from the microphone without explicit permission — that
+  `docs/HANDOVER.md`). Do not record from the microphone without explicit permission — that
   constraint is why the audio half remains untested.

@@ -405,8 +405,8 @@ export function Wizard({
                 <div className="card">
                   <p className="setup-command">
                     Dafür noch nötig: <code>sudo pacman -S ydotool</code> und{" "}
-                    <code>systemctl --user enable --now ydotoold</code>. Tippt yappr danach
-                    nichts, fehlt meist der Zugriff auf <code>/dev/uinput</code>.
+                    <code>systemctl --user enable --now ydotoold</code>. Fügt yappr danach
+                    nichts ein, fehlt meist der Zugriff auf <code>/dev/uinput</code>.
                   </p>
                 </div>
               )}

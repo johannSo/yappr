@@ -84,8 +84,12 @@ impl Normalizer for PanickingNormalizer {
 /// already uses on the normalizer side.
 struct FwdInjector(std::sync::Arc<MockInjector>);
 impl yappr_core::inject::TextInjector for FwdInjector {
-    fn inject(&self, text: &str) -> Result<(), yappr_core::inject::InjectError> {
-        self.0.inject(text)
+    fn inject(
+        &self,
+        text: &str,
+        target_class: Option<&str>,
+    ) -> Result<(), yappr_core::inject::InjectError> {
+        self.0.inject(text, target_class)
     }
     fn name(&self) -> &'static str {
         self.0.name()

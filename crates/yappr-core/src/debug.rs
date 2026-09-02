@@ -190,8 +190,6 @@ pub struct InjectDebug {
     pub primary_backend: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primary_error: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub env_report: Option<String>,
 }
 
 /// One utterance's full diagnostic record, written as
@@ -502,7 +500,6 @@ mod tests {
                 final_text: "Hello there. ".to_string(),
                 primary_backend: None,
                 primary_error: None,
-                env_report: None,
             }),
             timings: Timings { vad_ms: 1, asr_ms: 2, normalize_ms: 3, inject_ms: 4 },
         };
@@ -523,14 +520,13 @@ mod tests {
 
     #[test]
     fn inject_debug_written_before_the_failure_fields_existed_still_deserializes() {
-        // Records on disk predate primary_error/env_report -- `--debug` reads
+        // Records on disk predate primary_error -- `--debug` reads
         // whatever is newest, which may be an old record.
         let json = r#"{"backend":"clipboard","final_text":"Hallo. "}"#;
         let d: InjectDebug = serde_json::from_str(json).unwrap();
         assert_eq!(d.backend, "clipboard");
         assert!(d.primary_backend.is_none());
         assert!(d.primary_error.is_none());
-        assert!(d.env_report.is_none());
     }
 
     #[test]
@@ -595,7 +591,6 @@ mod tests {
                     final_text: "Hi. ".to_string(),
                     primary_backend: None,
                     primary_error: None,
-                    env_report: None,
                 }),
                 timings: Timings::default(),
             },
