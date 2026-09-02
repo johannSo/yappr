@@ -59,6 +59,16 @@ export default function Settings() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  // Kept apart from `notice` deliberately. That one carries `restart_reason`
+  // from a save, and the two used to share it: a save wiped the startup notice
+  // before the user had read it, and the next reveal's `load(true)` brought the
+  // startup notice back over the restart one. They are different messages with
+  // different lifetimes and both matter.
+  const [configNotice, setConfigNotice] = useState<string | null>(null);
+  // "Verstanden" has to stick. The daemon reports the same notice on every
+  // `get_config`, and this window re-reads on every reveal, so without this the
+  // banner would come back each time the window is reopened.
+  const dismissedNoticeRef = useRef<string | null>(null);
   const [saveState, setSaveState] = useState<SaveState>("clean");
   const [loading, setLoading] = useState(true);
 
@@ -104,7 +114,11 @@ export default function Settings() {
       // looks wrong -- and the settings on screen are not the settings the
       // user had. The banner names the file the old one went to, because that
       // is the only way back to it.
-      if (res.config_notice) setNotice(res.config_notice);
+      setConfigNotice(
+        res.config_notice && res.config_notice !== dismissedNoticeRef.current
+          ? res.config_notice
+          : null,
+      );
       setSaveState("clean");
       setSaveError(null);
     } catch (e) {
@@ -261,7 +275,16 @@ export default function Settings() {
 
   const schedule = useCallback(
     (commit: Commit) => {
-      if (timerRef.current !== null) window.clearTimeout(timerRef.current);
+      if (timerRef.current !== null) {
+        window.clearTimeout(timerRef.current);
+        // Cleared means cleared. Only the timeout callback used to null this,
+        // and cancelling it skipped that -- so after the ordinary sequence
+        // "type in a field, then flip a toggle within DEBOUNCE_MS" the ref
+        // stayed a stale non-null id for the life of the window, and the
+        // `show-settings` guard below reads it as "an edit is still pending"
+        // and refuses every reveal-time resync from then on.
+        timerRef.current = null;
+      }
       if (commit === "now") {
         void flush();
         return;
@@ -498,6 +521,30 @@ export default function Settings() {
                     <span>{saveError}</span>
                     <button type="button" className="ghost" onClick={() => void flush()}>
                       Erneut speichern
+                    </button>
+                  </motion.div>
+                )}
+                {configNotice && (
+                  <motion.div
+                    key="config-notice"
+                    className="banner error"
+                    layout
+                    initial={{ opacity: 0, y: -8 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -8 }}
+                    transition={SETTLE}
+                  >
+                    <Icon name="warn" className="icon-sm" />
+                    <span>{configNotice}</span>
+                    <button
+                      type="button"
+                      className="ghost"
+                      onClick={() => {
+                        dismissedNoticeRef.current = configNotice;
+                        setConfigNotice(null);
+                      }}
+                    >
+                      Verstanden
                     </button>
                   </motion.div>
                 )}

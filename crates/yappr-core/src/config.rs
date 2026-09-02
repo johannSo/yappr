@@ -199,8 +199,9 @@ pub struct NormalizeConfig {
     /// S1-mini runs in this process now; there is no `llama-server` to
     /// listen on a port. The field stays because every `config.toml`
     /// written before that change has this key in it, and `[normalize]` is
-    /// `deny_unknown_fields` (invariant 4) -- deleting it here would turn
-    /// an existing, valid config into a hard startup failure.
+    /// `deny_unknown_fields` (invariant 4) -- deleting it here would make
+    /// every pre-existing config unloadable, and `load_or_quarantine` would
+    /// then move each one aside and reset that user's settings.
     ///
     /// `skip_serializing` is what actually retires it (spec §2.1). While the
     /// writer merged into the user's own document, a key it never touched
@@ -570,9 +571,25 @@ impl Config {
         Ok(c)
     }
 
-    /// Loads the config, writing a default file if none exists.
+    /// Loads the *real* config, migrating a pre-2026-09-02 file across first
+    /// and writing a default if neither exists.
+    ///
+    /// The migration lives here, not only in `server::start`, because
+    /// [`Config::load_from`] **creates** the file when it is absent -- so any
+    /// caller that touched the new path before the daemon did would make
+    /// `current.exists()` true and strand the legacy config forever. Two such
+    /// callers exist and neither needs a daemon: `setup.rs`'s `debug_summary`
+    /// (`yappr --debug`) and `wizard.rs`'s `wizard_state`.
+    ///
+    /// Best-effort and silent here on purpose. `server::start` calls
+    /// [`migrate_from_legacy`] itself, before this, precisely so it can report
+    /// the outcome; by the time anything else reaches this path the migration
+    /// has already happened or already failed, and a second opinion about it
+    /// would only be noise.
     pub fn load() -> Result<Self> {
-        Self::load_from(&paths::config_file())
+        let current = paths::config_file();
+        let _ = migrate_from_legacy(&paths::legacy_config_file(), &current);
+        Self::load_from(&current)
     }
 
     /// [`Config::load`] against an explicit path.
@@ -693,9 +710,11 @@ impl Config {
 /// What [`load_or_quarantine`] moved aside, and why.
 #[derive(Debug, Clone)]
 pub struct Quarantine {
-    /// Where the unloadable file went. Shown to the user verbatim: it is the
-    /// only way back to whatever they had.
-    pub moved_to: PathBuf,
+    /// Where the unloadable file went, or `None` when even the rename failed
+    /// and it is still sitting at its original path. The distinction reaches
+    /// the user: a banner saying a file was moved somewhere it demonstrably
+    /// is not would send them looking in the wrong place.
+    pub moved_to: Option<PathBuf>,
     /// The load error as text rather than as an `anyhow::Error`, because this
     /// is stored behind a `Mutex` for the life of the process and
     /// `anyhow::Error` is not `Clone`.
@@ -730,7 +749,7 @@ pub fn load_or_quarantine(path: &Path) -> (Config, Option<Quarantine>) {
                     // to write one still leaves a daemon that runs on the
                     // in-memory defaults. The next successful save creates it.
                     let _ = std::fs::write(path, render(&Config::default()));
-                    (Config::default(), Some(Quarantine { moved_to, error }))
+                    (Config::default(), Some(Quarantine { moved_to: Some(moved_to), error }))
                 }
                 // Nothing left to do but carry on: refusing to start is the
                 // exact failure mode this function exists to remove, so a
@@ -738,9 +757,9 @@ pub fn load_or_quarantine(path: &Path) -> (Config, Option<Quarantine>) {
                 Err(rename_err) => (
                     Config::default(),
                     Some(Quarantine {
-                        moved_to: path.to_path_buf(),
+                        moved_to: None,
                         error: format!(
-                            "{error} (Datei konnte nicht beiseitegelegt werden: {rename_err})"
+                            "{error} (konnte auch nicht beiseitegelegt werden: {rename_err})"
                         ),
                     }),
                 ),
@@ -769,6 +788,22 @@ fn quarantine_file(path: &Path) -> std::io::Result<PathBuf> {
     Ok(candidate)
 }
 
+/// What [`migrate_from_legacy`] did, which startup has to be able to tell
+/// apart -- "there was nothing to move" and "there was something and it was
+/// unreadable" look identical from the outside and mean opposite things to the
+/// user.
+#[derive(Debug, Clone)]
+pub enum Migration {
+    /// No legacy file, or the new one already exists.
+    NotNeeded,
+    /// Moved across. The old file is at this path now.
+    Moved(PathBuf),
+    /// A legacy config exists and will not load, so it was left exactly where
+    /// it is. Startup reports this: the user is about to be handed defaults and
+    /// would otherwise have no idea why.
+    LegacyUnreadable { left_at: PathBuf, error: String },
+}
+
 /// Moves a pre-2026-09-02 config out of `~/.config` and into the state dir
 /// (spec §4).
 ///
@@ -787,19 +822,33 @@ fn quarantine_file(path: &Path) -> std::io::Result<PathBuf> {
 ///   would only move the problem into the new location, where startup's
 ///   quarantine has to deal with it anyway, and it would destroy the evidence
 ///   in a place the user knows to look for it.
-pub fn migrate_from_legacy(legacy: &Path, current: &Path) -> Result<Option<PathBuf>> {
+pub fn migrate_from_legacy(legacy: &Path, current: &Path) -> Result<Migration> {
     if current.exists() || !legacy.exists() {
-        return Ok(None);
+        return Ok(Migration::NotNeeded);
     }
-    let Ok(cfg) = Config::load_from(legacy) else {
-        return Ok(None);
+    let cfg = match Config::load_from(legacy) {
+        Ok(cfg) => cfg,
+        // Not `NotNeeded`. This is the case that silently cost a user every
+        // setting they had: the legacy file is left alone (right), but the new
+        // path does not exist yet, so `load_or_quarantine` creates a clean
+        // default there and reports nothing wrong (wrong). Startup has to be
+        // told, or the upgrade is a silent factory reset.
+        Err(e) => {
+            return Ok(Migration::LegacyUnreadable {
+                left_at: legacy.to_path_buf(),
+                error: format!("{e:#}"),
+            })
+        }
     };
     if let Some(parent) = current.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    std::fs::write(current, render(&cfg))
-        .with_context(|| format!("writing {}", current.display()))?;
+    // Atomic, not a bare `write`. This is a one-shot: a torn write leaves a
+    // file at the new path, which makes `current.exists()` true forever, which
+    // means the migration never runs again and the user's real settings stay
+    // stranded in `~/.config` where nothing will ever look for them.
+    crate::config_write::write_atomically(current, &render(&cfg))?;
 
     // Built from the file name rather than `with_extension`, which would
     // replace `.toml` instead of following it.
@@ -807,7 +856,7 @@ pub fn migrate_from_legacy(legacy: &Path, current: &Path) -> Result<Option<PathB
     let renamed = legacy.with_file_name(format!("{name}.migrated"));
     std::fs::rename(legacy, &renamed)
         .with_context(|| format!("renaming {}", legacy.display()))?;
-    Ok(Some(renamed))
+    Ok(Migration::Moved(renamed))
 }
 
 /// What every written `config.toml` starts with. Two lines, fixed: the file is
@@ -1014,7 +1063,8 @@ mod tests {
 
         assert_eq!(cfg, Config::default(), "startup continues, on defaults");
         let q = quarantine.expect("the failure must be reported, never swallowed");
-        assert!(q.moved_to.exists(), "the user's file must survive for inspection");
+        let moved_to = q.moved_to.expect("the file must have been moved");
+        assert!(moved_to.exists(), "the user's file must survive for inspection");
         assert!(q.error.contains("this_key_does_not_exist"), "and name what was wrong");
         assert_eq!(
             Config::load_from(&path).unwrap(),
@@ -1069,9 +1119,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         std::fs::write(&path, "[audio]\nfirst_bad_key = 1\n").unwrap();
-        let first = load_or_quarantine(&path).1.unwrap().moved_to;
+        let first = load_or_quarantine(&path).1.unwrap().moved_to.unwrap();
         std::fs::write(&path, "[audio]\nsecond_bad_key = 1\n").unwrap();
-        let second = load_or_quarantine(&path).1.unwrap().moved_to;
+        let second = load_or_quarantine(&path).1.unwrap().moved_to.unwrap();
 
         assert_ne!(first, second);
         assert!(std::fs::read_to_string(&first).unwrap().contains("first_bad_key"));
@@ -1092,7 +1142,7 @@ mod tests {
 
         let moved = migrate_from_legacy(&legacy, &current).unwrap();
 
-        assert!(moved.is_some(), "a migration must be reported to the caller");
+        assert!(matches!(moved, Migration::Moved(_)), "got {moved:?}");
         assert_eq!(Config::load_from(&current).unwrap().audio.max_seconds, 45);
         assert!(!legacy.exists(), "the legacy file is renamed out of the way");
         assert!(dir.join("old/config.toml.migrated").exists(), "and never deleted");
@@ -1112,7 +1162,10 @@ mod tests {
         std::fs::write(&legacy, "[audio]\nmax_seconds = 45\n").unwrap();
         std::fs::write(&current, "[audio]\nmax_seconds = 99\n").unwrap();
 
-        assert!(migrate_from_legacy(&legacy, &current).unwrap().is_none());
+        assert!(matches!(
+            migrate_from_legacy(&legacy, &current).unwrap(),
+            Migration::NotNeeded
+        ));
         assert_eq!(Config::load_from(&current).unwrap().audio.max_seconds, 99);
         assert!(legacy.exists(), "an ignored legacy file is left exactly as it was");
 
@@ -1130,7 +1183,11 @@ mod tests {
         std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
         std::fs::write(&legacy, "[audio]\nnope = 1\n").unwrap();
 
-        assert!(migrate_from_legacy(&legacy, &current).unwrap().is_none());
+        // Not `NotNeeded`: startup has to be able to tell "nothing to move"
+        // from "something to move that I could not read", because the second
+        // one means the user is about to lose every setting they had.
+        let outcome = migrate_from_legacy(&legacy, &current).unwrap();
+        assert!(matches!(outcome, Migration::LegacyUnreadable { .. }), "got {outcome:?}");
         assert!(!current.exists(), "nothing may be written from a file that will not load");
         assert!(legacy.exists(), "and the user's file stays where they left it");
 
@@ -1209,7 +1266,7 @@ to = "KDD"
         // them into every user's file, which is the opposite of retiring them
         // -- so they are `skip_serializing`. Reading one must still work: the
         // section is `deny_unknown_fields`, so a pre-existing file naming them
-        // would otherwise become a hard startup failure.
+        // would otherwise be quarantined and have its settings reset.
         let rendered = render(&Config::default());
         assert!(!rendered.contains("port"), "normalize.port must not be written any more");
         assert!(!rendered.contains("llama_server_path"));

@@ -26,7 +26,7 @@
 //! half-written `config.toml` is still a daemon that will not start -- which is
 //! why it outlived everything around it.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::path::Path;
 
@@ -72,6 +72,15 @@ fn merge_json(base: &mut Value, patch: &Value) {
 /// Returns the rendered document that was written, so a caller can log or diff
 /// it.
 pub fn save_config(path: &Path, incoming: &Value) -> Result<String> {
+    // The old `toml_edit` writer rejected a non-object update explicitly and
+    // this must too. Without it `merge_json`'s fall-through replaces the whole
+    // base with the patch, and because every `Config` field is
+    // `#[serde(default)]`, a JSON array deserializes cleanly into
+    // `Config::default()` -- every setting silently reset, reported as `ok`.
+    let Value::Object(_) = incoming else {
+        bail!("a config update must be a JSON object");
+    };
+
     // `exists`, not a bare `Config::load_from`: that one *creates* the file
     // when it is absent, and a writer must not create a file as a side effect
     // of deciding what to base a patch on.
@@ -105,7 +114,11 @@ pub fn save_config(path: &Path, incoming: &Value) -> Result<String> {
 /// Temp file in the same directory, then rename. Same filesystem, so the
 /// rename is atomic: readers see either the old file or the new one, never a
 /// truncated one.
-fn write_atomically(path: &Path, contents: &str) -> Result<()> {
+///
+/// `pub(crate)` for `config::migrate_from_legacy`, which needs it more than
+/// this module does: a torn migration write is unrecoverable, because the
+/// half-file makes the new path exist and the migration never runs again.
+pub(crate) fn write_atomically(path: &Path, contents: &str) -> Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let tmp = dir.join(format!(
@@ -220,8 +233,13 @@ mod tests {
         }];
         let (dir, path) = seeded("emptied-aot", &seed);
 
-        save_config(&path, &json!({"vocabulary": {"replacements": []}})).unwrap();
+        let written = save_config(&path, &json!({"vocabulary": {"replacements": []}})).unwrap();
 
+        // Both halves: the emptied list is *written* as an explicit empty
+        // array, and it survives a reload. Asserting only the reload would
+        // pass just as happily if the key were dropped from the file, because
+        // `#[serde(default)]` would hand back an empty Vec either way.
+        assert!(written.contains("replacements = []"), "written:\n{written}");
         assert!(Config::load_from(&path).unwrap().vocabulary.replacements.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -238,6 +256,20 @@ mod tests {
         save_config(&path, &json!({"models": {"idle_unload_seconds": 30}})).unwrap();
 
         assert_eq!(Config::load_from(&path).unwrap().models.idle_unload_seconds, 30);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The generated file has to say so on its first line: it is the only
+    /// warning a person who opens it ever gets that their edits will not last.
+    #[test]
+    fn a_written_config_starts_with_the_generated_by_header() {
+        let (dir, path) = seeded("header", &Config::default());
+        save_config(&path, &json!({"audio": {"max_seconds": 90}})).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.starts_with("# Automatisch erzeugt von yappr"), "raw:\n{raw}");
+        assert!(raw.contains("Handedits gehen verloren"), "raw:\n{raw}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -277,6 +309,27 @@ mod tests {
         assert_eq!(after.style_rules.len(), 1);
         assert_eq!(after.style_rules[0].context, Some(crate::config::Context::Email));
         assert_eq!(after.style_rules[0].styling, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The old `toml_edit` writer rejected a non-object update explicitly, and
+    /// dropping that guard with the rest of it was not free: `merge_json`
+    /// replaces the base wholesale with anything that is not an object, and
+    /// because every `Config` field is `#[serde(default)]` a JSON array
+    /// deserializes cleanly into `Config::default()` -- every setting reset,
+    /// reported as success.
+    #[test]
+    fn a_config_update_that_is_not_a_json_object_is_rejected() {
+        let mut seed = Config::default();
+        seed.audio.max_seconds = 90;
+        let (dir, path) = seeded("non-object", &seed);
+
+        for bad in [json!([]), json!([{"audio": {"max_seconds": 1}}]), json!(5), json!(null)] {
+            let err = save_config(&path, &bad).unwrap_err();
+            assert!(format!("{err:#}").contains("must be a JSON object"), "for {bad}: {err:#}");
+        }
+        assert_eq!(Config::load_from(&path).unwrap().audio.max_seconds, 90);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

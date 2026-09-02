@@ -40,9 +40,11 @@ pub enum Request {
     /// than TOML so the GUI never needs the Rust type -- there is no fourth
     /// hand-maintained copy of the config schema.
     GetConfig,
-    /// Merges `config` into `config.toml`, preserving its comments, and
-    /// applies whatever can be applied without a restart. Rejected outright if
-    /// the result would not load.
+    /// Applies `config` as a *patch* to the config on disk -- it is routinely
+    /// partial, and `wizard_finish` sends a single leaf -- then rewrites
+    /// `config.toml` from the merged `Config` and applies whatever can take
+    /// effect without a restart. Rejected outright if the result would not
+    /// load, with the file untouched.
     SetConfig { config: serde_json::Value },
     /// The input devices `cpal` can see, for the device dropdown.
     ListInputDevices,

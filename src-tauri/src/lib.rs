@@ -123,11 +123,12 @@ pub(crate) fn show_settings_window(app: &tauri::AppHandle) {
         // exactly once -- at app launch -- and its autosave posts that whole
         // snapshot back through `SetConfig`. Anything that writes
         // `config.toml` behind its back is therefore reverted by the next
-        // unrelated toggle: a hand edit (which README invites), and
-        // `wizard::wizard_finish`'s own `inject.backend` patch, which on
-        // GNOME is the difference between a working `ydotool` and a `wtype`
-        // that types nothing at all. Re-reading on every reveal is the only
-        // moment an already-mounted window can learn the file moved on.
+        // unrelated toggle -- and the writer behind its back is in this
+        // app, not outside it: `wizard::wizard_finish` patches
+        // `inject.backend` through `set_config`, which on GNOME is the
+        // difference between a working `ydotool` and a `wtype` that types
+        // nothing at all. Re-reading on every reveal is the only moment an
+        // already-mounted window can learn the file moved on.
         //
         // Emitted after `show` for the same reason `show_wizard_window`
         // emits after it: a webview that has not mounted yet loads on mount

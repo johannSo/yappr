@@ -301,15 +301,21 @@ pub struct Daemon {
     /// moment it happened -- can still learn *why* the daemon is stuck in
     /// `FAILED` (Task 3, Work Item 3). `None` for the entire run otherwise.
     fatal_error: Mutex<Option<String>>,
-    /// Set at startup when `config::load_or_quarantine` found a `config.toml`
-    /// it could not load and moved it aside (spec §3). Reported by `Status` and
-    /// `GetConfig` so the settings window can tell the user where their old
-    /// file went; `None` for the entire run otherwise.
+    /// The German sentence startup leaves behind when the config on disk was
+    /// not usable (spec §3.1) -- either it was quarantined, or a legacy config
+    /// in `~/.config` could not be migrated. Reported by `Status` and
+    /// `GetConfig` so the settings window can say what happened and name the
+    /// file; `None` for the entire run otherwise.
+    ///
+    /// A built sentence rather than the structured cause, because both causes
+    /// end at the same banner and the two facts that go into it -- the path and
+    /// the parser's own message -- are server-side. The GUI has no business
+    /// reconstructing either.
     ///
     /// Separate from `fatal_error` on purpose. That one is only read when the
-    /// state is `FAILED`, and a quarantined config is not a failed daemon --
-    /// reusing it would report a working app as broken.
-    config_quarantine: Mutex<Option<config::Quarantine>>,
+    /// state is `FAILED`, and a config that had to be replaced is not a failed
+    /// daemon -- reusing it would report a working app as broken.
+    config_notice: Mutex<Option<String>>,
     /// The background thread reaping dead subscribers and (when enabled)
     /// supervising `llama-server` -- see `spawn_housekeeping`. `None` until
     /// `main` installs it, and again after `shutdown` stops it.
@@ -593,6 +599,54 @@ fn open_debug_log_file(debug: &DebugConfig) -> std::io::Result<std::fs::File> {
 /// subscribers -- see [`EventSink`]. The standalone daemon (`run`, below)
 /// passes a sink that discards every event, since it has no in-process
 /// consumer of its own.
+/// Builds the one German sentence that describes whatever went wrong with the
+/// config at startup (spec §3.1), from the two ways it can go wrong.
+///
+/// Only the parser's **first line** reaches the banner. A `toml` diagnostic is
+/// a five-line caret-gutter dump; rendered in a proportional font inside a
+/// sentence the gutter does not line up and the useful half -- "unknown field
+/// `nope`" -- is buried in the middle of it. The whole diagnostic still goes to
+/// the log, where it lines up.
+///
+/// A failed migration wins over a quarantine when both somehow occur: the
+/// legacy file is the one holding the settings the user actually had.
+fn startup_config_notice(
+    migration: &config::Migration,
+    quarantine: Option<&config::Quarantine>,
+) -> Option<String> {
+    fn first_line(e: &str) -> String {
+        e.lines().next().unwrap_or(e).trim().to_string()
+    }
+
+    if let config::Migration::LegacyUnreadable { left_at, error } = migration {
+        return Some(format!(
+            "Die bisherige Konfiguration unter {} konnte nicht gelesen werden und wurde \
+             nicht übernommen. Sie liegt unverändert dort; yappr läuft mit \
+             Standardwerten. Grund: {}",
+            left_at.display(),
+            first_line(error),
+        ));
+    }
+
+    let q = quarantine?;
+    Some(match &q.moved_to {
+        Some(p) => format!(
+            "Die Konfigurationsdatei konnte nicht gelesen werden und wurde nach {} \
+             verschoben. yappr läuft mit Standardwerten. Grund: {}",
+            p.display(),
+            first_line(&q.error),
+        ),
+        // The rename failed too, so the file is still where it always was --
+        // saying it "was moved to" its own path would send the user looking
+        // for something that is not there.
+        None => format!(
+            "Die Konfigurationsdatei konnte nicht gelesen werden und liegt unverändert an \
+             ihrem Platz. yappr läuft mit Standardwerten. Grund: {}",
+            first_line(&q.error),
+        ),
+    })
+}
+
 pub fn start(sink: Arc<dyn EventSink>) -> Result<(Arc<Daemon>, UnixListener)> {
     // Single-instance guard: an exclusive, non-blocking lock on a runtime
     // file. The `File` is stored in `Daemon::_runtime_lock` so the lock is
@@ -618,15 +672,26 @@ pub fn start(sink: Arc<dyn EventSink>) -> Result<(Arc<Daemon>, UnixListener)> {
     // anything reads the new path. Best-effort -- a migration that fails must
     // not stop the app; it means the user starts from defaults with their old
     // file still sitting exactly where they left it.
-    let migrated =
-        config::migrate_from_legacy(&paths::legacy_config_file(), &paths::config_file())
-            .unwrap_or(None);
+    let migration = match config::migrate_from_legacy(
+        &paths::legacy_config_file(),
+        &paths::config_file(),
+    ) {
+        Ok(m) => m,
+        // An I/O failure mid-migration. Not fatal -- the legacy file is still
+        // there and the next start retries, because `write_atomically` means a
+        // torn write left nothing at the new path to block it.
+        Err(e) => config::Migration::LegacyUnreadable {
+            left_at: paths::legacy_config_file(),
+            error: format!("{e:#}"),
+        },
+    };
 
     // Spec §3: never fatal. This is the only caller that quarantines -- every
     // other `Config::load_from` in this file stays strict, because `Reload`
     // and `SetConfig` reporting a broken file is the honest answer where
     // silently resetting a user's settings would not be.
     let (cfg, quarantine) = config::load_or_quarantine(&paths::config_file());
+    let startup_notice = startup_config_notice(&migration, quarantine.as_ref());
 
     // Loaded before tracing is set up so the log destination (stdout, plus
     // `<debug.dir>/logs/daemon.log` when debug capture is enabled) can
@@ -634,12 +699,30 @@ pub fn start(sink: Arc<dyn EventSink>) -> Result<(Arc<Daemon>, UnixListener)> {
     // `tracing`, so nothing is lost by the reordering.
     init_tracing(&cfg.debug);
 
-    if let Some(old_path) = &migrated {
-        tracing::info!(renamed_to = %old_path.display(), "migrated the config out of ~/.config");
+    match &migration {
+        config::Migration::NotNeeded => {}
+        config::Migration::Moved(renamed) => {
+            tracing::info!(
+                old_file = %renamed.display(),
+                "migrated the config out of ~/.config"
+            );
+        }
+        // Logged at error level: the user still has this file and every
+        // setting in it, and nothing else is going to mention that yappr
+        // just started without any of them.
+        config::Migration::LegacyUnreadable { left_at, error } => {
+            tracing::error!(
+                left_at = %left_at.display(),
+                error = %error,
+                "the config in ~/.config could not be read; it was NOT migrated"
+            );
+        }
     }
     if let Some(q) = &quarantine {
+        // The full multi-line parser diagnostic goes here, where a caret
+        // gutter lines up. The banner gets only its first line.
         tracing::error!(
-            moved_to = %q.moved_to.display(),
+            moved_to = ?q.moved_to,
             error = %q.error,
             "config could not be loaded; started on defaults"
         );
@@ -690,7 +773,7 @@ pub fn start(sink: Arc<dyn EventSink>) -> Result<(Arc<Daemon>, UnixListener)> {
         normalize_enabled: cfg.normalize.enabled,
         normalize_available: AtomicBool::new(false),
         fatal_error: Mutex::new(None),
-        config_quarantine: Mutex::new(quarantine),
+        config_notice: Mutex::new(startup_notice),
         housekeeping: Mutex::new(None),
         last_timings: Mutex::new(None),
         sink,
@@ -1703,25 +1786,16 @@ fn toggle_target(state: u8) -> Request {
     }
 }
 
+/// What `Status` and `GetConfig` hand to the settings window when startup could
+/// not use the config on disk (spec §3.1).
+fn quarantine_notice(daemon: &Daemon) -> Option<String> {
+    lock_ignoring_poison(&daemon.config_notice).clone()
+}
+
 /// `pub` so `src-tauri/src/settings_cmds.rs` can call it directly: the
 /// settings window's three commands run in-process now, not over the
 /// socket, and this is the same request/response handling the socket path
 /// (`handle`, above) already funnels every other request through.
-/// The German sentence the settings window shows when startup had to move a
-/// `config.toml` aside (spec §3.1). Built here rather than in the GUI because
-/// the path and the parser's own message are both server-side facts, and the
-/// window has no business reconstructing either.
-fn quarantine_notice(daemon: &Daemon) -> Option<String> {
-    lock_ignoring_poison(&daemon.config_quarantine).as_ref().map(|q| {
-        format!(
-            "Die Konfigurationsdatei konnte nicht gelesen werden und wurde nach {} \
-             verschoben. yappr läuft mit Standardwerten. Grund: {}",
-            q.moved_to.display(),
-            q.error
-        )
-    })
-}
-
 pub fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
     let current = daemon.state.load(Ordering::SeqCst);
     match req {
@@ -3090,7 +3164,7 @@ mod tests {
             normalize_enabled,
             normalize_available: AtomicBool::new(false),
             fatal_error: Mutex::new(None),
-        config_quarantine: Mutex::new(None),
+        config_notice: Mutex::new(None),
             housekeeping: Mutex::new(None),
             last_timings: Mutex::new(None),
             sink: Arc::new(DropSink),
@@ -3184,7 +3258,7 @@ mod tests {
             normalize_enabled: false,
             normalize_available: AtomicBool::new(false),
             fatal_error: Mutex::new(None),
-        config_quarantine: Mutex::new(None),
+        config_notice: Mutex::new(None),
             housekeeping: Mutex::new(None),
             last_timings: Mutex::new(None),
             sink,
@@ -4705,18 +4779,6 @@ mod tests {
         assert!(r.ok, "reload refused with no pipeline: {:?}", r.err);
     }
 
-    /// Final-review fix 3. `SetConfig` mirrors `[models]` into
-    /// `daemon.models_cfg`; `Reload` returned `ok(Idle)` on both of its
-    /// branches without doing so, and `daemon.models_cfg` is the *only* thing
-    /// the housekeeping thread reads the idle timeout from. So hand-editing
-    /// `[models] idle_unload_seconds` and running `yappr --reload`
-    /// reported success and changed nothing until the next restart, while the
-    /// same edit made in the settings GUI applied live -- and README
-    /// documents `--reload` as applying every reloadable section.
-    ///
-    /// Driven with no pipeline installed, which is the ordinary state of a
-    /// lazily-loaded idle daemon *and* the branch that had no plausible
-    /// excuse for skipping the mirror.
     /// Spec §3's per-call-site table, at the one site where getting it wrong
     /// would be silent data loss. `server::start` quarantines a broken config
     /// because it has no way to report one and no user to report it to yet.
@@ -4759,10 +4821,13 @@ mod tests {
     fn a_quarantine_is_reported_by_both_get_config_and_status() {
         let path = scratch_config("quarantine-report");
         let daemon = fake_daemon_at(IDLE, false, path.clone());
-        *lock_ignoring_poison(&daemon.config_quarantine) = Some(config::Quarantine {
-            moved_to: path.with_file_name("config.toml.broken-1"),
-            error: "parsing config.toml: unknown field `nope`".to_string(),
-        });
+        *lock_ignoring_poison(&daemon.config_notice) = startup_config_notice(
+            &config::Migration::NotNeeded,
+            Some(&config::Quarantine {
+                moved_to: Some(path.with_file_name("config.toml.broken-1")),
+                error: "parsing config.toml: unknown field `nope`\n  |\n1 | nope = 1".to_string(),
+            }),
+        );
 
         for req in [Request::GetConfig, Request::Status] {
             let r = dispatch(&daemon, req);
@@ -4773,6 +4838,62 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A migration that could not read the user's old config is the case that
+    /// silently reset every setting: the legacy file is correctly left alone,
+    /// but the new path does not exist yet, so the quarantine never fires and
+    /// nothing else notices. The notice has to come from the migration itself.
+    #[test]
+    fn an_unreadable_legacy_config_still_produces_a_notice_naming_it() {
+        let notice = startup_config_notice(
+            &config::Migration::LegacyUnreadable {
+                left_at: std::path::PathBuf::from("/home/u/.config/yappr/config.toml"),
+                error: "parsing config.toml: unknown field `nope`\n  |\n1 | nope = 1\n  | ^"
+                    .to_string(),
+            },
+            None,
+        )
+        .expect("an unreadable legacy config must be reported");
+
+        assert!(notice.contains("/home/u/.config/yappr/config.toml"), "{notice}");
+        assert!(notice.contains("nicht übernommen"), "{notice}");
+        assert!(notice.contains("nope"), "{notice}");
+    }
+
+    /// Only the first line of a `toml` diagnostic belongs in a banner: the rest
+    /// is a caret gutter that does not line up in a proportional font.
+    #[test]
+    fn the_notice_carries_one_line_of_the_parser_diagnostic_not_its_gutter() {
+        let notice = startup_config_notice(
+            &config::Migration::NotNeeded,
+            Some(&config::Quarantine {
+                moved_to: Some(std::path::PathBuf::from("/tmp/config.toml.broken-1")),
+                error: "parsing config.toml: unknown field `nope`\n  |\n1 | nope = 1\n  | ^"
+                    .to_string(),
+            }),
+        )
+        .unwrap();
+
+        assert!(notice.contains("unknown field `nope`"), "{notice}");
+        assert!(!notice.contains('|'), "the caret gutter must not reach the banner: {notice}");
+    }
+
+    /// When even the rename failed the file is still where it always was, so
+    /// the sentence must not send the user somewhere else to look for it.
+    #[test]
+    fn a_quarantine_that_could_not_move_the_file_does_not_claim_it_moved() {
+        let notice = startup_config_notice(
+            &config::Migration::NotNeeded,
+            Some(&config::Quarantine {
+                moved_to: None,
+                error: "parsing config.toml: bad".to_string(),
+            }),
+        )
+        .unwrap();
+
+        assert!(notice.contains("liegt unverändert"), "{notice}");
+        assert!(!notice.contains("verschoben"), "{notice}");
     }
 
     /// The healthy path stays silent -- a banner on every launch would train
@@ -4788,6 +4909,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
+    /// Final-review fix 3. `SetConfig` mirrors `[models]` into
+    /// `daemon.models_cfg`; `Reload` returned `ok(Idle)` on both of its
+    /// branches without doing so, and `daemon.models_cfg` is the *only* thing
+    /// the housekeeping thread reads the idle timeout from. So a `[models]
+    /// idle_unload_seconds` change followed by `yappr --reload` reported
+    /// success and changed nothing until the next restart, while the same
+    /// change made in the settings GUI applied live -- and README documents
+    /// `--reload` as applying every reloadable section.
+    ///
+    /// Driven with no pipeline installed, which is the ordinary state of a
+    /// lazily-loaded idle daemon *and* the branch that had no plausible
+    /// excuse for skipping the mirror.
     #[test]
     fn reload_mirrors_the_models_section_the_way_set_config_does() {
         let path = scratch_config("reload-models");

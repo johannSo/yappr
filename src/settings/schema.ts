@@ -246,7 +246,8 @@ export const COLUMN_LABELS: Record<string, string> = {
 /// in-process, so there is no `llama-server` to give a path to and no port
 /// for it to listen on -- but `[normalize]` is `deny_unknown_fields`, so the
 /// Rust struct has to keep accepting both keys or every `config.toml`
-/// written before that change would stop the app from starting (invariant
+/// written before that change would be quarantined and its settings reset
+/// on the next start (invariant
 /// 4). See `NormalizeConfig::port`'s own comment.
 ///
 /// A key belongs here only when the Rust side has documented it as accepted
@@ -353,10 +354,10 @@ export function fold(s: string): string {
 /// (so `min_overlap_english` finds it even though the window never shows that
 /// string), its section's title and raw name, its unit, and its help text.
 ///
-/// The raw key is in there deliberately. This window is a view of a file the
-/// user is invited to edit by hand — someone who has read `config.toml`, or a
-/// daemon error naming a key, is searching for the name Rust uses, not the
-/// one German uses.
+/// The raw key is in there deliberately. Nobody is invited to *edit*
+/// `config.toml` any more, but people still read it — in a bug report, or in a
+/// daemon error naming a key — and someone arriving from either is searching
+/// for the name Rust uses, not the one German uses.
 function rowHaystack(section: string, key: string): string {
   const path = `${section}.${key}`;
   return fold(
