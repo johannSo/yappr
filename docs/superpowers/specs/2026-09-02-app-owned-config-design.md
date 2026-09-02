@@ -58,14 +58,40 @@ should join it.
 
 ## 2. The writer
 
-`config_write::save_config` (`config_write.rs:190`) becomes three steps:
+`save_config(path, incoming: &Value)` keeps its signature and gains an explicit
+patch step. **`incoming` is frequently partial** — `server.rs:1937` passes
+`Request::SetConfig`'s JSON straight through, and `wizard_finish`'s
+`backend_patch` (`src-tauri/src/wizard.rs:133`) is a single leaf. The old
+`toml_edit` merge satisfied that requirement implicitly, by editing a document
+that already held every other key. A canonical dump has no such document, so the
+merge has to become explicit or the first wizard-driven save blanks the entire
+config:
 
-1. **Render** — a fixed header comment followed by `toml::to_string_pretty(&Config)`.
-2. **Validate** — `Config::from_str` on the rendered text, exactly as today.
-3. **Replace** — `write_atomically` (`config_write.rs:213`), unchanged.
+1. **Base** — `Config::load_from(path)` if the file exists, else
+   `Config::default()`. A *struct*, not the old file's text, so nothing about the
+   previous layout can leak into the output.
+2. **Patch** — deep-merge `incoming` into `serde_json::to_value(base)`:
+   objects merge recursively; arrays replace wholesale, never element-wise; and
+   `null` **removes** the key, so a `StyleRule`'s unset axes come back as
+   `Option::None` rather than a TOML null, which does not exist. This is the one
+   piece of `merge_into_table` whose behaviour survives, at maybe 25 lines
+   against `serde_json::Value` with no TOML awareness at all.
+3. **Deserialize** — the merged JSON into `Config`. This is where
+   `deny_unknown_fields` and `validate()` run on the *incoming* change. Keep the
+   existing `.context("the resulting config is not valid")`: a test matches on
+   `"not valid"`.
+4. **Render** — the fixed header comment followed by `toml::to_string_pretty`.
+5. **Validate the render** — `Config::from_str` on the rendered text. Not
+   redundant with step 3: step 3 catches a bad patch, step 5 catches a renderer
+   that emits something it cannot read back.
+6. **Replace** — `write_atomically` (`config_write.rs:213`), unchanged.
 
 Validate-then-rename **stays**. That property is about crash-safety, not
 hand-editing: a half-written config is still a daemon that will not start.
+
+`Config::load_from` seeds the file when absent, so step 1 tests `path.exists()`
+explicitly rather than calling it — a writer must not create the file as a side
+effect of deciding what to base a patch on.
 
 **Deleted:** `merge_json_into_toml` (`config_write.rs:27`), `merge_into_table`
 (`:48`), `build_array` (`:105`), `set_preserving_decor` (`:146`), `scalar_to_toml`
@@ -232,6 +258,12 @@ New:
   fully-populated config with `style_rules`, vocabulary entries and replacements.
 - Rendering the same `Config` twice is byte-identical (invariant 9's no-op-save
   property, now a property of the renderer).
+- **A partial patch leaves every key it does not name at its previous on-disk
+  value** — not at the default. This is the regression the explicit patch step in
+  §2 exists to prevent, and the one a canonical dump makes easy to get wrong.
+- `null` in a patch removes the key (a `StyleRule`'s unset axis), and an emptied
+  array-of-tables is written as `[]` rather than dropped — `#[serde(default)]`
+  would otherwise hide the deletion.
 - A file with an unknown key boots with defaults, is renamed to
   `config.toml.broken-<ts>`, and the reason reaches `Status` and `GetConfig`.
 - A file failing `validate()` semantically (`max_seconds = 0`) quarantines on the
