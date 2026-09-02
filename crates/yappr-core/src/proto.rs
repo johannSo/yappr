@@ -169,8 +169,14 @@ pub struct Response {
     /// `GetConfig` only: the whole config as JSON.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config: Option<serde_json::Value>,
-    /// `GetConfig` only: where that config lives, so the GUI can name the file
-    /// it is editing.
+    /// `GetConfig` only: where that config lives. The settings window used to
+    /// print it at the foot of the sidebar; that line is the running version
+    /// now, so nothing in this tree renders it any more. It stays because it
+    /// is part of `GetConfig`'s answer on the socket and is the key any other
+    /// client reads the path by -- dropping it would be a wire change, not a
+    /// GUI one. Pinned by `settings_cmds`'s
+    /// `an_ok_response_becomes_ok_json_with_its_fields_intact` and `server`'s
+    /// `get_config_returns_the_whole_config_and_the_path_it_came_from`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config_path: Option<String>,
     /// `GetConfig` only: `Config::default()` as JSON, shaped exactly like

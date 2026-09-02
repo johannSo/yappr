@@ -118,6 +118,25 @@ pub(crate) fn show_settings_window(app: &tauri::AppHandle) {
     if let Some(w) = app.get_webview_window(SETTINGS_LABEL) {
         let _ = w.show();
         let _ = w.set_focus();
+        // This webview is hidden on close and never destroyed (see the
+        // `hide_instead_of_close` calls in `setup`), so it reads the config
+        // exactly once -- at app launch -- and its autosave posts that whole
+        // snapshot back through `SetConfig`. Anything that writes
+        // `config.toml` behind its back is therefore reverted by the next
+        // unrelated toggle: a hand edit (which README invites), and
+        // `wizard::wizard_finish`'s own `inject.backend` patch, which on
+        // GNOME is the difference between a working `ydotool` and a `wtype`
+        // that types nothing at all. Re-reading on every reveal is the only
+        // moment an already-mounted window can learn the file moved on.
+        //
+        // Emitted after `show` for the same reason `show_wizard_window`
+        // emits after it: a webview that has not mounted yet loads on mount
+        // anyway, and one that has needs telling. `show_wizard_window`
+        // funnels through here and so fires this too -- harmless, because
+        // the frontend's refresh is quiet (it raises no loading state) and
+        // skips itself outright when the window has an edit of its own still
+        // pending, in flight, or rejected.
+        let _ = w.emit("show-settings", ());
     }
 }
 
@@ -303,6 +322,7 @@ pub fn run() {
             settings_cmds::list_input_devices,
             settings_cmds::autostart_status,
             settings_cmds::set_autostart,
+            settings_cmds::app_version,
             provision::setup_status,
             provision::run_setup,
             wizard::wizard_state,

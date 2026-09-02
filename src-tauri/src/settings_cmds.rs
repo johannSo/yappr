@@ -1,5 +1,6 @@
 //! The settings window's commands: the original three config/device calls,
-//! plus (task 16) the pair backing the "Beim Anmelden starten" toggle.
+//! the pair backing the "Beim Anmelden starten" toggle (task 16), and the
+//! version string its sidebar foot shows.
 //!
 //! The first three were socket calls in `settings-tauri`; they are direct
 //! calls now. The command names and the JSON they return are byte-identical
@@ -154,6 +155,36 @@ fn set_autostart_at(path: &std::path::Path, enabled: bool) -> std::io::Result<()
     }
 }
 
+/// What the settings window's sidebar foot shows -- the only thing in that
+/// window naming the running *binary* rather than one of its settings.
+///
+/// `CARGO_PKG_VERSION` is this crate's own version, baked in at compile time,
+/// so it is true of the binary actually executing. `tauri.conf.json`'s
+/// `version` would not be: that one describes the *bundle*, and the only
+/// thing holding the two together is someone remembering to edit both --
+/// which is what `the_binary_and_the_bundle_agree_on_the_version_number`
+/// below exists to notice.
+///
+/// The `-debug` suffix is half the reason to show this at all. A
+/// `cargo build` with no `--release` and the shipped AppImage report the same
+/// three numbers and are not the same program (one of them runs the
+/// `debug_assertions` paths, at a fraction of the ASR speed), and nothing
+/// else on screen separates them -- least of all in the situation this line
+/// gets read out loud, which is a bug report.
+const APP_VERSION: &str = if cfg!(debug_assertions) {
+    concat!(env!("CARGO_PKG_VERSION"), "-debug")
+} else {
+    env!("CARGO_PKG_VERSION")
+};
+
+/// The version string for the sidebar foot. Plain and synchronous for the
+/// same reason [`autostart_status`] is: it returns a compile-time constant,
+/// which is not work worth handing to a blocking thread.
+#[tauri::command]
+pub fn app_version() -> &'static str {
+    APP_VERSION
+}
+
 /// Whether yappr currently starts itself at login -- read straight
 /// off the filesystem (see the module doc's "why not a config key"), so a
 /// file removed behind this app's back is reported truthfully instead of
@@ -284,6 +315,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The version line must name the binary that renders it, not a number
+    /// typed beside it: this pins that [`APP_VERSION`] is built out of this
+    /// crate's own `CARGO_PKG_VERSION`, and that the `-debug` marker tracks
+    /// the build profile rather than being pasted on for good.
+    #[test]
+    fn the_reported_version_is_this_crates_own_and_says_when_it_is_a_debug_build() {
+        assert!(APP_VERSION.starts_with(env!("CARGO_PKG_VERSION")));
+        assert_eq!(
+            APP_VERSION.ends_with("-debug"),
+            cfg!(debug_assertions),
+            "the -debug suffix must follow the build profile and nothing else"
+        );
+    }
+
+    /// [`APP_VERSION`] comes from `Cargo.toml`; the AppImage's filename, the
+    /// `.desktop` entry and every other bundle artefact come from
+    /// `tauri.conf.json`. Nothing makes those two agree on their own, so a
+    /// release that bumps one and forgets the other ships a binary reporting
+    /// a different version from the file it arrived in -- precisely the
+    /// confusion the sidebar line is there to end.
+    #[test]
+    fn the_binary_and_the_bundle_agree_on_the_version_number() {
+        let conf: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json"))
+            .expect("tauri.conf.json must be valid JSON");
+        assert_eq!(conf["version"], serde_json::json!(env!("CARGO_PKG_VERSION")));
+    }
+
     /// The exact scenario Task 9 exists to close off: `--replay` mode
     /// manages `Server(None)` (see `lib.rs`'s `setup()`), and a settings
     /// command must turn that into a stated German error rather than
@@ -300,9 +358,12 @@ mod tests {
     /// The JSON-shape half of the contract: the frontend's existing
     /// rejection handling depends on a successful `Response` staying an
     /// `Ok`, with every field (not just `ok`) carried through untouched --
-    /// including `config_path` staying snake_case, which is the literal key
-    /// `src/Settings.tsx` reads (`res.config_path`), since `Response` has no
-    /// `rename_all` attribute.
+    /// including `config_path` staying snake_case, since `Response` has no
+    /// `rename_all` attribute. The settings window stopped rendering that
+    /// field when its sidebar foot became the version line, but the key is
+    /// still part of the socket's answer to `GetConfig` and still the shape
+    /// any other client reads it by -- dropping it would be a wire change,
+    /// not a GUI one.
     #[test]
     fn an_ok_response_becomes_ok_json_with_its_fields_intact() {
         let mut resp = Response::ok(WireState::Idle);

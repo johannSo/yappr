@@ -51,7 +51,7 @@ type SaveState = "clean" | "pending" | "saving" | "saved" | "error";
 export default function Settings() {
   const [config, setConfig] = useState<Section | null>(null);
   const [defaults, setDefaults] = useState<Section | null>(null);
-  const [configPath, setConfigPath] = useState<string>("");
+  const [version, setVersion] = useState<string>("");
   const [devices, setDevices] = useState<Device[]>([]);
   const [active, setActive] = useState<string | null>(null);
   const [query, setQuery] = useState("");
@@ -76,28 +76,33 @@ export default function Settings() {
   const queuedRef = useRef(false);
   const timerRef = useRef<number | null>(null);
   const savedTimerRef = useRef<number | null>(null);
+  // Mirrors `saveState` for the reveal listener, which runs outside React's
+  // render cycle and must not re-subscribe every time the capsule changes.
+  const saveStateRef = useRef<SaveState>("clean");
   const searchRef = useRef<HTMLInputElement | null>(null);
   const paneRef = useRef<HTMLDivElement | null>(null);
 
-  const load = useCallback(async () => {
-    setLoading(true);
+  // `quiet` is the reveal path (see the `show-settings` listener below): the
+  // same read, without the full-window "Lade…" state. A window that blanked
+  // itself every time it was reopened would be a worse thing to look at than
+  // a stale value, which rather defeats the point.
+  const load = useCallback(async (quiet = false) => {
+    if (!quiet) setLoading(true);
     setLoadError(null);
     try {
       const res = (await invoke("get_config")) as {
         config: Section;
-        config_path?: string;
         defaults?: Section;
       };
       setConfig(res.config);
       configRef.current = res.config;
       setDefaults(res.defaults ?? null);
-      setConfigPath(res.config_path ?? "");
       setSaveState("clean");
       setSaveError(null);
     } catch (e) {
       setLoadError(String(e));
     } finally {
-      setLoading(false);
+      if (!quiet) setLoading(false);
     }
     // Devices are a separate call on purpose: enumeration can be slow or fail
     // on a sick audio stack, and that must not stop the rest of the settings
@@ -112,6 +117,43 @@ export default function Settings() {
 
   useEffect(() => {
     void load();
+  }, [load]);
+
+  // The running binary cannot change version while its own window is open, so
+  // this is read once on mount rather than on every `load()`. A failure leaves
+  // it empty and the sidebar foot simply stays blank: a settings window that
+  // refused to open because it could not name itself would be a bad trade.
+  useEffect(() => {
+    invoke("app_version")
+      .then((v) => setVersion(String(v)))
+      .catch((e) => console.error("app_version failed", e));
+  }, []);
+
+  useEffect(() => {
+    saveStateRef.current = saveState;
+  }, [saveState]);
+
+  // This window is hidden on close, never destroyed, so both it and its config
+  // snapshot outlive every close -- and `flush` posts that whole snapshot. A
+  // `config.toml` that changed underneath (edited by hand, or patched by
+  // `wizard_finish`) would be silently written back to what this window
+  // remembered at launch. `show_settings_window` emits on every reveal for
+  // exactly this; see its comment for what that costs on GNOME.
+  //
+  // Refused outright when this window holds something newer than the file: a
+  // debounced edit still waiting out `DEBOUNCE_MS`, a save in flight or
+  // queued behind one, or a rejected save whose value invariant 9 deliberately
+  // keeps on screen. Overwriting any of those would be the GUI discarding what
+  // the user typed -- the one thing that autosave contract forbids.
+  useEffect(() => {
+    const unlistenPromise = listen("show-settings", () => {
+      if (timerRef.current !== null || savingRef.current || queuedRef.current) return;
+      if (saveStateRef.current === "error") return;
+      void load(true);
+    });
+    return () => {
+      unlistenPromise.then((unlisten) => unlisten());
+    };
   }, [load]);
 
   // The window decides its own mode: `should_open` is computed from the same
@@ -302,9 +344,16 @@ export default function Settings() {
               // Not swallowed silently, but it must not trap the user in the
               // wizard either: the marker is a convenience, and a wizard that
               // will not close is worse than one that reappears next launch.
-              invoke("wizard_finish", { setBackend }).catch((e) => {
-                console.error("wizard_finish failed", e);
-              });
+              invoke("wizard_finish", { setBackend })
+                // `wizard_finish` puts `inject.backend` through `set_config`
+                // before it hides the window, so this window's snapshot is a
+                // key out of date the moment it returns. The reveal listener
+                // would catch that on the next open; re-reading here means it
+                // is never wrong in between.
+                .then(() => load(true))
+                .catch((e) => {
+                  console.error("wizard_finish failed", e);
+                });
               setWizardActive(false);
             }}
             onOpenSettings={() => setWizardActive(false)}
@@ -392,23 +441,14 @@ export default function Settings() {
             })}
           </div>
 
+          {/* What the foot of this rail is for: the one fact about the
+              running program that is not one of its settings. Nothing to
+              click -- the config path and its reload button used to live
+              here, and a line of text that answers "which build is this"
+              is worth more at the bottom of a settings window than a
+              control for a file the window already writes by itself. */}
           <div className="sidebar-foot">
-            {configPath && (
-              <p className="path" title={configPath}>
-                {configPath}
-              </p>
-            )}
-            <button
-              type="button"
-              className="ghost"
-              onClick={() => void load()}
-              title="Konfiguration neu vom Daemon laden"
-            >
-              <Icon name="reset" className="icon-sm" />
-              {/* In a span so the icon-only sidebar can drop the word without
-                  dropping the button -- a bare text node has no selector. */}
-              <span>Neu laden</span>
-            </button>
+            {version && <p className="version">Version: {version}</p>}
           </div>
         </nav>
 

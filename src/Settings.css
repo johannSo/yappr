@@ -474,7 +474,12 @@ body::before {
   align-items: flex-start;
 }
 
-.path {
+/* The version, at the foot of the rail. Mono because it is an identifier to
+   be read back character by character into a bug report, not prose; faint
+   and small because it is reference material that must never compete with
+   the navigation above it. Set to wrap rather than truncate -- a version
+   with half its suffix cut off is worse than a version on two lines. */
+.version {
   margin: 0;
   padding: 0 0.5rem;
   color: var(--faint);
@@ -1313,8 +1318,7 @@ button:disabled {
      application this window belongs to. */
   .brand__text,
   .nav-item__text,
-  .path,
-  .sidebar-foot .ghost span {
+  .version {
     display: none;
   }
 
