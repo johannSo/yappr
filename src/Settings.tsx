@@ -93,10 +93,18 @@ export default function Settings() {
       const res = (await invoke("get_config")) as {
         config: Section;
         defaults?: Section;
+        config_notice?: string;
       };
       setConfig(res.config);
       configRef.current = res.config;
       setDefaults(res.defaults ?? null);
+      // Startup found a config.toml it could not read, moved it aside and came
+      // up on defaults (spec §3). This window is the only place that can say
+      // so: the app is running and dictation works, so nothing else about it
+      // looks wrong -- and the settings on screen are not the settings the
+      // user had. The banner names the file the old one went to, because that
+      // is the only way back to it.
+      if (res.config_notice) setNotice(res.config_notice);
       setSaveState("clean");
       setSaveError(null);
     } catch (e) {
