@@ -1,18 +1,26 @@
 /* The settings window.
  *
- * The material is the one this app already uses: `Overlay.css` draws its HUD
- * capsule as a translucent slab with a light top edge (`--mat`, `--mat-edge`,
- * `--mat-sheen`), because a HUD floating over an unknown wallpaper has to
- * bring its own ground. This window borrows those three tokens by name so the
- * two windows read as one product -- but unlike the overlay it follows the
- * user's light/dark theme, because a settings window is *inside* the desktop
- * rather than floating over it.
+ * Flat, opaque, and drawn with edges rather than with light. `Overlay.css`
+ * earns its frosted slab: a HUD floating over an unknown wallpaper has to
+ * bring its own ground. This window does not float over anything -- it is
+ * *inside* the desktop, on a ground it owns, following the user's light/dark
+ * theme -- so it keeps the overlay's token names (`--mat`, `--mat-edge`) and
+ * drops the material. Nothing here is translucent, nothing is blurred, and no
+ * surface is a gradient. A settings window is read, not admired; every soft
+ * edge it declines to draw is one less thing between the user and the label
+ * they came for.
  *
- * The layout is the compositor's. Hyprland puts gapped, rounded, blurred
- * tiles on a wallpaper and marks the focused one with a gradient border;
- * this window is a rail tile and a stack of section tiles on a tinted ground,
- * and the active category wears that same border. One elevation for content,
- * so nothing is a card inside a card.
+ * The layout is still the compositor's. Hyprland puts gapped, rounded tiles on
+ * a ground and marks the focused one with a coloured border; this window is a
+ * rail tile and a stack of section tiles, and the active category wears that
+ * same border -- solid, the way most people actually set `col.active_border`,
+ * rather than the default 45-degree gradient.
+ *
+ * Elevation is declared once, and only in one direction. Content tiles carry a
+ * border and no shadow, so nothing is a card inside a card and nothing is a
+ * 1px edge under a soft glow. The two things that genuinely float -- the info
+ * popover and the save capsule -- cast a shadow and are the only things that
+ * do.
  *
  * Sizes are in `rem`, so a user who has raised their text size gets a bigger
  * window's worth of layout rather than the same layout with bigger text
@@ -44,64 +52,66 @@
 
   /* Light is the base set. Dark redefines only what changes, so no colour has
      its single definition inside a media query -- a token that exists only in
-     one branch is a token that goes missing in the other. */
+     one branch is a token that goes missing in the other.
 
-  /* -- The ground. --------------------------------------------------------
-     Two low-opacity blooms, not decoration: `backdrop-filter` over a flat
-     fill is invisible. The frost only reads as frost if there is something
-     varied behind it, and these are placed to pass behind both columns. */
-  --ground: #eaeef5;
-  --bloom-a: rgba(51, 204, 255, 0.2);
-  --bloom-b: rgba(0, 214, 138, 0.11);
-  /* A full-width vertical falloff under the blooms. The blooms only vary the
-     corners; this varies the middle band, which is where most tiles actually
-     sit -- and a tile whose whole footprint is one flat colour blurs to
-     exactly that colour. */
-  --veil: rgba(255, 255, 255, 0.55);
+     Every surface here is opaque. Stacked alphas were what made the old
+     palette impossible to reason about: a value's real contrast depended on
+     how many translucent layers happened to be under it that day. These are
+     the colours that actually land on screen. */
 
-  /* -- The material, named as `Overlay.css` names it. --------------------- */
-  --mat: rgba(255, 255, 255, 0.66);
-  --mat-rail: rgba(255, 255, 255, 0.5);
-  --mat-edge: rgba(15, 23, 42, 0.1);
-  /* The inset highlight along the top edge. This is what actually sells
-     glass; without it a translucent panel just looks washed out. */
-  --mat-sheen: rgba(255, 255, 255, 0.9);
+  /* -- The three surfaces. ------------------------------------------------
+     Ground, rail, tile: recessed, more recessed, raised. That ordering is
+     what a desktop's own settings window does, and it is the whole of the
+     depth model now -- no shadow under a content tile, no light along its
+     top edge. */
+  --ground: #e9ebef;
+  --mat: #ffffff;
+  --mat-rail: #dfe2e7;
+  --mat-edge: #ccd1d9;
 
-  /* Sunk surfaces: fields, wells, tracks. Inset rather than raised, so a
-     control reads as cut into the tile it sits on. */
-  --well: rgba(255, 255, 255, 0.8);
-  --well-edge: rgba(15, 23, 42, 0.16);
-  --sunk: rgba(15, 23, 42, 0.05);
-  --hairline: rgba(15, 23, 42, 0.09);
-  --row-hover: rgba(15, 23, 42, 0.028);
+  /* Fields and tracks. Filled and outlined rather than cut in with an inset
+     shadow: on a flat surface the border is the whole affordance, and a fake
+     bevel under it is the thing that reads as drawn-by-a-machine. */
+  --well: #ffffff;
+  --well-edge: #b6bdc8;
+  --sunk: #e4e7ec;
+  --hairline: #e2e5ea;
+  --row-hover: rgba(15, 23, 42, 0.04);
+  /* The switch, which needs two values of its own.
+     `--track` is the off state, and it is deliberately darker than `--sunk`:
+     an unlit switch has to read as a *control* sitting on the tile, where the
+     other sunk surfaces only have to read as recessed.
+     `--knob` is the knob at rest. It cannot clear 3:1 against any track pale
+     enough to still mean "off" -- no platform's switch does -- so what
+     separates it is its shadow, and its position, and the track turning solid
+     accent when it lights. */
+  --track: #ccd1d9;
+  --knob: #ffffff;
 
-  --text: #101623;
-  --muted: #54607a;
-  --faint: #626b80;
+  --text: #14171d;
+  --muted: #57606f;
+  --faint: #6b7382;
 
-  /* The accent is Hyprland's default active-window gradient, used where the
-     compositor uses it: to mark what has focus. Nowhere else. */
-  --accent-2: #00d68a;
-  --accent-grad: linear-gradient(45deg, #33ccff, var(--accent-2));
-  /* A text/icon accent has to clear AA against the ground, which the bright
-     cyan does not -- it measures 4.3:1. This is the same cyan taken down
-     until it does (5.6:1). */
+  /* One accent, used where the compositor uses it: to mark what has focus.
+     Nowhere else. The bright cyan the app is known by does not clear AA as
+     text on a light ground (4.3:1), so light mode carries it taken down until
+     it does; dark mode gets the bright value back, where it measures 10.3:1
+     on its own. */
   --accent: #06687f;
-  /* A filled chip keeps the bright cyan and takes *dark* ink rather than
-     white: #062430 on #33ccff measures 8.6:1, where white on it measures 2.0
-     and fails outright. The label on the fill is what sets the floor. */
-  --accent-fill: #33ccff;
-  --accent-ink: #062430;
-  --accent-wash: rgba(51, 204, 255, 0.16);
-  --focus: rgba(6, 104, 127, 0.6);
+  /* What reads on a solid `--accent` fill -- the toggle knob, chiefly. It
+     flips with the theme because the fill does: white on #06687f is 6.4:1,
+     while white on the dark theme's #33ccff is 1.9:1 and fails outright. */
+  --accent-ink: #ffffff;
+  --accent-wash: #dceef3;
+  --focus: #06687f;
 
-  --danger: #c62a1c;
-  --danger-wash: rgba(198, 42, 28, 0.09);
-  --danger-ink: #9a1f14;
-  --ok: #0d7a52;
-  --warn-ink: #7a4a00;
-  --warn-wash: rgba(255, 159, 10, 0.16);
-  --warn-edge: rgba(180, 110, 0, 0.35);
+  --danger: #c02a1c;
+  --danger-wash: #fbeae8;
+  --danger-ink: #8e1d13;
+  --ok: #0c7048;
+  --warn-ink: #6f4400;
+  --warn-wash: #fbf1dd;
+  --warn-edge: #e0c391;
 
   --sidebar-w: 14.5rem;
   --control-w: 14.5rem;
@@ -110,71 +120,63 @@
      around the rail is the space between sections, which is what makes the
      whole window read as a single tiling rather than a frame with contents. */
   --gap: 0.875rem;
-  --radius: 0.875rem;
-  --radius-sm: 0.5rem;
+  --radius: 0.75rem;
+  /* Controls round at the toolkit's radius, not the tile's. A 12px field
+     inside a 12px tile makes both look like the same object. */
+  --radius-sm: 0.375rem;
   --pane-x: 1.0625rem;
 
-  /* Two elevations. Content tiles sit at e1 and never move; e2 is for the
-     things that arrive over them -- the tooltip, the save capsule. */
-  --e1:
-    0 1px 2px rgba(15, 23, 42, 0.06),
-    0 8px 24px -12px rgba(15, 23, 42, 0.22);
+  /* The only shadow in the window, and only two things use it: the info
+     popover and the save capsule, both of which genuinely arrive on top of
+     something. It has an offset and a soft blur, because that is what a
+     shadow is; a zero-offset halo would be decoration. */
   --e2:
-    0 12px 28px -6px rgba(15, 23, 42, 0.2),
-    0 2px 6px -1px rgba(15, 23, 42, 0.12);
-
-  --blur: blur(22px) saturate(1.7);
+    0 6px 16px -6px rgba(15, 23, 42, 0.3),
+    0 1px 3px rgba(15, 23, 42, 0.14);
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --ground: #0b0e13;
-    /* Carried further than the light values, not less far. A tint that reads
-       clearly on porcelain disappears entirely on near-black, and a bloom
-       nobody can see is a frost with nothing to blur. */
-    --bloom-a: rgba(51, 204, 255, 0.28);
-    --bloom-b: rgba(0, 255, 153, 0.16);
-    --veil: rgba(126, 176, 214, 0.07);
+    /* The same three-surface ordering, not an inversion of it: the rail is
+       still the most recessed and the tile still the most raised. Dark themes
+       that swap that round end up with a sidebar glowing brighter than the
+       content it navigates. */
+    --ground: #16181b;
+    --mat: #212429;
+    --mat-rail: #101215;
+    --mat-edge: #33373e;
 
-    --mat: rgba(23, 27, 34, 0.66);
-    --mat-rail: rgba(16, 19, 25, 0.72);
-    --mat-edge: rgba(255, 255, 255, 0.09);
-    --mat-sheen: rgba(255, 255, 255, 0.1);
+    --well: #191c21;
+    --well-edge: #3d434c;
+    --sunk: #2a2e35;
+    --hairline: #2c3037;
+    --row-hover: rgba(255, 255, 255, 0.04);
+    --track: #3a4048;
+    --knob: #b9c1cd;
 
-    --well: rgba(8, 10, 14, 0.55);
-    --well-edge: rgba(255, 255, 255, 0.13);
-    --sunk: rgba(255, 255, 255, 0.055);
-    --hairline: rgba(255, 255, 255, 0.075);
-    --row-hover: rgba(255, 255, 255, 0.032);
+    --text: #e6e9ee;
+    --muted: #a0a8b5;
+    --faint: #8d95a3;
 
-    --text: #e9edf3;
-    --muted: #9aa4b4;
-    --faint: #7d8798;
-
-    --accent-2: #00ff99;
-    /* On the dark ground the bright cyan clears AA on its own (10.3:1), so
-       text and fill share one value here. The dark ink on the fill is
-       unchanged -- it is the fill's contrast, not the ground's. */
+    /* The bright cyan comes back: on this ground it measures 10.3:1 as text,
+       so the light theme's darkened variant would only look muddy here. The
+       knob ink flips with it -- dark on the fill, not white. */
     --accent: #33ccff;
-    --accent-fill: #33ccff;
-    --accent-ink: #062430;
-    --accent-wash: rgba(51, 204, 255, 0.14);
-    --focus: rgba(51, 204, 255, 0.65);
+    --accent-ink: #072530;
+    --accent-wash: #16323d;
+    --focus: #33ccff;
 
-    --danger: #ff5f52;
-    --danger-wash: rgba(255, 95, 82, 0.14);
+    --danger: #ff6b5e;
+    --danger-wash: #37201d;
     --danger-ink: #ffb3ad;
     --ok: #46e0a0;
-    --warn-ink: #f5c777;
-    --warn-wash: rgba(255, 159, 10, 0.12);
-    --warn-edge: rgba(255, 159, 10, 0.32);
+    --warn-ink: #f0c37a;
+    --warn-wash: #33280f;
+    --warn-edge: #6b5526;
 
-    --e1:
-      0 1px 2px rgba(0, 0, 0, 0.4),
-      0 10px 30px -14px rgba(0, 0, 0, 0.8);
     --e2:
-      0 14px 32px -6px rgba(0, 0, 0, 0.6),
-      0 2px 8px -1px rgba(0, 0, 0, 0.45);
+      0 8px 20px -6px rgba(0, 0, 0, 0.7),
+      0 1px 3px rgba(0, 0, 0, 0.5);
   }
 }
 
@@ -200,23 +202,12 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-/* The blooms. Fixed, so they stay put while a pane scrolls -- a ground that
-   scrolls with its content stops being a ground.
-
-   Placed so each one's *falloff* crosses the tiles rather than its centre:
-   frost reads as frost where there is a gradient behind it to bend, and a
-   flat patch of tint blurs to exactly itself. */
-body::before {
-  content: "";
-  position: fixed;
-  inset: 0;
-  z-index: 0;
-  pointer-events: none;
-  background:
-    radial-gradient(52rem 32rem at 22% -16%, var(--bloom-a), transparent 64%),
-    radial-gradient(44rem 34rem at 98% 106%, var(--bloom-b), transparent 62%),
-    linear-gradient(180deg, var(--veil), transparent 52%);
-}
+/* There is deliberately no `body::before` here. It used to hold two radial
+   tint blooms and a vertical veil, whose only job was giving the tiles'
+   `backdrop-filter` something varied to bend -- frost over a flat fill blurs
+   to exactly that fill and is invisible. With the frost gone the blooms had
+   nothing left to serve, and a cyan-to-mint wash across a settings window is
+   mood rather than information. The ground is one colour. */
 
 .shell {
   position: relative;
@@ -235,8 +226,13 @@ body::before {
 
 /* ------------------------------------------------------------- the tiles
 
-   One rule's worth of material, applied to the three things that are tiles:
-   the rail, the pane's header, and every section. */
+   One rule's worth of surface, applied to the four things that are tiles: the
+   rail, the pane's header, every section, and the empty-search panel.
+
+   A border and nothing else. The old rule stacked a 1px edge, a two-layer
+   drop shadow, an inset top highlight and a 22px blur on every tile in the
+   window -- four separate claims about depth for objects that all sit at the
+   same height. One edge says it once. */
 
 .sidebar,
 .topbar,
@@ -244,9 +240,6 @@ body::before {
 .nothing {
   border: 1px solid var(--mat-edge);
   border-radius: var(--radius);
-  box-shadow: var(--e1), inset 0 1px 0 var(--mat-sheen);
-  backdrop-filter: var(--blur);
-  -webkit-backdrop-filter: var(--blur);
 }
 
 /* ---------------------------------------------------------------- sidebar */
@@ -261,19 +254,20 @@ body::before {
   overflow-y: auto;
 }
 
+/* The wordmark, set the way the product spells itself: lower case, at reading
+   size, in the display face. It used to be an 11px tracked-out capital
+   "YAPPR" -- the tiny-uppercase-label habit, applied to the one string in the
+   window that is a name rather than a category. A name is not a label. */
 .brand {
   display: flex;
   align-items: center;
   gap: 0.5rem;
   padding: 0.125rem 0.5rem 0.75rem;
   font-family: var(--font-display);
-  font-size: 0.6875rem;
+  font-size: 0.875rem;
   font-weight: 600;
-  /* Small text is set slightly open: at this size the letters crowd, which is
-     the mirror image of the display sizes below wanting negative tracking. */
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--muted);
+  letter-spacing: -0.005em;
+  color: var(--text);
 }
 
 /* The app icon, at rail scale. The source is a 500px plate inset in a
@@ -286,7 +280,7 @@ body::before {
   width: 1.5rem;
   height: 1.5rem;
   flex: none;
-  filter: drop-shadow(0 1px 1.5px rgb(0 0 0 / 0.22));
+  filter: drop-shadow(0 1px 1px rgb(0 0 0 / 0.16));
 }
 
 @media (prefers-color-scheme: dark) {
@@ -325,17 +319,22 @@ body::before {
   pointer-events: none;
 }
 
+/* The same field the rest of the window uses, rather than a borderless tint.
+   On the rail -- which is the most recessed of the three surfaces -- a tinted
+   fill with no edge read as *raised*, exactly backwards, and the border
+   appearing only on focus made the field change size-class as you clicked it.
+   It is a text field the whole time. */
 .searchbox__input {
   width: 100%;
   padding: 0.375rem 1.75rem 0.375rem 1.875rem;
-  border: 1px solid transparent;
+  border: 1px solid var(--well-edge);
   border-radius: var(--radius-sm);
-  background: var(--sunk);
+  background: var(--well);
   color: var(--text);
   font: inherit;
   -webkit-appearance: none;
   appearance: none;
-  transition: background 140ms ease, border-color 140ms ease;
+  transition: border-color 140ms ease, box-shadow 140ms ease;
 }
 
 .searchbox__input::-webkit-search-cancel-button {
@@ -348,9 +347,8 @@ body::before {
 
 .searchbox__input:focus {
   outline: none;
-  background: var(--well);
   border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-wash);
+  box-shadow: 0 0 0 2px var(--accent-wash);
 }
 
 .searchbox__clear {
@@ -431,38 +429,24 @@ body::before {
 
 /* The focused tile.
 
-   This is the one place the window spends its boldness. Hyprland marks the
-   focused window with a 45-degree gradient border and nothing else; the
-   active category is marked the same way, so the sidebar reads as a stack of
-   tiles with one of them focused. It travels between rows on `layoutId`
-   (Settings.tsx) -- every nav item is the same width and height, so that
-   animation is a pure translation and the 1px edge never gets scaled. */
+   Hyprland marks the focused window with a coloured border and nothing else,
+   and the active category is marked the same way, so the rail reads as a
+   stack of tiles with one of them focused. The border is solid -- which is
+   how most people set `col.active_border` anyway, and what the default
+   45-degree cyan-to-mint sweep was standing in for here. Losing the gradient
+   loses the mask trick with it: a two-stop sweep needed a masked pseudo-
+   element to become a border at a radius, where one colour is just `border`.
+
+   It travels between rows on `layoutId` (Settings.tsx) -- every nav item is
+   the same width and height, so that animation is a pure translation and the
+   1px edge never gets scaled. */
 .nav-selection {
   position: absolute;
   inset: 0;
   z-index: -1;
+  border: 1px solid var(--accent);
   border-radius: var(--radius-sm);
   background: var(--accent-wash);
-}
-
-.nav-selection::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  border-radius: inherit;
-  padding: 1px;
-  background: var(--accent-grad);
-  /* Draw the gradient, then punch the middle out of it: a gradient *border*,
-     which `border-image` cannot do at a radius. */
-  -webkit-mask:
-    linear-gradient(#000 0 0) content-box,
-    linear-gradient(#000 0 0);
-  -webkit-mask-composite: xor;
-  mask:
-    linear-gradient(#000 0 0) content-box,
-    linear-gradient(#000 0 0);
-  mask-composite: exclude;
-  pointer-events: none;
 }
 
 .sidebar-foot {
@@ -478,11 +462,16 @@ body::before {
    be read back character by character into a bug report, not prose; faint
    and small because it is reference material that must never compete with
    the navigation above it. Set to wrap rather than truncate -- a version
-   with half its suffix cut off is worse than a version on two lines. */
+   with half its suffix cut off is worse than a version on two lines.
+
+   `--muted`, not `--faint`: the rail is the most recessed of the three
+   surfaces, and `--faint` on it measures 3.7:1 -- under AA, for the one
+   string in this window whose whole job is being transcribed correctly into
+   a bug report. Quiet is a rank, not a licence to be unreadable. */
 .version {
   margin: 0;
   padding: 0 0.5rem;
-  color: var(--faint);
+  color: var(--muted);
   font-family: var(--font-mono);
   font-size: 0.65rem;
   line-height: 1.35;
@@ -507,9 +496,11 @@ body::before {
   padding-right: 0.125rem;
 }
 
-/* Sticky inside the scroller, so section tiles really do pass underneath it
-   and the blur has content to work on. This is the one place in the window
-   where a translucent material is doing a job rather than setting a mood. */
+/* Sticky inside the scroller, so section tiles pass underneath it rather than
+   the whole column sliding beneath a fixed strip. Opaque, and it has to be:
+   this is the one surface in the window that content genuinely goes behind,
+   and a semi-transparent header with rows crawling through the pane title is
+   the exact effect translucency is worst at. */
 .topbar {
   position: sticky;
   top: 0;
@@ -541,11 +532,13 @@ body::before {
   font-variant-numeric: tabular-nums;
 }
 
-/* Content underneath is already visible through the frost. What the scrolled
-   state adds is depth -- the header lifts off the stack rather than drawing a
-   rule that would sit there just as hard with nothing under it. */
+/* The one shadow a content tile is allowed, and only while it has earned it:
+   once the pane has scrolled, the header really is on top of something, so it
+   casts. At rest it is a tile among tiles and casts nothing -- which is also
+   the answer to "why not just a rule": a rule would sit there just as hard
+   with nothing underneath it. */
 .topbar.is-scrolled {
-  box-shadow: var(--e2), inset 0 1px 0 var(--mat-sheen);
+  box-shadow: var(--e2);
 }
 
 .pane-body {
@@ -613,13 +606,18 @@ body::before {
   padding: 0.8125rem 1rem 0.6875rem;
 }
 
+/* Sentence case at reading size, not 11px tracked-out capitals. `titleFor`
+   already returns a written German title ("Aufnahme", "Texteingabe"); the old
+   rule shouted it, which is how a settings window ends up looking like a
+   dashboard. Capitals also cost the most where they are used most: a
+   condensed German compound in all caps is the hardest thing in this window
+   to read at a glance. */
 .group-head h2 {
   margin: 0;
   font-family: var(--font-display);
-  font-size: 0.6875rem;
+  font-size: 0.8125rem;
   font-weight: 600;
-  letter-spacing: 0.09em;
-  text-transform: uppercase;
+  letter-spacing: -0.005em;
   color: var(--text);
 }
 
@@ -775,9 +773,9 @@ body::before {
 }
 
 /* Anchored to the info button that opened it, not to its own centre: the
-   origin is what makes the panel read as belonging to this row. Opaque, not
-   frosted -- it lands on top of the row it explains, and text over text is
-   the one place translucency costs more than it gives. */
+   origin is what makes the panel read as belonging to this row. One of the
+   two things in this window that genuinely floats, so one of the two that
+   casts a shadow. */
 .tip {
   position: absolute;
   top: calc(100% + 0.4375rem);
@@ -788,7 +786,7 @@ body::before {
   max-width: 22rem;
   padding: 0.5625rem 0.6875rem;
   border-radius: var(--radius-sm);
-  background: var(--ground);
+  background: var(--mat);
   border: 1px solid var(--mat-edge);
   box-shadow: var(--e2);
   color: var(--text);
@@ -810,10 +808,12 @@ body::before {
 
 /* --------------------------------------------------------------- controls
 
-   Wells: cut into the tile rather than raised off it, so the eye reads the
-   tile as the surface and the control as a hole in it. The inset shadow is
-   the whole of that effect -- without it a translucent field on a
-   translucent tile is just a lighter rectangle. */
+   Fill plus a real border, and no inset bevel. The bevel existed to separate
+   a translucent field from the translucent tile under it; on an opaque tile
+   the border does that on its own, and a 2px gradient of fake shadow under
+   the top edge of every field is a costume for depth the control does not
+   have. The edge is drawn a shade darker than the tile's own instead, which
+   is the honest version of the same signal. */
 
 input[type="text"],
 input[type="number"],
@@ -825,7 +825,6 @@ input[type="number"],
   border-radius: var(--radius-sm);
   padding: 0.375rem 0.625rem;
   font: inherit;
-  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.06);
   transition: border-color 120ms ease, box-shadow 120ms ease;
 }
 
@@ -860,7 +859,7 @@ input[type="number"]:focus,
 select:focus {
   outline: none;
   border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-wash);
+  box-shadow: 0 0 0 2px var(--accent-wash);
 }
 
 .select {
@@ -898,8 +897,7 @@ option:disabled {
   padding: 0;
   border: 1px solid var(--well-edge);
   border-radius: 999px;
-  background: var(--sunk);
-  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.08);
+  background: var(--track);
   cursor: pointer;
   transition: background 160ms ease, border-color 160ms ease;
 }
@@ -911,13 +909,21 @@ option:disabled {
   width: 1.125rem;
   height: 1.125rem;
   border-radius: 50%;
-  background: #fff;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+  background: var(--knob);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.28);
 }
 
+/* On: the accent as a solid fill, and the knob takes whichever ink reads on
+   it -- white on the light theme's darkened teal, near-black on the dark
+   theme's bright cyan. A white knob on #33ccff measures 1.9:1 and simply
+   disappears, which is a switch you cannot tell the state of. */
 .toggle.on {
-  background: var(--accent-fill);
-  border-color: var(--accent-fill);
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.toggle.on .knob {
+  background: var(--accent-ink);
 }
 
 .toggle:focus-visible,
@@ -1075,12 +1081,14 @@ button:disabled {
   align-items: center;
 }
 
+/* Column headers, in the UI face rather than the display one. These name the
+   fields directly under them and are read together with the values; the
+   display face is for titles, and small tracked-out capitals here would make
+   the header the loudest thing in a table of data. */
 .trow.head {
   color: var(--faint);
-  font-family: var(--font-display);
-  font-size: 0.6875rem;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
+  font-size: 0.75rem;
+  font-weight: 500;
   padding-right: 2rem;
 }
 
@@ -1158,9 +1166,7 @@ button:disabled {
   border-radius: 999px;
   background: var(--mat);
   border: 1px solid var(--mat-edge);
-  box-shadow: var(--e2), inset 0 1px 0 var(--mat-sheen);
-  backdrop-filter: var(--blur);
-  -webkit-backdrop-filter: var(--blur);
+  box-shadow: var(--e2);
   color: var(--text);
   font-size: 0.8125rem;
   font-weight: 500;
@@ -1255,16 +1261,17 @@ button:disabled {
   height: 0.3125rem;
   border-radius: 999px;
   background: var(--sunk);
-  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.1);
   overflow: hidden;
 }
 
-/* The one other place the focus gradient appears: a download is the only
-   thing in this window that is actively happening. */
+/* The one other place the accent appears at full strength: a download is the
+   only thing in this window that is actively happening. Flat, because a bar
+   whose colour changes along its own length makes its length harder to read,
+   which is the single thing a progress bar exists to communicate. */
 .progressbar__fill {
   height: 100%;
   border-radius: inherit;
-  background: var(--accent-grad);
+  background: var(--accent);
   transition: width 0.2s ease;
 }
 
@@ -1366,52 +1373,19 @@ button:disabled {
   }
 }
 
-/* Translucency is the one thing in this window that can quietly destroy
-   contrast, so it is the first thing to go. The tiles stay tiles -- edges,
-   radius and elevation are what carry the layout; the blur was only ever the
-   material. */
-@media (prefers-reduced-transparency: reduce) {
-  :root {
-    --mat: var(--ground);
-    --mat-rail: var(--ground);
-    --well: var(--ground);
-  }
+/* There is no `prefers-reduced-transparency` block any more, and that is the
+   answer rather than an omission: this window has no translucent surface and
+   no `backdrop-filter` left to switch off. What that query used to buy is
+   simply how the window renders for everyone now. */
 
-  body::before {
-    display: none;
-  }
-
-  .sidebar,
-  .topbar,
-  .group,
-  .nothing,
-  .save-capsule {
-    backdrop-filter: none;
-    -webkit-backdrop-filter: none;
-  }
-}
-
+/* Contrast, though, still has somewhere to go. The edges do all the
+   structural work here, so raising contrast means drawing them harder --
+   not flattening surfaces that are already flat. */
 @media (prefers-contrast: more) {
   :root {
-    --mat: var(--ground);
-    --mat-rail: var(--ground);
-    --well: var(--ground);
-    --hairline: rgba(128, 128, 128, 0.6);
-    --mat-edge: rgba(128, 128, 128, 0.7);
-    --well-edge: rgba(128, 128, 128, 0.85);
-  }
-
-  body::before {
-    display: none;
-  }
-
-  .sidebar,
-  .topbar,
-  .group,
-  .nothing,
-  .save-capsule {
-    backdrop-filter: none;
-    -webkit-backdrop-filter: none;
+    --hairline: #9aa0aa;
+    --mat-edge: #7c838e;
+    --well-edge: #5c636e;
   }
 
   .muted,
@@ -1420,6 +1394,20 @@ button:disabled {
   .setup-row__status,
   .setup-command {
     color: var(--text);
+  }
+
+  /* A 1px accent border is enough to point at the active row when it is the
+     only one; it is not enough when everything else has a hard edge too. */
+  .nav-selection {
+    border-width: 2px;
+  }
+}
+
+@media (prefers-contrast: more) and (prefers-color-scheme: dark) {
+  :root {
+    --hairline: #5b626d;
+    --mat-edge: #757d89;
+    --well-edge: #8b93a0;
   }
 }
 
@@ -1535,8 +1523,11 @@ button:disabled {
 .wizard-pre {
   margin: 0.75rem 0;
   padding: 0.9rem 1rem;
-  border-radius: 0.6rem;
-  background: rgb(0 0 0 / 0.22);
+  border-radius: var(--radius-sm);
+  /* The same sunk surface every other well in this window uses. It was a flat
+     22% black, which is a value that only works on one of the two themes. */
+  background: var(--sunk);
+  border: 1px solid var(--mat-edge);
   overflow-x: auto;
   font-size: 0.8rem;
   line-height: 1.5;

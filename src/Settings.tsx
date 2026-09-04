@@ -493,9 +493,10 @@ export default function Settings() {
             }}
           >
             {/* Sticky *inside* the scroller, so content genuinely passes
-                beneath it and the blur has something to blur. A soft edge
-                where the two meet, rather than a hairline rule that would sit
-                there just as hard when there is nothing underneath it. */}
+                beneath it rather than the whole column sliding under a fixed
+                strip. It is opaque, and picks up a shadow only once the pane
+                has scrolled -- a rule would sit there just as hard when there
+                is nothing underneath it. */}
             <header className={`topbar${scrolled ? " is-scrolled" : ""}`}>
               <h1>{searching ? "Suchergebnisse" : current.title}</h1>
               {searching && (
