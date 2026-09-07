@@ -408,6 +408,12 @@ export function Wizard({
                     <code>systemctl --user enable --now ydotoold</code>. Fügt yappr danach
                     nichts ein, fehlt meist der Zugriff auf <code>/dev/uinput</code>.
                   </p>
+                  <p className="setup-command">
+                    Kommt <em>nur in Terminals</em> nichts an, ist es etwas anderes: yappr
+                    kann unter GNOME die Fensterklasse nicht ermitteln und drückt deshalb
+                    Strg+V statt Strg+Umschalt+V. Dann unter Allgemein → Texteingabe die
+                    Einfüge-Tastenkombination fest auf <code>ctrl_shift_v</code> stellen.
+                  </p>
                 </div>
               )}
 

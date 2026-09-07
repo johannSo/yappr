@@ -338,6 +338,45 @@ pub enum InjectBackend {
     Clipboard,
 }
 
+/// Which chord the `ydotool` backend presses to paste (spec 10.3).
+///
+/// `Auto` is the historical behaviour and still the default: Ctrl+Shift+V
+/// when the focused window's class is in `terminal_classes`, plain Ctrl+V
+/// otherwise. The override exists because that decision has exactly one
+/// source -- `hypr::active_window_class()`, i.e. `hyprctl` -- and it is
+/// unavailable in precisely the places this backend is *for*:
+///
+///   - On GNOME/Mutter there is no `hyprctl` at all, and `wtype` does not
+///     work there, so ydotool is the only backend a GNOME user has.
+///   - On Hyprland, `hyprctl` needs `HYPRLAND_INSTANCE_SIGNATURE` in the
+///     daemon's environment. Without it (a systemd user unit or a `.desktop`
+///     autostart on a session that never exported it) it prints
+///     "HYPRLAND_INSTANCE_SIGNATURE not set!" -- on *stdout* -- and exits 1;
+///     with a stale signature it cannot connect and exits 4.
+///   - And on Hyprland proper, `hyprctl` answers `{}` with exit 0 whenever
+///     nothing is focused.
+///
+/// All three collapse to the same `None`, which is the point: the caller
+/// cannot tell "no compositor" from "nothing focused", and `wants_shift`
+/// reads either as "not a terminal".
+///
+/// An unknown class means `Auto` sends plain Ctrl+V, which every terminal
+/// ignores -- and `ydotool` exits 0, so nothing fails, no clipboard-fallback
+/// notification fires and nothing is logged as an error. The user sees a
+/// dictation that simply produced no text. `CtrlShiftV` is the answer for
+/// "my compositor cannot tell yappr what is focused, and I dictate into a
+/// terminal".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PasteChord {
+    /// Decide per window, from `terminal_classes`.
+    Auto,
+    /// Always Ctrl+V.
+    CtrlV,
+    /// Always Ctrl+Shift+V.
+    CtrlShiftV,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InjectConfig {
@@ -353,6 +392,10 @@ pub struct InjectConfig {
     /// inside them. Only the `ydotool` backend reads this.
     #[serde(default = "d_terminal_classes")]
     pub terminal_classes: Vec<String>,
+    /// Which paste chord the `ydotool` backend presses. Only that backend
+    /// reads this. See [`PasteChord`] for why an override is needed at all.
+    #[serde(default = "d_paste_chord")]
+    pub paste_chord: PasteChord,
 }
 
 fn d_backend() -> InjectBackend {
@@ -392,6 +435,9 @@ fn d_terminal_classes() -> Vec<String> {
     .map(str::to_string)
     .to_vec()
 }
+fn d_paste_chord() -> PasteChord {
+    PasteChord::Auto
+}
 
 impl Default for InjectConfig {
     fn default() -> Self {
@@ -400,6 +446,7 @@ impl Default for InjectConfig {
             trailing_space: true,
             keystroke_delay_ms: d_keydelay(),
             terminal_classes: d_terminal_classes(),
+            paste_chord: d_paste_chord(),
         }
     }
 }

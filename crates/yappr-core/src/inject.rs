@@ -3,7 +3,7 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use crate::config::{InjectBackend, InjectConfig};
+use crate::config::{InjectBackend, InjectConfig, PasteChord};
 use crate::paths;
 use crate::procutil;
 
@@ -178,6 +178,23 @@ fn is_terminal_class(class: Option<&str>, terminal_classes: &[String]) -> bool {
     terminal_classes.iter().any(|t| t.eq_ignore_ascii_case(class))
 }
 
+/// Whether the paste chord carries Shift, given the configured
+/// [`PasteChord`] and the target window's class.
+///
+/// The `Auto` arm is the class-based rule this backend has always used. The
+/// two forced arms exist because `class` is `None` whenever `hyprctl` cannot
+/// answer -- on GNOME/Mutter always, on Hyprland whenever the daemon's
+/// environment lacks `HYPRLAND_INSTANCE_SIGNATURE` -- and an unknown class
+/// under `Auto` means plain Ctrl+V, which no terminal accepts. See
+/// [`PasteChord`] for the full account.
+fn wants_shift(chord: PasteChord, class: Option<&str>, terminal_classes: &[String]) -> bool {
+    match chord {
+        PasteChord::CtrlV => false,
+        PasteChord::CtrlShiftV => true,
+        PasteChord::Auto => is_terminal_class(class, terminal_classes),
+    }
+}
+
 /// Spec 10.3's second injector, for the surfaces `wtype` cannot reach
 /// (GNOME/Mutter, XWayland, some Electron windows) -- since 2026-09-02 by
 /// pasting rather than typing: `wl-copy` the transcript, then press one
@@ -195,11 +212,12 @@ fn is_terminal_class(class: Option<&str>, terminal_classes: &[String]) -> bool {
 /// reason `hypr.rs` prints a config block rather than applying one).
 pub struct YdotoolInjector {
     terminal_classes: Vec<String>,
+    paste_chord: PasteChord,
 }
 
 impl YdotoolInjector {
     pub fn new(cfg: &InjectConfig) -> Self {
-        Self { terminal_classes: cfg.terminal_classes.clone() }
+        Self { terminal_classes: cfg.terminal_classes.clone(), paste_chord: cfg.paste_chord }
     }
 }
 
@@ -211,8 +229,20 @@ impl TextInjector for YdotoolInjector {
     fn inject(&self, text: &str, target_class: Option<&str>) -> Result<(), InjectError> {
         ClipboardInjector.inject(text, target_class)?;
         std::thread::sleep(PASTE_SETTLE);
-        let terminal = is_terminal_class(target_class, &self.terminal_classes);
-        run_typer("ydotool", paste_key_argv(terminal), PASTE_KEY_TIMEOUT)
+        let shift = wants_shift(self.paste_chord, target_class, &self.terminal_classes);
+        if target_class.is_none() && self.paste_chord == PasteChord::Auto {
+            // Not a failure -- `ydotool` will exit 0 and this function will
+            // return `Ok` -- which is exactly why it has to be said out loud.
+            // A terminal ignores the plain Ctrl+V that is about to be sent,
+            // so the user gets no text and no error. Naming the override
+            // here is the only warning they will ever see.
+            tracing::warn!(
+                "no target window class (hyprctl unavailable or HYPRLAND_INSTANCE_SIGNATURE unset); \
+                 pasting with plain Ctrl+V, which terminals ignore -- \
+                 set [inject] paste_chord = \"ctrl_shift_v\" if you dictate into a terminal"
+            );
+        }
+        run_typer("ydotool", paste_key_argv(shift), PASTE_KEY_TIMEOUT)
     }
 }
 
@@ -481,6 +511,44 @@ mod tests {
         // application running inside them; their paste is Ctrl+Shift+V.
         let argv = paste_key_argv(true);
         assert_eq!(argv, vec!["key", "29:1", "42:1", "47:1", "47:0", "42:0", "29:0"]);
+    }
+
+    #[test]
+    fn an_unknown_window_class_falls_back_to_plain_ctrl_v_under_auto() {
+        // The bug this pins: `hyprctl` is the only source of the target
+        // class, so on GNOME/Mutter (where it does not exist -- and which is
+        // the very desktop this backend exists for), on Hyprland whenever
+        // `HYPRLAND_INSTANCE_SIGNATURE` is missing from the daemon's
+        // environment (`hyprctl` then reports that on stdout and exits 1),
+        // and on Hyprland with nothing focused (`{}`, exit 0), the class is
+        // `None`. Under `Auto` that means "not a terminal", so every
+        // terminal gets a plain Ctrl+V it ignores.
+        let list = vec!["kitty".to_string()];
+        assert!(!wants_shift(PasteChord::Auto, None, &list));
+    }
+
+    #[test]
+    fn a_forced_ctrl_shift_v_pastes_into_a_terminal_whose_class_is_unknown() {
+        // The fix: a user whose compositor cannot report a window class can
+        // still say "I dictate into terminals", and get the chord terminals
+        // actually accept.
+        let list = vec!["kitty".to_string()];
+        assert!(wants_shift(PasteChord::CtrlShiftV, None, &list));
+        assert!(wants_shift(PasteChord::CtrlShiftV, Some("firefox"), &list));
+    }
+
+    #[test]
+    fn a_forced_ctrl_v_never_adds_shift_even_for_a_known_terminal() {
+        let list = vec!["kitty".to_string()];
+        assert!(!wants_shift(PasteChord::CtrlV, Some("kitty"), &list));
+        assert!(!wants_shift(PasteChord::CtrlV, None, &list));
+    }
+
+    #[test]
+    fn auto_still_reads_the_class_when_one_is_available() {
+        let list = vec!["kitty".to_string()];
+        assert!(wants_shift(PasteChord::Auto, Some("kitty"), &list));
+        assert!(!wants_shift(PasteChord::Auto, Some("firefox"), &list));
     }
 
     #[test]

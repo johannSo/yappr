@@ -262,12 +262,49 @@ fn parse_class(json: &str) -> Option<String> {
 pub fn active_window_class() -> Option<String> {
     let mut cmd = Command::new("hyprctl");
     cmd.args(["-j", "activewindow"]);
-    let out = procutil::run_with_timeout(cmd, HYPRCTL_TIMEOUT, None).ok()?;
+    let out = match procutil::run_with_timeout(cmd, HYPRCTL_TIMEOUT, None) {
+        Ok(out) => out,
+        Err(e) => {
+            // `debug`, not `warn`: this is the *ordinary* case off Hyprland.
+            // `start_recording` calls this on every utterance with no
+            // compositor or backend guard, so on GNOME -- where `hyprctl`
+            // does not exist -- a warning here would fire once per dictation
+            // forever, for every user, including the majority on `wtype` for
+            // whom the window class changes nothing. It would also bury the
+            // one warning that is actionable (`inject.rs`'s, which fires
+            // only for the backend that actually reads this value).
+            tracing::debug!(error = %e, "hyprctl could not be run; no target window class");
+            return None;
+        }
+    };
+    // Read stdout *before* the status check: `hyprctl` reports its own
+    // failures on stdout and exits nonzero (1 with
+    // `HYPRLAND_INSTANCE_SIGNATURE` unset, 4 when the socket it names is
+    // unreachable), so the failure arm is exactly where that text is worth
+    // having -- measured against Hyprland 0.56.2 on 2026-09-07.
+    let stdout = String::from_utf8_lossy(&out.stdout);
     if !out.status.success() {
-        tracing::debug!("hyprctl activewindow failed; using default style");
+        tracing::warn!(
+            status = %out.status,
+            output = %stdout.trim(),
+            "hyprctl activewindow failed; no target window class -- \
+             style rules and the ydotool paste chord will fall back to their defaults"
+        );
         return None;
     }
-    parse_class(&String::from_utf8_lossy(&out.stdout))
+    let class = parse_class(&stdout);
+    if class.is_none() {
+        // Exit 0 and still no class: `hyprctl` answers `{}` when nothing is
+        // focused. Downstream that `None` is indistinguishable from the
+        // failure arm above, and `inject::wants_shift` reads either as "not
+        // a terminal" -- so both say so, where the actual output is in hand.
+        tracing::warn!(
+            output = %stdout.trim(),
+            "hyprctl activewindow returned no parseable class; \
+             style rules and the ydotool paste chord will fall back to their defaults"
+        );
+    }
+    class
 }
 
 #[cfg(test)]
@@ -292,6 +329,26 @@ mod tests {
     fn parses_the_class_from_hyprctl_json() {
         let json = r#"{"address":"0x1","class":"thunderbird","title":"Inbox"}"#;
         assert_eq!(parse_class(json).as_deref(), Some("thunderbird"));
+    }
+
+    #[test]
+    fn hyprctl_reporting_its_own_failure_on_stdout_is_not_a_window_class() {
+        // `hyprctl` writes these to *stdout*, not stderr, and exits nonzero
+        // (1 with HYPRLAND_INSTANCE_SIGNATURE unset, 4 when the socket it
+        // names is unreachable) -- measured against Hyprland 0.56.2 on
+        // 2026-09-07. `active_window_class` returns at its status check
+        // before reaching here, so this pins the belt-and-braces half: if
+        // that check ever moves or a future hyprctl exits 0 on these,
+        // neither line may be mistaken for a class.
+        assert_eq!(parse_class("HYPRLAND_INSTANCE_SIGNATURE not set! (is hyprland running?)\n"), None);
+        assert_eq!(parse_class("Couldn't connect to /run/user/1000/hypr/x/.socket.sock. (4)\n"), None);
+    }
+
+    #[test]
+    fn an_empty_object_is_how_hyprctl_says_nothing_is_focused() {
+        // The one genuine exit-0-with-no-class case, and the reason
+        // `active_window_class` warns after a *successful* hyprctl too.
+        assert_eq!(parse_class("{}"), None);
     }
 
     #[test]

@@ -95,6 +95,16 @@ fn print_debug_summary(
     match &record.inject {
         Some(i) => {
             println!("  final text ({}): {:?}", i.backend, i.final_text);
+            // The ydotool backend picks its paste chord from this, so an
+            // unknown class is a diagnosis, not a missing detail -- say so
+            // rather than printing nothing.
+            match &i.window_class {
+                Some(c) => println!("  target window class: {c:?}"),
+                None => println!(
+                    "  target window class: (unknown -- hyprctl could not answer; \
+                     the ydotool backend pasted with plain Ctrl+V)"
+                ),
+            }
             if let Some(err) = &i.primary_error {
                 println!(
                     "  primary injector {} failed: {err}",

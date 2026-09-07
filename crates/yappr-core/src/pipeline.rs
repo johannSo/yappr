@@ -435,6 +435,7 @@ impl Pipeline {
         dbg.inject = Some(debug::InjectDebug {
             backend: backend.to_string(),
             final_text: text.clone(),
+            window_class: window_class.map(str::to_string),
             // Failure detail only when the fallback actually ran: on the
             // happy path primary_backend would just repeat `backend`.
             primary_backend: outcome

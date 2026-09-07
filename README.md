@@ -235,7 +235,7 @@ first start, and the old `~/.config/yappr/config.toml` is left behind as
 | `[asr]` | `num_threads` for Parakeet |
 | `[normalize]` | `enabled` (`false` skips S1-mini and types rule-cleaned raw text), plus `timeout_ms`, `context_size`, `threads` |
 | `[guardrail]` | `min_word_ratio`/`max_word_ratio`, `min_overlap_english`/`min_overlap_other`, `short_input_words`, `ngram_size`/`ngram_max_repeats` |
-| `[inject]` | `backend` (`wtype`, `ydotool`, `clipboard`), `trailing_space`, `keystroke_delay_ms` (wtype only), `terminal_classes` (windows that paste with Ctrl+Shift+V) |
+| `[inject]` | `backend` (`wtype`, `ydotool`, `clipboard`), `trailing_space`, `keystroke_delay_ms` (wtype only), `terminal_classes` (windows that paste with Ctrl+Shift+V), `paste_chord` (`auto`, `ctrl_v`, `ctrl_shift_v`; ydotool only) |
 | `[vocabulary]` | terms and replacements applied to the raw transcript before clean-up — put short acronyms in `replacements`, not `terms` |
 | `[style_default]`, `[[style_rules]]` | the `styling`/`structure`/`context` axes S1-mini is prompted with, and per-application overrides matched on window class (regex) |
 | `[debug]` | `enabled` (off), `dir` (default `~/yappr`), `save_audio` — see [Troubleshooting](#troubleshooting) |
@@ -286,6 +286,36 @@ Then set it in Settings → Allgemein → Texteingabe → Verfahren, or:
 backend = "ydotool"
 ```
 
+#### If nothing is pasted into a terminal
+
+Choosing Ctrl+Shift+V over Ctrl+V needs the class of the window you dictated into, and
+that answer comes from `hyprctl` alone. Three situations leave yappr without it:
+
+- **On GNOME there is no `hyprctl`** — and GNOME is exactly where you were told to use
+  this backend, because `wtype` does nothing there. `auto` can never work there.
+- **On Hyprland, `hyprctl` needs `HYPRLAND_INSTANCE_SIGNATURE`** in yappr's own
+  environment. Started from a systemd user unit or a `.desktop` autostart on a session
+  that never exported it, `hyprctl` fails and yappr is left without a class.
+- **Nothing was focused** when you started talking.
+
+Either way the class is unknown, yappr falls back to plain Ctrl+V, and every terminal
+ignores it: the dictation lands in the clipboard and nothing appears. Nothing fails, so
+there is no error — only a warning on yappr's stdout, which is `journalctl --user` if
+your desktop session started it, or set `[debug] enabled = true` and read
+`~/yappr/logs/daemon.log`. `yappr --debug` also prints the target window class of the
+last dictation, which tells you directly whether this is what you hit. Force the chord:
+
+```toml
+[inject]
+paste_chord = "ctrl_shift_v"   # "auto" (default) | "ctrl_v" | "ctrl_shift_v"
+```
+
+`auto` keeps the per-window behaviour and is right whenever `hyprctl` can answer.
+Forcing `ctrl_shift_v` makes terminals work everywhere, at the cost of sending
+Ctrl+Shift+V to ordinary windows too — in browsers and Electron apps that is
+"paste as plain text", which is what you want for dictation anyway, but a few apps
+bind it to something else (LibreOffice opens *Paste Special*).
+
 ## Memory use
 
 By default the models load on your first key press and unload again a minute after your
@@ -313,6 +343,7 @@ needed — `preload_at_startup` alone still unloads after the idle timeout.
 |---|---|
 | **Nothing happens when I press `SUPER+D`** | The app isn't running (check for the tray icon), or the shortcut isn't bound. Run `yappr --toggle` in a terminal: with no app running it exits non-zero and raises a notification. |
 | **Nothing gets typed, but the overlay says it worked** | `wtype` can't reach that window — you're on GNOME, or it's an XWayland/Electron window. Switch to [`ydotool`](#pasting-with-ydotool). Check the clipboard: the text is probably there. |
+| **Nothing is pasted *into a terminal* on the `ydotool` backend** | yappr couldn't read the target window's class, so it sent plain Ctrl+V, which terminals ignore. Set `[inject] paste_chord = "ctrl_shift_v"` — see [If nothing is pasted into a terminal](#if-nothing-is-pasted-into-a-terminal). |
 | **`cargo build` fails in `gtk-layer-shell-sys`** | `sudo pacman -S gtk-layer-shell`. |
 | **Blank windows after building** | Built without `--features custom-protocol`, or without `bun run build` first. |
 | **The first dictation of the day is slow** | Expected — the models load lazily. See [Memory use](#memory-use). |

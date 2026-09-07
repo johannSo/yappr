@@ -175,17 +175,37 @@ impl GuardrailDebug {
 
 /// The injector backend used, and exactly what it was handed.
 ///
-/// The three optional fields exist only on records where the primary
-/// injector failed and the fallback carried the text: which backend failed,
-/// what it said, and (ydotool only) what its environment looked like at
-/// that moment. `#[serde(default)]` for the same reason `vocab` has it --
+/// Two groups of optional fields, and they are optional for different
+/// reasons. `window_class` is recorded on *every* injection and is written
+/// even when it is `null`, because "the class was unknown" is the single
+/// most diagnostic thing a record can say (see the field's own comment).
+/// `primary_backend`/`primary_error` exist only on records where the
+/// primary injector failed and the fallback carried the text, and are
+/// skipped when absent so happy-path records carry no `null`s.
+/// `#[serde(default)]` on all three for the same reason `vocab` has it --
 /// `--debug` reads whatever record is newest on disk, which may predate
-/// these fields; `skip_serializing_if` keeps happy-path records free of
-/// three `null`s.
+/// them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InjectDebug {
     pub backend: String,
     pub final_text: String,
+    /// The target window's class as captured at recording start, or `null`
+    /// when `hyprctl` could not answer. `#[serde(default)]` so records
+    /// written before this field existed still deserialize.
+    ///
+    /// Present because its absence made a real bug undiagnosable: the
+    /// ydotool backend picks Ctrl+V vs Ctrl+Shift+V from this value, and
+    /// with it missing there was no way to tell, after the fact, whether a
+    /// dictation that produced no text in a terminal had been sent the
+    /// wrong chord.
+    ///
+    /// Deliberately *not* `skip_serializing_if`, unlike the two fields
+    /// below: an omitted key would make "the class was unknown -- this is
+    /// the bug" byte-identical to a record written before the field
+    /// existed, which is precisely the distinction it was added to draw.
+    /// A written `null` is the diagnosis.
+    #[serde(default)]
+    pub window_class: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primary_backend: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -339,6 +359,35 @@ pub fn latest_record_path(logs_dir: &Path) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_unknown_window_class_is_written_as_null_not_omitted() {
+        // The whole diagnostic value of this field is telling "hyprctl
+        // could not answer, and that is why nothing pasted into your
+        // terminal" apart from "this record predates the field". Skipping
+        // the key when it is `None` would make those two byte-identical,
+        // which is exactly the question the field was added to answer.
+        let rec = InjectDebug {
+            backend: "ydotool".to_string(),
+            final_text: "hallo ".to_string(),
+            window_class: None,
+            primary_backend: None,
+            primary_error: None,
+        };
+        let json = serde_json::to_value(&rec).unwrap();
+        assert!(
+            json.get("window_class").is_some(),
+            "an unknown class must be written as null, got: {json}"
+        );
+        assert!(json["window_class"].is_null());
+        // The other two stay skipped: a happy-path record carries no nulls.
+        assert!(json.get("primary_error").is_none());
+
+        // And a record written before the field existed still loads.
+        let old: InjectDebug =
+            serde_json::from_str(r#"{"backend":"wtype","final_text":"hi "}"#).unwrap();
+        assert_eq!(old.window_class, None);
+    }
+
     use super::*;
     use std::time::Duration;
 
@@ -498,6 +547,7 @@ mod tests {
             inject: Some(InjectDebug {
                 backend: "wtype".to_string(),
                 final_text: "Hello there. ".to_string(),
+                window_class: Some("kitty".to_string()),
                 primary_backend: None,
                 primary_error: None,
             }),
@@ -589,6 +639,7 @@ mod tests {
                 inject: Some(InjectDebug {
                     backend: "mock".to_string(),
                     final_text: "Hi. ".to_string(),
+                    window_class: None,
                     primary_backend: None,
                     primary_error: None,
                 }),

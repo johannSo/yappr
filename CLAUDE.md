@@ -13,6 +13,9 @@ target window's class is in `[inject] terminal_classes`; the transcript stays in
 clipboard afterwards — if `[inject] backend` selects it). Fully local at
 dictation time. `SUPER+ALT+D`
 cancels a recording in progress; nothing else can end one deliberately — see invariant 11.
+The Ctrl+V/Ctrl+Shift+V choice can be forced with `[inject] paste_chord`
+(`auto` default / `ctrl_v` / `ctrl_shift_v`), because `auto` needs a window class it
+cannot always get — see the `hyprctl` gotcha at the bottom of this file.
 
 yappr is one binary, `yappr`, and one process. Running it with no
 arguments starts everything: a tray icon (no window), the Unix socket, the models, and
@@ -51,7 +54,7 @@ bun run tauri dev                         # dev: Vite on :1420 + the Tauri windo
 bun run build                             # frontend only (tsc && vite build -> dist/)
 #   ^ builds BOTH pages: index.html (overlay) and settings.html (settings window).
 
-# Tests (399 passed, 0 failed, 8 #[ignore]d because they need downloaded models)
+# Tests (426 passed, 0 failed, 8 #[ignore]d because they need downloaded models)
 cargo test --workspace
 # NOT optional. These are the only tests that catch a C++ ABI mismatch between
 # sherpa-onnx and llama.cpp -- see the gotcha at the bottom of this file. A wrong
@@ -65,6 +68,8 @@ cargo clippy --workspace --all-targets    # kept clean
 # Exercising things without a microphone
 cargo run -p yappr -- --replay src-tauri/fixtures/replay-full.ndjson
 cargo run -p yappr-core --example list_devices
+cargo run -p yappr-core --example paste_probe -- "hi" ctrl_shift_v  # injection only, no mic
+#   ^ presses real keys into the focused window; prints the class and the chord it chose.
 cargo run --release -p yappr -- --bench   # ASR latency table
 
 # Runtime inspection / control (against a running instance)
@@ -529,6 +534,38 @@ happen to be resident.
   script repacks the AppImage in place with the 256×256 at the root (the AppImage spec's
   recommended `.DirIcon` size), reusing the original runtime; verified 2026-09-01. The
   release CI runs it after `tauri build` — a locally built AppImage needs it run by hand.
+- **Every way `hyprctl` can fail collapses to the same `None`, and that silently
+  changes the ydotool paste chord.** `hypr::active_window_class()` is the *only*
+  source of the target window's class, and `inject::wants_shift` reads `None` as
+  "not a terminal" — so the ydotool backend presses plain Ctrl+V, which every
+  terminal ignores. `ydotool` then exits 0, so `inject_with_recovery` records
+  success, no clipboard-fallback notification fires, and the user sees a dictation
+  that produced no text. Measured against Hyprland 0.56.2 on 2026-09-07, the three
+  ways to get that `None` are **not** interchangeable and only one of them is a
+  clean exit:
+
+  | Situation | stdout | exit |
+  |---|---|---|
+  | `HYPRLAND_INSTANCE_SIGNATURE` unset (systemd unit, `.desktop` autostart) | `HYPRLAND_INSTANCE_SIGNATURE not set! (is hyprland running?)` | 1 |
+  | signature set but stale — socket unreachable | `Couldn't connect to …/.socket.sock. (4)` | 4 |
+  | Hyprland fine, nothing focused | `{}` | 0 |
+  | not Hyprland at all (GNOME/Mutter) | — | spawn fails |
+
+  Note `hyprctl` reports its own failures on **stdout**, not stderr, which is why
+  `active_window_class` reads stdout *before* the status check and attaches it to
+  the failure warning — the text naming the cause is only in hand there. The
+  spawn-failure arm is deliberately `debug!`, not `warn!`: `start_recording` calls
+  this on every utterance with no compositor guard, so on GNOME a warning would fire
+  once per dictation forever, for every user, including the majority on `wtype` for
+  whom the class changes nothing.
+
+  GNOME is the case that matters most, because it is the desktop the ydotool backend
+  exists for — `wtype` does nothing there — and `hyprctl` can never exist on it, so
+  `auto` can never work. `InjectDebug` records `window_class` (written as `null`
+  rather than omitted, so "unknown" is distinguishable from "old record"), and
+  `[inject] paste_chord` forces the chord for setups that can never answer. Verified
+  by reading `/dev/input/event*` (the `ydotoold virtual device`) while firing the
+  chord, and end to end in kitty, ghostty and foot.
 - **Do not trust `cpal`'s advertised sample-rate range.** It advertised 16 kHz on hardware
   that rejected the stream build; `capture.rs` now probes by building a throwaway stream and
   falls back to 48 kHz plus `rubato` resampling.
