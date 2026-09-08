@@ -346,8 +346,24 @@ pub fn setup(update_lock: bool) -> Result<()> {
         );
     }
 
+    // `--update-lock` is the developer action that maintains the pins, so it
+    // is the one caller that legitimately wants the *whole* catalogue: a
+    // model with no pin is one `download_all` refuses to install, so leaving
+    // an entry unpinned would make it undownloadable for every user who
+    // selects it. Ordinary provisioning takes only what the selection
+    // requires (spec asr-model §4, §7).
+    let artifacts = if update_lock {
+        yappr_core::models::all_artifacts()
+    } else {
+        let model = match yappr_core::config::Config::load() {
+            Ok(c) => c.asr.model,
+            Err(_) => yappr_core::config::AsrConfig::default().model,
+        };
+        yappr_core::models::required_artifacts(model)
+    };
+
     let mut state = ProgressState::default();
-    yappr_core::models::download_all(update_lock, &mut |url, done, total| {
+    yappr_core::models::download_all(&artifacts, update_lock, &mut |url, done, total| {
         let (line, new_state) = progress_line(url, done, total, std::mem::take(&mut state));
         state = new_state;
         if let Some(line) = line {

@@ -1,6 +1,5 @@
 //! Ad-hoc: transcribe wav files given on the command line and print raw ASR output.
 //! Usage: cargo run --release -p yappr-core --example transcribe_file -- a.wav b.wav
-use yappr_core::asr::Transcriber;
 
 fn read_wav_16k_mono(path: &str) -> Vec<f32> {
     let mut r = hound::WavReader::open(path).expect("open wav");

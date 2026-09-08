@@ -1,4 +1,3 @@
-use yappr_core::asr::Transcriber;
 
 fn read_wav_16k_mono(path: &str) -> Vec<f32> {
     let mut r = hound::WavReader::open(path).expect("open fixture");
