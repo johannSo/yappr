@@ -110,11 +110,48 @@ fi
 
 # Upstream's script imports a sibling module by walking one directory up, so
 # the on-disk layout has to match the repo's.
+#
+# `fetch_script` exists because GitHub's raw endpoint serves a *symlinked*
+# file as its target path in plain text rather than as the file's contents.
+# scripts/nemo/parakeet-tdt-0.6b-v3/test_onnx.py is a 36-byte symlink to the
+# v2 copy, so fetching it naively yields a one-line file that Python then
+# rejects with "SyntaxError: invalid decimal literal". Resolved generically
+# rather than by hardcoding the v2 path, because any of these files could
+# become a symlink later.
+fetch_script() {
+  local rel="$1" dest="$2" hops=0 target resolved
+  while :; do
+    curl -fsSL -o "$dest" "$SHERPA_RAW/$rel"
+    # A symlink payload is a single short line holding a relative path.
+    if [ "$(wc -c <"$dest")" -ge 256 ] || [ "$(wc -l <"$dest")" -gt 1 ]; then
+      return 0
+    fi
+    target=$(tr -d '\n' <"$dest")
+    case "$target" in
+      ./*|../*|*/*) ;;
+      *) return 0 ;;   # not a path: a genuinely tiny script
+    esac
+    hops=$((hops + 1))
+    [ "$hops" -le 4 ] || die "symlink loop resolving $rel"
+    resolved=$(realpath -m --relative-to=/r "/r/$(dirname "$rel")/$target")
+    printf '  %s -> %s\n' "$rel" "$resolved"
+    rel="$resolved"
+  done
+}
+
 log "fetching upstream export scripts"
 mkdir -p nemo/parakeet-tdt-0.6b-v3
-curl -fsSL -o nemo/generate_bpe_vocab.py "$SHERPA_RAW/generate_bpe_vocab.py"
-curl -fsSL -o nemo/parakeet-tdt-0.6b-v3/export_onnx.py "$SHERPA_RAW/parakeet-tdt-0.6b-v3/export_onnx.py"
-curl -fsSL -o nemo/parakeet-tdt-0.6b-v3/test_onnx.py "$SHERPA_RAW/parakeet-tdt-0.6b-v3/test_onnx.py"
+fetch_script generate_bpe_vocab.py nemo/generate_bpe_vocab.py
+fetch_script parakeet-tdt-0.6b-v3/export_onnx.py nemo/parakeet-tdt-0.6b-v3/export_onnx.py
+fetch_script parakeet-tdt-0.6b-v3/test_onnx.py nemo/parakeet-tdt-0.6b-v3/test_onnx.py
+
+# Everything above is cheap and idempotent. The export is neither -- it is
+# 10-25 minutes of CPU -- so a re-run picks up from whatever is already on
+# disk. Delete the int8 files to force it again.
+if [ -s encoder.int8.onnx ] && [ -s decoder.int8.onnx ] \
+   && [ -s joiner.int8.onnx ] && [ -s tokens.txt ]; then
+  log "int8 export already present -- skipping export, going straight to verification"
+else
 
 # Correct the provenance stamped into the ONNX metadata. Upstream hardcodes
 # nvidia's URL, and an export of a *different* checkpoint carrying that string
@@ -155,6 +192,8 @@ python nemo/parakeet-tdt-0.6b-v3/export_onnx.py
 for f in encoder.int8.onnx decoder.int8.onnx joiner.int8.onnx tokens.txt; do
   [ -s "$f" ] || die "$f was not produced"
 done
+
+fi   # end of the skip-if-already-exported guard
 
 # --------------------------------------------------------------- verify
 
