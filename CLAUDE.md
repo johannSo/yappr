@@ -5,8 +5,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 Press-to-start, press-to-stop dictation for Hyprland/Wayland. Press `SUPER+D`, speak,
-press `SUPER+D` again; the audio is captured, VAD-trimmed, transcribed (Parakeet TDT via
-`sherpa-onnx`), rewritten by S1-mini (llama.cpp, in-process), checked by a guardrail, and
+press `SUPER+D` again; the audio is captured, VAD-trimmed, transcribed (one of several
+`sherpa-onnx` models, chosen by `[asr] model`; Parakeet TDT 0.6b v3 by default),
+rewritten by S1-mini (llama.cpp, in-process), checked by a guardrail, and
 typed into the focused window with `wtype` (or `ydotool` — a *paste* backend since
 2026-09-02: wl-copy plus one layout-independent ydotool Ctrl+V, Ctrl+Shift+V when the
 target window's class is in `[inject] terminal_classes`; the transcript stays in the
@@ -191,6 +192,28 @@ the config from disk at load time, so `[asr]`/`[normalize]` changes take effect
 on the next dictation for a lazily-loaded daemon — `schema.ts`'s
 `RESTART_SECTIONS` is unchanged because it is still correct whenever the models
 happen to be resident.
+
+`[asr] model` picks which speech-recognition model runs, from the catalogue in
+`models.rs` (`ASR_MODELS`). **Provisioning follows the selection rather than
+requiring every artifact**: `required_artifacts` is the support pair (Silero,
+S1-mini) plus the one selected model, and `verify` / `looks_present` /
+`download_all` all take that list. A model left on disk by an earlier selection
+is never verified, redownloaded or deleted, so switching back is instant and
+offline. `all_artifacts()` is the whole catalogue and is for name/URL lookups
+and the lock-file completeness test only — never for "what must be present".
+`--update-lock` is the one caller that legitimately wants all of it, because an
+unpinned entry is one `download_all` refuses to install.
+
+Two flavours sit behind `asr::build`: `Offline` (sherpa's `OfflineRecognizer`,
+as always) and `CacheAwareStreaming` (`OnlineRecognizer`, fed the whole
+utterance at once — yappr has no streaming UI, and the nemotron export is
+published no other way). The streaming flavour **must be fed silence on both
+sides** or it silently drops the start and end of the utterance; see
+`SILENCE_PADDING`'s comment in `asr.rs` for the measured evidence, and note
+that the leading half appears in no upstream example. An `Artifact::name` is a
+key in `models.lock.toml` and therefore must be a TOML *bare* key — no dots, or
+the whole lock file stops parsing. See
+`docs/superpowers/specs/2026-09-08-asr-model-selection-design.md`.
 
 ## Invariants worth knowing before editing
 
