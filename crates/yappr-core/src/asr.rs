@@ -72,6 +72,34 @@ impl Transcriber for SherpaTranscriber {
 /// it, and the single final result is what gets injected. Endpointing stays
 /// off for the same reason: it exists to cut a live stream into utterances,
 /// and that decision was already made upstream.
+/// Silence fed *before and after* the real audio, so the whole utterance is
+/// actually decoded.
+///
+/// Both halves are load-bearing, and each was measured against
+/// `fixtures/hallo_german.wav` (2.75 s, "Alles hat ein Ende, nur die Wurst
+/// hat zwei."):
+///
+/// | padding | transcript |
+/// |---|---|
+/// | none | "Nur die Wurst" |
+/// | tail only | "Nur die Wurst hat zwei" |
+/// | lead + tail | "Alles hat ein Ende, nur die Wurst hat zwei" |
+///
+/// The tail is what the upstream reference does (0.66 s), and without it the
+/// final chunks never become `is_ready` so the end is never emitted. The
+/// *lead* is not in any upstream example and matters more here than it would
+/// anywhere else: a cache-aware model starts with zeroed caches and spends
+/// its first chunk priming them, so whatever audio arrives during that chunk
+/// is lost -- and `SileroTrimmer` has already stripped the leading silence
+/// that would otherwise have absorbed it. Every real dictation hits this
+/// model with an abrupt start.
+///
+/// Losing the opening words of an utterance is invariant 1 territory, which
+/// is why the regression test asserts on the *first* word surviving rather
+/// than merely on non-empty output.
+static SILENCE_PADDING: [f32; (SAMPLE_RATE as usize) * 66 / 100] =
+    [0.0; (SAMPLE_RATE as usize) * 66 / 100];
+
 pub struct SherpaStreamingTranscriber {
     recognizer: OnlineRecognizer,
     language: String,
@@ -124,7 +152,9 @@ impl Transcriber for SherpaStreamingTranscriber {
         }
         let stream = self.recognizer.create_stream();
         stream.set_option("language", &self.language);
+        stream.accept_waveform(SAMPLE_RATE, &SILENCE_PADDING);
         stream.accept_waveform(SAMPLE_RATE, samples);
+        stream.accept_waveform(SAMPLE_RATE, &SILENCE_PADDING);
         stream.input_finished();
         while self.recognizer.is_ready(&stream) {
             self.recognizer.decode(&stream);
@@ -134,7 +164,14 @@ impl Transcriber for SherpaStreamingTranscriber {
             .get_result(&stream)
             .map(|r| r.text)
             .unwrap_or_default();
-        Ok(text.trim().to_string())
+        // Collapse internal whitespace. This flavour joins its segments with
+        // a doubled space ("Alles hat ein Ende.  Nur die Wurst..."), which
+        // the offline recognizer never produces -- and which would be
+        // injected verbatim whenever normalization is off or falls back to
+        // the raw transcript (invariant 1). Fixed here rather than in
+        // `finish` because it is this recognizer's quirk, not a property of
+        // dictated text.
+        Ok(text.split_whitespace().collect::<Vec<_>>().join(" "))
     }
 }
 
