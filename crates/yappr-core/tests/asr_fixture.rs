@@ -110,3 +110,26 @@ fn the_streaming_transcriber_returns_empty_for_empty_input() {
         .expect("build streaming transcriber");
     assert_eq!(t.transcribe(&[]).expect("transcribe"), "");
 }
+
+/// primeline is the only catalogue entry we host ourselves, so this is also
+/// the only one where a bad export would be our own doing rather than
+/// k2-fsa's. It is German-only and the most accurate German model of the
+/// four, so the bar is the full sentence, not merely plausible words.
+#[test]
+#[ignore = "requires downloaded models; run with --ignored"]
+fn the_primeline_model_transcribes_the_german_fixture() {
+    let samples = read_wav_16k_mono("fixtures/hallo_german.wav");
+    let cfg = yappr_core::config::AsrConfig {
+        model: yappr_core::config::AsrModel::ParakeetPrimelineDe,
+        ..Default::default()
+    };
+    let t = yappr_core::asr::build(&yappr_core::paths::models_dir(), &cfg)
+        .expect("build primeline transcriber");
+    let text = t.transcribe(&samples).expect("transcribe");
+    eprintln!("primeline transcript: {text:?}");
+
+    let lower = text.to_lowercase();
+    for word in ["alles", "ende", "wurst", "zwei"] {
+        assert!(lower.contains(word), "expected {word:?} in: {text:?}");
+    }
+}

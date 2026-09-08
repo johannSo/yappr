@@ -205,10 +205,26 @@ old_comment = '"comment": "Only the transducer branch is exported",'
 assert old_url in s, "upstream changed the url metadata line; re-check the patch"
 assert old_comment in s, "upstream changed the comment metadata line; re-check the patch"
 
-s = s.replace(
-    old_url,
-    '"url": "https://huggingface.co/primeline/parakeet-primeline",',
-)
+# The url metadata is NOT just documentation. sherpa-onnx decides whether a
+# model is a Token-and-Duration Transducer by substring-searching this field:
+#
+#   offline-transducer-nemo-model.cc:
+#     SHERPA_ONNX_READ_META_DATA_STR_ALLOW_EMPTY(url, "url");
+#     if (url.find("tdt") != std::string::npos) { is_tdt_ = 1; }
+#
+# A TDT joiner emits vocab_size + num_durations outputs (8198 here, against
+# 8193 tokens). Without "tdt" in this string sherpa takes the plain-transducer
+# branch and refuses to load the model outright:
+#
+#   InitJoiner:279 vocab_size: 8193 != output_size: 8198
+#
+# So the replacement has to name primeline *and* keep the substring. This is
+# also why the pre-existing third-party export's seemingly stale
+# "parakeet-tdt-0.6b-v2" url still worked -- it was load-bearing by accident.
+new_url = ('"url": "primeline/parakeet-primeline '
+           '(parakeet-tdt-0.6b-v3)",')
+assert "tdt" in new_url, "sherpa will not detect a TDT model without this"
+s = s.replace(old_url, new_url)
 s = s.replace(
     old_comment,
     '"comment": "primeline-parakeet, a German finetune of '
@@ -295,6 +311,13 @@ assert meta.get("vocab_size") == "8192", (
     f"vocab_size {meta.get('vocab_size')!r} is not v3 lineage -- wrong checkpoint?"
 )
 assert "primeline" in (meta.get("url") or ""), "provenance patch did not take"
+# sherpa-onnx reads TDT-ness out of this string by substring search. Without
+# it the model does not merely score worse -- OfflineRecognizer::create
+# refuses it with "vocab_size != output_size" and the whole app degrades.
+assert "tdt" in (meta.get("url") or ""), (
+    f"url {meta.get('url')!r} lacks the 'tdt' substring sherpa-onnx uses to "
+    "detect a Token-and-Duration Transducer; the model would fail to load"
+)
 print("  metadata OK")
 PY
 
