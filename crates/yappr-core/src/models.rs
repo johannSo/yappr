@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use crate::config::AsrModel;
 use crate::paths;
 
 pub struct Artifact {
@@ -24,14 +25,78 @@ pub struct Artifact {
     pub archive: bool,
 }
 
-pub static ARTIFACTS: [Artifact; 3] = [
-    Artifact {
-        name: "parakeet",
-        url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2",
-        display: "Parakeet TDT 0.6b v3 (int8)",
-        rel_path: "parakeet-tdt-0.6b-v3-int8",
-        archive: true,
+/// How a model is decoded. Not a property of the file layout -- every entry
+/// is encoder/decoder/joiner plus tokens.txt -- but of which sherpa-onnx
+/// recognizer can read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsrFlavor {
+    /// `OfflineRecognizer`, as every version before model selection used.
+    Offline,
+    /// `OnlineRecognizer`. Exported for cache-aware streaming; yappr feeds it
+    /// the whole VAD-trimmed utterance at once and takes the final result.
+    /// See spec asr-model §3.
+    CacheAwareStreaming,
+}
+
+/// One selectable speech-recognition model.
+pub struct AsrModelSpec {
+    /// The `[asr] model` spelling. Distinct from `artifact.name`, which is
+    /// the lock key and can never change.
+    pub key: AsrModel,
+    pub artifact: Artifact,
+    pub flavor: AsrFlavor,
+    /// German dropdown label. Names the language, because that is what
+    /// actually decides the choice.
+    pub display: &'static str,
+}
+
+pub static ASR_MODELS: [AsrModelSpec; 3] = [
+    AsrModelSpec {
+        key: AsrModel::ParakeetTdtV3,
+        artifact: Artifact {
+            // Never rename: this is the committed lock key.
+            name: "parakeet",
+            url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2",
+            display: "Parakeet TDT 0.6b v3 (int8)",
+            rel_path: "parakeet-tdt-0.6b-v3-int8",
+            archive: true,
+        },
+        flavor: AsrFlavor::Offline,
+        display: "Parakeet TDT 0.6b v3 — mehrsprachig",
     },
+    AsrModelSpec {
+        key: AsrModel::ParakeetUnifiedEn,
+        artifact: Artifact {
+            name: "parakeet-unified-en",
+            url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming.tar.bz2",
+            display: "Parakeet Unified EN 0.6b (int8)",
+            rel_path: "parakeet-unified-en-0.6b-int8",
+            archive: true,
+        },
+        flavor: AsrFlavor::Offline,
+        display: "Parakeet Unified 0.6b — nur Englisch",
+    },
+    AsrModelSpec {
+        key: AsrModel::Nemotron35,
+        artifact: Artifact {
+            // No dot: a TOML bare key cannot contain one, and this string is
+            // a key in models.lock.toml. "nemotron-3.5-560ms" parsed as the
+            // dotted key `nemotron-3` -> `5-560ms` and made the whole lock
+            // file unreadable. The user-facing config spelling keeps its dot
+            // ("nemotron-3.5") because that is a TOML *value*, not a key.
+            name: "nemotron-3-5-560ms",
+            url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-560ms-int8-2026-06-11.tar.bz2",
+            display: "Nemotron 3.5 ASR 0.6b (560 ms, int8)",
+            rel_path: "nemotron-3.5-asr-streaming-0.6b-560ms-int8",
+            archive: true,
+        },
+        flavor: AsrFlavor::CacheAwareStreaming,
+        display: "Nemotron 3.5 ASR 0.6b — mehrsprachig",
+    },
+];
+
+/// Everything needed no matter which ASR model is selected.
+pub static SUPPORT_ARTIFACTS: [Artifact; 2] = [
     Artifact {
         name: "silero",
         url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx",
@@ -54,6 +119,44 @@ pub static ARTIFACTS: [Artifact; 3] = [
     },
 ];
 
+/// Every artifact this build knows about, selected or not.
+///
+/// Used for name/URL lookups -- a download-progress event names a URL and
+/// the Setup pane has to turn that back into a display name -- and for the
+/// lock-file completeness check. Never as "what must be present": that is
+/// [`required_artifacts`], and confusing the two is what would make an
+/// unselected model's absence look like a broken install.
+pub fn all_artifacts() -> Vec<&'static Artifact> {
+    SUPPORT_ARTIFACTS
+        .iter()
+        .chain(ASR_MODELS.iter().map(|m| &m.artifact))
+        .collect()
+}
+
+/// The catalogue entry for `model`.
+///
+/// Panics only if a variant were added to `AsrModel` without an entry here,
+/// which `every_asr_model_enum_variant_has_a_catalogue_entry` keeps out of a
+/// release.
+pub fn spec_for(model: AsrModel) -> &'static AsrModelSpec {
+    ASR_MODELS
+        .iter()
+        .find(|m| m.key == model)
+        .unwrap_or_else(|| panic!("no catalogue entry for {model:?}"))
+}
+
+/// What provisioning may treat as required: the support pair plus the one
+/// selected ASR model.
+///
+/// Models left on disk by an earlier selection are deliberately absent --
+/// not verified, not redownloaded, and never deleted -- so switching back is
+/// instant and offline. See spec asr-model §4.
+pub fn required_artifacts(model: AsrModel) -> Vec<&'static Artifact> {
+    SUPPORT_ARTIFACTS
+        .iter()
+        .chain(std::iter::once(&spec_for(model).artifact))
+        .collect()
+}
 /// The lock file committed to the repository at `crates/yappr-core/models.lock.toml`,
 /// generated once during M0 via `owf-ctl setup --update-lock` (spec 14.2).
 ///
@@ -164,9 +267,9 @@ fn hash_target(a: &Artifact) -> PathBuf {
 
 /// Returns the names of artifacts that are absent, or present with a hash that
 /// disagrees with the lock file.
-pub fn verify(lock: &LockFile) -> Result<Vec<String>> {
+pub fn verify(lock: &LockFile, required: &[&'static Artifact]) -> Result<Vec<String>> {
     let mut bad = Vec::new();
-    for a in ARTIFACTS.iter() {
+    for a in required.iter().copied() {
         let target = hash_target(a);
         if !target.exists() {
             bad.push(a.name.to_string());
@@ -208,8 +311,8 @@ fn all_targets_look_present(targets: &[PathBuf]) -> bool {
 /// `src-tauri/src/provision.rs`, the one caller). The common case -- a
 /// machine that finished setup once and never touched the models directory
 /// again -- only ever needs this cheap answer.
-pub fn looks_present() -> bool {
-    let targets: Vec<PathBuf> = ARTIFACTS.iter().map(hash_target).collect();
+pub fn looks_present(required: &[&'static Artifact]) -> bool {
+    let targets: Vec<PathBuf> = required.iter().map(|a| hash_target(a)).collect();
     all_targets_look_present(&targets)
 }
 
@@ -370,11 +473,12 @@ fn promote_staged(staged: &Path, dest: &Path) -> Result<()> {
 }
 
 pub fn download_all(
+    required: &[&'static Artifact],
     update_lock: bool,
     progress: &mut dyn FnMut(&str, u64, Option<u64>),
 ) -> Result<()> {
     let mut lock = LockFile::load()?;
-    for a in ARTIFACTS.iter() {
+    for a in required.iter().copied() {
         let target = hash_target(a);
         if target.exists() {
             if let Some(expected) = lock.hashes.get(a.name) {
@@ -435,6 +539,74 @@ pub fn download_all(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    use crate::config::AsrModel;
+
+    const EVERY_MODEL: [AsrModel; 3] = [
+        AsrModel::ParakeetTdtV3,
+        AsrModel::ParakeetUnifiedEn,
+        AsrModel::Nemotron35,
+    ];
+
+    #[test]
+    fn required_artifacts_is_the_support_pair_plus_exactly_one_asr_model() {
+        for model in EVERY_MODEL {
+            let required = required_artifacts(model);
+            assert_eq!(required.len(), 3, "for {model:?}");
+            assert!(required.iter().any(|a| a.name == "silero"), "for {model:?}");
+            assert!(required.iter().any(|a| a.name == "s1-mini"), "for {model:?}");
+            assert!(
+                required.iter().any(|a| a.name == spec_for(model).artifact.name),
+                "the selected model itself is missing, for {model:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn selecting_one_asr_model_never_requires_another() {
+        let required = required_artifacts(AsrModel::Nemotron35);
+        assert!(
+            !required.iter().any(|a| a.name == "parakeet"),
+            "Parakeet v3 must not be required when it is not selected: {:?}",
+            required.iter().map(|a| a.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn the_parakeet_v3_lock_key_is_still_the_bare_name_parakeet() {
+        // Renaming this key invalidates models.lock.toml on every machine
+        // that already downloaded the model. See Artifact::name's doc comment.
+        assert_eq!(spec_for(AsrModel::ParakeetTdtV3).artifact.name, "parakeet");
+    }
+
+    #[test]
+    fn every_artifact_name_is_usable_as_a_toml_bare_key() {
+        // `Artifact::name` is a key in models.lock.toml. TOML bare keys allow
+        // only letters, digits, `_` and `-`; a dot makes it a *dotted* key,
+        // which silently nests it into a sub-table and makes the whole lock
+        // file fail to parse -- taking down every read of it, not just the
+        // one entry. Caught exactly this way once already.
+        for a in all_artifacts() {
+            assert!(
+                !a.name.is_empty()
+                    && a.name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                "{:?} is not a TOML bare key, so it cannot be a lock-file key",
+                a.name
+            );
+        }
+    }
+
+    #[test]
+    fn every_asr_model_enum_variant_has_a_catalogue_entry() {
+        // `spec_for` panics on a variant with no entry, which is the failure
+        // this asserts against: adding a variant without an artifact must not
+        // compile its way into a panic on someone's first dictation.
+        for model in EVERY_MODEL {
+            let _ = spec_for(model);
+        }
+    }
 
     #[test]
     fn sha256_of_known_content_matches() {
@@ -503,17 +675,18 @@ mod tests {
     #[test]
     fn every_artifact_has_a_distinct_name_and_https_url() {
         let mut names = std::collections::HashSet::new();
-        for a in ARTIFACTS.iter() {
+        for a in all_artifacts() {
             assert!(names.insert(a.name), "duplicate artifact name: {}", a.name);
             assert!(a.url.starts_with("https://"), "{} is not https", a.name);
         }
-        assert_eq!(ARTIFACTS.len(), 3);
+        // Two support artifacts plus one entry per selectable ASR model.
+        assert_eq!(all_artifacts().len(), SUPPORT_ARTIFACTS.len() + ASR_MODELS.len());
     }
 
     #[test]
     fn compiled_in_lock_covers_every_artifact() {
         let compiled = LockFile::compiled_in().unwrap();
-        for a in ARTIFACTS.iter() {
+        for a in all_artifacts() {
             assert!(
                 compiled.hashes.contains_key(a.name),
                 "crates/yappr-core/models.lock.toml has no pinned hash for {}",
@@ -537,7 +710,7 @@ mod tests {
 
         let lock = LockFile::load_from(&never_created).unwrap();
 
-        for a in ARTIFACTS.iter() {
+        for a in all_artifacts() {
             assert!(
                 lock.hashes.contains_key(a.name),
                 "compiled-in pin should cover {} when no runtime lock exists",
@@ -586,9 +759,12 @@ mod tests {
     #[test]
     fn verify_reports_missing_artifacts_rather_than_erroring() {
         let lock = LockFile::default(); // no hashes recorded
-        let missing = verify(&lock).unwrap();
-        // With an empty lock, every artifact counts as unverified.
-        assert_eq!(missing.len(), ARTIFACTS.len());
+        let required = required_artifacts(AsrModel::ParakeetTdtV3);
+        let missing = verify(&lock, &required).unwrap();
+        // With an empty lock, every *required* artifact counts as unverified
+        // -- and only the required ones, which is the whole point of the
+        // selection-driven list.
+        assert_eq!(missing.len(), required.len());
     }
 
     #[test]
@@ -598,7 +774,7 @@ mod tests {
         // display name must still carry verbatim. `name` (the committed
         // lock-file key) stays lowercase and is never shown to a user
         // directly.
-        let s1 = ARTIFACTS.iter().find(|a| a.name == "s1-mini").unwrap();
+        let s1 = all_artifacts().into_iter().find(|a| a.name == "s1-mini").unwrap();
         assert_eq!(s1.display, "S1-mini by Superwhisper (de-v3 Finetune)");
         assert!(s1.display.contains("S1-mini by Superwhisper"));
         assert_eq!(s1.name, "s1-mini", "lock-file key must not change");
