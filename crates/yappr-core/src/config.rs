@@ -153,6 +153,14 @@ pub enum AsrModel {
     /// multilingual, and the only entry that is not an `OfflineRecognizer`.
     #[serde(rename = "nemotron-3.5")]
     Nemotron35,
+    /// primeline-parakeet -- a German finetune of Parakeet TDT v3, and the
+    /// most accurate German model in the catalogue (2.95 % average WER
+    /// against the v3 base's 3.64 %, 4.11 vs 7.05 on Tuda-De).
+    ///
+    /// Not the default: the default stays on the model every existing
+    /// install already has on disk. See spec asr-model §2.
+    #[serde(rename = "parakeet-primeline-de")]
+    ParakeetPrimelineDe,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1405,6 +1413,7 @@ to = "KDD"
             ("parakeet-tdt-v3", AsrModel::ParakeetTdtV3),
             ("parakeet-unified-en", AsrModel::ParakeetUnifiedEn),
             ("nemotron-3.5", AsrModel::Nemotron35),
+            ("parakeet-primeline-de", AsrModel::ParakeetPrimelineDe),
         ] {
             let c = Config::from_str(&format!("[asr]\nmodel = \"{spelling}\"\n")).unwrap();
             assert_eq!(c.asr.model, expected, "for {spelling}");

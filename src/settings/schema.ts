@@ -144,7 +144,7 @@ export const HELP: Record<string, string> = {
   "audio.vad_padding_ms":
     "Wie viel Ton vor und nach der erkannten Sprache erhalten bleibt. Zu wenig schneidet Wortanfänge ab, zu viel nimmt Stille mit in die Erkennung.",
   "asr.model":
-    "Welches Modell den gesprochenen Text erkennt. Parakeet TDT v3 ist mehrsprachig und die Voreinstellung. Parakeet Unified versteht nur Englisch, erkennt es aber genauer. Nemotron 3.5 ist mehrsprachig. Ein Wechsel lädt einmalig rund 500 MB herunter; bereits geladene Modelle bleiben liegen, ein Zurückwechseln geht also ohne erneuten Download.",
+    "Welches Modell den gesprochenen Text erkennt. Parakeet TDT v3 ist mehrsprachig und die Voreinstellung. primeline Parakeet versteht nur Deutsch, erkennt es aber deutlich genauer als alle anderen hier — die beste Wahl, wenn du nur auf Deutsch diktierst. Parakeet Unified versteht nur Englisch, erkennt es aber genauer. Nemotron 3.5 ist mehrsprachig. Ein Wechsel lädt einmalig rund 500 MB herunter; bereits geladene Modelle bleiben liegen, ein Zurückwechseln geht also ohne erneuten Download.",
   "asr.language":
     "Nur für mehrsprachige Modelle. „auto“ lässt das Modell die Sprache selbst erkennen; ein Kürzel wie „de“ legt sie fest. Parakeet TDT v3 und Parakeet Unified ignorieren diese Einstellung.",
   "asr.num_threads":
@@ -211,7 +211,12 @@ export const HELP: Record<string, string> = {
 };
 
 export const ENUMS: Record<string, string[]> = {
-  "asr.model": ["parakeet-tdt-v3", "parakeet-unified-en", "nemotron-3.5"],
+  "asr.model": [
+    "parakeet-tdt-v3",
+    "parakeet-primeline-de",
+    "parakeet-unified-en",
+    "nemotron-3.5",
+  ],
   "inject.backend": ["wtype", "ydotool", "clipboard"],
   "inject.paste_chord": ["auto", "ctrl_v", "ctrl_shift_v"],
   "style_default.styling": ["casual", "semi-casual", "semi-formal", "formal"],

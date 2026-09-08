@@ -50,7 +50,7 @@ pub struct AsrModelSpec {
     pub display: &'static str,
 }
 
-pub static ASR_MODELS: [AsrModelSpec; 3] = [
+pub static ASR_MODELS: [AsrModelSpec; 4] = [
     AsrModelSpec {
         key: AsrModel::ParakeetTdtV3,
         artifact: Artifact {
@@ -92,6 +92,23 @@ pub static ASR_MODELS: [AsrModelSpec; 3] = [
         },
         flavor: AsrFlavor::CacheAwareStreaming,
         display: "Nemotron 3.5 ASR 0.6b — mehrsprachig",
+    },
+    AsrModelSpec {
+        key: AsrModel::ParakeetPrimelineDe,
+        artifact: Artifact {
+            name: "parakeet-primeline-de",
+            // The only catalogue entry not hosted by k2-fsa. Upstream
+            // publishes primeline-parakeet as a .nemo checkpoint, which
+            // sherpa-onnx cannot load, so this is our own export --
+            // reproducible via scripts/export-primeline-onnx.sh, and
+            // CC-BY-4.0 like the model it derives from.
+            url: "https://huggingface.co/Joni000000000/parakeet-primeline-sherpa-onnx-int8/resolve/main/parakeet-primeline-de-int8.tar.bz2",
+            display: "primeline Parakeet 0.6b (int8)",
+            rel_path: "parakeet-primeline-de-int8",
+            archive: true,
+        },
+        flavor: AsrFlavor::Offline,
+        display: "primeline Parakeet 0.6b — nur Deutsch, genaueste deutsche Erkennung",
     },
 ];
 
@@ -542,10 +559,11 @@ mod tests {
 
     use crate::config::AsrModel;
 
-    const EVERY_MODEL: [AsrModel; 3] = [
+    const EVERY_MODEL: [AsrModel; 4] = [
         AsrModel::ParakeetTdtV3,
         AsrModel::ParakeetUnifiedEn,
         AsrModel::Nemotron35,
+        AsrModel::ParakeetPrimelineDe,
     ];
 
     #[test]

@@ -28,6 +28,7 @@ const FADE = { type: "spring", bounce: 0, duration: 0.24 } as const;
 /// deny_unknown_fields on save rather than silently defaulted.
 export const ASR_MODELS: { value: string; label: string }[] = [
   { value: "parakeet-tdt-v3", label: "Parakeet TDT v3 — mehrsprachig (Voreinstellung)" },
+  { value: "parakeet-primeline-de", label: "primeline Parakeet — nur Deutsch, am genauesten" },
   { value: "parakeet-unified-en", label: "Parakeet Unified — nur Englisch" },
   { value: "nemotron-3.5", label: "Nemotron 3.5 — mehrsprachig" },
 ];
