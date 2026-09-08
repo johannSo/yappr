@@ -8,6 +8,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use yappr_core::desktop::{self, Desktop};
 
 /// Prints a short summary of the most recently written debug record --
 /// see `yappr_core::debug` and `[debug]` in config.toml. Reads straight off
@@ -208,6 +209,71 @@ fn status_line(label: &str, name: &str, why: &str) {
     eprintln!("  {label:<18} {name}  ({why})");
 }
 
+/// One external program this install may need: the binary to look for, why
+/// it is needed, the pacman package that provides it, and whether its
+/// absence is fatal.
+struct Prerequisite {
+    bin: &'static str,
+    why: &'static str,
+    pkg: &'static str,
+    fatal: bool,
+}
+
+/// Which programs are worth checking on `d`, and which of them are fatal.
+///
+/// Desktop-dependent for exactly one reason: **`wtype` cannot work on
+/// GNOME.** It types through the virtual-keyboard protocol Mutter does not
+/// implement, so there it is not missing, it is inapplicable -- which is why
+/// `wizard::recommended_backend` sends GNOME to `ydotool` in the first
+/// place. Reporting it anyway cost a GNOME user a `sudo pacman -S wtype`
+/// that would still type nothing, and -- because a *fatal* gap keeps
+/// `provision::is_ready` false -- a first-run wizard that reopened on every
+/// launch, forever.
+///
+/// `ydotool` stays **optional** even on GNOME, where it is the only backend
+/// that works. Everywhere else that is because `wtype` is the default
+/// injector and needs no setup, so a machine without `ydotool` is fully
+/// working and listing it would put a package almost nobody needs into the
+/// "install these" list. On GNOME it is because making it fatal would
+/// recreate exactly the never-ready loop above: it also needs `ydotoold`
+/// running, which no `pacman -S` line can report. The wizard states that
+/// requirement separately instead, unit and all -- `wizard::backend_prereqs`.
+fn prerequisites_for(d: &Desktop) -> Vec<Prerequisite> {
+    let gnome = matches!(d, Desktop::Gnome);
+    let mut checks = Vec::new();
+    if !gnome {
+        checks.push(Prerequisite {
+            bin: "wtype",
+            why: "typing into the focused window",
+            pkg: "wtype",
+            fatal: true,
+        });
+    }
+    checks.push(Prerequisite {
+        bin: "wl-copy",
+        why: "clipboard fallback when typing fails",
+        pkg: "wl-clipboard",
+        fatal: true,
+    });
+    checks.push(Prerequisite {
+        bin: "ydotool",
+        why: if gnome {
+            "pasting via /dev/uinput -- the only backend Mutter supports"
+        } else {
+            "pasting via /dev/uinput when inject.backend = \"ydotool\""
+        },
+        pkg: "ydotool",
+        fatal: false,
+    });
+    checks.push(Prerequisite {
+        bin: "hyprctl",
+        why: "per-application style rules",
+        pkg: "hyprland",
+        fatal: false,
+    });
+    checks
+}
+
 /// Reports required external programs and libraries without installing
 /// anything. Returns the pacman packages that would fix every *fatal* gap
 /// found; empty means every essential prerequisite is present (optional
@@ -224,26 +290,23 @@ fn status_line(label: &str, name: &str, why: &str) {
 /// this binary now, so neither the program nor the backend can be missing:
 /// if the app started, they are present.
 ///
+/// It also used to be desktop-*independent*, and that was a bug on GNOME --
+/// see [`prerequisites_for`].
+///
 /// `pub(crate)`: the Setup pane's `setup_status` command (`provision.rs`)
 /// reports this alongside model presence, which is a separate question
 /// (`yappr_core::models::verify`) -- neither subsumes the other, so both are
 /// checked and reported independently rather than duplicating either check.
 pub(crate) fn check_prerequisites() -> Vec<&'static str> {
-    // (binary, why it is needed, pacman package that provides it, fatal)
-    let checks = [
-        ("wtype", "typing into the focused window", "wtype", true),
-        ("wl-copy", "clipboard fallback when typing fails", "wl-clipboard", true),
-        // Optional, not fatal: `wtype` is the default injector and needs no
-        // setup, so a machine without `ydotool` is fully working. It only
-        // matters to someone who has switched `inject.backend` to it, and
-        // reporting it as MISSING would put a package in the "install these"
-        // list that almost nobody needs.
-        ("ydotool", "pasting via /dev/uinput when inject.backend = \"ydotool\"", "ydotool", false),
-        ("hyprctl", "per-application style rules", "hyprland", false),
-    ];
+    check_prerequisites_for(&desktop::detect())
+}
 
+/// [`check_prerequisites`] against a stated desktop rather than this
+/// session's -- the seam the tests drive, since a test cannot pick the
+/// desktop it runs under.
+fn check_prerequisites_for(d: &Desktop) -> Vec<&'static str> {
     let mut missing_pkgs = Vec::new();
-    for (bin, why, pkg, fatal) in checks {
+    for Prerequisite { bin, why, pkg, fatal } in prerequisites_for(d) {
         let found = std::process::Command::new("sh")
             .arg("-c")
             .arg(format!("command -v {bin}"))
@@ -354,6 +417,47 @@ mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("yappr-ctl-test-{tag}-{}-{n}", std::process::id()))
+    }
+
+    /// The GNOME half of `prerequisites_for`. `wtype` types through a
+    /// protocol Mutter does not implement, so asking a GNOME user to install
+    /// it asks for a package that will still type nothing -- and, as a
+    /// *fatal* gap, it kept `provision::is_ready` false and reopened the
+    /// first-run wizard on every launch.
+    #[test]
+    fn gnome_is_never_asked_to_install_wtype() {
+        assert!(
+            !prerequisites_for(&Desktop::Gnome).iter().any(|c| c.bin == "wtype"),
+            "wtype must not even be reported as absent on GNOME"
+        );
+        // Asserted on the returned list, not just the plan: this is the
+        // value `setup_status` hands the wizard, and it must not name wtype
+        // whatever this machine happens to have on PATH.
+        assert!(!check_prerequisites_for(&Desktop::Gnome).contains(&"wtype"));
+    }
+
+    /// Everywhere else `wtype` is the default injector, and its absence is
+    /// still the thing that makes a dictation silently produce nothing.
+    #[test]
+    fn every_other_desktop_still_requires_wtype() {
+        for d in [Desktop::Hyprland, Desktop::Other("KDE".into()), Desktop::Unknown] {
+            assert!(
+                prerequisites_for(&d).iter().any(|c| c.bin == "wtype" && c.fatal),
+                "for {d:?}"
+            );
+        }
+    }
+
+    /// Dropping `wtype` on GNOME must not drop anything beside it -- and
+    /// `ydotool`, the only backend that works there, stays optional on
+    /// purpose (see `prerequisites_for`'s doc comment: it also needs
+    /// `ydotoold`, so a fatal entry would restore the never-ready loop).
+    #[test]
+    fn gnome_still_checks_everything_else_with_the_same_severities() {
+        let checks = prerequisites_for(&Desktop::Gnome);
+        assert!(checks.iter().any(|c| c.bin == "wl-copy" && c.fatal));
+        assert!(checks.iter().any(|c| c.bin == "ydotool" && !c.fatal));
+        assert!(checks.iter().any(|c| c.bin == "hyprctl" && !c.fatal));
     }
 
     #[test]

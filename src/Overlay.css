@@ -27,17 +27,22 @@ body,
      Deliberately dark in both system appearances, unlike the settings window,
      which follows the user's theme. A HUD floats over content nobody chose --
      a white wallpaper, a photo, a dark terminal -- and the only way to stay
-     legible against all of them is to bring your own ground. Apple's own
-     always-on-top HUDs make the same trade. */
-  --mat: rgba(26, 26, 30, 0.72);
+     legible against all of them is to bring your own ground.
+
+     Fully opaque, by request: no translucency, no backdrop blur, so the
+     capsule looks the same over every wallpaper and every window. The window
+     *canvas* stays transparent (see the note at the top of this file) -- that
+     is what makes the capsule's rounded corners corners rather than a
+     420x120 black rectangle. */
+  --mat: rgb(26, 26, 30);
   --mat-edge: rgba(255, 255, 255, 0.1);
   --mat-sheen: rgba(255, 255, 255, 0.14);
 
   --ink: #f5f5f7;
-  /* Secondary text on a translucent surface: heavier and slightly tracked
-     out rather than merely greyer, because a flat grey loses the moment the
-     wallpaper behind the blur changes (vibrancy, not opacity). */
-  --ink-2: rgba(245, 245, 247, 0.68);
+  /* Secondary text: the old vibrancy-friendly translucent grey, flattened
+     against the opaque material above, so nothing behind the capsule can
+     reach it. */
+  --ink-2: rgb(175, 175, 178);
 
   --accent: #0a84ff;
   --accent-2: #64d2ff;
@@ -96,8 +101,6 @@ body {
   box-shadow:
     var(--shadow),
     inset 0 1px 0 var(--mat-sheen);
-  backdrop-filter: blur(30px) saturate(180%);
-  -webkit-backdrop-filter: blur(30px) saturate(180%);
 
   color: var(--ink);
   font-size: 14px;
@@ -158,17 +161,17 @@ body {
    Measured, not eyeballed. White on rgb(140,22,22) is 9.4:1 and on
    rgb(122,74,0) is 7.5:1, both comfortably past WCAG AA rather than sitting
    on its edge -- the previous accents measured 3.5:1 and 5.9:1 at their true
-   rendered values. Near-opaque on purpose: an error must not be able to lose
-   its contrast to whatever happens to be behind it. */
+   rendered values. Opaque, like the base material: an error must not be able
+   to lose its contrast to whatever happens to be behind it. */
 
 .capsule--error {
-  background: rgba(140, 22, 22, 0.94);
+  background: rgb(140, 22, 22);
   border-color: rgba(255, 138, 128, 0.4);
   color: #fff;
 }
 
 .capsule--busy {
-  background: rgba(122, 74, 0, 0.94);
+  background: rgb(122, 74, 0);
   border-color: rgba(255, 214, 122, 0.42);
   color: #fff;
 }
@@ -387,30 +390,14 @@ body {
   }
 }
 
-/* A translucent surface is a preference, not a requirement. Frost it up to
-   near-solid and drop the blur when the user has asked for less of it. */
-@media (prefers-reduced-transparency: reduce) {
-  .capsule {
-    background: rgb(26, 26, 30);
-    backdrop-filter: none;
-    -webkit-backdrop-filter: none;
-  }
-
-  .capsule--error {
-    background: rgb(140, 22, 22);
-  }
-
-  .capsule--busy {
-    background: rgb(122, 74, 0);
-  }
-}
+/* No `prefers-reduced-transparency` block: the capsule is opaque and
+   blur-free for everyone, so there is nothing left for that preference to
+   turn off. */
 
 @media (prefers-contrast: more) {
   .capsule {
     background: rgb(16, 16, 18);
     border-color: rgba(255, 255, 255, 0.55);
-    backdrop-filter: none;
-    -webkit-backdrop-filter: none;
   }
 
   .timer,

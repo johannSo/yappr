@@ -61,10 +61,13 @@ pub(crate) fn recommended_backend(d: &Desktop) -> &'static str {
 
 /// What else has to be true for [`recommended_backend`] to actually type.
 ///
-/// Not folded into `setup.rs`'s `check_prerequisites`: that list is
-/// desktop-independent and deliberately reports a missing `ydotool` as
-/// optional, because on the default `wtype` backend it is. This is the
-/// desktop-specific half, shown in the wizard's shortcut step for that reason.
+/// Not folded into `setup.rs`'s `check_prerequisites`. That check knows the
+/// desktop too (it has to: `wtype` is inapplicable on GNOME, not missing),
+/// but it reports a missing `ydotool` as *optional* everywhere, including
+/// here -- a fatal gap keeps `provision::is_ready` false, which would reopen
+/// this wizard on every launch over a requirement no `pacman -S` line can
+/// satisfy on its own. `ydotoold` has to be running as well, and that is
+/// only sayable in prose: this list, shown in the wizard's shortcut step.
 pub(crate) fn backend_prereqs(d: &Desktop) -> Vec<&'static str> {
     match d {
         Desktop::Gnome => vec!["ydotool", "ydotoold"],

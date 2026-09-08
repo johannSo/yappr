@@ -332,9 +332,13 @@ export function Wizard({
               )}
 
               <div className="wizard-actions">
-                {/* The download never blocks the wizard: once it is running,
-                    the only button is Weiter, and the transfer continues
-                    while the user reads the next two steps. */}
+                {/* A running download *does* block the step. It used to not:
+                    Weiter stayed live and the transfer continued while the
+                    user read the next two steps — which reads as "this is
+                    finished" at 3 %, and lands them on the done step with no
+                    working dictation. Skipping is still allowed, but only as
+                    the deliberate "Später" below, which a running download
+                    replaces rather than hides. */}
                 {!setup.installing && setup.status && !modelsDone && (
                   <button type="button" className="add" onClick={setup.install}>
                     Jetzt laden
@@ -343,9 +347,10 @@ export function Wizard({
                 <button
                   type="button"
                   className={setup.installing || modelsDone ? "add" : "ghost"}
+                  disabled={setup.installing}
                   onClick={() => setStep("shortcuts")}
                 >
-                  {setup.installing || modelsDone ? "Weiter" : "Später"}
+                  {setup.installing ? "Lädt…" : modelsDone ? "Weiter" : "Später"}
                 </button>
               </div>
             </section>
