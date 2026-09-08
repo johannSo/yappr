@@ -1,26 +1,25 @@
 /* The settings window.
  *
- * Flat, opaque, and drawn with edges rather than with light. `Overlay.css`
- * earns its frosted slab: a HUD floating over an unknown wallpaper has to
- * bring its own ground. This window does not float over anything -- it is
- * *inside* the desktop, on a ground it owns, following the user's light/dark
- * theme -- so it keeps the overlay's token names (`--mat`, `--mat-edge`) and
- * drops the material. Nothing here is translucent, nothing is blurred, and no
- * surface is a gradient. A settings window is read, not admired; every soft
- * edge it declines to draw is one less thing between the user and the label
- * they came for.
+ * One continuous surface, not a tiling. The previous shape put every part of
+ * this window -- rail, header, each section -- on its own bordered, rounded
+ * tile with a gap of ground showing between them, which read as a set of
+ * islands floating on a sea. This window is not a set of objects; it is a
+ * sheet. The rail and the pane are two tones of one material meeting at a
+ * single seam, the sections are headed stretches of the same pane separated by
+ * air and a hairline, and nothing is inset from the window's own edge.
  *
- * The layout is still the compositor's. Hyprland puts gapped, rounded tiles on
- * a ground and marks the focused one with a coloured border; this window is a
- * rail tile and a stack of section tiles, and the active category wears that
- * same border -- solid, the way most people actually set `col.active_border`,
- * rather than the default 45-degree gradient.
+ * Two things carry that idea. The active category is drawn in the *pane's*
+ * colour -- a patch of the page lifted into the rail, rather than a bordered
+ * button pointing at a card -- and it sits centred in the rail with equal air
+ * on both sides, its own shape and not an appendage of the pane. And a faint
+ * grain lies over the whole ground, rail and pane alike, so the two tones read
+ * as one textured material rather than two flat fills that happen to touch.
  *
- * Elevation is declared once, and only in one direction. Content tiles carry a
- * border and no shadow, so nothing is a card inside a card and nothing is a
- * 1px edge under a soft glow. The two things that genuinely float -- the info
- * popover and the save capsule -- cast a shadow and are the only things that
- * do.
+ * Still opaque, still no blur: the grain is texture, not translucency, and it
+ * switches off under `prefers-contrast: more` and
+ * `prefers-reduced-transparency`. Elevation is declared once and in one
+ * direction: the two things that genuinely float -- the info popover and the
+ * save capsule -- cast a shadow and are the only things that do.
  *
  * Sizes are in `rem`, so a user who has raised their text size gets a bigger
  * window's worth of layout rather than the same layout with bigger text
@@ -59,23 +58,32 @@
      how many translucent layers happened to be under it that day. These are
      the colours that actually land on screen. */
 
-  /* -- The three surfaces. ------------------------------------------------
-     Ground, rail, tile: recessed, more recessed, raised. That ordering is
-     what a desktop's own settings window does, and it is the whole of the
-     depth model now -- no shadow under a content tile, no light along its
-     top edge. */
-  --ground: #e9ebef;
-  --mat: #ffffff;
-  --mat-rail: #dfe2e7;
-  --mat-edge: #ccd1d9;
+  /* -- Two tones of one material. -----------------------------------------
+     The pane (`--mat`) and the rail (`--mat-rail`), meeting at one seam. The
+     rail is only a shade darker: far enough to read as the margin of the
+     page, close enough that the grain over both makes them one sheet. There
+     is no third "ground" tone showing between tiles any more, so `--ground`
+     is simply the pane's colour -- it is what the body paints under
+     everything, and what shows during load. `--mat-rail-deep` is the rail's
+     far edge, so it can fall off softly toward the seam. */
+  --ground: #f5f6f8;
+  --mat: #f5f6f8;
+  --mat-rail: #e6e8ec;
+  --mat-rail-deep: #dfe2e7;
+  --mat-edge: #d3d7de;
+  /* How strongly the grain shows. A few percent is all it takes; at 10% it
+     stops being paper and starts being noise. */
+  --grain: 0.055;
 
   /* Fields and tracks. Filled and outlined rather than cut in with an inset
      shadow: on a flat surface the border is the whole affordance, and a fake
-     bevel under it is the thing that reads as drawn-by-a-machine. */
+     bevel under it is the thing that reads as drawn-by-a-machine. The well
+     is a touch brighter than the pane, so a field reads as a place to write
+     on the sheet. */
   --well: #ffffff;
-  --well-edge: #b6bdc8;
-  --sunk: #e4e7ec;
-  --hairline: #e2e5ea;
+  --well-edge: #b9c0ca;
+  --sunk: #e7e9ed;
+  --hairline: #dfe2e7;
   --row-hover: rgba(15, 23, 42, 0.04);
   /* The switch, which needs two values of its own.
      `--track` is the off state, and it is deliberately darker than `--sunk`:
@@ -116,10 +124,10 @@
   --sidebar-w: 14.5rem;
   --control-w: 14.5rem;
   --gutter-w: 1.875rem;
-  /* The gap between tiles, and the window's own inset. One value: the space
-     around the rail is the space between sections, which is what makes the
-     whole window read as a single tiling rather than a frame with contents. */
-  --gap: 0.875rem;
+  /* The vertical rhythm between sections. There is no inset from the window
+     edge and no gap between rail and pane any more; this is air *within* the
+     sheet, not ground showing between tiles. */
+  --gap: 1.75rem;
   --radius: 0.75rem;
   /* Controls round at the toolkit's radius, not the tile's. A 12px field
      inside a 12px tile makes both look like the same object. */
@@ -137,19 +145,20 @@
 
 @media (prefers-color-scheme: dark) {
   :root {
-    /* The same three-surface ordering, not an inversion of it: the rail is
-       still the most recessed and the tile still the most raised. Dark themes
-       that swap that round end up with a sidebar glowing brighter than the
-       content it navigates. */
-    --ground: #16181b;
-    --mat: #212429;
-    --mat-rail: #101215;
+    /* The same ordering, not an inversion of it: the rail is still the darker
+       tone and the page the lighter. Dark themes that swap that round end up
+       with a sidebar glowing brighter than the content it navigates. */
+    --ground: #1c1f23;
+    --mat: #1c1f23;
+    --mat-rail: #15171b;
+    --mat-rail-deep: #101215;
     --mat-edge: #33373e;
+    --grain: 0.07;
 
-    --well: #191c21;
+    --well: #23272d;
     --well-edge: #3d434c;
-    --sunk: #2a2e35;
-    --hairline: #2c3037;
+    --sunk: #282c33;
+    --hairline: #2b2f36;
     --row-hover: rgba(255, 255, 255, 0.04);
     --track: #3a4048;
     --knob: #b9c1cd;
@@ -202,55 +211,63 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-/* There is deliberately no `body::before` here. It used to hold two radial
-   tint blooms and a vertical veil, whose only job was giving the tiles'
-   `backdrop-filter` something varied to bend -- frost over a flat fill blurs
-   to exactly that fill and is invisible. With the frost gone the blooms had
-   nothing left to serve, and a cyan-to-mint wash across a settings window is
-   mood rather than information. The ground is one colour. */
+/* The grain. One fixed layer of monochrome noise over the whole window, rail
+   and pane alike, at a few percent -- the thing that makes two adjacent tones
+   read as one sheet of material rather than two fills that happen to touch.
+   It is an SVG turbulence tile, so it costs no image and scales with nothing:
+   the noise is always at device pixels, which is what paper does too.
+   `mix-blend-mode: multiply` darkens the grain into light surfaces; dark mode
+   flips it to `screen` below so the flecks lighten instead of vanishing. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+  opacity: var(--grain);
+  mix-blend-mode: multiply;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='180' height='180'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 0.5 0 0 0 0 0.5 0 0 0 0 0.5 0 0 0 1 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+  background-size: 180px 180px;
+}
 
+@media (prefers-color-scheme: dark) {
+  body::before {
+    mix-blend-mode: screen;
+  }
+}
+
+/* Edge to edge. No inset, no gap: the rail starts at the window's left edge
+   and the pane runs to its right, and the only line between them is the
+   rail's own seam. */
 .shell {
   position: relative;
   z-index: 1;
   display: grid;
   grid-template-columns: var(--sidebar-w) 1fr;
-  gap: var(--gap);
   height: 100vh;
-  padding: var(--gap);
 }
 
 .shell--bare {
   display: block;
-  padding: calc(var(--gap) * 2);
-}
-
-/* ------------------------------------------------------------- the tiles
-
-   One rule's worth of surface, applied to the four things that are tiles: the
-   rail, the pane's header, every section, and the empty-search panel.
-
-   A border and nothing else. The old rule stacked a 1px edge, a two-layer
-   drop shadow, an inset top highlight and a 22px blur on every tile in the
-   window -- four separate claims about depth for objects that all sit at the
-   same height. One edge says it once. */
-
-.sidebar,
-.topbar,
-.group,
-.nothing {
-  border: 1px solid var(--mat-edge);
-  border-radius: var(--radius);
+  padding: 2rem;
 }
 
 /* ---------------------------------------------------------------- sidebar */
 
+/* The rail: the darker tone of the sheet, falling off softly toward the seam
+   so the edge is a gradient of the material, not a wall. The same inset on
+   both sides, so every item in it -- brand, search, categories, version -- is
+   a symmetrical shape centred in the rail rather than something leaning on
+   the pane. */
 .sidebar {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 0.125rem;
   min-height: 0;
-  padding: 0.875rem 0.5rem 0.625rem;
-  background: var(--mat-rail);
+  padding: 1rem 0.625rem 0.75rem;
+  background: linear-gradient(to right, var(--mat-rail-deep), var(--mat-rail));
+  border-right: 1px solid var(--hairline);
   overflow-y: auto;
 }
 
@@ -262,7 +279,7 @@ body {
   display: flex;
   align-items: center;
   gap: 0.5rem;
-  padding: 0.125rem 0.5rem 0.75rem;
+  padding: 0.125rem 0.5rem 0.875rem;
   font-family: var(--font-display);
   font-size: 0.875rem;
   font-weight: 600;
@@ -309,7 +326,7 @@ body {
   position: relative;
   display: flex;
   align-items: center;
-  margin: 0 0.125rem 0.75rem;
+  margin: 0 0.125rem 0.875rem;
 }
 
 .searchbox__glyph {
@@ -382,7 +399,7 @@ body {
   align-items: center;
   gap: 0.6875rem;
   width: 100%;
-  padding: 0.5rem 0.75rem;
+  padding: 0.5625rem 0.75rem;
   border: 0;
   border-radius: var(--radius-sm);
   background: transparent;
@@ -427,26 +444,23 @@ body {
   white-space: nowrap;
 }
 
-/* The focused tile.
+/* The open category.
 
-   Hyprland marks the focused window with a coloured border and nothing else,
-   and the active category is marked the same way, so the rail reads as a
-   stack of tiles with one of them focused. The border is solid -- which is
-   how most people set `col.active_border` anyway, and what the default
-   45-degree cyan-to-mint sweep was standing in for here. Losing the gradient
-   loses the mask trick with it: a two-stop sweep needed a masked pseudo-
-   element to become a border at a radius, where one colour is just `border`.
+   Filled with the *pane's* colour: a patch of the page, lifted into the rail,
+   which says "this is the one you are looking at" in the material itself. No
+   border, no wash; the accent stays on the icon. It is a complete rounded
+   shape with the rail's inset on both sides, not a tab reaching for the pane
+   -- the two surfaces already belong to each other through tone and grain,
+   and a shape stuck to the seam only made the rail look lopsided.
 
    It travels between rows on `layoutId` (Settings.tsx) -- every nav item is
-   the same width and height, so that animation is a pure translation and the
-   1px edge never gets scaled. */
+   the same width and height, so that animation is a pure translation. */
 .nav-selection {
   position: absolute;
   inset: 0;
   z-index: -1;
-  border: 1px solid var(--accent);
   border-radius: var(--radius-sm);
-  background: var(--accent-wash);
+  background: var(--mat);
 }
 
 .sidebar-foot {
@@ -480,27 +494,25 @@ body {
 
 /* ------------------------------------------------------------------- pane
 
-   Not a tile itself: it is the region the section tiles are stacked in, so
-   giving it a surface of its own would put every section in a card inside a
-   card. It is transparent, and only scrolls. */
+   The page: the lighter tone of the sheet, running edge to edge. It is the
+   surface every section sits directly on, so no section needs one of its own. */
 
 .pane-wrap {
   position: relative;
   overflow: hidden;
+  background: var(--mat);
 }
 
 .pane {
   height: 100%;
   overflow-y: auto;
-  /* Room for the scrollbar without the tiles hard against it. */
-  padding-right: 0.125rem;
 }
 
-/* Sticky inside the scroller, so section tiles pass underneath it rather than
-   the whole column sliding beneath a fixed strip. Opaque, and it has to be:
-   this is the one surface in the window that content genuinely goes behind,
-   and a semi-transparent header with rows crawling through the pane title is
-   the exact effect translucency is worst at. */
+/* Sticky inside the scroller, so rows pass underneath it rather than the whole
+   column sliding beneath a fixed strip. Opaque and the pane's own colour, so
+   at rest it is indistinguishable from the page -- just the title, sitting at
+   the top. Once the pane has scrolled, the content underneath does not hit an
+   edge: it dissolves into the header through the gradient `::after` below. */
 .topbar {
   position: sticky;
   top: 0;
@@ -508,16 +520,27 @@ body {
   display: flex;
   align-items: baseline;
   gap: 0.75rem;
-  margin-bottom: var(--gap);
-  padding: 0.625rem var(--pane-x) 0.6875rem;
+  padding: 1.375rem var(--pane-x) 0.875rem;
   background: var(--mat);
-  transition: box-shadow 220ms ease;
+}
+
+.topbar::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 100%;
+  height: 1.25rem;
+  pointer-events: none;
+  background: linear-gradient(to bottom, var(--mat), transparent);
+  opacity: 0;
+  transition: opacity 220ms ease;
 }
 
 .topbar h1 {
   margin: 0;
   font-family: var(--font-display);
-  font-size: 1.1875rem;
+  font-size: 1.375rem;
   font-weight: 700;
   /* Display size, so the tracking closes up. A single letter-spacing value
      shared with the 11px labels above would be wrong at both ends. */
@@ -532,19 +555,17 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
-/* The one shadow a content tile is allowed, and only while it has earned it:
-   once the pane has scrolled, the header really is on top of something, so it
-   casts. At rest it is a tile among tiles and casts nothing -- which is also
-   the answer to "why not just a rule": a rule would sit there just as hard
-   with nothing underneath it. */
-.topbar.is-scrolled {
-  box-shadow: var(--e2);
+/* Only while it has something underneath it. A shadow here would make the
+   header a slab lying on the page; a fade lets the rows go under it the way
+   text goes under the fold of a sheet. */
+.topbar.is-scrolled::after {
+  opacity: 1;
 }
 
 .pane-body {
   /* Bottom padding clears the floating save capsule, so the last row of the
      last section is never the thing it covers. */
-  padding: 0 0 5.5rem;
+  padding: 0.25rem var(--pane-x) 5.5rem;
 }
 
 .status {
@@ -559,7 +580,7 @@ body {
   gap: 0.625rem;
   padding: 0.6875rem 0.8125rem;
   border-radius: var(--radius-sm);
-  margin-bottom: var(--gap);
+  margin-bottom: 1rem;
   border: 1px solid transparent;
   white-space: pre-wrap;
 }
@@ -587,23 +608,19 @@ body {
 
 /* ----------------------------------------------------------------- groups
 
-   A section is one tile: its heading, its note and its rows are inside the
-   same surface. The old shape put a floating label above a detached card,
-   which read as two objects for one section.
-
-   No `overflow: clip` here, however much the rounded corners want it: the
-   info popover is positioned inside a row, and clipping the tile would cut
-   it off. The last row rounds its own bottom corners instead. */
+   A section is a headed stretch of the page, not a card on it: a heading, an
+   optional note, the rows, and then air before the next heading. Nothing has
+   a surface of its own, so nothing is an island. What separates sections is
+   the whitespace and the rule the row list draws above itself. */
 .group {
   margin-bottom: var(--gap);
-  background: var(--mat);
 }
 
 .group-head {
   display: flex;
   align-items: center;
   gap: 0.5625rem;
-  padding: 0.8125rem 1rem 0.6875rem;
+  padding: 0.5rem 0 0.5rem;
 }
 
 /* Sentence case at reading size, not 11px tracked-out capitals. `titleFor`
@@ -615,7 +632,7 @@ body {
 .group-head h2 {
   margin: 0;
   font-family: var(--font-display);
-  font-size: 0.8125rem;
+  font-size: 0.9375rem;
   font-weight: 600;
   letter-spacing: -0.005em;
   color: var(--text);
@@ -641,16 +658,19 @@ body {
 }
 
 .note {
-  margin: -0.25rem 1rem 0.6875rem;
+  margin: -0.25rem 0 0.75rem;
+  max-width: 44rem;
   color: var(--muted);
   font-size: 0.78rem;
 }
 
-/* The row list. Transparent -- the tile around it is the surface. The rule on
-   top is what separates the heading (and the note, when there is one) from
-   the rows, wherever the heading block happens to end. */
+/* The row list. Transparent -- the page is the surface. One rule above and
+   one below: the top separates the heading (and the note, when there is one)
+   from the rows, the bottom closes the list so the air after it reads as
+   space between sections rather than as the list trailing off. */
 .card {
   border-top: 1px solid var(--hairline);
+  border-bottom: 1px solid var(--hairline);
 }
 
 /* ------------------------------------------------------------------- rows */
@@ -661,25 +681,22 @@ body {
 
 /* Inset separators, the way a grouped list draws them: the rule starts where
    the label starts, so it reads as dividing entries rather than as slicing the
-   tile into strips. */
+   page into strips. */
 .row + .row::before {
   content: "";
   position: absolute;
   top: 0;
-  left: 1rem;
+  left: 0.75rem;
   right: 0;
   height: 1px;
   background: var(--hairline);
 }
 
-/* Only the bottom pair: the top of the list is a rule, not an edge. */
-.row:last-child,
-.setup-row:last-child {
-  border-radius: 0 0 calc(var(--radius) - 1px) calc(var(--radius) - 1px);
-}
-
+/* The hover is the one place a row gets a shape of its own, and it is soft:
+   a rounded wash, not a bar. */
 .row:hover {
   background: var(--row-hover);
+  border-radius: var(--radius-sm);
 }
 
 .row.disabled {
@@ -692,7 +709,7 @@ body {
   align-items: center;
   gap: 0.875rem;
   min-height: 2.875rem;
-  padding: 0.375rem 0.625rem 0.375rem 1rem;
+  padding: 0.375rem 0.375rem 0.375rem 0.75rem;
 }
 
 .row-label {
@@ -744,7 +761,7 @@ body {
 }
 
 .row-block {
-  padding: 0 1rem 0.875rem 1rem;
+  padding: 0 0.75rem 0.875rem 0.75rem;
 }
 
 .row.has-block .row-head {
@@ -1071,7 +1088,7 @@ button:disabled {
 /* A section that is itself a list puts its table straight into the tile, with
    no row around it to supply the inset. */
 .card > .table {
-  padding: 0.875rem 1rem;
+  padding: 0.875rem 0.75rem;
 }
 
 .trow {
@@ -1098,16 +1115,15 @@ button:disabled {
 
 /* ------------------------------------------------------------ empty search */
 
-/* A tile too. Everything else in this column is one, and a headline sitting
-   directly on the ground reads as the pane having failed to load rather than
-   as the pane having nothing to show. */
+/* On the page like everything else, with a rule above it where a section's
+   row list would begin -- so an empty result still has the shape of a result. */
 .nothing {
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: 0.5rem;
   padding: 3.5rem 1rem;
-  background: var(--mat);
+  border-top: 1px solid var(--hairline);
   text-align: center;
 }
 
@@ -1204,14 +1220,14 @@ button:disabled {
   align-items: center;
   gap: 0.625rem;
   min-height: 2.875rem;
-  padding: 0.5625rem 1rem;
+  padding: 0.5625rem 0.75rem;
 }
 
 .setup-row + .setup-row::before {
   content: "";
   position: absolute;
   top: 0;
-  left: 1rem;
+  left: 0.75rem;
   right: 0;
   height: 1px;
   background: var(--hairline);
@@ -1283,7 +1299,7 @@ button:disabled {
 }
 
 .setup-command {
-  margin: 0.5rem 1rem 0.875rem;
+  margin: 0.5rem 0.75rem 0.875rem;
   color: var(--muted);
   font-size: 0.78rem;
 }
@@ -1307,11 +1323,10 @@ button:disabled {
   :root {
     --sidebar-w: 11.5rem;
     --control-w: 10.5rem;
-    --gap: 0.75rem;
+    --gap: 1.375rem;
   }
 
   .row-head {
-    padding-left: 0.8125rem;
     gap: 0.625rem;
   }
 }
@@ -1333,6 +1348,11 @@ button:disabled {
     justify-content: center;
     padding-left: 0;
     padding-right: 0;
+  }
+
+  .sidebar {
+    padding-left: 0.375rem;
+    padding-right: 0.375rem;
   }
 
   .searchbox__input {
@@ -1362,7 +1382,7 @@ button:disabled {
     transform: none;
   }
 
-  .topbar {
+  .topbar::after {
     transition: none;
   }
 
@@ -1373,19 +1393,27 @@ button:disabled {
   }
 }
 
-/* There is no `prefers-reduced-transparency` block any more, and that is the
-   answer rather than an omission: this window has no translucent surface and
-   no `backdrop-filter` left to switch off. What that query used to buy is
-   simply how the window renders for everyone now. */
+/* The grain is the one thing here that is not a flat fill, so it is the one
+   thing these two preferences switch off. Under either, the window is two
+   plain tones meeting at a seam -- still one sheet, just an unprinted one. */
+@media (prefers-reduced-transparency: reduce), (prefers-contrast: more) {
+  body::before {
+    display: none;
+  }
+}
 
-/* Contrast, though, still has somewhere to go. The edges do all the
-   structural work here, so raising contrast means drawing them harder --
-   not flattening surfaces that are already flat. */
+/* Contrast still has somewhere to go. The rules do the structural work here,
+   so raising contrast means drawing them harder, and giving the rail a hard
+   seam instead of a soft falloff. */
 @media (prefers-contrast: more) {
   :root {
     --hairline: #9aa0aa;
     --mat-edge: #7c838e;
     --well-edge: #5c636e;
+  }
+
+  .sidebar {
+    background: var(--mat-rail);
   }
 
   .muted,
@@ -1396,10 +1424,10 @@ button:disabled {
     color: var(--text);
   }
 
-  /* A 1px accent border is enough to point at the active row when it is the
-     only one; it is not enough when everything else has a hard edge too. */
+  /* The selection is told apart from the rail by tone alone; with the grain
+     gone and the edges hard, give it an edge of its own. */
   .nav-selection {
-    border-width: 2px;
+    box-shadow: inset 0 0 0 1px var(--hairline);
   }
 }
 
@@ -1418,6 +1446,7 @@ button:disabled {
 .shell--wizard {
   display: block;
   overflow: auto;
+  background: var(--mat);
 }
 
 .wizard {
