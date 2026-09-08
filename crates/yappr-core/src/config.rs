@@ -425,6 +425,12 @@ fn d_terminal_classes() -> Vec<String> {
         "gnome-terminal-server",
         "org.gnome.console",
         "kgx",
+        // GNOME's default terminal since Fedora 41, and the one the
+        // accessibility provider is most likely to report on that desktop --
+        // as the bare `ptyxis`, which is the AT-SPI application name, not the
+        // app id. Both spellings, because a future class source may differ.
+        "ptyxis",
+        "org.gnome.Ptyxis",
         "xterm",
         "urxvt",
         "st-256color",

@@ -15,7 +15,7 @@ dictation time. `SUPER+ALT+D`
 cancels a recording in progress; nothing else can end one deliberately — see invariant 11.
 The Ctrl+V/Ctrl+Shift+V choice can be forced with `[inject] paste_chord`
 (`auto` default / `ctrl_v` / `ctrl_shift_v`), because `auto` needs a window class it
-cannot always get — see the `hyprctl` gotcha at the bottom of this file.
+cannot always get — see the window-class gotcha at the bottom of this file.
 
 yappr is one binary, `yappr`, and one process. Running it with no
 arguments starts everything: a tray icon (no window), the Unix socket, the models, and
@@ -534,9 +534,9 @@ happen to be resident.
   script repacks the AppImage in place with the 256×256 at the root (the AppImage spec's
   recommended `.DirIcon` size), reusing the original runtime; verified 2026-09-01. The
   release CI runs it after `tauri build` — a locally built AppImage needs it run by hand.
-- **Every way `hyprctl` can fail collapses to the same `None`, and that silently
-  changes the ydotool paste chord.** `hypr::active_window_class()` is the *only*
-  source of the target window's class, and `inject::wants_shift` reads `None` as
+- **Every way a window-class provider can fail collapses to the same `None`, and that
+  silently changes the ydotool paste chord.** `winclass::active_window_class()` is the
+  *only* source of the target window's class, and `inject::wants_shift` reads `None` as
   "not a terminal" — so the ydotool backend presses plain Ctrl+V, which every
   terminal ignores. `ydotool` then exits 0, so `inject_with_recovery` records
   success, no clipboard-fallback notification fires, and the user sees a dictation
@@ -552,20 +552,36 @@ happen to be resident.
   | not Hyprland at all (GNOME/Mutter) | — | spawn fails |
 
   Note `hyprctl` reports its own failures on **stdout**, not stderr, which is why
-  `active_window_class` reads stdout *before* the status check and attaches it to
+  `hypr::window_class` reads stdout *before* the status check and attaches it to
   the failure warning — the text naming the cause is only in hand there. The
   spawn-failure arm is deliberately `debug!`, not `warn!`: `start_recording` calls
   this on every utterance with no compositor guard, so on GNOME a warning would fire
   once per dictation forever, for every user, including the majority on `wtype` for
   whom the class changes nothing.
 
-  GNOME is the case that matters most, because it is the desktop the ydotool backend
-  exists for — `wtype` does nothing there — and `hyprctl` can never exist on it, so
-  `auto` can never work. `InjectDebug` records `window_class` (written as `null`
-  rather than omitted, so "unknown" is distinguishable from "old record"), and
-  `[inject] paste_chord` forces the chord for setups that can never answer. Verified
-  by reading `/dev/input/event*` (the `ydotoold virtual device`) while firing the
-  chord, and end to end in kitty, ghostty and foot.
+  GNOME used to be the case that mattered most — it is the desktop the ydotool backend
+  exists for, `wtype` does nothing there, and `hyprctl` can never exist on it — so
+  `auto` could never work. Since 2026-09-08 it can: `gnome.rs` answers from the
+  accessibility bus, which needs no extension and no gsetting, and
+  `winclass::active_window_class` falls back to it when `hyprctl` cannot be run.
+
+  Read that module's header before touching it. Two things there are not guessable.
+  **AT-SPI delivers no `window:activate` events on this desktop** -- registration
+  succeeds and nothing ever arrives, measured with this crate and with an independent
+  `pyatspi` listener, with `toolkit-accessibility` both off and on -- so it *polls*
+  the tree (a sweep costs ~7 ms; `POLL_INTERVAL` is 500 ms). An event-driven version
+  was written first and fails viciously: its one startup sweep succeeds, so the class
+  freezes on whatever was focused then, dictation keeps working in that window and
+  silently stops working in every other one. **And it cannot query at `ptt-start`
+  either**, because by then the overlay holds focus itself (invariant 2), so the
+  answer has to be already in hand.
+
+  `InjectDebug` still records `window_class` (written as `null` rather than omitted,
+  so "unknown" is distinguishable from "old record"), and `[inject] paste_chord` still
+  forces the chord for setups that can never answer — an Electron or Qt app that
+  registers with no accessibility bus is exactly such a setup. Verified by reading
+  `/dev/input/event*` (the `ydotoold virtual device`) while firing the chord, and end
+  to end in kitty, ghostty and foot.
 - **Do not trust `cpal`'s advertised sample-rate range.** It advertised 16 kHz on hardware
   that rejected the stream build; `capture.rs` now probes by building a throwaway stream and
   falls back to 48 kHz plus `rubato` resampling.
@@ -573,6 +589,7 @@ happen to be resident.
   --print-shortcuts`) and let them paste it. A bad window rule breaks their desktop.
   `hypr.rs` detects Lua vs classic `.conf`; Hyprland 0.56+ with a Lua config rejects the
   legacy keyword parser outright, so the formats are not interchangeable.
-- **Real dictation is still unverified end to end** (no one has spoken into it; see
-  `docs/HANDOVER.md`). Do not record from the microphone without explicit permission — that
-  constraint is why the audio half remains untested.
+- **Real dictation was first verified end to end on 2026-09-07**, on Fedora 44/GNOME 50
+  with the `ydotool` backend: spoken German, transcribed, normalised and pasted into
+  Ptyxis and GNOME Text Editor. `docs/HANDOVER.md` predates that and still says
+  otherwise. Still do not record from the microphone without explicit permission.

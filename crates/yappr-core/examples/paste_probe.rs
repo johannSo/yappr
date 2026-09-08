@@ -3,9 +3,10 @@
 //! daemon.
 //!
 //! This exists because the ydotool backend's Ctrl+V/Ctrl+Shift+V choice
-//! depends on `hypr::active_window_class()`, which is unavailable on
-//! GNOME/Mutter and on any Hyprland session whose environment lacks
-//! `HYPRLAND_INSTANCE_SIGNATURE` (see that function, and `config::PasteChord`).
+//! depends on `winclass::active_window_class()`, which answers `None` on any
+//! Hyprland session whose environment lacks `HYPRLAND_INSTANCE_SIGNATURE`,
+//! and on GNOME for an app that is on no accessibility bus (see that
+//! function, and `config::PasteChord`).
 //! The failure is silent -- `ydotool` exits 0 either way -- so the only way to
 //! tell which chord was pressed used to be to read `/dev/input/event*`.
 //!
@@ -17,7 +18,21 @@
 //! cargo run -p yappr-core --example paste_probe -- "hello" ctrl_shift_v  # forced
 //! ```
 use yappr_core::config::{Config, InjectBackend, PasteChord};
-use yappr_core::{hypr, inject};
+use yappr_core::{inject, winclass};
+
+/// Poll until the focus tracker has an answer, or give up.
+fn wait_for_class() -> Option<String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if let Some(class) = winclass::active_window_class() {
+            return Some(class);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
 
 fn main() {
     let mut cfg = Config::load().unwrap_or_default();
@@ -34,7 +49,11 @@ fn main() {
             }
         };
     }
-    let class = hypr::active_window_class();
+    // The GNOME provider answers from a thread that tracks focus, so a
+    // short-lived process has to let it connect and sweep first. The daemon
+    // has been tracking since startup and never waits like this.
+    winclass::start_tracking();
+    let class = wait_for_class();
     println!("active_window_class() = {class:?}");
     println!("paste_chord           = {:?}", cfg.inject.paste_chord);
     let shift = match cfg.inject.paste_chord {

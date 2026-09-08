@@ -273,11 +273,51 @@ layout-independent, so this works on any keyboard layout, umlauts and ß include
 clipboard afterwards, so if the paste keystroke fails you can paste it yourself.
 
 ```bash
-sudo pacman -S ydotool                          # For Arch based distros
-sudo dnf install ydotool                        # For Fedora based distros
-systemctl --user enable --now ydotool.service   # the unit is named for the package,
-                                                # not for ydotoold
+sudo pacman -S ydotool    # For Arch based distros
+sudo dnf install ydotool  # For Fedora based distros
 ```
+
+`ydotoold` needs write access to `/dev/uinput`, which is `root`-only out of the box.
+Hand it to the `input` group once:
+
+```bash
+sudo tee /etc/udev/rules.d/60-uinput.rules <<'EOF'
+KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"
+EOF
+sudo udevadm control --reload-rules && sudo udevadm trigger /dev/uinput
+sudo usermod -aG input "$USER"   # log out and back in for the group to take effect
+```
+
+Then run the daemon as a **user** service. Some distros ship one — try
+`systemctl --user enable --now ydotool.service` first (the unit is named for the
+package, not for ydotoold). If `systemctl --user cat ydotool.service` finds nothing,
+as on Fedora, write your own:
+
+```ini
+# ~/.config/systemd/user/ydotoold.service
+[Unit]
+Description=ydotoold - ydotool user daemon
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ydotoold --socket-path=%t/.ydotool_socket --socket-perm=0600
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now ydotoold.service
+ydotool type ''   # exits 0 once the socket is up; prints nothing, types nothing
+```
+
+Do **not** enable a system-wide `ydotoold` pointed at `/run/user/$UID/.ydotool_socket`.
+A system unit starts at boot, before logind has created `/run/user/$UID`, so it dies
+with `failed to bind socket: No such file or directory` and never retries once
+systemd's restart limit is hit.
 
 Then set it in Settings → Allgemein → Texteingabe → Verfahren, or:
 
@@ -291,8 +331,10 @@ backend = "ydotool"
 Choosing Ctrl+Shift+V over Ctrl+V needs the class of the window you dictated into, and
 that answer comes from `hyprctl` alone. Three situations leave yappr without it:
 
-- **On GNOME there is no `hyprctl`** — and GNOME is exactly where you were told to use
-  this backend, because `wtype` does nothing there. `auto` can never work there.
+- **On GNOME there is no `hyprctl`** — but since 2026-09-07 yappr asks the
+  accessibility bus instead, which needs no extension and no setting, so `auto` works
+  there too. It only comes up empty for an app that registers with no accessibility
+  bus at all, which some Electron and Qt apps do not.
 - **On Hyprland, `hyprctl` needs `HYPRLAND_INSTANCE_SIGNATURE`** in yappr's own
   environment. Started from a systemd user unit or a `.desktop` autostart on a session
   that never exported it, `hyprctl` fails and yappr is left without a class.
@@ -343,7 +385,8 @@ needed — `preload_at_startup` alone still unloads after the idle timeout.
 |---|---|
 | **Nothing happens when I press `SUPER+D`** | The app isn't running (check for the tray icon), or the shortcut isn't bound. Run `yappr --toggle` in a terminal: with no app running it exits non-zero and raises a notification. |
 | **Nothing gets typed, but the overlay says it worked** | `wtype` can't reach that window — you're on GNOME, or it's an XWayland/Electron window. Switch to [`ydotool`](#pasting-with-ydotool). Check the clipboard: the text is probably there. |
-| **Nothing is pasted *into a terminal* on the `ydotool` backend** | yappr couldn't read the target window's class, so it sent plain Ctrl+V, which terminals ignore. Set `[inject] paste_chord = "ctrl_shift_v"` — see [If nothing is pasted into a terminal](#if-nothing-is-pasted-into-a-terminal). |
+| **`ydotool` says `failed to connect socket ... Please check if ydotoold is running`** | `ydotoold` isn't up. `systemctl --user status ydotoold` — if it's a *system* unit bound to `/run/user/$UID/…`, that can never work; see [Pasting with `ydotool`](#pasting-with-ydotool). yappr falls back to the clipboard here, so the transcript is still there to paste by hand. |
+| **Nothing is pasted *into a terminal* on the `ydotool` backend** | yappr couldn't read the target window's class, so it sent plain Ctrl+V, which terminals ignore. Check that your terminal's name is in `[inject] terminal_classes` — GNOME's Ptyxis reports itself as `ptyxis`. Failing that, set `[inject] paste_chord = "ctrl_shift_v"` — see [If nothing is pasted into a terminal](#if-nothing-is-pasted-into-a-terminal). |
 | **`cargo build` fails in `gtk-layer-shell-sys`** | `sudo pacman -S gtk-layer-shell`. |
 | **Blank windows after building** | Built without `--features custom-protocol`, or without `bun run build` first. |
 | **The first dictation of the day is slow** | Expected — the models load lazily. See [Memory use](#memory-use). |

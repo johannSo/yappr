@@ -654,6 +654,12 @@ pub fn start(sink: Arc<dyn EventSink>) -> Result<(Arc<Daemon>, UnixListener)> {
     // here would drop, and release the exclusive flock with it, the moment
     // `start` returns, letting a second `yappr` race this one for
     // the socket.
+    // Before anything else that can be slow: the focused-window tracker has
+    // to be listening well before the first `ptt-start`, because what it
+    // records is the state *prior* to the overlay taking focus. Spawning a
+    // thread that may find no accessibility bus is free.
+    crate::winclass::start_tracking();
+
     let lock_path = paths::runtime_lock();
     if let Some(parent) = lock_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -2274,7 +2280,10 @@ fn start_recording(daemon: &Arc<Daemon>) -> Response {
     // Capturing the window class here, now that the mic is already open,
     // is still deliberate (spec 11): it is the window that was focused when
     // the user *started* talking, not whatever has focus once they finish.
-    *lock_ignoring_poison(&daemon.window_class) = crate::hypr::active_window_class();
+    // On GNOME that is a claim this call can only honour because
+    // `winclass`'s accessibility provider has been *tracking* focus since
+    // startup -- by now the overlay itself holds it (invariant 2).
+    *lock_ignoring_poison(&daemon.window_class) = crate::winclass::active_window_class();
 
     // Bump the epoch *before* flipping the state, not after: they are two
     // independent atomics, and the safety-valve timer below reads the epoch

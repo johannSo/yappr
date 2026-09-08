@@ -250,16 +250,14 @@ fn parse_class(json: &str) -> Option<String> {
     }
 }
 
-/// The class of the currently focused window, or `None` when Hyprland is
-/// unavailable or nothing is focused.
+/// The class of the currently focused window per Hyprland, or `None` when
+/// `hyprctl` is unavailable or nothing is focused.
 ///
-/// Called from `start_recording` (`server.rs`) when a recording begins, off
-/// the latency-critical path. `Request::PttStart` still exists internally
-/// and is still what triggers this call -- but there is no longer an
-/// `owf-ctl ptt-start` route that sends it directly: `Request::Toggle`
-/// resolves to it when the daemon is `IDLE` (see spec §2, "Toggle
-/// semantics"), which is the only way a user-facing action reaches here now.
-pub fn active_window_class() -> Option<String> {
+/// This is the *Hyprland* provider, not the general question -- ask
+/// [`crate::winclass::active_window_class`] for that, which falls back to
+/// [`crate::gnome`] here. It used to be the general question, back when
+/// Hyprland was the only desktop that could answer it at all.
+pub fn window_class() -> Option<String> {
     let mut cmd = Command::new("hyprctl");
     cmd.args(["-j", "activewindow"]);
     let out = match procutil::run_with_timeout(cmd, HYPRCTL_TIMEOUT, None) {
@@ -273,7 +271,7 @@ pub fn active_window_class() -> Option<String> {
             // whom the window class changes nothing. It would also bury the
             // one warning that is actionable (`inject.rs`'s, which fires
             // only for the backend that actually reads this value).
-            tracing::debug!(error = %e, "hyprctl could not be run; no target window class");
+            tracing::debug!(error = %e, "hyprctl could not be run; not a Hyprland session");
             return None;
         }
     };

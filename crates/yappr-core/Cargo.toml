@@ -40,6 +40,16 @@ rubato = "5.0"
 # SIGINT/SIGHUP shutdown path (fix 2) -- no async runtime, matching the rest
 # of `server.rs`.
 signal-hook = "0.3"
+# The focused window on GNOME, where no other interface will say (`gnome.rs`).
+# AT-SPI is D-Bus-only and the protocol is not worth reimplementing: event
+# registration alone means talking to the registry, match rules and the
+# accessible tree. Default features pull `atspi-connection` and
+# `atspi-proxies` over zbus, and deliberately *not* `tokio` -- without it
+# zbus uses async-io, so the async this drags in is driven by a `block_on`
+# on one dedicated thread inside `gnome.rs` and reaches no other module.
+# `server.rs` stays synchronous.
+atspi = "0.30"
+futures-lite = "2"
 
 [dev-dependencies]
 hound = "3.5"

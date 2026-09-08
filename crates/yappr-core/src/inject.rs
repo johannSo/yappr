@@ -237,7 +237,8 @@ impl TextInjector for YdotoolInjector {
             // so the user gets no text and no error. Naming the override
             // here is the only warning they will ever see.
             tracing::warn!(
-                "no target window class (hyprctl unavailable or HYPRLAND_INSTANCE_SIGNATURE unset); \
+                "no target window class (no provider could name the focused window: \
+                 no hyprctl, and no accessibility bus or an app not on it); \
                  pasting with plain Ctrl+V, which terminals ignore -- \
                  set [inject] paste_chord = \"ctrl_shift_v\" if you dictate into a terminal"
             );
