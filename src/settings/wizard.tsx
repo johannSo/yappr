@@ -21,6 +21,17 @@ import { Icon } from "./icons";
 const STEP = { type: "spring", bounce: 0, duration: 0.36 } as const;
 const FADE = { type: "spring", bounce: 0, duration: 0.24 } as const;
 
+/// The selectable ASR models, in catalogue order. Kept next to `STEPS`
+/// rather than in `schema.ts` because the wizard renders its own `<select>`
+/// -- `schema.ts`'s ENUMS drives the settings form only. The spellings must
+/// match `models::ASR_MODELS`; an unknown one is rejected by the config's
+/// deny_unknown_fields on save rather than silently defaulted.
+export const ASR_MODELS: { value: string; label: string }[] = [
+  { value: "parakeet-tdt-v3", label: "Parakeet TDT v3 — mehrsprachig (Voreinstellung)" },
+  { value: "parakeet-unified-en", label: "Parakeet Unified — nur Englisch" },
+  { value: "nemotron-3.5", label: "Nemotron 3.5 — mehrsprachig" },
+];
+
 export const STEPS = ["welcome", "models", "shortcuts", "done"] as const;
 export type Step = (typeof STEPS)[number];
 
@@ -205,6 +216,42 @@ export function Wizard({
   const [step, setStep] = useState<Step>(state.start_step);
   const index = STEPS.indexOf(step);
   const setup = useSetup();
+  const [asrModel, setAsrModel] = useState("parakeet-tdt-v3");
+  const { check } = setup;
+
+  // Read the current selection rather than assuming the default: this wizard
+  // reopens whenever the selected model is missing (invariant 13's
+  // `should_open`), which includes a machine that already chose one.
+  useEffect(() => {
+    void (async () => {
+      try {
+        const res = (await invoke("get_config")) as {
+          config?: { asr?: { model?: string } };
+        };
+        const current = res.config?.asr?.model;
+        if (current) setAsrModel(current);
+      } catch {
+        // Leave the default showing; the step still works.
+      }
+    })();
+  }, []);
+
+  // Writes the selection, then re-runs the status check so the missing-model
+  // list below is about the model just picked. A single-leaf patch, which
+  // `config_write::save_config` merges rather than renders -- the same path
+  // `wizard_finish`'s backend patch takes (invariant 9).
+  const chooseModel = useCallback(
+    async (model: string) => {
+      setAsrModel(model);
+      try {
+        await invoke("set_config", { config: { asr: { model } } });
+      } catch (e) {
+        console.error("set_config(asr.model) failed", e);
+      }
+      await check();
+    },
+    [check],
+  );
 
   // Only a genuine first run writes the injection backend — see
   // `wizard_finish`'s doc comment. `start_step` is the frontend's evidence
@@ -251,6 +298,28 @@ export function Wizard({
                 vollständig auf diesem Rechner. Dafür braucht yappr einmalig etwa
                 1,1 GB an Modellen.
               </p>
+
+              <div className="card">
+                <label className="setup-row" htmlFor="wizard-asr-model">
+                  <span>Spracherkennungs-Modell</span>
+                  <select
+                    id="wizard-asr-model"
+                    value={asrModel}
+                    disabled={setup.installing}
+                    onChange={(e) => void chooseModel(e.target.value)}
+                  >
+                    {ASR_MODELS.map((m) => (
+                      <option key={m.value} value={m.value}>
+                        {m.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <p className="setup-command">
+                  Es wird nur das ausgewählte Modell geladen. Ein Wechsel später in
+                  den Einstellungen lädt das neue Modell nach.
+                </p>
+              </div>
 
               {setup.checkError && (
                 <div className="banner error">
