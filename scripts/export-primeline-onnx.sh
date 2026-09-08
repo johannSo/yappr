@@ -55,15 +55,31 @@ sys.exit(0 if (major == 3 and 10 <= minor <= 12) else 1)
 PY
 
 mkdir -p "$WORKDIR"
-avail_kb=$(df -Pk "$WORKDIR" | awk 'NR==2 {print $4}')
-if [ "$avail_kb" -lt 8388608 ]; then
-  die "need ~8 GB free in $WORKDIR, have $((avail_kb / 1024)) MB.
-     Peak usage is the 2.51 GB checkpoint plus a ~2.6 GB fp32 intermediate
-     that exists until quantisation collapses it to ~650 MB."
+cd "$WORKDIR"
+
+# Whether the expensive half still has to run decides how much disk is
+# needed, so answer that first. Re-running after a late failure must not be
+# blocked by a requirement only the export itself has.
+if [ -s encoder.int8.onnx ] && [ -s decoder.int8.onnx ] \
+   && [ -s joiner.int8.onnx ] && [ -s tokens.txt ]; then
+  EXPORT_NEEDED=0
+  need_kb=$((2 * 1024 * 1024))   # packaging: a copy of the int8 files, plus the tarball
+  need_human="~2 GB"
+else
+  EXPORT_NEEDED=1
+  need_kb=$((8 * 1024 * 1024))
+  need_human="~8 GB"
 fi
 
-cd "$WORKDIR"
-log "workdir: $WORKDIR  ($((avail_kb / 1048576)) GB free)"
+avail_kb=$(df -Pk . | awk 'NR==2 {print $4}')
+if [ "$avail_kb" -lt "$need_kb" ]; then
+  die "need $need_human free in $WORKDIR, have $((avail_kb / 1024)) MB.
+     $( [ "$EXPORT_NEEDED" -eq 1 ] \
+        && printf '%s' 'Peak is the 2.51 GB checkpoint plus a ~2.6 GB fp32 intermediate that exists until quantisation collapses it to ~650 MB.' \
+        || printf '%s' 'Only packaging is left: a copy of the ~640 MB of int8 files, plus the tarball.' )"
+fi
+
+log "workdir: $WORKDIR  ($((avail_kb / 1048576)) GB free, export needed: $EXPORT_NEEDED)"
 
 # ------------------------------------------------------------------- python
 
@@ -148,8 +164,7 @@ fetch_script parakeet-tdt-0.6b-v3/test_onnx.py nemo/parakeet-tdt-0.6b-v3/test_on
 # Everything above is cheap and idempotent. The export is neither -- it is
 # 10-25 minutes of CPU -- so a re-run picks up from whatever is already on
 # disk. Delete the int8 files to force it again.
-if [ -s encoder.int8.onnx ] && [ -s decoder.int8.onnx ] \
-   && [ -s joiner.int8.onnx ] && [ -s tokens.txt ]; then
+if [ "$EXPORT_NEEDED" -eq 0 ]; then
   log "int8 export already present -- skipping export, going straight to verification"
 else
 
@@ -192,6 +207,51 @@ python nemo/parakeet-tdt-0.6b-v3/export_onnx.py
 for f in encoder.int8.onnx decoder.int8.onnx joiner.int8.onnx tokens.txt; do
   [ -s "$f" ] || die "$f was not produced"
 done
+
+# The fp32 encoder is over 2 GB, so torch.onnx.export writes its weights as
+# hundreds of loose external-data files ("onnx__MatMul_7060",
+# "layers.3.conv.pointwise_conv1.weight", ...), and `add_meta_data` then
+# re-saves a consolidated `encoder.weights` beside them. None of it is needed
+# once the int8 files exist, and together it is ~5 GB -- enough to fill the
+# disk and block the packaging step that follows.
+#
+# The delete list comes from the model itself rather than from a glob: those
+# filenames have no extension and no safely distinctive prefix, and this
+# directory also holds the outputs we must not touch.
+log "removing fp32 intermediates"
+python - <<'PY'
+import os
+from pathlib import Path
+
+import onnx
+
+removed = bytes_freed = 0
+if Path("encoder.onnx").exists():
+    model = onnx.load("encoder.onnx", load_external_data=False)
+    targets = set()
+    for init in model.graph.initializer:
+        if init.data_location == onnx.TensorProto.EXTERNAL:
+            for kv in init.external_data:
+                if kv.key == "location":
+                    targets.add(kv.value)
+    for name in sorted(targets):
+        f = Path(name)
+        # Never step outside the work directory on a malformed location.
+        if f.is_absolute() or ".." in f.parts or not f.is_file():
+            continue
+        bytes_freed += f.stat().st_size
+        f.unlink()
+        removed += 1
+
+for name in ("encoder.onnx", "encoder.weights", "decoder.onnx", "joiner.onnx"):
+    f = Path(name)
+    if f.is_file():
+        bytes_freed += f.stat().st_size
+        f.unlink()
+        removed += 1
+
+print(f"  removed {removed} files, {bytes_freed / 1e9:.2f} GB")
+PY
 
 fi   # end of the skip-if-already-exported guard
 
