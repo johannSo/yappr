@@ -74,7 +74,10 @@ pub fn run() -> Result<()> {
     let long_samples = repeat_buffer(&short_samples, 3);
 
     let t0 = Instant::now();
-    let asr = SherpaTranscriber::new(&yappr_core::paths::models_dir(), 4)?;
+    let asr = yappr_core::asr::build(
+        &yappr_core::paths::models_dir(),
+        &yappr_core::config::AsrConfig::default(),
+    )?;
     let load_ms = t0.elapsed().as_millis();
     println!("model load   {load_ms} ms  (once, at daemon start)");
     println!();

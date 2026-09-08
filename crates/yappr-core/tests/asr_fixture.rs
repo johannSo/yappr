@@ -1,4 +1,4 @@
-use yappr_core::asr::{SherpaTranscriber, Transcriber};
+use yappr_core::asr::Transcriber;
 
 fn read_wav_16k_mono(path: &str) -> Vec<f32> {
     let mut r = hound::WavReader::open(path).expect("open fixture");
@@ -14,7 +14,11 @@ fn read_wav_16k_mono(path: &str) -> Vec<f32> {
 #[ignore = "requires downloaded models; run with --ignored"]
 fn transcribes_the_english_fixture() {
     let samples = read_wav_16k_mono("fixtures/hello_english.wav");
-    let t = SherpaTranscriber::new(&yappr_core::paths::models_dir(), 4).expect("build transcriber");
+    let t = yappr_core::asr::build(
+        &yappr_core::paths::models_dir(),
+        &yappr_core::config::AsrConfig::default(),
+    )
+    .expect("build transcriber");
     let text = t.transcribe(&samples).expect("transcribe");
 
     // Assert on content that must survive any reasonable ASR, not exact wording.
@@ -35,7 +39,11 @@ fn transcribes_the_english_fixture() {
 #[ignore = "requires downloaded models; run with --ignored"]
 fn transcribes_the_german_fixture() {
     let samples = read_wav_16k_mono("fixtures/hallo_german.wav");
-    let t = SherpaTranscriber::new(&yappr_core::paths::models_dir(), 4).expect("build transcriber");
+    let t = yappr_core::asr::build(
+        &yappr_core::paths::models_dir(),
+        &yappr_core::config::AsrConfig::default(),
+    )
+    .expect("build transcriber");
     let text = t.transcribe(&samples).expect("transcribe");
 
     // Parakeet TDT 0.6b v3 is multilingual; this just proves the pipeline
