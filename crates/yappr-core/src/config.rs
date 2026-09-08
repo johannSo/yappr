@@ -132,20 +132,60 @@ impl Default for AudioConfig {
     }
 }
 
+/// Which speech-recognition model the pipeline loads.
+///
+/// The spelling here is the stable, user-visible name in `config.toml` and
+/// the key in `models::ASR_MODELS`. It is deliberately *not* the lock-file
+/// key: the Parakeet v3 entry is pinned under the bare name `parakeet`,
+/// which can never change (see `models::Artifact::name`).
+///
+/// See `docs/superpowers/specs/2026-09-08-asr-model-selection-design.md` §2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AsrModel {
+    /// Parakeet TDT 0.6b v3 -- multilingual, the default, and the only model
+    /// that existed before model selection did.
+    #[serde(rename = "parakeet-tdt-v3")]
+    ParakeetTdtV3,
+    /// Parakeet Unified 0.6b -- English only.
+    #[serde(rename = "parakeet-unified-en")]
+    ParakeetUnifiedEn,
+    /// Nemotron 3.5 ASR 0.6b, 560 ms cache-aware streaming export --
+    /// multilingual, and the only entry that is not an `OfflineRecognizer`.
+    #[serde(rename = "nemotron-3.5")]
+    Nemotron35,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AsrConfig {
+    #[serde(default = "d_asr_model")]
+    pub model: AsrModel,
+    /// `"auto"`, or a two-letter code such as `"de"`. Only a
+    /// `CacheAwareStreaming` model reads this; the offline models are either
+    /// single-language or detect it themselves.
+    #[serde(default = "d_asr_language")]
+    pub language: String,
     #[serde(default = "d_threads")]
     pub num_threads: i32,
 }
 
+fn d_asr_model() -> AsrModel {
+    AsrModel::ParakeetTdtV3
+}
+fn d_asr_language() -> String {
+    "auto".to_string()
+}
 fn d_threads() -> i32 {
     4
 }
 
 impl Default for AsrConfig {
     fn default() -> Self {
-        Self { num_threads: d_threads() }
+        Self {
+            model: d_asr_model(),
+            language: d_asr_language(),
+            num_threads: d_threads(),
+        }
     }
 }
 
@@ -671,6 +711,15 @@ impl Config {
         }
         if self.asr.num_threads < 1 {
             bail!("asr.num_threads must be at least 1");
+        }
+        let lang_ok = self.asr.language == "auto"
+            || (self.asr.language.len() == 2
+                && self.asr.language.bytes().all(|b| b.is_ascii_lowercase()));
+        if !lang_ok {
+            bail!(
+                "asr.language must be \"auto\" or a two-letter lowercase code such as \"de\", got {:?}",
+                self.asr.language
+            );
         }
         if self.normalize.timeout_ms == 0 {
             bail!("normalize.timeout_ms must be greater than 0");
@@ -1347,6 +1396,53 @@ to = "KDD"
         ] {
             let c = Config::from_str(&format!("[inject]\nbackend = \"{spelling}\"\n")).unwrap();
             assert_eq!(c.inject.backend, expected, "for {spelling}");
+        }
+    }
+
+    #[test]
+    fn every_asr_model_spelling_round_trips_from_toml() {
+        for (spelling, expected) in [
+            ("parakeet-tdt-v3", AsrModel::ParakeetTdtV3),
+            ("parakeet-unified-en", AsrModel::ParakeetUnifiedEn),
+            ("nemotron-3.5", AsrModel::Nemotron35),
+        ] {
+            let c = Config::from_str(&format!("[asr]\nmodel = \"{spelling}\"\n")).unwrap();
+            assert_eq!(c.asr.model, expected, "for {spelling}");
+        }
+    }
+
+    #[test]
+    fn a_config_written_before_model_selection_existed_still_loads() {
+        // Invariant 4: [asr] is deny_unknown_fields, and every pre-existing
+        // config.toml has num_threads in this section and nothing else.
+        let c = Config::from_str("[asr]\nnum_threads = 7\n").unwrap();
+        assert_eq!(c.asr.num_threads, 7);
+        assert_eq!(c.asr.model, AsrModel::ParakeetTdtV3, "the default must not move");
+        assert_eq!(c.asr.language, "auto");
+    }
+
+    #[test]
+    fn an_unknown_asr_model_spelling_is_rejected_rather_than_silently_defaulted() {
+        let err = Config::from_str("[asr]\nmodel = \"whisper\"\n").unwrap_err();
+        assert!(format!("{err:#}").contains("model"), "unhelpful error: {err:#}");
+    }
+
+    #[test]
+    fn asr_language_must_be_auto_or_a_two_letter_code() {
+        // `from_str` validates, so a bad value never becomes a `Config` at
+        // all -- same as every other range check (`out_of_range_values_are_rejected`).
+        for good in ["auto", "de", "en", "ja"] {
+            let c = Config::from_str(&format!("[asr]\nlanguage = \"{good}\"\n"))
+                .unwrap_or_else(|e| panic!("{good} should be accepted: {e:#}"));
+            assert_eq!(c.asr.language, good);
+        }
+        for bad in ["Deutsch", "DE", "d", "de-DE", ""] {
+            let err = Config::from_str(&format!("[asr]\nlanguage = \"{bad}\"\n"))
+                .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("asr.language"),
+                "{bad:?} was rejected, but not for a reason that names the key: {err:#}"
+            );
         }
     }
 
