@@ -5,6 +5,7 @@ import { AnimatePresence, MotionConfig, motion } from "motion/react";
 import { Icon } from "./settings/icons";
 import { Commit, Device, Field, ResetButton, Row, TableEditor, Toggle } from "./settings/controls";
 import { Wizard, WizardState } from "./settings/wizard";
+import { AsrModelDownload } from "./settings/model-download";
 import {
   HELP,
   Json,
@@ -59,6 +60,10 @@ export default function Settings() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  // Bumped by every *successful* save. `AsrModelDownload` re-checks on this
+  // rather than on the dropdown's local value, which would race the save that
+  // is still in flight -- `setup_status` answers from config.toml on disk.
+  const [savedRevision, setSavedRevision] = useState(0);
   // Kept apart from `notice` deliberately. That one carries `restart_reason`
   // from a save, and the two used to share it: a save wiped the startup notice
   // before the user had read it, and the next reveal's `load(true)` brought the
@@ -254,6 +259,7 @@ export default function Settings() {
         restart_reason?: string;
       };
       setSaveError(null);
+      setSavedRevision((n) => n + 1);
       setNotice(res.restart_reason ?? null);
       setSaveState("saved");
       if (savedTimerRef.current !== null) window.clearTimeout(savedTimerRef.current);
@@ -602,6 +608,16 @@ export default function Settings() {
                       pane={searching ? paneTitleOf(section) : null}
                       onField={(key, value, commit) => update(section, key, value, commit)}
                       onSection={(value, commit) => updateSection(section, value, commit)}
+                      extra={
+                        section === "asr" ? (
+                          <AsrModelDownload
+                            model={String(
+                              (config as Record<string, any>)?.asr?.model ?? "",
+                            )}
+                            revision={savedRevision}
+                          />
+                        ) : undefined
+                      }
                     />
                   ))}
                   {/* Same reasoning as the Setup pane above: filesystem
@@ -756,6 +772,7 @@ function SectionCard({
   pane,
   onField,
   onSection,
+  extra,
 }: {
   name: string;
   value: Json;
@@ -767,6 +784,8 @@ function SectionCard({
   pane: string | null;
   onField: (key: string, value: Json, commit: Commit) => void;
   onSection: (value: Json, commit: Commit) => void;
+  /** Rendered after the card. Used by `asr` for the model download row. */
+  extra?: React.ReactNode;
 }) {
   const note = SECTION_NOTES[name];
   // Only a section that is itself a list carries its own reset; a section of
@@ -824,6 +843,7 @@ function SectionCard({
           <p className="empty">Unerwarteter Abschnitt.</p>
         )}
       </div>
+      {extra}
     </section>
   );
 }

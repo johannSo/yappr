@@ -59,10 +59,10 @@ export type WizardState = {
 };
 
 /// `provision::MissingModel`, unchanged across the wire.
-type MissingModel = { name: string; display: string };
+export type MissingModel = { name: string; display: string };
 
 /// `provision::setup_status`'s response shape.
-type SetupStatus = {
+export type SetupStatus = {
   ready: boolean;
   missing_prerequisites: string[];
   missing_models: MissingModel[];
@@ -72,7 +72,7 @@ type SetupStatus = {
 /// only for artifacts a `"setup-progress"` event has actually mentioned, so a
 /// model nothing has reported on yet renders as "fehlt" rather than a bar
 /// stuck at 0 %.
-type DownloadProgress = { display: string; done: number; total: number | null };
+export type DownloadProgress = { display: string; done: number; total: number | null };
 
 /// `provision::SetupProgress`, unchanged across the wire.
 type SetupProgressEvent =
@@ -93,7 +93,7 @@ function downloadStatusText(progress: DownloadProgress | undefined, installing: 
 /// step itself: the `setup-progress` listener has to outlive the step, so a
 /// user who walks on to the shortcut step mid-download does not lose the
 /// running total — the same reason it used to be scoped to the whole window.
-function useSetup() {
+export function useSetup() {
   const [status, setStatus] = useState<SetupStatus | null>(null);
   const [checkError, setCheckError] = useState<string | null>(null);
   const [installing, setInstalling] = useState(false);
