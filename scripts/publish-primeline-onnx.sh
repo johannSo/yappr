@@ -41,8 +41,14 @@ ENCODER=$(find "$TMP" -name encoder.int8.onnx -print -quit)
 SHA=$(sha256sum "$ENCODER" | cut -d' ' -f1)
 echo "  $SHA"
 
-log "creating $REPO if it does not exist"
-"$HF" repo create "$REPO" --repo-type model -y 2>/dev/null || true
+# Explicitly public. yappr downloads this URL with a plain HTTP GET and no
+# credentials -- a private repo answers 401 and every user who selects the
+# model gets a failed download, while it keeps working for whoever uploaded
+# it. That asymmetry is exactly the kind of bug that ships.
+log "creating $REPO if it does not exist (public)"
+"$HF" repo create "$REPO" --repo-type model --private false -y 2>/dev/null \
+  || "$HF" repo create "$REPO" --repo-type model -y 2>/dev/null \
+  || true
 
 cat > "$TMP/README.md" <<'EOF'
 ---
@@ -83,6 +89,31 @@ log "uploading"
 "$HF" upload "$REPO" "$TMP/README.md" README.md --repo-type model
 
 URL="https://huggingface.co/$REPO/resolve/main/$BASENAME"
+
+# Verify the way yappr will actually fetch it: anonymously. `hf upload`
+# succeeding proves only that *your* token works.
+log "verifying anonymous access"
+code=$(curl -sIL --max-time 30 "$URL" -o /dev/null -w '%{http_code}')
+if [ "$code" != "200" ]; then
+  die "HTTP $code fetching $URL without credentials.
+     If the repo is private, make it public:
+       $HF repo settings $REPO --private false
+     yappr downloads this with no token, so a private repo means every user
+     who selects this model gets a failed download."
+fi
+echo "  200 OK"
+
+# And that what is being served hashes to the pin that is about to be
+# committed. A mismatch here is a model nobody can install.
+log "verifying the served file against the pin"
+tar_check=$(mktemp -d)
+curl -sL --max-time 900 "$URL" -o "$tar_check/dl.tar.bz2" \
+  || die "could not download $URL"
+tar xjf "$tar_check/dl.tar.bz2" -C "$tar_check"
+served=$(sha256sum "$(find "$tar_check" -name encoder.int8.onnx -print -quit)" | cut -d' ' -f1)
+rm -rf "$tar_check"
+[ "$served" = "$SHA" ] || die "served file hashes to $served, expected $SHA"
+echo "  pin matches"
 
 log "done"
 cat <<EOF
