@@ -226,9 +226,11 @@ struct Prerequisite {
 /// implement, so there it is not missing, it is inapplicable -- which is why
 /// `wizard::recommended_backend` sends GNOME to `ydotool` in the first
 /// place. Reporting it anyway cost a GNOME user a `sudo pacman -S wtype`
-/// that would still type nothing, and -- because a *fatal* gap keeps
-/// `provision::is_ready` false -- a first-run wizard that reopened on every
-/// launch, forever.
+/// that would still type nothing, and -- because a *fatal* gap makes
+/// `setup_status` report the whole install as not ready -- a wizard that
+/// reopened on every launch, forever. That gap is a standing "Einrichtung
+/// unvollständig" banner rather than a reopening wizard since 2026-09-09
+/// (invariant 13); a permanent banner nobody can act on is no better.
 ///
 /// `ydotool` stays **optional** even on GNOME, where it is the only backend
 /// that works. Everywhere else that is because `wtype` is the default
@@ -438,8 +440,8 @@ mod tests {
     /// The GNOME half of `prerequisites_for`. `wtype` types through a
     /// protocol Mutter does not implement, so asking a GNOME user to install
     /// it asks for a package that will still type nothing -- and, as a
-    /// *fatal* gap, it kept `provision::is_ready` false and reopened the
-    /// first-run wizard on every launch.
+    /// *fatal* gap, it kept `setup_status` reporting the install as not
+    /// ready: a reopening wizard then, a permanent banner now.
     #[test]
     fn gnome_is_never_asked_to_install_wtype() {
         assert!(

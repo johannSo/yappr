@@ -49,7 +49,14 @@ export type WizardShortcut = {
 
 /// `wizard::build_wizard_state`'s response shape.
 export type WizardState = {
+  /** Whether the wizard opens at all: a first run, or an explicit request. */
   should_open: boolean;
+  /**
+   * `provision::setup_status`'s answer, passed through whole rather than
+   * reduced to a flag — `Settings.tsx`'s banner has to *name* the gap, and a
+   * missing package is not a missing model. See `wizard::should_open`.
+   */
+  setup: SetupStatus;
   start_step: Step;
   desktop: "hyprland" | "gnome" | "other" | "unknown";
   desktop_name: string;
@@ -68,6 +75,39 @@ export type SetupStatus = {
   missing_prerequisites: string[];
   missing_models: MissingModel[];
 };
+
+/// What to tell the user when `setup.ready` is false, naming the actual gap.
+///
+/// The wording used to blame the selected ASR model for every cause, which
+/// on a machine missing only a *package* read as "das Modell fehlt" beside a
+/// models step reporting "Alle Modelle sind vorhanden" — the contradiction
+/// that got the startup gate narrowed (`wizard::should_open`). The
+/// cause-unknown arm is `provision::status_or_assume_incomplete`'s error
+/// case: both lists empty and `ready` still false. Saying so is the point;
+/// guessing a cause is what this replaced.
+export function setupGapSummary(setup: SetupStatus): string {
+  const models = setup.missing_models.map((m) => m.display);
+  const pkgs = setup.missing_prerequisites;
+  if (models.length === 0 && pkgs.length === 0) {
+    return "Die Einrichtung ist unvollständig — die Ursache konnte nicht ermittelt werden.";
+  }
+  const parts: string[] = [];
+  if (models.length > 0) {
+    parts.push(
+      models.length === 1
+        ? `es fehlt noch das Modell ${models[0]}`
+        : `es fehlen noch die Modelle ${models.join(", ")}`,
+    );
+  }
+  if (pkgs.length > 0) {
+    parts.push(
+      pkgs.length === 1
+        ? `es fehlt noch das Programm ${pkgs[0]}`
+        : `es fehlen noch die Programme ${pkgs.join(", ")}`,
+    );
+  }
+  return `Die Einrichtung ist unvollständig — ${parts.join("; ")}. Bis dahin schlägt jedes Diktat fehl.`;
+}
 
 /// One artifact's live download progress, keyed by `MissingModel.name` — kept
 /// only for artifacts a `"setup-progress"` event has actually mentioned, so a
@@ -422,6 +462,22 @@ export function Wizard({
                 >
                   {setup.installing ? "Lädt…" : modelsDone ? "Weiter" : "Später"}
                 </button>
+                {/* A returning user reaches this step from the settings
+                    banner, for one errand: load the model. Making them walk
+                    the remaining two steps to get back is what this whole
+                    flow was just changed to stop doing. Not offered on a
+                    first run -- there is no settings form to go back to yet,
+                    and the shortcut step is the point of the exercise. */}
+                {!firstRun && (
+                  <button
+                    type="button"
+                    className="ghost"
+                    disabled={setup.installing}
+                    onClick={onOpenSettings}
+                  >
+                    Einstellungen
+                  </button>
+                )}
               </div>
             </section>
           )}

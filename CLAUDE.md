@@ -438,13 +438,42 @@ the whole lock file stops parsing. See
     custom-keybindings` *replaces* the list, so the obvious one-liner destroys
     every custom shortcut the user already had -- `desktop.rs`'s
     `GNOME_GSETTINGS_SNIPPET` reads the current value and appends, and the
-    wizard shows it rather than running it. The wizard opens when
-    `~/.local/state/yappr/wizard-done` is absent *or* `setup_status()` is not
-    ready (`src-tauri/src/wizard.rs`'s `should_open`), so a model deleted
-    after setup brings it back -- at the models step, not the welcome -- 
-    instead of surfacing as a failed dictation days later. A state file, not
-    a config key: a key would have to join a `deny_unknown_fields` struct and
-    then appear in the settings GUI as a setting nobody should touch. See
+    wizard shows it rather than running it.
+
+    **The wizard marker is the only input to whether the wizard opens** --
+    at startup and as a take-over of the settings form, one rule
+    (`wizard.rs`'s `should_open`, the `should_open` field on the wire).
+    Finished once, never again by itself, however broken the install is.
+    It briefly had a second, sufficient reason (`setup_status()` not ready),
+    and both stages of removing it are worth knowing, because the obvious
+    "surface a deleted model immediately" instinct is what put it there:
+    - **2026-09-09, first pass:** the two questions were split, because one
+      unready model had the wizard *replace* the settings window on every
+      launch, with the only way out three clicks away at the last step's
+      "Einstellungen öffnen" -- the settings window became unreachable over
+      an errand that takes one click. (That is also why the models step
+      carries an "Einstellungen" button when the marker exists.)
+    - **Same day, second pass:** `!ready` stopped opening the window at all.
+      It is false for a missing prerequisite *binary* and for a hash
+      mismatch too -- neither of which the wizard has a button for, and
+      `ydotoold` not *running* is not even checkable -- so it reopened
+      forever over gaps it could not close, while its models step said
+      "Alle Modelle sind vorhanden". Reported as exactly that
+      contradiction.
+    The warning moved rather than went away: `build_wizard_state` passes
+    `provision::setup_status`'s whole answer through as `setup`, and
+    `Settings.tsx` renders it as a banner **naming the missing packages and
+    models** (`setupGapSummary`), with the wizard one click behind it,
+    opened at the models step. `provision::status_or_assume_incomplete` is
+    that path's error case -- `ready: false` with both lists empty, which
+    the banner reports as an unknown cause rather than blaming a model it
+    never checked. Nothing else would tell the form that provisioning is
+    incomplete, and nothing pops a window for it: seeing it costs opening
+    the settings window, which is what the tray is for.
+
+    The marker is a state file, not a config key: a key would have to join a
+    `deny_unknown_fields` struct and then appear in the settings GUI as a
+    setting nobody should touch. See
     `docs/superpowers/specs/2026-08-29-first-run-wizard-design.md`.
 
 15. **A theme is chosen, so nothing may key on `prefers-color-scheme` any more —

@@ -178,7 +178,8 @@ fn invalidate_missing_models_cache() {
 /// prerequisite binaries are missing (always recomputed -- cheap `command
 /// -v` shells, not worth caching), and which models are absent or failing
 /// their pinned hash (cached; see [`missing_models_cached`]). Pulled out so
-/// `is_ready` and `setup_status` run through the exact same two checks
+/// [`status_or_assume_incomplete`] and [`setup_status`] run through the exact
+/// same two checks
 /// rather than each re-deriving them, which is how the two could go out of
 /// sync.
 fn check_missing() -> Result<(Vec<&'static str>, Vec<String>), String> {
@@ -225,26 +226,30 @@ impl Drop for InstallGuard {
     }
 }
 
-/// Whether setup is complete right now. `lib.rs`'s `setup()` runs this on a
-/// plain background thread at startup, which is currently the *only* way a
-/// first-run user ever sees the Setup pane at all: there is no tray yet
-/// (Task 12 is blocked behind a compositor probe), so nothing else would
-/// ever show the settings window on a fresh install.
-fn is_ready() -> Result<bool, String> {
-    let (missing_prerequisites, missing_models) = check_missing()?;
-    Ok(missing_prerequisites.is_empty() && missing_models.is_empty())
-}
-
-/// Blocking, best-effort convenience over [`is_ready`] for a plain
-/// background thread (not an async context) that just needs a yes/no and
-/// would rather treat "couldn't tell" as "not ready" than propagate the
-/// error further -- see `lib.rs`'s `setup()`, the one caller.
-pub(crate) fn is_ready_or_assume_not(app_ctx: &str) -> bool {
-    match is_ready() {
-        Ok(ready) => ready,
+/// [`setup_status`]'s answer for a caller with no way to report an error:
+/// the same two lists, with a failed computation reported as "not ready,
+/// cause unknown" rather than as a specific gap it never checked. The
+/// settings banner is that caller (via `wizard::build_wizard_state`), and
+/// naming the wrong cause is what it exists to stop doing -- see
+/// `wizard::should_open`'s doc comment.
+///
+/// Blocking: hashes whatever models are on disk the first time it runs per
+/// process, so never on the Tauri event-loop thread.
+pub(crate) fn status_or_assume_incomplete(app_ctx: &str) -> serde_json::Value {
+    match check_missing() {
+        Ok((missing_prerequisites, missing_models)) => {
+            build_status(missing_prerequisites, missing_models)
+        }
         Err(e) => {
             eprintln!("{app_ctx}: could not determine setup status, assuming incomplete: {e}");
-            false
+            // Deliberately not `build_status(vec![], vec![])`: that derives
+            // `ready` from the two lists and would call an *unknown* state
+            // ready. Same shape as the frontend's own catch fallback.
+            serde_json::json!({
+                "ready": false,
+                "missing_prerequisites": [],
+                "missing_models": [],
+            })
         }
     }
 }

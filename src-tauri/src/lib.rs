@@ -510,14 +510,15 @@ pub fn run() {
                     // Now that the tray (Task 12) exists, Einstellungen is
                     // always reachable -- this is a redundant safety net,
                     // not the only way in, for a first-run user who has not
-                    // yet noticed the tray icon: a one-time check, off the
-                    // event-loop thread (it hashes whatever models are
-                    // already on disk), that opens Settings for exactly the
-                    // machines that need it and does nothing on every other
-                    // run.
+                    // yet noticed the tray icon. One `stat` of the wizard
+                    // marker, off the event-loop thread because the window
+                    // is shown from here too: it opens Settings on a machine
+                    // that has never finished setup, and does nothing on
+                    // every other run, however healthy or broken the install
+                    // is (invariant 13).
                     let setup_check_handle = app.handle().clone();
                     std::thread::spawn(move || {
-                        if wizard::should_open_wizard() {
+                        if wizard::should_show_settings_at_startup() {
                             if let Some(w) = setup_check_handle.get_webview_window(SETTINGS_LABEL) {
                                 let _ = w.show();
                                 let _ = w.set_focus();

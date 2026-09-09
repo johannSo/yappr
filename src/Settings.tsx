@@ -5,7 +5,7 @@ import { applyTheme, type ConfiguredTheme } from "./theme";
 import { AnimatePresence, MotionConfig, motion } from "motion/react";
 import { Icon } from "./settings/icons";
 import { Commit, Device, Field, ResetButton, Row, TableEditor, Toggle } from "./settings/controls";
-import { Wizard, WizardState } from "./settings/wizard";
+import { setupGapSummary, Wizard, WizardState } from "./settings/wizard";
 import { AsrModelDownload } from "./settings/model-download";
 import {
   HELP,
@@ -237,9 +237,9 @@ export default function Settings() {
     };
   }, [load]);
 
-  // The window decides its own mode: `should_open` is computed from the same
-  // marker-plus-readiness rule `lib.rs`'s startup thread uses, so there is no
-  // ordering hazard between that thread and this webview's first paint.
+  // The window decides its own mode: `should_open` is the same marker check
+  // `lib.rs`'s startup thread makes, so there is no ordering hazard between
+  // that thread and this webview's first paint.
   const loadWizardState = useCallback(async (activate: boolean) => {
     try {
       const res = (await invoke("wizard_state")) as WizardState;
@@ -256,6 +256,19 @@ export default function Settings() {
   useEffect(() => {
     void loadWizardState(false);
   }, [loadWizardState]);
+
+  // Re-reads the facts *without* the activate branch. Called on the way out
+  // of the wizard: the banner below has to disappear once the model is there,
+  // and `loadWizardState` cannot be used for that -- on a first run the
+  // marker is not written until "Fertig", so it would put the user straight
+  // back into the wizard they just left.
+  const refreshWizardState = useCallback(async () => {
+    try {
+      setWizardState((await invoke("wizard_state")) as WizardState);
+    } catch (e) {
+      console.error("wizard_state failed", e);
+    }
+  }, []);
 
   // `yappr --wizard` and the tray's Einrichtung item. The state is re-read
   // rather than reused: the desktop or the backend may have changed since
@@ -488,9 +501,13 @@ export default function Settings() {
                 .catch((e) => {
                   console.error("wizard_finish failed", e);
                 });
+              void refreshWizardState();
               setWizardActive(false);
             }}
-            onOpenSettings={() => setWizardActive(false)}
+            onOpenSettings={() => {
+              void refreshWizardState();
+              setWizardActive(false);
+            }}
           />
         </main>
       </MotionConfig>
@@ -649,6 +666,29 @@ export default function Settings() {
                       }}
                     >
                       Verstanden
+                    </button>
+                  </motion.div>
+                )}
+                {/* What replaced the wizard reopening itself on every launch
+                    of an install that is not ready (invariant 13, revised
+                    2026-09-09). The warning is the same warning; it no longer
+                    stands between the user and the other forty settings, and
+                    it names its own cause -- `setup` carries both lists, so a
+                    missing package cannot read as a missing model. */}
+                {wizardState && !wizardState.setup.ready && (
+                  <motion.div
+                    key="setup-incomplete"
+                    className="banner notice"
+                    layout
+                    initial={{ opacity: 0, y: -8 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -8 }}
+                    transition={SETTLE}
+                  >
+                    <Icon name="warn" className="icon-sm" />
+                    <span>{setupGapSummary(wizardState.setup)}</span>
+                    <button type="button" className="add" onClick={() => setWizardActive(true)}>
+                      Einrichtung öffnen
                     </button>
                   </motion.div>
                 )}
