@@ -527,23 +527,20 @@ export function Wizard({
 
               <p className="note">
                 Texteingabe: <code>{state.recommended_backend}</code>
-                {state.recommended_backend === "ydotool"
-                  ? " — GNOME (Mutter) unterstützt das Protokoll nicht, über das wtype tippt."
+                {state.recommended_backend === "clipboard"
+                  ? " — GNOME (Mutter) unterstützt das Protokoll nicht, über das wtype tippt. yappr legt den Text deshalb in die Zwischenablage; einfügen musst du selbst mit Strg+V."
                   : " — braucht keine weitere Einrichtung."}
               </p>
 
-              {state.backend_prereqs.length > 0 && (
+              {state.recommended_backend === "clipboard" && (
                 <div className="card">
                   <p className="setup-command">
-                    Dafür noch nötig: <code>sudo pacman -S ydotool</code> und{" "}
-                    <code>systemctl --user enable --now ydotoold</code>. Fügt yappr danach
-                    nichts ein, fehlt meist der Zugriff auf <code>/dev/uinput</code>.
-                  </p>
-                  <p className="setup-command">
-                    Kommt <em>nur in Terminals</em> nichts an, ist es etwas anderes: yappr
-                    kann unter GNOME die Fensterklasse nicht ermitteln und drückt deshalb
-                    Strg+V statt Strg+Umschalt+V. Dann unter Allgemein → Texteingabe die
-                    Einfüge-Tastenkombination fest auf <code>ctrl_shift_v</code> stellen.
+                    Automatisch einfügen geht trotzdem, aber nur mit einem eigenen Skript:
+                    unter Allgemein → Texteingabe das Verfahren auf <code>script</code> stellen
+                    und bei <em>Einfüge-Skript</em> den Pfad eintragen. yappr ruft es mit dem
+                    fertigen Text als erstem Argument auf (<code>$1</code>); alles Weitere —
+                    Zwischenablage, Tastenkombination, Fenstererkennung — macht das Skript
+                    selbst.
                   </p>
                 </div>
               )}

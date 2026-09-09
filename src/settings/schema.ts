@@ -101,10 +101,9 @@ export const LABELS: Record<string, string> = {
   "guardrail.ngram_size": "N-Gramm-Größe",
   "guardrail.ngram_max_repeats": "Maximale N-Gramm-Wiederholungen",
   "inject.backend": "Verfahren",
+  "inject.script": "Einfüge-Skript",
   "inject.trailing_space": "Leerzeichen anhängen",
   "inject.keystroke_delay_ms": "Tastenverzögerung",
-  "inject.terminal_classes": "Terminal-Fensterklassen",
-  "inject.paste_chord": "Einfüge-Tastenkombination",
   "vocabulary.enabled": "Vokabular aktiv",
   "vocabulary.terms": "Begriffe",
   "vocabulary.replacements": "Feste Ersetzungen",
@@ -185,15 +184,13 @@ export const HELP: Record<string, string> = {
   "guardrail.ngram_max_repeats":
     "Wie oft dieselbe Wortfolge vorkommen darf, bevor die Fassung als Schleife verworfen wird.",
   "inject.backend":
-    "wtype tippt den Text Zeichen für Zeichen ins Fenster und braucht keine Einrichtung. ydotool legt ihn per wl-copy in die Zwischenablage und drückt einmal Strg+V (in Terminals Strg+Umschalt+V) — layoutunabhängig, Umlaute und ß kommen richtig an, und es erreicht auch Fenster, in denen wtype nichts bewirkt; setzt aber einen laufenden ydotoold voraus. clipboard legt ihn nur in die Zwischenablage, einfügen musst du selbst.",
+    "wtype tippt den Text Zeichen für Zeichen ins Fenster und braucht keine Einrichtung — unter GNOME (Mutter) bewirkt es allerdings nichts. script übergibt den fertigen Text als erstes Argument an ein eigenes Programm, das dann selbst entscheidet, wie es ihn einfügt. clipboard legt ihn nur in die Zwischenablage, einfügen musst du selbst.",
+  "inject.script":
+    "Pfad zu dem Programm, das das script-Verfahren aufruft. Es bekommt den fertigen Text als erstes und einziges Argument ($1) und ist danach für alles zuständig: Zwischenablage, Tastenkombination, Fenstererkennung. Muss ausführbar sein; ~ wird aufgelöst. Beispiel: ~/bin/paste.sh. Schlägt es fehl oder ist hier nichts eingetragen, landet der Text wie beim clipboard-Verfahren in der Zwischenablage.",
   "inject.trailing_space":
     "Hängt ein Leerzeichen an, damit das nächste Diktat nicht am vorherigen klebt.",
   "inject.keystroke_delay_ms":
     "Pause zwischen zwei simulierten Tastenanschlägen. Höher setzen, wenn ein Fenster Zeichen verschluckt. Nur das wtype-Verfahren tippt Zeichen für Zeichen; die anderen ignorieren das.",
-  "inject.paste_chord":
-    "Welche Tastenkombination das ydotool-Verfahren zum Einfügen drückt. automatisch entscheidet pro Fenster: Strg+Umschalt+V, wenn die Fensterklasse in der Terminal-Liste steht, sonst Strg+V. Dafür muss yappr die Klasse des Zielfensters kennen, und die liefert nur hyprctl. Unter GNOME gibt es hyprctl nicht, unter Hyprland fehlt es, wenn HYPRLAND_INSTANCE_SIGNATURE nicht in der Umgebung des Dienstes steht — dann wird immer Strg+V gedrückt, das jedes Terminal ignoriert: Der Text liegt in der Zwischenablage, im Terminal erscheint aber nichts. Wenn du in Terminals diktierst und automatisch nicht greift, stell hier fest auf Strg+Umschalt+V.",
-  "inject.terminal_classes":
-    "Fensterklassen, in denen das ydotool-Verfahren mit Strg+Umschalt+V einfügt statt Strg+V — Terminals reservieren Strg+V für das Programm darin. Groß-/Kleinschreibung spielt keine Rolle.",
   "vocabulary.enabled":
     "Korrigiert Fachbegriffe und Namen schon im Erkennungstext, bevor die Nachbearbeitung ihn zu sehen bekommt.",
   "vocabulary.terms":
@@ -243,8 +240,7 @@ export const ENUMS: Record<string, string[]> = {
     "parakeet-unified-en",
     "nemotron-3.5",
   ],
-  "inject.backend": ["wtype", "ydotool", "clipboard"],
-  "inject.paste_chord": ["auto", "ctrl_v", "ctrl_shift_v"],
+  "inject.backend": ["wtype", "script", "clipboard"],
   "style_default.styling": ["casual", "semi-casual", "semi-formal", "formal"],
   "style_default.structure": ["prose", "lists"],
   "style_default.context": ["general", "email"],
@@ -321,6 +317,12 @@ export const COLUMN_LABELS: Record<string, string> = {
 export const OBSOLETE_FIELDS = new Set([
   "normalize.port",
   "normalize.llama_server_path",
+  // Retired with the ydotool backend on 2026-09-09. Rust still accepts both
+  // keys so a pre-existing config.toml loads (invariant 4) and still sends
+  // them over the wire (`skip_serializing` is TOML-only), but nothing reads
+  // them: a script picks its own paste chord. They are not settings.
+  "inject.paste_chord",
+  "inject.terminal_classes",
 ]);
 
 /// Only an ordering hint: a key missing from this table still renders, after
@@ -329,7 +331,7 @@ export const OBSOLETE_FIELDS = new Set([
 export const FIELD_ORDER: Record<string, string[]> = {
   audio: ["device", "max_seconds", "vad_padding_ms"],
   asr: ["model", "language", "num_threads"],
-  inject: ["backend", "trailing_space", "keystroke_delay_ms"],
+  inject: ["backend", "script", "trailing_space", "keystroke_delay_ms"],
   normalize: ["enabled", "timeout_ms", "context_size", "threads"],
   guardrail: [
     "min_word_ratio",
