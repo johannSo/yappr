@@ -190,20 +190,22 @@ pub struct InjectDebug {
     pub backend: String,
     pub final_text: String,
     /// The target window's class as captured at recording start, or `null`
-    /// when `hyprctl` could not answer. `#[serde(default)]` so records
+    /// when no provider could name it. `#[serde(default)]` so records
     /// written before this field existed still deserialize.
     ///
-    /// Present because its absence made a real bug undiagnosable: the
-    /// ydotool backend picks Ctrl+V vs Ctrl+Shift+V from this value, and
+    /// Added because its absence made a real bug undiagnosable: the retired
+    /// ydotool backend picked Ctrl+V vs Ctrl+Shift+V from this value, and
     /// with it missing there was no way to tell, after the fact, whether a
-    /// dictation that produced no text in a terminal had been sent the
-    /// wrong chord.
+    /// dictation that produced no text in a terminal had been sent the wrong
+    /// chord. No injector reads it since 2026-09-09 -- a paste script asks
+    /// its own desktop -- but the per-window style rules still resolve
+    /// against it, so it stays a real diagnostic.
     ///
     /// Deliberately *not* `skip_serializing_if`, unlike the two fields
-    /// below: an omitted key would make "the class was unknown -- this is
-    /// the bug" byte-identical to a record written before the field
-    /// existed, which is precisely the distinction it was added to draw.
-    /// A written `null` is the diagnosis.
+    /// below: an omitted key would make "the class was unknown" byte-
+    /// identical to a record written before the field existed, which is
+    /// precisely the distinction it was added to draw. A written `null` is
+    /// the diagnosis.
     #[serde(default)]
     pub window_class: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -361,13 +363,13 @@ pub fn latest_record_path(logs_dir: &Path) -> Result<PathBuf> {
 mod tests {
     #[test]
     fn an_unknown_window_class_is_written_as_null_not_omitted() {
-        // The whole diagnostic value of this field is telling "hyprctl
-        // could not answer, and that is why nothing pasted into your
-        // terminal" apart from "this record predates the field". Skipping
-        // the key when it is `None` would make those two byte-identical,
-        // which is exactly the question the field was added to answer.
+        // The whole diagnostic value of this field is telling "no provider
+        // could name the focused window" apart from "this record predates
+        // the field". Skipping the key when it is `None` would make those
+        // two byte-identical, which is exactly the question the field was
+        // added to answer.
         let rec = InjectDebug {
-            backend: "ydotool".to_string(),
+            backend: "script".to_string(),
             final_text: "hallo ".to_string(),
             window_class: None,
             primary_backend: None,

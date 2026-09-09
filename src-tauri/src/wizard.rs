@@ -175,7 +175,7 @@ pub(crate) fn backend_patch(backend: &str) -> serde_json::Value {
 /// from `wizard_state`'s `start_step` and passes it explicitly, rather than
 /// having this re-derive it -- a marker written moments earlier in the same
 /// click would otherwise change the answer). On a re-run it is `None`, so a
-/// user who deliberately switched to `ydotool` on Hyprland to reach an
+/// user who deliberately switched to `script` on Hyprland to reach an
 /// XWayland window does not have that undone by a wizard they reopened for
 /// another reason.
 ///

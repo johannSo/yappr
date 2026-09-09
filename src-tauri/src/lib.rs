@@ -126,7 +126,7 @@ pub(crate) fn show_settings_window(app: &tauri::AppHandle) {
         // unrelated toggle -- and the writer behind its back is in this
         // app, not outside it: `wizard::wizard_finish` patches
         // `inject.backend` through `set_config`, which on GNOME is the
-        // difference between a working `ydotool` and a `wtype` that types
+        // difference between a working injector and a `wtype` that types
         // nothing at all. Re-reading on every reveal is the only moment an
         // already-mounted window can learn the file moved on.
         //
@@ -168,7 +168,7 @@ const FOCUS_RETURN_DELAY: std::time::Duration = std::time::Duration::from_millis
 /// GNOME/Mutter it is routinely true, because `focusable: false` reaches
 /// GTK's `accept_focus` -- an X11 mechanism with no Wayland counterpart --
 /// and Mutter focuses the freshly mapped toplevel. A focus-following
-/// injector (ydotool via uinput, and wtype alike) would then type the
+/// injector (wtype, and any paste script that presses keys) would then type the
 /// transcript into the overlay itself.
 fn overlay_hijacks_injection(event: &OverlayEvent, overlay_focused: bool) -> bool {
     overlay_focused && matches!(event, OverlayEvent::Injecting)
@@ -747,7 +747,7 @@ mod tests {
     fn a_focused_overlay_hijacks_injection_only_at_the_injecting_event() {
         // Invariant 2's failure mode on GNOME/Mutter: no layer-shell, so the
         // overlay toplevel takes keyboard focus and a focus-following
-        // injector (ydotool via uinput, wtype alike) types the transcript
+        // injector (wtype, and any paste script that presses keys) types the transcript
         // into the overlay itself. The moment that matters is Injecting.
         assert!(overlay_hijacks_injection(&OverlayEvent::Injecting, true));
         assert!(!overlay_hijacks_injection(&OverlayEvent::Injecting, false));

@@ -286,7 +286,7 @@ pub fn window_class() -> Option<String> {
             status = %out.status,
             output = %stdout.trim(),
             "hyprctl activewindow failed; no target window class -- \
-             style rules and the ydotool paste chord will fall back to their defaults"
+             per-application style rules will fall back to their defaults"
         );
         return None;
     }
@@ -294,12 +294,12 @@ pub fn window_class() -> Option<String> {
     if class.is_none() {
         // Exit 0 and still no class: `hyprctl` answers `{}` when nothing is
         // focused. Downstream that `None` is indistinguishable from the
-        // failure arm above, and `inject::wants_shift` reads either as "not
-        // a terminal" -- so both say so, where the actual output is in hand.
+        // failure arm above, and `style::resolve` reads either as "no rule
+        // matched" -- so both say so, where the actual output is in hand.
         tracing::warn!(
             output = %stdout.trim(),
             "hyprctl activewindow returned no parseable class; \
-             style rules and the ydotool paste chord will fall back to their defaults"
+             per-application style rules will fall back to their defaults"
         );
     }
     class

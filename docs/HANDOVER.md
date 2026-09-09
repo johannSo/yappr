@@ -499,3 +499,43 @@ Pre-existing flake found while running the gate, unrelated to this change:
   even execute under `--ignored`), but worth knowing before the next person
   reads a red gate as a regression. The fix is a deadline that is not
   wall-clock, or serialising the model-loading tests.
+
+---
+
+## Added after this letter: the `script` backend replaces `ydotool` (2026-09-09)
+
+**The `ydotool` injector documented above no longer exists.** `[inject] backend` now
+accepts `"wtype"`, `"script"` and `"clipboard"`; `"ydotool"` survives only as a read-only
+serde alias for `"script"`, so a pre-existing `config.toml` still loads (invariant 4 — an
+unrecognised value would have `server::start` quarantine the user's only settings file)
+and the next save rewrites it. The entries above are left as written: they are a dated
+record of what was true then, and the "not verified on hardware" note in particular is
+still the honest state of that backend — it was retired without ever having been proven
+on this machine.
+
+What replaced it: `[inject] script` names an executable, and `ScriptInjector` runs it with
+the finished transcript as `argv[1]` and nothing else — no pre-copy to the clipboard, no
+environment of its own, no paste chord. The chord is what killed the old backend: it
+needed the focused window's class, every provider can answer `None`, and an unknown class
+meant a plain Ctrl+V that terminals ignore — from a `ydotool` that exited 0, so nothing
+failed, no fallback notification fired, and the user simply got no text.
+
+`[inject] paste_chord` and `[inject] terminal_classes` are accepted-and-ignored keys now,
+on the `[normalize] port` precedent: `#[serde(skip_serializing)]` and hidden by
+`schema.ts`'s `OBSOLETE_FIELDS`. GNOME's recommended backend is `clipboard`, and
+`prerequisites_for` no longer checks for `ydotool` on any desktop —
+`wizard::backend_prereqs` returns an empty list everywhere and its wizard card is gone.
+
+- `cargo test --workspace`: **473 passed, 0 failed, 11 ignored.** `cargo clippy
+  --workspace --all-targets`: clean. `bun run build`: clean.
+- `crates/yappr-core/examples/paste_probe.rs` is replaced by `script_probe.rs`: it runs
+  the configured script for one line of text and prints the program, its `argv[1]` and
+  the outcome. There is no chord left to probe.
+- **Not verified on hardware, and this is the one to know.** The script path has been
+  exercised end to end against shell fixtures only — argv shape, non-zero exit, missing
+  file, tilde expansion, and (invariant 6) a script that backgrounds a grandchild holding
+  its stdout open, which is what a clipboard-restoring paste script does on every run.
+  Nobody has yet dictated into a real window through a real paste script. The reference
+  script the design was built against is the user's `handy-paste.sh`, which needs GNOME's
+  "Window Calls Extended" extension and a running `ydotoold`; neither is present on this
+  Arch/Hyprland machine.

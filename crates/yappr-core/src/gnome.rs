@@ -29,7 +29,7 @@
 //! startup succeeds, so the class is correct for whatever window was focused
 //! then and silently frozen from that moment on. Dictation keeps working in
 //! that one window and stops working everywhere else, with no error at all --
-//! `ydotool` exits 0 whichever chord it pressed.
+//! a paste script exits 0 whichever chord it pressed.
 //!
 //! A full sweep costs about 7 ms here (median of 10, same session), and its
 //! cost grows with the number of running applications, since it walks them.
@@ -116,7 +116,7 @@ pub fn start_tracking() {
         .spawn(|| futures_lite::future::block_on(poll_forever()));
     if let Err(e) = spawned {
         tracing::warn!(error = %e, "could not spawn the focus poller; \
-             the ydotool paste chord and style rules will fall back to their defaults");
+             per-application style rules will fall back to their defaults");
     }
 }
 
@@ -180,9 +180,9 @@ async fn accessible(
 /// The application owning whichever window currently holds focus.
 ///
 /// Walks applications, then their windows, stopping at the first whose state
-/// carries `Active`. The *application's* name is what
-/// `[inject] terminal_classes` is matched against -- `ptyxis`,
-/// `gnome-text-editor` -- not the window's own name, which is its title.
+/// carries `Active`. The *application's* name is what a paste script's own
+/// terminal list is matched against -- `ptyxis`, `gnome-text-editor` -- not
+/// the window's own name, which is its title.
 async fn active_app(conn: &AccessibilityConnection) -> Result<Option<String>, atspi::AtspiError> {
     let root = AccessibleProxy::builder(conn.connection())
         .destination("org.a11y.atspi.Registry")?

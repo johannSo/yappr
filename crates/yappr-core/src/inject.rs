@@ -443,6 +443,45 @@ mod tests {
         InjectConfig { script: path.display().to_string(), ..InjectConfig::default() }
     }
 
+    /// `ScriptInjector::inject`, retrying only on `ETXTBSY`.
+    ///
+    /// Exec'ing a script this process wrote moments ago races every *other*
+    /// thread in the same process that is spawning a child: between a
+    /// sibling's `fork` and its `exec`, that child holds an inherited
+    /// (`O_CLOEXEC`, but not yet closed) write descriptor on our fresh file,
+    /// and the kernel answers our exec with `ETXTBSY`. It is transient,
+    /// microseconds wide, and entirely an artifact of writing the fixture
+    /// in-process -- `cargo test --workspace` runs enough subprocess tests
+    /// beside these to hit it perhaps one run in ten.
+    ///
+    /// Retried here rather than in `ScriptInjector` on purpose: a real user's
+    /// paste script is not being rewritten while yappr runs it, so absorbing
+    /// this in production code would only hide a genuinely broken script
+    /// behind a delay. `ENOENT` and every other spawn failure are returned
+    /// untouched, which is what
+    /// `a_missing_script_file_is_a_spawn_error_not_a_panic` pins.
+    fn inject_script(
+        cfg: &InjectConfig,
+        text: &str,
+        class: Option<&str>,
+    ) -> Result<(), InjectError> {
+        /// `ETXTBSY` on Linux. Spelled out rather than pulled from `libc`,
+        /// which this crate does not depend on.
+        const ETXTBSY: i32 = 26;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let out = ScriptInjector::new(cfg).inject(text, class);
+            let busy = matches!(
+                &out,
+                Err(InjectError::Spawn { source, .. }) if source.raw_os_error() == Some(ETXTBSY)
+            );
+            if !busy || std::time::Instant::now() >= deadline {
+                return out;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
     #[test]
     fn mock_injector_records_what_it_was_given() {
         let m = MockInjector::default();
@@ -606,7 +645,7 @@ mod tests {
 printf '%s' "$1" > "$(dirname "$0")/arg1""#,
         );
 
-        ScriptInjector::new(&script_cfg(&path)).inject("hallo welt", Some("kitty")).unwrap();
+        inject_script(&script_cfg(&path), "hallo welt", Some("kitty")).unwrap();
 
         assert_eq!(std::fs::read_to_string(dir.join("count")).unwrap(), "1");
         assert_eq!(std::fs::read_to_string(dir.join("arg1")).unwrap(), "hallo welt");
@@ -622,7 +661,7 @@ printf '%s' "$1" > "$(dirname "$0")/arg1""#,
         // obvious wrong turn, and it would break on this input.
         let (dir, path) = script_fixture("dash", r#"printf '%s' "$1" > "$(dirname "$0")/arg1""#);
 
-        ScriptInjector::new(&script_cfg(&path)).inject("-n --version", None).unwrap();
+        inject_script(&script_cfg(&path), "-n --version", None).unwrap();
 
         assert_eq!(std::fs::read_to_string(dir.join("arg1")).unwrap(), "-n --version");
         let _ = std::fs::remove_dir_all(&dir);
@@ -657,7 +696,7 @@ printf '%s' "$1" > "$(dirname "$0")/arg1""#,
 exit 3"#,
         );
 
-        let err = ScriptInjector::new(&script_cfg(&path)).inject("hallo", None).unwrap_err();
+        let err = inject_script(&script_cfg(&path), "hallo", None).unwrap_err();
 
         assert!(matches!(err, InjectError::Failed { .. }), "expected Failed, got {err:?}");
         assert!(err.to_string().contains("no uinput"), "stderr must survive into the error: {err}");
@@ -686,7 +725,7 @@ exit 3"#,
         let (dir, path) = script_fixture("grandchild", "sleep 30 &\nexit 0");
 
         let started = std::time::Instant::now();
-        ScriptInjector::new(&script_cfg(&path)).inject("hallo", None).unwrap();
+        inject_script(&script_cfg(&path), "hallo", None).unwrap();
 
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),

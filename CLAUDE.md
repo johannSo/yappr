@@ -8,15 +8,16 @@ Press-to-start, press-to-stop dictation for Hyprland/Wayland. Press `SUPER+D`, s
 press `SUPER+D` again; the audio is captured, VAD-trimmed, transcribed (one of several
 `sherpa-onnx` models, chosen by `[asr] model`; Parakeet TDT 0.6b v3 by default),
 rewritten by S1-mini (llama.cpp, in-process), checked by a guardrail, and
-typed into the focused window with `wtype` (or `ydotool` — a *paste* backend since
-2026-09-02: wl-copy plus one layout-independent ydotool Ctrl+V, Ctrl+Shift+V when the
-target window's class is in `[inject] terminal_classes`; the transcript stays in the
-clipboard afterwards — if `[inject] backend` selects it). Fully local at
-dictation time. `SUPER+ALT+D`
+typed into the focused window with `wtype` (or, if `[inject] backend` selects it,
+handed to a *user-supplied script* — a `script` backend since 2026-09-09, replacing the
+`ydotool` one: yappr runs `[inject] script` with the finished transcript as `$1` and
+passes nothing else, so the script owns the clipboard, the paste chord and any window
+detection; a failure of any kind falls back to the clipboard, per invariant 1). Fully
+local at dictation time. `SUPER+ALT+D`
 cancels a recording in progress; nothing else can end one deliberately — see invariant 11.
-The Ctrl+V/Ctrl+Shift+V choice can be forced with `[inject] paste_chord`
-(`auto` default / `ctrl_v` / `ctrl_shift_v`), because `auto` needs a window class it
-cannot always get — see the window-class gotcha at the bottom of this file.
+`[inject] paste_chord` and `[inject] terminal_classes` still load, but nothing reads
+them: choosing a chord needed a window class yappr cannot always get, which is what
+retired the old backend — see the window-class gotcha at the bottom of this file.
 
 yappr is one binary, `yappr`, and one process. Running it with no
 arguments starts everything: a tray icon (no window), the Unix socket, the models, and
@@ -75,8 +76,12 @@ cargo clippy --workspace --all-targets    # kept clean
 # Exercising things without a microphone
 cargo run -p yappr -- --replay src-tauri/fixtures/replay-full.ndjson
 cargo run -p yappr-core --example list_devices
-cargo run -p yappr-core --example paste_probe -- "hi" ctrl_shift_v  # injection only, no mic
-#   ^ presses real keys into the focused window; prints the class and the chord it chose.
+cargo run -p yappr-core --example script_probe -- "hi"                    # injection only, no mic
+cargo run -p yappr-core --example script_probe -- "hi" ~/bin/paste.sh    # override the path
+#   ^ runs your real paste script, which presses real keys into the focused window and
+#     will replace your clipboard; prints the program, its argv[1] and what it exited
+#     with. Replaced `paste_probe` on 2026-09-09 -- yappr no longer chooses a chord, so
+#     there is no chord left to probe.
 cargo run --release -p yappr -- --bench   # ASR latency table
 
 # Runtime inspection / control (against a running instance)
@@ -235,7 +240,7 @@ the whole lock file stops parsing. See
    cleanup of it). See `pipeline.rs`'s module doc and spec §15. Never add a path that can
    lose a transcribed utterance.
 2. **The overlay must never take keyboard focus** — a focused overlay means the injector
-   (`wtype` and `ydotool` alike — both follow keyboard focus) types the dictation into
+   (`wtype`, and any paste script that presses keys — both follow keyboard focus) types the dictation into
    the overlay instead of the target window. Enforcement is per-compositor, and only the
    layer-shell mechanism is airtight:
    - The **overlay** always carries Tauri's `focus: false` / `focusable: false`
@@ -311,8 +316,14 @@ the whole lock file stops parsing. See
    child that forks a daemon (`wl-copy` does, on every successful copy) leaves a
    grandchild holding the pipes open, and `read_to_end` on that blocked the pipeline
    thread at `INJECTING` until the clipboard was next replaced — the ydotool paste
-   backend never reached `ydotool` at all. Pinned by
-   `a_child_that_exits_but_leaves_a_grandchild_holding_its_pipes_does_not_block`.
+   backend never reached `ydotool` at all. This is now the *script* backend's ordinary
+   case, not a corner one: a paste script that restores the previous clipboard does it
+   from a backgrounded `nohup … &`, so the grandchild is there on every successful
+   dictation. Pinned twice:
+   `a_child_that_exits_but_leaves_a_grandchild_holding_its_pipes_does_not_block` in
+   `procutil.rs`, and
+   `a_paste_script_that_backgrounds_its_clipboard_restore_does_not_block` in
+   `inject.rs`.
 7. **Debug records are written from `DebugRecordGuard`'s `Drop`**, not at each return point,
    so a `?` added anywhere in `process_with_capture` still produces a record.
 8. **Capitalisation and terminal punctuation are applied at one choke point**
@@ -692,15 +703,21 @@ the whole lock file stops parsing. See
   script repacks the AppImage in place with the 256×256 at the root (the AppImage spec's
   recommended `.DirIcon` size), reusing the original runtime; verified 2026-09-01. The
   release CI runs it after `tauri build` — a locally built AppImage needs it run by hand.
-- **Every way a window-class provider can fail collapses to the same `None`, and that
-  silently changes the ydotool paste chord.** `winclass::active_window_class()` is the
-  *only* source of the target window's class, and `inject::wants_shift` reads `None` as
-  "not a terminal" — so the ydotool backend presses plain Ctrl+V, which every
-  terminal ignores. `ydotool` then exits 0, so `inject_with_recovery` records
-  success, no clipboard-fallback notification fires, and the user sees a dictation
-  that produced no text. Measured against Hyprland 0.56.2 on 2026-09-07, the three
-  ways to get that `None` are **not** interchangeable and only one of them is a
-  clean exit:
+- **Every way a window-class provider can fail collapses to the same `None`, and the
+  per-application style rules then fall back to their defaults.**
+  `winclass::active_window_class()` is the *only* source of the target window's class,
+  and since 2026-09-09 `style::resolve` is its only consumer — a `None` means no
+  `[[style_rules]]` entry matches and S1-mini is prompted with `[style_default]`
+  instead. That is a quiet wrong-tone, not a lost dictation.
+
+  It used to be much worse, and the table below is the measurement that retired the
+  ydotool backend: `inject::wants_shift` read `None` as "not a terminal", so yappr
+  pressed plain Ctrl+V, which every terminal ignores — and `ydotool` exited 0, so
+  `inject_with_recovery` recorded success, no clipboard-fallback notification fired,
+  and the user saw a dictation that produced no text. yappr no longer chooses a chord
+  at all; a paste script asks its own desktop. Measured against Hyprland 0.56.2 on
+  2026-09-07, the three ways to get that `None` are **not** interchangeable and only
+  one of them is a clean exit:
 
   | Situation | stdout | exit |
   |---|---|---|
@@ -717,11 +734,12 @@ the whole lock file stops parsing. See
   once per dictation forever, for every user, including the majority on `wtype` for
   whom the class changes nothing.
 
-  GNOME used to be the case that mattered most — it is the desktop the ydotool backend
-  exists for, `wtype` does nothing there, and `hyprctl` can never exist on it — so
-  `auto` could never work. Since 2026-09-08 it can: `gnome.rs` answers from the
-  accessibility bus, which needs no extension and no gsetting, and
-  `winclass::active_window_class` falls back to it when `hyprctl` cannot be run.
+  GNOME used to be the case that mattered most — `wtype` does nothing there and
+  `hyprctl` can never exist on it, so the chord's `auto` could never work. Since
+  2026-09-08 the class is answerable there: `gnome.rs` answers from the accessibility
+  bus, which needs no extension and no gsetting, and `winclass::active_window_class`
+  falls back to it when `hyprctl` cannot be run. That provider now serves the style
+  rules rather than a chord, but it is the same code and the same failure modes.
 
   Read that module's header before touching it. Two things there are not guessable.
   **AT-SPI delivers no `window:activate` events on this desktop** -- registration
@@ -735,11 +753,12 @@ the whole lock file stops parsing. See
   answer has to be already in hand.
 
   `InjectDebug` still records `window_class` (written as `null` rather than omitted,
-  so "unknown" is distinguishable from "old record"), and `[inject] paste_chord` still
-  forces the chord for setups that can never answer — an Electron or Qt app that
-  registers with no accessibility bus is exactly such a setup. Verified by reading
-  `/dev/input/event*` (the `ydotoold virtual device`) while firing the chord, and end
-  to end in kitty, ghostty and foot.
+  so "unknown" is distinguishable from "old record"), which is how you tell a style
+  rule that did not fire from one that fired wrong. An Electron or Qt app that
+  registers with no accessibility bus is the setup that still answers `None` on GNOME.
+  The chord measurements this note used to end on — `/dev/input/event*` reads of the
+  `ydotoold virtual device`, verified end to end in kitty, ghostty and foot — belong
+  to the retired backend and are kept only in git history.
 - **Do not trust `cpal`'s advertised sample-rate range.** It advertised 16 kHz on hardware
   that rejected the stream build; `capture.rs` now probes by building a throwaway stream and
   falls back to 48 kHz plus `rubato` resampling.
