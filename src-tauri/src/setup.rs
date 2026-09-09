@@ -96,14 +96,14 @@ fn print_debug_summary(
     match &record.inject {
         Some(i) => {
             println!("  final text ({}): {:?}", i.backend, i.final_text);
-            // The ydotool backend picks its paste chord from this, so an
+            // The per-application style rules resolve against this, so an
             // unknown class is a diagnosis, not a missing detail -- say so
             // rather than printing nothing.
             match &i.window_class {
                 Some(c) => println!("  target window class: {c:?}"),
                 None => println!(
-                    "  target window class: (unknown -- hyprctl could not answer; \
-                     the ydotool backend pasted with plain Ctrl+V)"
+                    "  target window class: (unknown -- no provider could name the \
+                     focused window; style rules used their defaults)"
                 ),
             }
             if let Some(err) = &i.primary_error {
@@ -223,23 +223,25 @@ struct Prerequisite {
 ///
 /// Desktop-dependent for exactly one reason: **`wtype` cannot work on
 /// GNOME.** It types through the virtual-keyboard protocol Mutter does not
-/// implement, so there it is not missing, it is inapplicable -- which is why
-/// `wizard::recommended_backend` sends GNOME to `ydotool` in the first
-/// place. Reporting it anyway cost a GNOME user a `sudo pacman -S wtype`
-/// that would still type nothing, and -- because a *fatal* gap makes
-/// `setup_status` report the whole install as not ready -- a wizard that
-/// reopened on every launch, forever. That gap is a standing "Einrichtung
-/// unvollständig" banner rather than a reopening wizard since 2026-09-09
-/// (invariant 13); a permanent banner nobody can act on is no better.
+/// implement, so there it is not missing, it is inapplicable. Reporting it
+/// anyway cost a GNOME user a `sudo pacman -S wtype` that would still type
+/// nothing, and -- because a *fatal* gap makes `setup_status` report the
+/// whole install as not ready -- a wizard that reopened on every launch,
+/// forever. That gap is a standing "Einrichtung unvollständig" banner rather
+/// than a reopening wizard since 2026-09-09 (invariant 14); a permanent
+/// banner nobody can act on is no better.
 ///
-/// `ydotool` stays **optional** even on GNOME, where it is the only backend
-/// that works. Everywhere else that is because `wtype` is the default
-/// injector and needs no setup, so a machine without `ydotool` is fully
-/// working and listing it would put a package almost nobody needs into the
-/// "install these" list. On GNOME it is because making it fatal would
-/// recreate exactly the never-ready loop above: it also needs `ydotoold`
-/// running, which no `pacman -S` line can report. The wizard states that
-/// requirement separately instead, unit and all -- `wizard::backend_prereqs`.
+/// `ydotool` was on this list, optional, until 2026-09-09. It is not
+/// replaced by a check for the script backend's program: `[inject] script`
+/// names a file the user writes themselves, and reporting its absence as a
+/// missing prerequisite would put a permanent gap on every install that has
+/// not opted into a backend almost nobody uses -- exactly the never-ready
+/// loop above, wearing different clothes. `ScriptInjector` reports a missing
+/// script when it is actually asked to run one, and the clipboard fallback
+/// carries the transcript meanwhile (invariant 1).
+///
+/// `wl-copy` is fatal everywhere, and on GNOME it now carries the whole of
+/// injection rather than only the fallback.
 fn prerequisites_for(d: &Desktop) -> Vec<Prerequisite> {
     let gnome = matches!(d, Desktop::Gnome);
     let mut checks = Vec::new();
@@ -256,16 +258,6 @@ fn prerequisites_for(d: &Desktop) -> Vec<Prerequisite> {
         why: "clipboard fallback when typing fails",
         pkg: "wl-clipboard",
         fatal: true,
-    });
-    checks.push(Prerequisite {
-        bin: "ydotool",
-        why: if gnome {
-            "pasting via /dev/uinput -- the only backend Mutter supports"
-        } else {
-            "pasting via /dev/uinput when inject.backend = \"ydotool\""
-        },
-        pkg: "ydotool",
-        fatal: false,
     });
     checks.push(Prerequisite {
         bin: "hyprctl",
@@ -466,16 +458,52 @@ mod tests {
         }
     }
 
-    /// Dropping `wtype` on GNOME must not drop anything beside it -- and
-    /// `ydotool`, the only backend that works there, stays optional on
-    /// purpose (see `prerequisites_for`'s doc comment: it also needs
-    /// `ydotoold`, so a fatal entry would restore the never-ready loop).
+    /// Dropping `wtype` on GNOME must not drop anything beside it.
     #[test]
     fn gnome_still_checks_everything_else_with_the_same_severities() {
         let checks = prerequisites_for(&Desktop::Gnome);
         assert!(checks.iter().any(|c| c.bin == "wl-copy" && c.fatal));
-        assert!(checks.iter().any(|c| c.bin == "ydotool" && !c.fatal));
         assert!(checks.iter().any(|c| c.bin == "hyprctl" && !c.fatal));
+    }
+
+    /// Nothing yappr can install makes injection work on GNOME, so nothing
+    /// is listed for it.
+    ///
+    /// `ydotool` was here as an optional entry until 2026-09-09 -- optional
+    /// because making it fatal would have made `setup_status` report every
+    /// GNOME install as not ready forever (`ydotoold` also has to be
+    /// *running*, which no package check can see). With the backend retired
+    /// the entry has no meaning at all: a user's own paste script is not a
+    /// package, and its absence is not a gap yappr can name.
+    #[test]
+    fn no_desktop_checks_for_ydotool_any_more() {
+        for d in [
+            Desktop::Gnome,
+            Desktop::Hyprland,
+            Desktop::Other("sway".to_string()),
+            Desktop::Unknown,
+        ] {
+            let checks = prerequisites_for(&d);
+            assert!(!checks.iter().any(|c| c.bin == "ydotool"), "{d:?} still checks for ydotool");
+        }
+    }
+
+    /// `wl-copy` is fatal on every desktop, and on GNOME it is now the whole
+    /// of injection rather than a fallback.
+    #[test]
+    fn wl_copy_is_required_everywhere() {
+        for d in [
+            Desktop::Gnome,
+            Desktop::Hyprland,
+            Desktop::Other("sway".to_string()),
+            Desktop::Unknown,
+        ] {
+            let checks = prerequisites_for(&d);
+            assert!(
+                checks.iter().any(|c| c.bin == "wl-copy" && c.fatal),
+                "{d:?} does not require wl-copy"
+            );
+        }
     }
 
     #[test]

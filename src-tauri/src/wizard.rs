@@ -62,33 +62,38 @@ pub(crate) fn write_marker(path: &Path) -> std::io::Result<()> {
     std::fs::write(path, b"")
 }
 
-/// The injection backend that works on `d`.
+/// The injection backend that works on `d` out of the box.
 ///
-/// GNOME is the exception and Mutter is the reason: it does not implement the
-/// virtual-keyboard protocol `wtype` types through, so `wtype` silently does
-/// nothing there. Everywhere else `wtype` is right *and* free -- no daemon,
-/// no `/dev/uinput`.
+/// GNOME is the exception and Mutter is the reason: it does not implement
+/// the virtual-keyboard protocol `wtype` types through, so `wtype` silently
+/// does nothing there. Everywhere else `wtype` is right *and* free -- no
+/// daemon, no `/dev/uinput`.
+///
+/// GNOME's answer was `ydotool` until 2026-09-09, at the cost of a package,
+/// a systemd unit and write access to `/dev/uinput`. With that backend
+/// retired the honest answer is `clipboard`: the transcript lands in the
+/// clipboard and the user pastes it. Automating that is `[inject] script`
+/// and a script of their own -- which is a paragraph in the wizard, not a
+/// recommendation, because a default cannot point at a file that does not
+/// exist yet.
 pub(crate) fn recommended_backend(d: &Desktop) -> &'static str {
     match d {
-        Desktop::Gnome => "ydotool",
+        Desktop::Gnome => "clipboard",
         _ => "wtype",
     }
 }
 
-/// What else has to be true for [`recommended_backend`] to actually type.
+/// What else has to be true for [`recommended_backend`] to actually work.
 ///
-/// Not folded into `setup.rs`'s `check_prerequisites`. That check knows the
-/// desktop too (it has to: `wtype` is inapplicable on GNOME, not missing),
-/// but it reports a missing `ydotool` as *optional* everywhere, including
-/// here -- a fatal gap would put a permanent "Einrichtung unvollständig"
-/// banner on the settings window over a requirement no `pacman -S` line can
-/// satisfy on its own. `ydotoold` has to be running as well, and that is
-/// only sayable in prose: this list, shown in the wizard's shortcut step.
-pub(crate) fn backend_prereqs(d: &Desktop) -> Vec<&'static str> {
-    match d {
-        Desktop::Gnome => vec!["ydotool", "ydotoold"],
-        _ => Vec::new(),
-    }
+/// Empty on every desktop since 2026-09-09, and kept rather than deleted
+/// because the *shape* of the question is still right. It existed for one
+/// thing no package check could express -- `ydotoold` having to be running,
+/// on top of `pacman -S ydotool` -- and both recommendations left now need
+/// nothing beyond the fatal prerequisites `setup.rs` already reports. The
+/// wizard renders its card only when this is non-empty, so an empty list
+/// means the card is simply absent.
+pub(crate) fn backend_prereqs(_d: &Desktop) -> Vec<&'static str> {
+    Vec::new()
 }
 
 /// Shapes the answer, given facts rather than a world to read -- split out
@@ -273,15 +278,38 @@ mod tests {
         );
     }
 
-    /// Mutter does not implement the virtual-keyboard protocol `wtype` needs,
-    /// so GNOME is the one desktop that has to pay `ydotool`'s setup cost.
+    /// GNOME recommends the one backend that needs nothing installed.
+    ///
+    /// Mutter implements neither the virtual-keyboard protocol `wtype` types
+    /// through nor anything else yappr can drive itself, and the `ydotool`
+    /// recommendation that used to fill that gap went with the backend on
+    /// 2026-09-09. `clipboard` is honest: the transcript lands in the
+    /// clipboard and the user presses Ctrl+V. Anyone who wants that
+    /// automated writes a script and points `[inject] script` at it -- which
+    /// no prerequisite check can verify, because the script does not exist
+    /// until they write it.
     #[test]
-    fn gnome_is_the_only_desktop_that_recommends_ydotool() {
-        assert_eq!(recommended_backend(&Desktop::Gnome), "ydotool");
-        assert_eq!(backend_prereqs(&Desktop::Gnome), vec!["ydotool", "ydotoold"]);
+    fn gnome_recommends_the_backend_that_needs_no_setup() {
+        assert_eq!(recommended_backend(&Desktop::Gnome), "clipboard");
+        assert!(backend_prereqs(&Desktop::Gnome).is_empty());
         assert_eq!(recommended_backend(&Desktop::Hyprland), "wtype");
-        assert!(backend_prereqs(&Desktop::Hyprland).is_empty());
         assert_eq!(recommended_backend(&Desktop::Unknown), "wtype");
+    }
+
+    #[test]
+    fn no_desktop_asks_the_user_to_install_anything_for_its_backend() {
+        // `backend_prereqs` exists to name what a `pacman -S` line cannot
+        // finish -- it was `ydotoold` having to be *running*. With that
+        // backend gone nothing qualifies, and the wizard's card must not
+        // reappear for some other desktop by accident.
+        for d in [
+            Desktop::Gnome,
+            Desktop::Hyprland,
+            Desktop::Other("sway".to_string()),
+            Desktop::Unknown,
+        ] {
+            assert!(backend_prereqs(&d).is_empty(), "{d:?} still lists prerequisites");
+        }
     }
 
     #[test]
@@ -295,7 +323,7 @@ mod tests {
         assert_eq!(fresh["start_step"], "welcome");
         assert_eq!(fresh["desktop"], "hyprland");
 
-        let broken = build_wizard_state(true, no_model(), &Desktop::Gnome, "ydotool");
+        let broken = build_wizard_state(true, no_model(), &Desktop::Gnome, "clipboard");
         // Nothing opens by itself: the banner (`setup`) is what tells the
         // user, and the wizard is one click behind it, opened at the step
         // that matters.
@@ -304,7 +332,10 @@ mod tests {
         assert_eq!(broken["start_step"], "models");
         assert_eq!(broken["shortcut"]["kind"], "gnome");
         assert_eq!(broken["shortcut"]["bindings"][0]["command"], "yappr --toggle");
-        assert_eq!(broken["backend_prereqs"][0], "ydotool");
+        assert!(
+            broken["backend_prereqs"].as_array().unwrap().is_empty(),
+            "no desktop has backend prerequisites since ydotool was retired"
+        );
 
         // Opened by hand from the tray on a healthy install: an explicit
         // request gets the whole flow.
@@ -341,7 +372,10 @@ mod tests {
     /// were -- a different and much worse thing than setting a backend.
     #[test]
     fn the_backend_patch_names_only_the_one_key_it_changes() {
-        assert_eq!(backend_patch("ydotool"), serde_json::json!({ "inject": { "backend": "ydotool" } }));
+        assert_eq!(
+            backend_patch("script"),
+            serde_json::json!({ "inject": { "backend": "script" } })
+        );
         assert_eq!(backend_patch("wtype")["inject"].as_object().unwrap().len(), 1);
     }
 }
