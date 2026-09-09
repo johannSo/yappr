@@ -384,10 +384,25 @@ Not verified — still open:
 - **The wizard and Sprache-pane dropdowns are built, not clicked.**
   `bun run build` passes for both entry points; the UI has not been exercised
   against a running daemon.
-- **primeline-parakeet is not shipped.** It is the best German model of the
-  four (2.95 % vs the shipped v3's 3.64 % average WER) but has no first-party
-  sherpa-onnx export, so it needs one produced out of band — see §9 of the
-  design doc and Task 12 of the plan for the exact procedure.
+- ~~primeline-parakeet is not shipped.~~ **Shipped and verified end to end on
+  2026-09-09.** Exported from primeline's `.nemo` with sherpa-onnx's own v3
+  export script (`scripts/export-primeline-onnx.sh`), published CC-BY-4.0 at
+  `Joni000000000/parakeet-primeline-sherpa-onnx-int8`, and installed *through
+  `models::download_all`* rather than by hand: `required_artifacts` asked for
+  exactly `[silero, s1-mini, parakeet-primeline-de]`, fetched only the
+  486,631,039-byte tarball, passed `verify` against the committed pin, and
+  transcribed the German fixture as "Alles hat ein Ende, nur die Wurst hat
+  zwei." The published file was also re-downloaded anonymously (no token) to
+  confirm it is publicly readable and hashes to `67adc0d8…`.
+
+  One trap is recorded in the export script and worth repeating: **sherpa-onnx
+  decides a model is a Token-and-Duration Transducer by substring-searching
+  the `url` ONNX metadata field for "tdt"**. A TDT joiner emits
+  `vocab_size + num_durations` outputs (8198 against 8193 tokens), so without
+  that substring `OfflineRecognizer::create` rejects the model outright with
+  `vocab_size: 8193 != output_size: 8198`. A provenance edit that removed it
+  cost one full re-upload. The metadata check passed throughout; only
+  transcribing real audio caught it.
 
 ## The restart prompt (2026-09-09)
 
@@ -395,13 +410,13 @@ A settings change that needs a restart now asks for one and performs it, instead
 of printing a banner and leaving the user to run `yappr --quit` and start the app
 again by hand. `Request::Restart` is `Request::Quit`'s arm plus one call:
 `EventSink::relaunch`, between `shutdown` and `std::process::exit(0)`.
-`TauriSink::relaunch` spawns `tauri::process::current_binary(&app.env())` with no
+`TauriSink::relaunch` spawns the binary `pick_successor_binary` chose, with no
 arguments. The settings window latches the requirement, shows a dialog once the
 save settles, and keeps an actionable amber bar if the user picks **Später**.
 
 Verified on this machine:
 
-- **The full gate is green.** `cargo test --workspace`: 449 passed / 0 failed /
+- **The full gate is green.** `cargo test --workspace`: 452 passed / 0 failed /
   11 ignored. `cargo clippy --workspace --all-targets`: clean. `bun run build`
   (`tsc` included): clean, both entry points.
 - **The ordering that makes a restart a restart is pinned by a test.**
@@ -425,7 +440,6 @@ Verified on this machine:
   — not wrong", which a passive pill could afford and a modal cannot: with
   `preload_at_startup` defaulting to `false`, an idle daemon is the ordinary
   case, so the dialog would have nagged nearly every user for nothing.
-
 - **A real restart was performed on this desktop, twice.** Hyprland session, the
   debug binary, `{"cmd":"restart"}` over the socket. The log reads `shutting
   down` -> `restart: successor started pid=3111677

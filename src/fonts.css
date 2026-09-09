@@ -1,0 +1,106 @@
+/* The app's type, and the three roles it is spent on.
+ *
+ * yappr ships its own fonts. It did not until now: the three roles below were
+ * stacks of family names that the desktop was expected to already have, with
+ * generic fallbacks behind them, and the comment here used to say that this
+ * binary ships no font and cannot fetch one at runtime. Both halves of that
+ * were true and the conclusion was still wrong -- what it actually bought was
+ * a window whose typography was a property of the machine it was opened on.
+ * "Adwaita Sans" is present on a GNOME box and absent on a minimal Hyprland
+ * one; where it is missing the UI face fell through Inter, `system-ui`,
+ * "Segoe UI" and landed on "Noto Sans", which is a wider, looser design than
+ * the one every size and letter-spacing value in these stylesheets was tuned
+ * against. The same stack resolved three different ways on three machines,
+ * and the AppImage -- whose whole purpose is to run on a machine we have
+ * never seen -- was the worst case of all.
+ *
+ * So the faces are bundled, as subset WOFF2 next to the app's own assets, and
+ * loaded by the webview rather than looked up through fontconfig. The system
+ * families stay in each stack behind ours: they are what draws a glyph our
+ * subset does not carry, per-glyph, which is the one job they are still good
+ * at. `scripts/build-fonts.sh` regenerates the files from pinned upstream
+ * sources, and documents the character set and the licensing -- read the
+ * header there before changing anything about them, because one of the three
+ * carries a Reserved Font Name and is deliberately not subset.
+ *
+ * Total cost: about 250 KB across four files, of which any one window loads
+ * only the faces it actually sets text in.
+ */
+
+/* -- The UI face. -------------------------------------------------------------
+   Adwaita Sans, GNOME's Inter fork, which is what the old stack asked for
+   first and got only sometimes. Variable on both of its axes, and both are
+   used: `wght` because this UI sets 450, 500, 600, 650 and 700 and a variable
+   face draws those rather than faking them, and `opsz` because the same face
+   is set from 10.4px to 25.6px and `font-optical-sizing: auto` is on by
+   default in every engine. */
+@font-face {
+  font-family: "Adwaita Sans";
+  src: url("/fonts/AdwaitaSans-Regular.subset.woff2") format("woff2");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: block;
+}
+
+/* Static, pinned to weight 400 -- see `scripts/build-fonts.sh` for why the
+   italic alone does not get a variable file. */
+@font-face {
+  font-family: "Adwaita Sans";
+  src: url("/fonts/AdwaitaSans-Italic.subset.woff2") format("woff2");
+  font-weight: 400;
+  font-style: italic;
+  font-display: block;
+}
+
+/* -- The display face. --------------------------------------------------------
+   iA Writer Duo, the current name for what this codebase has called iA Writer
+   Duospace since before the family was renamed upstream. Variable over
+   wght 400-700, so the 600 and 650 the headings ask for are drawn.
+   Shipped unmodified rather than subset; the licensing note in
+   `scripts/build-fonts.sh` explains why that is not an oversight. */
+@font-face {
+  font-family: "iA Writer Duo V";
+  src: url("/fonts/iAWriterDuoV.woff2") format("woff2");
+  font-weight: 400 700;
+  font-style: normal;
+  font-display: block;
+}
+
+/* -- The data face. -----------------------------------------------------------
+   Adwaita Mono, which is itself a JetBrains Mono derivative -- so naming it
+   first honours the old stack's preference rather than overruling it, and it
+   comes from the same upstream release as the UI face. Regular only: nothing
+   in either window sets a weight on a mono element. */
+@font-face {
+  font-family: "Adwaita Mono";
+  src: url("/fonts/AdwaitaMono-Regular.subset.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: block;
+}
+
+/* -- The three roles. ---------------------------------------------------------
+   These live here rather than in either window's stylesheet because both
+   windows now draw from them; the settings window defined them and the
+   overlay carried an unrelated `system-ui` stack of its own, which is how the
+   two windows came to disagree about what the product looks like.
+
+   Each stack is the bundled face, then the families a desktop might have, then
+   a generic. Everything after the first entry is now a per-glyph safety net
+   rather than the plan. */
+:root {
+  /* Display is a *writing* typeface in a dictation app, which is the closest
+     thing this product has to a native vernacular. It is duospaced rather
+     than proportional, so headings carry a typed quality the UI face cannot
+     fake. Every fallback in the stack is monospaced, so the intent survives
+     even on the path that no longer happens. */
+  --font-display: "iA Writer Duo V", "iA Writer Duo", "iA Writer Duospace",
+    "iA Writer Quattro S", ui-monospace, monospace;
+  /* The desktop's own UI face, bundled: the window should look like it belongs
+     to the session, and now it does so on sessions that never installed it. */
+  --font-ui: "Adwaita Sans", Inter, system-ui, -apple-system, "Segoe UI",
+    "Noto Sans", sans-serif;
+  /* Data: config keys, milliseconds, thresholds, paths. */
+  --font-mono: "Adwaita Mono", "JetBrainsMono Nerd Font", "JetBrains Mono",
+    ui-monospace, "SFMono-Regular", monospace;
+}

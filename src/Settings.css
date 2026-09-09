@@ -26,28 +26,16 @@
  * overflowing it.
  */
 
+/* The three type roles -- `--font-display`, `--font-ui`, `--font-mono` -- and
+   the faces behind them are declared in `fonts.css`, which both windows
+   import. They used to be defined here, which is why the overlay had a
+   different idea of the product's typography than this window did. */
+@import "./fonts.css";
+
 /* ---------------------------------------------------------------- tokens */
 
 :root {
   color-scheme: light dark;
-
-  /* Three type roles, all from families the desktop already has -- this
-     binary ships no font and cannot fetch one at runtime.
-
-     Display is iA Writer Duospace: a *writing* typeface in a dictation app,
-     which is the closest thing this product has to a native vernacular. It
-     is duospaced rather than proportional, so headings carry a typed quality
-     the UI face cannot fake. Every fallback in the stack is monospaced, so
-     the intent survives on a machine that lacks it. */
-  --font-display: "iA Writer Duospace", "iA Writer Quattro S",
-    "JetBrainsMono Nerd Font", ui-monospace, monospace;
-  /* The desktop's own UI face first: the window should look like it belongs
-     to the session, not to the web. */
-  --font-ui: "Adwaita Sans", Inter, system-ui, -apple-system, "Segoe UI",
-    "Noto Sans", sans-serif;
-  /* Data: config keys, milliseconds, thresholds, paths. */
-  --font-mono: "JetBrainsMono Nerd Font", "JetBrains Mono", ui-monospace,
-    "SFMono-Regular", monospace;
 
   /* Light is the base set. Dark redefines only what changes, so no colour has
      its single definition inside a media query -- a token that exists only in
