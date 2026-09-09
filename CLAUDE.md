@@ -55,12 +55,18 @@ bun run tauri dev                         # dev: Vite on :1420 + the Tauri windo
 bun run build                             # frontend only (tsc && vite build -> dist/)
 #   ^ builds BOTH pages: index.html (overlay) and settings.html (settings window).
 
-# Tests (426 passed, 0 failed, 8 #[ignore]d because they need downloaded models)
+# Tests (452 passed, 0 failed, 11 #[ignore]d because they need downloaded models)
 cargo test --workspace
 # NOT optional. These are the only tests that catch a C++ ABI mismatch between
 # sherpa-onnx and llama.cpp -- see the gotcha at the bottom of this file. A wrong
 # `CXXFLAGS` aborts the process inside the VAD, and the default run notices nothing.
-cargo test --workspace -- --ignored       # needs models already on disk (Settings' Setup pane, or --update-lock)
+cargo test --workspace -- --ignored --test-threads=1   # needs models on disk (Settings' Setup pane, or --update-lock)
+#   ^ `--test-threads=1` is not optional in practice. Run in parallel, several of
+#     these load S1-mini (~480 MB) and an ASR model at once and
+#     `llama::engine_tests::the_normalizer_trait_cleans_up_a_transcript_end_to_end`
+#     intermittently fails at its `.expect` -- `NormalizeConfig::default()`'s
+#     `timeout_ms` elapsing under the contention, not a real regression. It passes
+#     alone and all 11 pass serially. Pre-existing; see docs/HANDOVER.md.
 cargo test -p yappr-core guardrail::        # one module
 cargo test -p yappr-core --test pipeline_e2e a_good_cleanup_is_injected
 cargo test -p yappr-core --lib server::tests::state_of_and_snapshot_event_report_failed_as_a_real_error_state
@@ -392,7 +398,34 @@ the whole lock file stops parsing. See
     lazy path misbehaves. See
     `docs/superpowers/specs/2026-08-29-lazy-model-lifecycle-design.md`.
 
-13. **The first-run wizard never writes desktop config, on either desktop.**
+13. **A self-restart must spawn the successor *after* `shutdown`, and
+    `AppHandle::restart` must never be used.** `Request::Restart` is
+    `Request::Quit`'s arm plus one call -- `EventSink::relaunch`, placed
+    between `wait_for_busy_to_clear_then_shutdown` and
+    `std::process::exit(0)` -- and that position is the whole feature, not a
+    detail. `shutdown` is what unlinks `$XDG_RUNTIME_DIR/yappr.lock`, and
+    `server::start`'s single-instance guard takes an exclusive `flock` on it
+    and `exit(1)`s with "yappr is already running" if it cannot. So a
+    successor started any earlier loses the lock and dies, and then the
+    parent exits too: the app closes for good. Tauri's own
+    `AppHandle::restart` does exactly that -- read
+    `tauri-2.11.5/src/process.rs:83-88`, it spawns and *then* `exit(0)`s --
+    which is why this is hand-rolled, and why `lib.rs`'s `RunEvent::Exit`
+    hook (written when nothing called `exit`/`restart`) is still not the
+    thing that runs on this path. `TauriSink::relaunch` resolves the binary
+    with `tauri::process::current_binary`, not `std::env::current_exe`:
+    under an AppImage the latter names a path inside a mount that is torn
+    down as this process exits. It passes **no** arguments, so a `--replay`
+    session cannot resurrect itself as a second replay. Pinned by
+    `restart_starts_the_successor_only_after_shutdown_released_the_lock`,
+    which asserts the ordering through a spy sink rather than the mere fact
+    of the call. Note also that `restart_reason` takes `models_loaded`: with
+    nothing resident, an `[asr]`/`[normalize]` change needs no restart at all
+    (`ensure_models_loaded` re-reads the file on the next press), and since
+    `preload_at_startup` defaults to `false` that is the ordinary case --
+    a dialog that ignored this would nag almost every user for nothing.
+
+14. **The first-run wizard never writes desktop config, on either desktop.**
     Hyprland is the standing rule (a bad window rule breaks the desktop).
     GNOME is the same rule for a different reason: `gsettings set ...
     custom-keybindings` *replaces* the list, so the obvious one-liner destroys

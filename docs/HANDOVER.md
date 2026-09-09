@@ -388,3 +388,100 @@ Not verified — still open:
   four (2.95 % vs the shipped v3's 3.64 % average WER) but has no first-party
   sherpa-onnx export, so it needs one produced out of band — see §9 of the
   design doc and Task 12 of the plan for the exact procedure.
+
+## The restart prompt (2026-09-09)
+
+A settings change that needs a restart now asks for one and performs it, instead
+of printing a banner and leaving the user to run `yappr --quit` and start the app
+again by hand. `Request::Restart` is `Request::Quit`'s arm plus one call:
+`EventSink::relaunch`, between `shutdown` and `std::process::exit(0)`.
+`TauriSink::relaunch` spawns `tauri::process::current_binary(&app.env())` with no
+arguments. The settings window latches the requirement, shows a dialog once the
+save settles, and keeps an actionable amber bar if the user picks **Später**.
+
+Verified on this machine:
+
+- **The full gate is green.** `cargo test --workspace`: 449 passed / 0 failed /
+  11 ignored. `cargo clippy --workspace --all-targets`: clean. `bun run build`
+  (`tsc` included): clean, both entry points.
+- **The ordering that makes a restart a restart is pinned by a test.**
+  `restart_starts_the_successor_only_after_shutdown_released_the_lock` asserts,
+  through a spy sink that answers "was `yappr.lock` still there when you were
+  called?", both that the relaunch happens after `shutdown` has unlinked it and
+  that it does not happen at all while an utterance is still `TRANSCRIBING`.
+- **Tauri's own `AppHandle::restart` cannot be used here, and would have failed
+  silently in the worst way.** Read `tauri-2.11.5/src/process.rs:83-88`: it
+  spawns the successor and *then* `exit(0)`s, so the successor starts while this
+  process still holds the exclusive `flock` on `$XDG_RUNTIME_DIR/yappr.lock`
+  (`server.rs`'s single-instance guard), loses it, prints "yappr is already
+  running" and exits 1 — after which the parent exits too. A restart button that
+  closes the app for good. This is why the relaunch is hand-rolled and why its
+  position in the teardown is load-bearing rather than incidental.
+- **`restart_reason` now consults `models_loaded`.** `[asr]`/`[normalize]` are
+  read when the models are *built*, and `ensure_models_loaded` re-reads
+  `config.toml` from disk at that moment — so with nothing resident the change
+  lands on the next press and a restart buys nothing. The lazy-lifecycle design
+  doc (2026-08-29 §1) already called the old unconditional answer "pessimistic
+  — not wrong", which a passive pill could afford and a modal cannot: with
+  `preload_at_startup` defaulting to `false`, an idle daemon is the ordinary
+  case, so the dialog would have nagged nearly every user for nothing.
+
+- **A real restart was performed on this desktop, twice.** Hyprland session, the
+  debug binary, `{"cmd":"restart"}` over the socket. The log reads `shutting
+  down` -> `restart: successor started pid=3111677
+  path=.../target/debug/yappr` -> `listening` -> `ready`; afterwards exactly one
+  yappr process exists, it is the new one, `yappr.lock` has a *different inode*
+  than before (2416 -> 2418, which is the handoff working as designed rather
+  than a reused file), and `{"cmd":"status"}` answers `{"ok":true,"state":"idle"}`.
+- **The ksni tray item re-registers under the new PID.** After the restart,
+  `org.kde.StatusNotifierWatcher`'s `RegisteredStatusNotifierItems` contains
+  `org.kde.StatusNotifierItem-3111677-1` — the successor's PID. The
+  predecessor's `unregister_tray` and the successor's registration landing
+  close together does not wedge the item.
+- **`restart_required` is true only when it should be.** Against a preloaded
+  daemon (`warm: true`), `set-config` on `{"asr":{"num_threads":7}}` answers
+  `restart_required: true` with the corrected reason; the same call with
+  `{"vocabulary":{"terms":[...]}}` answers `restart_required: false`. Driven
+  through a scratch `XDG_STATE_HOME` so the real `config.toml` was never
+  touched (confirmed by hash afterwards).
+
+**A bug found by that first live run, which no test would have caught.** The
+first implementation used `tauri::process::current_binary`, and the restart
+started */home/joni/AppImages/t3_code_nightly.appimage* — a completely unrelated
+application — while yappr stayed down. `current_binary` returns `$APPIMAGE`
+whenever that variable is merely *set*, and it is inherited like any other
+environment variable, so a yappr launched from a terminal that is itself an
+AppImage sees its ancestor's path. `pick_successor_binary` in `lib.rs` replaces
+it: `$APPIMAGE` is trusted only when `current_exe` actually lives inside
+`$APPDIR`, the mount of the AppImage whose payload is running. Three tests
+cover it, including the inherited-variable case that shipped first. Do not
+"simplify" this back to Tauri's helper.
+
+Not verified — still open:
+
+- **The dialog has been built, not seen.** `tsc` and `vite build` pass and the
+  settings window opens and maps (749x814 under Hyprland), but `grim` cannot
+  capture in this session at all — every invocation times out waiting for a
+  screencopy frame, for whole outputs as well as regions — so nobody has looked
+  at the scrim, the spring, the focus behaviour or the Escape handling. The
+  logic behind it is verified from the daemon side; the pixels are not.
+- **The overlay's layer-shell surface has not been re-anchored.** The restart
+  test never mapped the overlay, because that needs a dictation and recording
+  from the microphone was out of scope. `anchor_overlay` is an ordinary startup
+  path, but it has not run twice in one session.
+- **The AppImage path is reasoned and unit-tested, not run.** No AppImage has
+  restarted itself from its own dialog. The unit tests pin the decision, not
+  the behaviour of a real squashfs mount being torn down.
+
+Pre-existing flake found while running the gate, unrelated to this change:
+
+- **`llama::engine_tests::the_normalizer_trait_cleans_up_a_transcript_end_to_end`
+  fails intermittently under `cargo test --workspace -- --ignored`.** It failed
+  at `llama.rs:340` — the `.expect("normalizing through the trait")`, i.e.
+  `normalize` returned `Err`, i.e. `NormalizeConfig::default()`'s `timeout_ms`
+  elapsed. Passes alone, and all 11 ignored tests pass with
+  `--test-threads=1`; the parallel run has several S1-mini and ASR loads
+  contending at once. Not caused by this branch (none of this branch's tests
+  even execute under `--ignored`), but worth knowing before the next person
+  reads a red gate as a regression. The fix is a deadline that is not
+  wall-clock, or serialising the model-loading tests.

@@ -76,18 +76,39 @@ const DEVICE_LIST_TIMEOUT: Duration = Duration::from_secs(5);
 /// restatement of what `Pipeline::update_reloadable` will and will not swap,
 /// and a second copy in TypeScript would drift from it the first time the
 /// pipeline learned to reload something new.
-fn restart_reason(old: &Config, new: &Config) -> Option<String> {
+///
+/// `models_loaded` is why this takes a third argument. `[asr]` and
+/// `[normalize]` are read when the models are *built*, and since the lazy
+/// lifecycle landed that is `ensure_models_loaded`, which re-reads
+/// `config.toml` from disk at the moment of the call -- so with nothing
+/// resident, a changed model or normalizer takes effect on the next press
+/// and a restart buys the user exactly nothing. The lazy-lifecycle design
+/// doc (2026-08-29 §1) already recorded this as leaving the requirement
+/// "pessimistic -- not wrong", which a passive pill could afford. A dialog
+/// that interrupts to demand a restart cannot: being pessimistic there
+/// means nagging every user who has not dictated recently, which -- with
+/// `preload_at_startup` defaulting to `false` and `idle_unload_seconds` to
+/// 60 -- is the ordinary state of an idle daemon, not an edge case. So the
+/// question is asked against what is actually resident.
+///
+/// Read `daemon.models_loaded` for this, never `pipeline.is_some()`:
+/// invariant 12's first bullet, and `SetConfig` is dispatched from the same
+/// accept loop that would deadlock on it.
+fn restart_reason(old: &Config, new: &Config, models_loaded: bool) -> Option<String> {
+    if !models_loaded {
+        return None;
+    }
     let mut sections = Vec::new();
     if old.asr != new.asr {
-        sections.push("[asr] -- the ASR model is loaded once, at startup");
+        sections.push("[asr] -- the ASR model is loaded once, when the models come up");
     }
     if old.normalize != new.normalize {
-        sections.push("[normalize] -- llama-server is spawned once, at startup");
+        sections.push("[normalize] -- the normalizer is built once, when the models come up");
     }
     if sections.is_empty() {
         return None;
     }
-    Some(format!("saved, but a daemon restart is needed for: {}", sections.join("; ")))
+    Some(format!("saved, but a restart is needed for: {}", sections.join("; ")))
 }
 
 fn state_of(v: u8) -> State {
@@ -206,15 +227,39 @@ pub trait EventSink: Send + Sync + 'static {
     /// sink in this file own no tray to unregister. Only `TauriSink`
     /// (Task 12, `src-tauri/src/tray.rs`) overrides it.
     fn unregister_tray(&self) {}
+    /// Starts a fresh copy of this binary, for [`Request::Restart`]. Called
+    /// once, from that arm's thread, *after* [`shutdown`] and immediately
+    /// before `std::process::exit(0)`.
+    ///
+    /// A no-op default for the same reason `show_settings`'s is -- but here
+    /// the reason it must live behind the sink at all is narrower than
+    /// "only `TauriSink` owns the thing": resolving *which* file to spawn
+    /// needs `tauri::process::current_binary`, and this crate does not
+    /// depend on `tauri`. `std::env::current_exe` is not a substitute --
+    /// under an AppImage it names a path inside the mount that disappears
+    /// the moment the parent exits, where `current_binary` prefers
+    /// `$APPIMAGE`. So the decision lives in `src-tauri` and this is the
+    /// seam it reaches through.
+    ///
+    /// Called after `shutdown` deliberately: `shutdown` removes
+    /// `yappr.lock`, so the successor's `OpenOptions::create` makes a fresh
+    /// inode and its `flock` cannot contend with the one this process still
+    /// holds on the now-unlinked old one. That is what makes the handoff
+    /// race-free without any retry or backoff on the successor's side.
+    fn relaunch(&self) {}
 }
 
 pub struct Daemon {
     state: AtomicU8,
     /// Spec §8 step 1's first clause, missed by this task's initial pass:
     /// "stop accepting new utterances" -- set once, synchronously, by
-    /// `Request::Quit` before it spawns the wait/shutdown thread, and
+    /// `Request::Quit` (and by `Request::Restart`, which is that arm plus a
+    /// relaunch and needs the latch for the identical reason) before it
+    /// spawns the wait/shutdown thread, and
     /// checked at the top of `PttStart` and `Toggle` (never cleared; a
-    /// daemon that has been asked to quit never un-quits). Without this, a
+    /// daemon that has been asked to quit never un-quits -- a *restarting*
+    /// one does come back, but as a new process with a fresh `Daemon`).
+    /// Without this, a
     /// `PttStart`/`Toggle` landing on the very next `accept()` after Beenden
     /// -- the accept loop is single-threaded, so "next" can be milliseconds
     /// away -- would be accepted normally and could reach `TRANSCRIBING`
@@ -1339,6 +1384,37 @@ fn wait_for_busy_to_clear_then_shutdown_with(daemon: &Daemon, timeout: Duration,
     shutdown(daemon);
 }
 
+/// [`Request::Restart`]'s real work: everything `Request::Quit` does, and
+/// then start the successor. Split out from the dispatch arm for exactly the
+/// reason the quit pair above is -- so the *ordering* is reachable in a test
+/// without the `std::process::exit` that must follow it in production.
+///
+/// The order of these two lines is the entire feature. `shutdown` unlinks
+/// `yappr.lock`; only after that can the successor take an uncontended
+/// `flock` on a freshly created one. Swap them -- or hoist the relaunch up
+/// beside the `quitting` store, or reach for Tauri's `AppHandle::restart`,
+/// which spawns first and tears down second -- and the successor loses the
+/// lock, prints "yappr is already running", exits 1, and then this process
+/// exits too: a restart button that reliably closes the app for good.
+fn wait_for_busy_to_clear_then_shutdown_and_relaunch(daemon: &Daemon) {
+    wait_for_busy_to_clear_then_shutdown_and_relaunch_with(
+        daemon,
+        QUIT_BUSY_WAIT_TIMEOUT,
+        QUIT_BUSY_POLL_INTERVAL,
+    );
+}
+
+/// [`wait_for_busy_to_clear_then_shutdown_and_relaunch`] with an injectable
+/// timeout/poll, for the same reason its quit-only counterpart takes them.
+fn wait_for_busy_to_clear_then_shutdown_and_relaunch_with(
+    daemon: &Daemon,
+    timeout: Duration,
+    poll: Duration,
+) {
+    wait_for_busy_to_clear_then_shutdown_with(daemon, timeout, poll);
+    daemon.sink.relaunch();
+}
+
 // -- subscriber housekeeping (Task 3, Work Item 2) and the idle-unload
 // deadline (Task 6) --------------------------------------------------------
 //
@@ -2078,7 +2154,11 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
                 Err(e) => return Response::err(format!("config error after write: {e}")),
             };
 
-            let reason = restart_reason(&old, &new_cfg);
+            let reason = restart_reason(
+                &old,
+                &new_cfg,
+                daemon.models_loaded.load(Ordering::SeqCst),
+            );
 
             // Best-effort live apply. `update_reloadable` refuses a
             // `[normalize].enabled` flip, which is exactly one of the cases
@@ -2162,6 +2242,29 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
             let d = Arc::clone(daemon);
             std::thread::spawn(move || {
                 wait_for_busy_to_clear_then_shutdown(&d);
+                std::process::exit(0);
+            });
+            Response::ok(state_of(current))
+        }
+        Request::Restart => {
+            // Quit's arm, verbatim, plus one call -- and for all the same
+            // reasons, so read that arm's comments as this one's too. In
+            // particular `quitting` is set here synchronously as well: a
+            // restart is a teardown like any other from a `PttStart`'s point
+            // of view, and the utterance it would otherwise let through
+            // would be destroyed by the `shutdown` below exactly as invariant
+            // 1 forbids.
+            daemon.quitting.store(true, Ordering::SeqCst);
+
+            let d = Arc::clone(daemon);
+            std::thread::spawn(move || {
+                // The successor is spawned inside this call, after
+                // `shutdown` -- not here, and emphatically not before the
+                // wait. `EventSink::relaunch`'s doc comment has the full
+                // argument; the short version is that `shutdown` is what
+                // unlinks `yappr.lock`, and a successor that starts any
+                // earlier loses the race for it and exits 1.
+                wait_for_busy_to_clear_then_shutdown_and_relaunch(&d);
                 std::process::exit(0);
             });
             Response::ok(state_of(current))
@@ -2998,7 +3101,7 @@ mod tests {
         ] {
             let changed = Config::from_str(toml).unwrap();
             assert_eq!(
-                restart_reason(&base, &changed),
+                restart_reason(&base, &changed, true),
                 None,
                 "should be live-reloadable: {toml:?}"
             );
@@ -3010,18 +3113,62 @@ mod tests {
         let base = Config::from_str("").unwrap();
 
         let asr = Config::from_str("[asr]\nnum_threads = 8\n").unwrap();
-        let reason = restart_reason(&base, &asr).expect("asr needs a restart");
+        let reason = restart_reason(&base, &asr, true).expect("asr needs a restart");
         assert!(reason.contains("[asr]"), "got: {reason}");
 
         let norm = Config::from_str("[normalize]\ntimeout_ms = 9000\n").unwrap();
-        let reason = restart_reason(&base, &norm).expect("normalize needs a restart");
+        let reason = restart_reason(&base, &norm, true).expect("normalize needs a restart");
         assert!(reason.contains("[normalize]"), "got: {reason}");
+    }
+
+    /// The reason string is shown to the user, and until 2026-09-09 its
+    /// `[normalize]` half said "llama-server is spawned once, at startup" --
+    /// a sentence describing a supervised child process that the in-process
+    /// llama.cpp rewrite deleted. It went unnoticed because no test read the
+    /// text, only `is_some()`. This one reads it, so the next such rewrite
+    /// has to update the copy or go red.
+    #[test]
+    fn the_restart_reason_does_not_name_anything_this_app_no_longer_runs() {
+        let base = Config::from_str("").unwrap();
+        let norm = Config::from_str("[normalize]\ntimeout_ms = 9000\n").unwrap();
+        let reason = restart_reason(&base, &norm, true).expect("normalize needs a restart");
+        assert!(
+            !reason.contains("llama-server"),
+            "there is no llama-server any more; got: {reason}"
+        );
+    }
+
+    /// The gate that keeps the restart *dialog* honest. With no models
+    /// resident, `ensure_models_loaded` re-reads `config.toml` from disk on
+    /// the next press, so a changed `[asr]`/`[normalize]` takes effect
+    /// without a restart and asking for one buys the user nothing. That is
+    /// the ordinary state of an idle daemon, not an edge case:
+    /// `preload_at_startup` defaults to `false` and `idle_unload_seconds` to
+    /// 60. Before the dialog existed this was merely pessimistic (the
+    /// lazy-lifecycle doc says as much); a modal makes it a nag.
+    #[test]
+    fn nothing_needs_a_restart_while_no_models_are_resident() {
+        let base = Config::from_str("").unwrap();
+        for toml in ["[asr]\nnum_threads = 8\n", "[normalize]\ntimeout_ms = 9000\n"] {
+            let changed = Config::from_str(toml).unwrap();
+            assert_eq!(
+                restart_reason(&base, &changed, false),
+                None,
+                "unloaded models take the new config on the next press: {toml:?}"
+            );
+            // The same diff with the models up is the case that *does* need
+            // one -- so this test cannot pass by the diff being empty.
+            assert!(
+                restart_reason(&base, &changed, true).is_some(),
+                "and must still ask once they are resident: {toml:?}"
+            );
+        }
     }
 
     #[test]
     fn an_unchanged_config_asks_for_nothing() {
         let base = Config::from_str("").unwrap();
-        assert_eq!(restart_reason(&base, &base.clone()), None);
+        assert_eq!(restart_reason(&base, &base.clone(), true), None);
     }
 
     #[test]
@@ -3155,6 +3302,20 @@ mod tests {
     /// The seam the config handlers need: `set-config` writes, so a test must
     /// never be pointed at the real `paths::config_file()`.
     fn fake_daemon_at(initial_state: u8, normalize_enabled: bool, config_path: PathBuf) -> Arc<Daemon> {
+        fake_daemon_at_with_sink(initial_state, normalize_enabled, config_path, Arc::new(DropSink))
+    }
+
+    /// The general form of `fake_daemon_at`, for the one test that has to
+    /// observe what the daemon does *to its sink* rather than to its state:
+    /// `Request::Restart` calls `EventSink::relaunch`, and the only thing
+    /// worth asserting about that call is when it happens relative to
+    /// `shutdown`.
+    fn fake_daemon_at_with_sink(
+        initial_state: u8,
+        normalize_enabled: bool,
+        config_path: PathBuf,
+        sink: Arc<dyn EventSink>,
+    ) -> Arc<Daemon> {
         let (runtime_socket_path, runtime_lock_path) = fake_runtime_files();
         Arc::new(Daemon {
             state: AtomicU8::new(initial_state),
@@ -3176,7 +3337,7 @@ mod tests {
         config_notice: Mutex::new(None),
             housekeeping: Mutex::new(None),
             last_timings: Mutex::new(None),
-            sink: Arc::new(DropSink),
+            sink,
             runtime_socket_path,
             runtime_lock_path,
             _runtime_lock: fake_runtime_lock(),
@@ -3394,6 +3555,11 @@ mod tests {
     fn set_config_reports_the_sections_that_need_a_restart() {
         let path = scratch_config("set-restart");
         let daemon = fake_daemon_at(IDLE, false, path.clone());
+        // The precondition the assertion below is about. A `fake_daemon` has
+        // nothing resident, which since the `models_loaded` gate landed is
+        // the case that needs *no* restart -- so without this line this test
+        // would pass on `Some(false)` and assert nothing.
+        daemon.models_loaded.store(true, Ordering::SeqCst);
 
         let r = dispatch(
             &daemon,
@@ -3405,6 +3571,31 @@ mod tests {
         assert!(r.restart_reason.unwrap().contains("[asr]"));
         // Written regardless: the file is the source of truth, and the change
         // takes effect at the next start.
+        assert_eq!(Config::load_from(&path).unwrap().asr.num_threads, 8);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The same save on the daemon a user actually has -- `preload_at_startup`
+    /// defaults to `false`, so nothing is resident until the first press.
+    /// `SetConfig` must answer that no restart is needed, because
+    /// `ensure_models_loaded` will read this very file on that press. This is
+    /// the end-to-end counterpart of
+    /// `nothing_needs_a_restart_while_no_models_are_resident`, which pins the
+    /// rule; this pins that `SetConfig` actually consults it.
+    #[test]
+    fn set_config_does_not_ask_for_a_restart_when_nothing_is_resident_yet() {
+        let path = scratch_config("set-restart-lazy");
+        let daemon = fake_daemon_at(IDLE, false, path.clone());
+        assert!(!daemon.models_loaded.load(Ordering::SeqCst), "precondition");
+
+        let r = dispatch(
+            &daemon,
+            Request::SetConfig { config: serde_json::json!({"asr": {"num_threads": 8}}) },
+        );
+
+        assert!(r.ok, "{:?}", r.err);
+        assert_eq!(r.restart_required, Some(false));
+        assert_eq!(r.restart_reason, None);
         assert_eq!(Config::load_from(&path).unwrap().asr.num_threads, 8);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
@@ -4449,6 +4640,86 @@ mod tests {
             assert!(
                 !d.runtime_socket_path.exists(),
                 "shutdown must run once the state clears"
+            );
+        });
+    }
+
+    /// `Request::Restart`'s whole correctness condition, and the one thing
+    /// about this feature that cannot be discovered by trying it once on a
+    /// good day: the successor must be started *after* `shutdown`, because
+    /// `shutdown` is what unlinks `yappr.lock` and the successor takes an
+    /// exclusive `flock` on it. Start it any earlier -- which is exactly
+    /// what Tauri's own `AppHandle::restart` does, spawning before it tears
+    /// down -- and the successor loses the lock, prints "yappr is already
+    /// running", exits 1, and then this process exits too: a restart button
+    /// that closes the app for good.
+    ///
+    /// The spy answers "was the lock still there when you were called?", so
+    /// a passing run is evidence about ordering rather than about the mere
+    /// fact of the call. It also re-proves the busy wait for the relaunch
+    /// path specifically: a restart that relaunched while `TRANSCRIBING`
+    /// would destroy the utterance invariant 1 protects, and the assertion
+    /// before the state is cleared is what catches that.
+    ///
+    /// `wait_for_busy_to_clear_then_shutdown_and_relaunch_with`, never the
+    /// `Request::Restart` dispatch arm -- that arm ends in
+    /// `std::process::exit(0)`, which would take the test runner with it.
+    #[test]
+    fn restart_starts_the_successor_only_after_shutdown_released_the_lock() {
+        with_a_fresh_shutting_down_guard(|| {
+            #[derive(Default)]
+            struct RelaunchSpy {
+                lock_path: Mutex<Option<PathBuf>>,
+                /// `None` until `relaunch` is called; then whether the lock
+                /// file was still present at that moment.
+                lock_present_at_relaunch: Mutex<Option<bool>>,
+            }
+            impl EventSink for RelaunchSpy {
+                fn emit(&self, _: &OverlayEvent) {}
+                fn relaunch(&self) {
+                    let path = self
+                        .lock_path
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .expect("the test sets the lock path before dispatching");
+                    *self.lock_present_at_relaunch.lock().unwrap() = Some(path.exists());
+                }
+            }
+
+            let spy = Arc::new(RelaunchSpy::default());
+            let d = fake_daemon_at_with_sink(
+                TRANSCRIBING,
+                false,
+                PathBuf::from("/nonexistent/yappr-test/config.toml"),
+                spy.clone(),
+            );
+            *spy.lock_path.lock().unwrap() = Some(d.runtime_lock_path.clone());
+            create_runtime_files(&d);
+
+            let d2 = Arc::clone(&d);
+            let handle = std::thread::spawn(move || {
+                wait_for_busy_to_clear_then_shutdown_and_relaunch_with(
+                    &d2,
+                    Duration::from_secs(10),
+                    Duration::from_millis(5),
+                );
+            });
+
+            std::thread::sleep(Duration::from_millis(100));
+            assert_eq!(
+                *spy.lock_present_at_relaunch.lock().unwrap(),
+                None,
+                "must not relaunch while an utterance is still TRANSCRIBING"
+            );
+
+            d.state.store(IDLE, Ordering::SeqCst);
+            handle.join().expect("wait/shutdown/relaunch thread panicked");
+
+            assert_eq!(
+                *spy.lock_present_at_relaunch.lock().unwrap(),
+                Some(false),
+                "the successor was started before shutdown released the lock -- it would exit 1"
             );
         });
     }

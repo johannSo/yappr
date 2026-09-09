@@ -59,16 +59,38 @@ export default function Settings() {
   const [scrolled, setScrolled] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
+  // The restart latch. Deliberately sticky, and deliberately *not* a
+  // a re-read of `restart_reason`: that arrives on one save and the very next
+  // unrelated autosave used to clear the state holding it
+  // (`setNotice(res.restart_reason ?? null)`), which for a passive banner was
+  // a cosmetic loss and for a dialog that must be answered would be the whole
+  // feature going missing because the user flipped some other toggle
+  // afterwards. Once a restart is
+  // owed it stays owed until the process actually restarts, which is the only
+  // thing that can pay it off — hence no setter that clears this.
+  const [restartPending, setRestartPending] = useState(false);
+  // "Später": the dialog has been answered once, so it stops re-opening and
+  // the amber banner carries the offer from then on. Not a dismissal of the
+  // requirement itself — see `restartPending`.
+  const [restartDeferred, setRestartDeferred] = useState(false);
+  // True from the moment `restart_app` is invoked. Normally this never goes
+  // back to false: the command returns as soon as the daemon has *accepted*
+  // the restart, and the webview is torn down underneath us a moment later.
+  // It exists to keep a second click from firing a second restart in that
+  // window, and to say so on the button.
+  const [restarting, setRestarting] = useState(false);
+  const [restartError, setRestartError] = useState<string | null>(null);
   // Bumped by every *successful* save. `AsrModelDownload` re-checks on this
   // rather than on the dropdown's local value, which would race the save that
   // is still in flight -- `setup_status` answers from config.toml on disk.
   const [savedRevision, setSavedRevision] = useState(0);
-  // Kept apart from `notice` deliberately. That one carries `restart_reason`
-  // from a save, and the two used to share it: a save wiped the startup notice
-  // before the user had read it, and the next reveal's `load(true)` brought the
-  // startup notice back over the restart one. They are different messages with
-  // different lifetimes and both matter.
+  // Kept apart from the restart state deliberately. That one comes from a
+  // save (`restart_required`), and the two used to share one string: a save
+  // wiped the startup notice before the user had read it, and the next
+  // reveal's `load(true)` brought the startup notice back over the restart
+  // one. They are different messages with different lifetimes and both
+  // matter — the split is now also a difference in kind, since the restart
+  // side is a latched boolean and this one is the daemon's own text.
   const [configNotice, setConfigNotice] = useState<string | null>(null);
   // "Verstanden" has to stick. The daemon reports the same notice on every
   // `get_config`, and this window re-reads on every reveal, so without this the
@@ -260,7 +282,12 @@ export default function Settings() {
       };
       setSaveError(null);
       setSavedRevision((n) => n + 1);
-      setNotice(res.restart_reason ?? null);
+      // Only ever set, never cleared — see `restartPending`. A save that
+      // needs no restart says nothing about one already owed by an earlier
+      // save, so it must not answer for it.
+      if (res.restart_required) {
+        setRestartPending(true);
+      }
       setSaveState("saved");
       if (savedTimerRef.current !== null) window.clearTimeout(savedTimerRef.current);
       savedTimerRef.current = window.setTimeout(() => setSaveState("clean"), SAVED_MS);
@@ -328,6 +355,27 @@ export default function Settings() {
     [schedule],
   );
 
+  /// Hands the restart to the daemon and does not expect to be around
+  /// afterwards. `Request::Restart` latches `quitting`, waits for any
+  /// utterance in flight to finish (invariant 1), tears down, starts the
+  /// successor and exits — so this promise resolving means "accepted", not
+  /// "done", and the webview is gone a moment later. Nothing may be
+  /// scheduled off the success path for that reason.
+  ///
+  /// The `catch` is not dead code even so: in `--replay` mode there is no
+  /// daemon to restart and `restart_app` answers with a stated German error
+  /// rather than exiting anything.
+  const restartNow = useCallback(async () => {
+    setRestarting(true);
+    setRestartError(null);
+    try {
+      await invoke("restart_app");
+    } catch (e) {
+      setRestarting(false);
+      setRestartError(String(e));
+    }
+  }, []);
+
   const categories = useMemo(
     () => (config ? categorize(Object.keys(config)) : []),
     [config],
@@ -370,6 +418,23 @@ export default function Settings() {
   const searching = hits !== null;
   const hitCount = hits?.reduce((n, h) => n + (h.keys?.length ?? 1), 0) ?? 0;
   const shown = searching ? hits : current.sections.map((s) => ({ section: s, keys: null }));
+
+  // A restart must never be started on top of an edit that has not been
+  // written yet. `"pending"` is the 700 ms debounce still counting and
+  // `"saving"` is a write in flight; restarting through either would throw
+  // away what the user just typed, and the daemon would come back running
+  // the previous value — the exact opposite of what pressing a button
+  // labelled "restart so the change takes effect" is asking for.
+  const saveSettled = saveState !== "pending" && saveState !== "saving";
+  // The dialog waits for that same settling rather than firing straight off
+  // the save response. Autosave writes a toggle immediately but a text field
+  // 700 ms after the last keystroke, so a dialog on the response would land
+  // in the middle of typing and steal the caret. Waiting means it appears
+  // once, when the user pauses.
+  const restartDialogOpen = restartPending && !restartDeferred && saveSettled;
+  // The standing reminder, in the amber banner slot: whenever a restart is
+  // owed and the dialog is not the thing saying so.
+  const restartBanner = restartPending && !restartDialogOpen;
 
   if (wizardActive && wizardState) {
     return (
@@ -555,7 +620,7 @@ export default function Settings() {
                     </button>
                   </motion.div>
                 )}
-                {notice && (
+                {restartBanner && (
                   <motion.div
                     key="notice"
                     className="banner notice"
@@ -566,9 +631,20 @@ export default function Settings() {
                     transition={SETTLE}
                   >
                     <Icon name="warn" className="icon-sm" />
-                    <span>{notice}</span>
-                    <button type="button" className="ghost" onClick={() => setNotice(null)}>
-                      Verstanden
+                    {/* No "Verstanden" here any more. Acknowledging used to
+                        be the only thing this banner could offer, because
+                        nothing in the app could restart it; now that the
+                        button next to it works, a dismissal would only hide
+                        a requirement that is still owed and leave no way
+                        back to it. The restart is the acknowledgement. */}
+                    <span>Damit die Änderung greift, muss yappr neu starten.</span>
+                    <button
+                      type="button"
+                      className="add"
+                      disabled={!saveSettled || restarting}
+                      onClick={() => void restartNow()}
+                    >
+                      {restarting ? "Startet neu…" : "Jetzt neu starten"}
                     </button>
                   </motion.div>
                 )}
@@ -636,8 +712,149 @@ export default function Settings() {
 
           <SaveCapsule state={saveState} />
         </div>
+
+        <RestartDialog
+          open={restartDialogOpen}
+          restarting={restarting}
+          error={restartError}
+          onRestart={() => void restartNow()}
+          onDefer={() => setRestartDeferred(true)}
+        />
       </main>
     </MotionConfig>
+  );
+}
+
+/// The restart prompt.
+///
+/// Why this is a dialog and not just the banner it replaces: until now the
+/// app could only *tell* the user a restart was needed and leave them to run
+/// `yappr --quit` and start it again by hand. Something the app can do for
+/// you is worth interrupting for; something it cannot is not. The banner
+/// remains as the standing reminder once this has been answered with
+/// "Später", which is why deferring here does not clear the requirement.
+///
+/// The scrim is the only element in this window that covers the pane, and it
+/// is not a blur: this window's own CSS header states that elevation is
+/// declared in one direction and nothing here is translucent, so the scrim is
+/// a flat dim and the card is the same material as the info popover, one
+/// elevation above the sheet.
+///
+/// Motion follows the file's rule rather than inventing a spring: `SETTLE`,
+/// `bounce: 0`. Overshoot is reserved for motion with momentum behind it —
+/// the sidebar's travelling selection, a knob between two stops — and a
+/// dialog arriving in place has none. It enters as a material, scale plus
+/// blur, the same vocabulary `InfoTip` and `SaveCapsule` already use.
+function RestartDialog({
+  open,
+  restarting,
+  error,
+  onRestart,
+  onDefer,
+}: {
+  open: boolean;
+  restarting: boolean;
+  error: string | null;
+  onRestart: () => void;
+  onDefer: () => void;
+}) {
+  const card = useRef<HTMLDivElement>(null);
+
+  /// Keeps Tab inside the card while the dialog is up.
+  ///
+  /// This exists because of the `aria-modal="true"` below. The scrim covers
+  /// the pane *and* the rail, so a pointer cannot reach what is behind it,
+  /// but Tab still could — and a dialog that announces itself as modal to a
+  /// screen reader while its focus quietly walks off into the form behind it
+  /// is worse than one that never made the claim. Two focusable elements is
+  /// the whole cycle, but it is read out of the DOM rather than hardcoded so
+  /// adding a third control to the card cannot silently break it.
+  const keepTabInside = (e: React.KeyboardEvent) => {
+    if (e.key !== "Tab" || !card.current) return;
+    const stops = card.current.querySelectorAll<HTMLElement>(
+      "button:not(:disabled)",
+    );
+    if (stops.length === 0) return;
+    const first = stops[0];
+    const last = stops[stops.length - 1];
+    const on = e.shiftKey ? first : last;
+    if (document.activeElement === on) {
+      e.preventDefault();
+      (e.shiftKey ? last : first).focus();
+    }
+  };
+
+  return (
+    <AnimatePresence>
+      {open && (
+        <motion.div
+          key="restart-scrim"
+          className="scrim"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={SETTLE}
+          onKeyDown={(e) => {
+            // Escape defers, like every other cancel affordance in a dialog.
+            // `stopPropagation` is load-bearing and not defensive tidiness:
+            // this window installs a `keydown` listener on `window` that
+            // claims Escape to clear the search query, and without this an
+            // Escape aimed at the dialog would also wipe a search the user
+            // had running behind it.
+            if (e.key === "Escape") {
+              e.stopPropagation();
+              if (!restarting) onDefer();
+              return;
+            }
+            keepTabInside(e);
+          }}
+        >
+          <motion.div
+            ref={card}
+            className="dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="restart-title"
+            initial={{ opacity: 0, scale: 0.94, y: 8, filter: "blur(8px)" }}
+            animate={{ opacity: 1, scale: 1, y: 0, filter: "blur(0px)" }}
+            exit={{ opacity: 0, scale: 0.94, y: 8, filter: "blur(8px)" }}
+            transition={SETTLE}
+          >
+            <h2 className="dialog__title" id="restart-title">
+              Neustart nötig
+            </h2>
+            <p className="dialog__body">
+              Die Änderung ist gespeichert, greift aber erst, wenn yappr neu
+              startet. Das dauert einen Moment; dein Kurzbefehl und deine
+              Einstellungen bleiben dabei erhalten.
+            </p>
+            {error && (
+              <p className="dialog__error">
+                <Icon name="warn" className="icon-sm" />
+                <span>{error}</span>
+              </p>
+            )}
+            <div className="dialog__actions">
+              <button type="button" className="ghost" onClick={onDefer} disabled={restarting}>
+                Später
+              </button>
+              {/* Focused on open: this is the action the dialog exists to
+                  offer, and it also puts the keyboard inside the dialog so
+                  the Escape handler above is the one that sees the key. */}
+              <button
+                type="button"
+                className="add"
+                autoFocus
+                onClick={onRestart}
+                disabled={restarting}
+              >
+                {restarting ? "Startet neu…" : "Jetzt neu starten"}
+              </button>
+            </div>
+          </motion.div>
+        </motion.div>
+      )}
+    </AnimatePresence>
   );
 }
 
@@ -805,9 +1022,9 @@ function SectionCard({
         {RESTART_SECTIONS.has(name) && (
           <span
             className="tag"
-            title="Diese Einstellungen greifen erst nach einem Neustart des Daemons."
+            title="Diese Einstellungen werden gelesen, wenn die Modelle geladen werden. Sind sie gerade im Speicher, fragt yappr nach dem Speichern nach einem Neustart — sonst greift die Änderung beim nächsten Diktat."
           >
-            Neustart nötig
+            Neustart möglich
           </span>
         )}
         {sectionReset && <ResetButton onClick={() => onSection(defaults as Json, "now")} />}

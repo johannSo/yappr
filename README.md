@@ -211,9 +211,16 @@ changes nothing leaves the file byte-identical, and a config that wouldn't load 
 rejected before anything is written. Every row has a reset button that appears only when
 the value isn't the default.
 
-**`[asr]` and `[normalize]` changes need a restart** (`yappr --quit`, then launch
-again); the window says so on those rows. Everything else — the microphone included —
-applies at your next dictation, or immediately with `yappr --reload`.
+**`[asr]` and `[normalize]` changes can need a restart**, and the window asks you when
+they do: a prompt with a **Jetzt neu starten** button that shuts yappr down and brings it
+straight back. Pick **Später** and the offer stays as a bar at the top of the pane until
+you take it. You never have to restart it by hand.
+
+They only need one if the models are actually loaded at that moment. With the default
+`[models] preload_at_startup = false`, an idle yappr has nothing resident and picks up
+the new model or normalizer on your next dictation, so nothing is asked. Everything else
+— the microphone included — applies at your next dictation, or immediately with
+`yappr --reload`.
 
 ## config.toml
 

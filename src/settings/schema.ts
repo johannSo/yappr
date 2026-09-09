@@ -59,7 +59,15 @@ export const SECTION_TITLES: Record<string, string> = {
   overlay: "Overlay",
 };
 
-/** Sections the daemon cannot apply without a restart — see `restart_reason`. */
+/**
+ * Sections the daemon may not be able to apply without a restart — see
+ * `restart_reason`, which is where the rule actually lives (in Rust, so this
+ * cannot drift into deciding anything). "May not" because since the lazy
+ * model lifecycle the answer depends on whether the models are resident when
+ * the save lands: unloaded, `ensure_models_loaded` reads the new config off
+ * disk on the next press and no restart is needed. This Set only decides
+ * whether to mark the section in the GUI, never whether a restart happens.
+ */
 export const RESTART_SECTIONS = new Set(["asr", "normalize"]);
 
 export const SECTION_NOTES: Record<string, string> = {

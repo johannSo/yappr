@@ -185,6 +185,24 @@ pub fn app_version() -> &'static str {
     APP_VERSION
 }
 
+/// Restarts the whole app, for the settings window's restart dialog.
+///
+/// Goes through [`call`] like every other command here, which means it
+/// returns as soon as `dispatch` has *accepted* the restart -- not when the
+/// app comes back. That is deliberate and is what the arm is built for:
+/// `Request::Restart` latches `quitting` synchronously and does the waiting,
+/// the teardown and the relaunch on its own thread, so the frontend gets its
+/// `Ok` and the webview then dies underneath it mid-promise. The dialog must
+/// therefore treat this call resolving as "the restart is under way", never
+/// as "the restart finished", and must not try to render anything afterwards.
+///
+/// An `Err` is genuinely worth showing, though, and there is exactly one:
+/// [`NO_DAEMON`], in `--replay` mode, where there is no daemon to restart.
+#[tauri::command]
+pub async fn restart_app(server: tauri::State<'_, Server>) -> Result<serde_json::Value, String> {
+    call(&server, Request::Restart).await
+}
+
 /// Whether yappr currently starts itself at login -- read straight
 /// off the filesystem (see the module doc's "why not a config key"), so a
 /// file removed behind this app's back is reported truthfully instead of

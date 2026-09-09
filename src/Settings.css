@@ -606,6 +606,101 @@ body::before {
   color: var(--warn-ink);
 }
 
+/* ---------------------------------------------------------------- dialog
+
+   The restart prompt, and the only thing in this window that covers the
+   pane. Two rules from the header still apply and shape it: nothing here is
+   translucent (so the scrim is a flat dim over the sheet, not a blur, and the
+   card is opaque `--mat` rather than a frosted panel), and elevation is
+   declared once and in one direction (so the card takes `--e2`, the same one
+   step the info popover and the save capsule take — there is no third tier).
+
+   `position: fixed` against the window rather than the pane: this window's
+   settings can be reached from the rail as well, and a prompt that only
+   covered the pane would leave the rail live underneath it while claiming to
+   be modal. */
+
+.scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: grid;
+  place-items: center;
+  padding: 1.5rem;
+  /* Dark in both schemes: this dims whatever is behind it, and a light dim
+     over the dark palette would read as a flash rather than a recede. */
+  background: rgba(8, 10, 13, 0.44);
+}
+
+.dialog {
+  width: min(26rem, 100%);
+  padding: 1.125rem 1.1875rem 1rem;
+  border-radius: var(--radius);
+  background: var(--mat);
+  border: 1px solid var(--mat-edge);
+  box-shadow: var(--e2);
+  color: var(--text);
+}
+
+.dialog__title {
+  margin: 0 0 0.4375rem;
+  font-family: var(--font-display);
+  font-size: 0.95rem;
+  font-weight: 600;
+  /* Sentence case, per the rule on `.group-head h2`: German compounds set in
+     all caps are the hardest thing in this window to read. */
+  letter-spacing: 0;
+}
+
+.dialog__body {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.5;
+}
+
+.dialog__error {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  margin: 0.75rem 0 0;
+  padding: 0.5rem 0.625rem;
+  border-radius: var(--radius-sm);
+  background: var(--danger-wash);
+  border: 1px solid var(--danger);
+  color: var(--danger-ink);
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+
+.dialog__error .icon-sm {
+  flex: none;
+  margin-top: 0.125rem;
+}
+
+.dialog__actions {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 1.0625rem;
+}
+
+/* The banner's restart button is a primary action sitting in an amber
+   surface, where `button.add` would otherwise draw itself in the pane's own
+   colours and read as unrelated to the message it belongs to. */
+.banner.notice button.add {
+  align-self: center;
+  background: transparent;
+  border-color: var(--warn-edge);
+  color: var(--warn-ink);
+}
+
+.banner.notice button.add:hover:not(:disabled) {
+  border-color: var(--warn-ink);
+  color: var(--warn-ink);
+}
+
 /* ----------------------------------------------------------------- groups
 
    A section is a headed stretch of the page, not a card on it: a heading, an

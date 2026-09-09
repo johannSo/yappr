@@ -201,6 +201,87 @@ impl EventSink for TauriSink {
     fn unregister_tray(&self) {
         self.tray.unregister();
     }
+
+    /// `Request::Restart`'s last step, called from that arm's thread after
+    /// `shutdown` and immediately before `std::process::exit(0)`.
+    ///
+    /// Started with **no arguments**, deliberately, rather than forwarding
+    /// this process's own. Two reasons: the only argv that reaches a running
+    /// app is the no-args start (every flag in `cli::route` is a client call
+    /// that exits before Tauri initialises), and `--replay` is the one
+    /// exception -- a replay session must not resurrect itself as a second
+    /// replay, which is what forwarding argv (Tauri's own `restart` does
+    /// exactly that) would do.
+    ///
+    /// A spawn failure is logged and swallowed: the caller exits either way,
+    /// and there is nothing left to fall back to -- `shutdown` has already
+    /// run. The user sees the app close, which is a bad outcome but a
+    /// legible one, and `yappr` starts normally afterwards.
+    fn relaunch(&self) {
+        let path = match successor_binary() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("restart: cannot resolve this binary's path, not relaunching: {e}");
+                return;
+            }
+        };
+        match std::process::Command::new(&path).spawn() {
+            Ok(child) => {
+                tracing::info!(pid = child.id(), path = %path.display(), "restart: successor started")
+            }
+            Err(e) => eprintln!("restart: failed to start {}: {e}", path.display()),
+        }
+    }
+}
+
+/// Which file [`TauriSink::relaunch`] should start.
+///
+/// **Not `tauri::process::current_binary`.** That was the first
+/// implementation and it is actively wrong here, which a live restart on this
+/// machine demonstrated the first time it ran: it returns `$APPIMAGE`
+/// whenever that variable is merely *set*, without ever checking that this
+/// process is the AppImage in question. `$APPIMAGE` is inherited like any
+/// other environment variable, so a yappr launched from a terminal that is
+/// itself packaged as an AppImage sees its *ancestor's* path -- and the
+/// restart dutifully started a copy of the unrelated editor the developer
+/// happened to be running, while yappr itself stayed down.
+///
+/// The variable is still the right answer when it really is ours, and that
+/// case has to be handled: under an AppImage `current_exe` names a path
+/// inside the mount (`/tmp/.mount_yapprXXXX/usr/bin/yappr`), and the runtime
+/// unmounts it as this process exits, so a successor started from there would
+/// be running out of a directory being pulled out from under it.
+///
+/// The discriminator is `$APPDIR`, which the AppImage runtime sets to the
+/// mount root of *the AppImage whose payload is running*. If this executable
+/// lives inside it, `$APPIMAGE` names the outer file and is correct; if it
+/// does not, both variables belong to somebody else's AppImage and
+/// `current_exe` is correct.
+fn successor_binary() -> std::io::Result<std::path::PathBuf> {
+    Ok(pick_successor_binary(
+        std::env::current_exe()?,
+        std::env::var_os("APPIMAGE").map(std::path::PathBuf::from),
+        std::env::var_os("APPDIR").map(std::path::PathBuf::from),
+    ))
+}
+
+/// [`successor_binary`]'s decision, with the environment passed in so the
+/// wrong answer that shipped first is a test rather than a story.
+fn pick_successor_binary(
+    current_exe: std::path::PathBuf,
+    appimage: Option<std::path::PathBuf>,
+    appdir: Option<std::path::PathBuf>,
+) -> std::path::PathBuf {
+    match (appimage, appdir) {
+        (Some(appimage), Some(appdir))
+            if !appimage.as_os_str().is_empty()
+                && !appdir.as_os_str().is_empty()
+                && current_exe.starts_with(&appdir) =>
+        {
+            appimage
+        }
+        _ => current_exe,
+    }
 }
 
 impl TauriSink {
@@ -323,6 +404,7 @@ pub fn run() {
             settings_cmds::list_input_devices,
             settings_cmds::autostart_status,
             settings_cmds::set_autostart,
+            settings_cmds::restart_app,
             settings_cmds::app_version,
             provision::setup_status,
             provision::run_setup,
@@ -593,6 +675,71 @@ fn position_bottom_center(window: &tauri::WebviewWindow) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    /// The bug this function exists to prevent, reproduced. The first
+    /// implementation used `tauri::process::current_binary`, which returns
+    /// `$APPIMAGE` whenever that variable is set at all -- and it is an
+    /// ordinary inherited variable, so a yappr started from a terminal that
+    /// is itself an AppImage sees the terminal's path. On the first live
+    /// restart on the developer's machine that is exactly what happened: the
+    /// restart started a second copy of an unrelated editor and left yappr
+    /// down. `$APPDIR` is what distinguishes the two cases, because the
+    /// runtime points it at the mount of the AppImage whose payload is
+    /// actually running.
+    #[test]
+    fn an_inherited_appimage_variable_from_some_other_app_is_ignored() {
+        let exe = PathBuf::from("/home/joni/yappr/target/debug/yappr");
+        assert_eq!(
+            pick_successor_binary(
+                exe.clone(),
+                Some(PathBuf::from("/home/joni/AppImages/some-editor.appimage")),
+                Some(PathBuf::from("/tmp/.mount_some-editorAbC123")),
+            ),
+            exe,
+            "this executable is not inside that AppImage's mount, so the variables are not ours"
+        );
+    }
+
+    /// The case the variable is genuinely for: running as the AppImage's own
+    /// payload, where `current_exe` is inside a mount the runtime unmounts as
+    /// this process exits -- so a successor started from it would be running
+    /// out of a directory being pulled out from under it.
+    #[test]
+    fn our_own_appimage_is_relaunched_by_its_outer_path_not_its_mount_path() {
+        assert_eq!(
+            pick_successor_binary(
+                PathBuf::from("/tmp/.mount_yapprXy9z/usr/bin/yappr"),
+                Some(PathBuf::from("/home/joni/AppImages/yappr.appimage")),
+                Some(PathBuf::from("/tmp/.mount_yapprXy9z")),
+            ),
+            PathBuf::from("/home/joni/AppImages/yappr.appimage"),
+        );
+    }
+
+    /// The ordinary case, and the two half-set ones. An empty variable is
+    /// treated as unset because that is how a shell exports a cleared one.
+    #[test]
+    fn without_a_matching_appimage_pair_the_current_executable_is_used() {
+        let exe = PathBuf::from("/usr/bin/yappr");
+        for (appimage, appdir) in [
+            (None, None),
+            (Some("/home/joni/AppImages/yappr.appimage"), None),
+            (None, Some("/tmp/.mount_yapprXy9z")),
+            (Some(""), Some("/tmp/.mount_yapprXy9z")),
+            (Some("/home/joni/AppImages/yappr.appimage"), Some("")),
+        ] {
+            assert_eq!(
+                pick_successor_binary(
+                    exe.clone(),
+                    appimage.map(PathBuf::from),
+                    appdir.map(PathBuf::from),
+                ),
+                exe,
+                "appimage={appimage:?} appdir={appdir:?}"
+            );
+        }
+    }
 
     #[test]
     fn a_focused_overlay_hijacks_injection_only_at_the_injecting_event() {

@@ -21,6 +21,19 @@ pub enum Request {
     Toggle,
     /// Shut the whole app down. The tray's Beenden sends the same request.
     Quit,
+    /// Shut the whole app down and start it again. Identical to
+    /// [`Request::Quit`] up to the last instruction -- the same `quitting`
+    /// latch, the same wait for an in-flight utterance, the same `shutdown`
+    /// -- with the successor spawned in between `shutdown` and the exit.
+    ///
+    /// The ordering is the whole point and is not interchangeable with
+    /// Tauri's own `AppHandle::restart`, which spawns the successor *before*
+    /// the parent has released anything: `shutdown` is what removes
+    /// `yappr.lock`, so a successor started ahead of it finds the exclusive
+    /// `flock` still held, prints "yappr is already running" and exits 1 --
+    /// and then the parent exits too, leaving nothing running at all. See
+    /// `server::dispatch`'s arm and `EventSink::relaunch`.
+    Restart,
     /// Show and focus the settings window.
     ShowSettings,
     /// Show the settings window with the first-run wizard on top of it
@@ -276,6 +289,7 @@ mod tests {
         assert_eq!(serde_json::to_string(&Request::Reload).unwrap(), r#"{"cmd":"reload"}"#);
         assert_eq!(serde_json::to_string(&Request::Toggle).unwrap(), r#"{"cmd":"toggle"}"#);
         assert_eq!(serde_json::to_string(&Request::Quit).unwrap(), r#"{"cmd":"quit"}"#);
+        assert_eq!(serde_json::to_string(&Request::Restart).unwrap(), r#"{"cmd":"restart"}"#);
         assert_eq!(
             serde_json::to_string(&Request::ShowSettings).unwrap(),
             r#"{"cmd":"show-settings"}"#
