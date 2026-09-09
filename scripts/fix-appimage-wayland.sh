@@ -76,6 +76,13 @@ if [ -z "$removed" ]; then
 fi
 rm -f squashfs-root/usr/lib/libwayland-*.so*
 
-ARCH=x86_64 "$APPIMAGETOOL" --runtime-file runtime squashfs-root repacked.AppImage >&2
-mv repacked.AppImage "$appimage"
+# Absolute paths, not relative. appimagetool is itself an AppImage and runs
+# here under APPIMAGE_EXTRACT_AND_RUN, which extracts it and executes from a
+# different working directory -- so a relative "squashfs-root" resolves
+# against the wrong place and it fails with the unhelpful
+# "Error: no such file or directory: squashfs-root" while the directory is
+# sitting right there in $workdir.
+ARCH=x86_64 "$APPIMAGETOOL" --runtime-file "$workdir/runtime" \
+    "$workdir/squashfs-root" "$workdir/repacked.AppImage" >&2
+mv "$workdir/repacked.AppImage" "$appimage"
 echo "$appimage now defaults to the Wayland backend; removed:" $(basename -a $removed)
