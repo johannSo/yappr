@@ -1,6 +1,6 @@
 [package]
 name = "yappr"
-version = "0.2.3"
+version = "0.2.4"
 description = "Press-to-start, press-to-stop dictation for Hyprland"
 authors = ["you"]
 edition = "2021"
