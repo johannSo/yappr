@@ -143,7 +143,7 @@ pub async fn wizard_state() -> Result<serde_json::Value, String> {
         // things. A broken install is what the wizard is *for*.
         let current = yappr_core::config::Config::load()
             .map(|c| match c.inject.backend {
-                yappr_core::config::InjectBackend::Ydotool => "ydotool",
+                yappr_core::config::InjectBackend::Script => "script",
                 yappr_core::config::InjectBackend::Clipboard => "clipboard",
                 yappr_core::config::InjectBackend::Wtype => "wtype",
             })
