@@ -453,6 +453,25 @@ the whole lock file stops parsing. See
   names *freedesktop symbolic* icons because its icon is a state readout, not branding
   (invariant: recording must never look like idle), and a full-colour plate would neither
   theme with the panel nor survive 22 px.
+- **The app ships its own type, and `public/fonts/*.woff2` is generated — regenerate it
+  with `scripts/build-fonts.sh`, never by hand.** Three roles (`--font-display`,
+  `--font-ui`, `--font-mono`), declared once in `src/fonts.css`, which both windows
+  `@import`; they used to live in `Settings.css` while the overlay carried an unrelated
+  `system-ui` stack, which is how the two windows came to disagree. The stacks still name
+  system families behind the bundled ones, but only as a per-glyph net for a character
+  outside the subset — not as the plan, which is what they were until the fonts were
+  bundled. Two things there are not guessable. **The subset is not "all of Latin"**: the
+  script's header records what each range costs in bytes and why Latin Extended-B, the
+  combining block, Greek, Cyrillic and Vietnamese are all deliberately out, so widening it
+  is a decision with a measured price rather than a free `+=`. And **iA Writer Duo is
+  deliberately converted but never subset**, because it declares the Reserved Font Names
+  "iA Writer" and "Plex": OFL-FAQ 2.6 makes glyph removal a modification, which forfeits
+  an RFN, while 2.7/2.8 let a container change keep it. Adding `--unicodes` to that one
+  call obliges you to rewrite the font's internal name records to a name of our own
+  (OFL-FAQ 3.1) — i.e. to fork someone else's typeface. Adwaita Sans and Adwaita Mono
+  declare no RFN and are subset freely. `--name-IDs='*'` on every call keeps the
+  copyright and licence records inside each file; `public/fonts/OFL-*.txt` carries the
+  full texts.
 
 ## Environment gotchas
 

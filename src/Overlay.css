@@ -7,6 +7,12 @@
    Every element here renders on top of an arbitrary desktop background, so the
    capsule supplies all of its own contrast rather than relying on the page. */
 
+/* The bundled faces and the three type roles. This window used to carry its
+   own `system-ui` stack and nothing else, so the one place the product shows
+   a user their own words was also the one place it did not use the product's
+   typeface. */
+@import "./fonts.css";
+
 :root,
 html,
 body,
@@ -57,9 +63,7 @@ body,
 }
 
 body {
-  font-family:
-    system-ui, -apple-system, "Segoe UI", "Noto Sans", Cantarell, Ubuntu,
-    Roboto, "Helvetica Neue", Arial, sans-serif;
+  font-family: var(--font-ui);
 }
 
 /* The canvas. Bottom-anchored, so a capsule that grows for a two-line preview
