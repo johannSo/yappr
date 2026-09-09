@@ -31,6 +31,7 @@ export const CATEGORIES: Category[] = [
   { id: "sprache", title: "Sprache", icon: "waveform", sections: ["asr", "vocabulary"] },
   { id: "stil", title: "Stil", icon: "pen", sections: ["style_default", "style_rules"] },
   { id: "erweitert", title: "Erweitert", icon: "gear", sections: ["models", "normalize", "guardrail"] },
+  { id: "darstellung", title: "Darstellung", icon: "palette", sections: ["ui"] },
   { id: "diagnose", title: "Diagnose", icon: "pulse", sections: ["debug", "overlay"] },
 ];
 
@@ -57,6 +58,7 @@ export const SECTION_TITLES: Record<string, string> = {
   guardrail: "Schutzschwellen",
   debug: "Diagnose",
   overlay: "Overlay",
+  ui: "Farben & Thema",
 };
 
 /**
@@ -78,6 +80,7 @@ export const SECTION_NOTES: Record<string, string> = {
 };
 
 export const LABELS: Record<string, string> = {
+  "ui.theme": "Farbschema",
   "audio.device": "Mikrofon",
   "audio.max_seconds": "Maximale Aufnahmedauer",
   "audio.vad_padding_ms": "Sprachpuffer",
@@ -212,6 +215,8 @@ export const HELP: Record<string, string> = {
     "Legt zusätzlich die aufgenommene Tonspur ab. Braucht deutlich mehr Platz.",
   "overlay.position":
     "Wird eingelesen, steuert aber nichts — unter Wayland kann ein Fenster seine eigene Position nicht setzen.",
+  "ui.theme":
+    "Gilt für beide Fenster, auch für das Diktat-Overlay. \u201eSystem\u201c folgt der Hell-/Dunkel-Einstellung des Schreibtischs; jedes andere Schema legt eine Variante fest und bleibt auch dann, wenn der Schreibtisch wechselt. Wirkt sofort, kein Neustart nötig.",
   "overlay.width": "Wird eingelesen, steuert aber nichts.",
   "overlay.height": "Wird eingelesen, steuert aber nichts.",
   "autostart.enabled":
@@ -219,6 +224,19 @@ export const HELP: Record<string, string> = {
 };
 
 export const ENUMS: Record<string, string[]> = {
+  // Mirrors `Theme::ALL` in `crates/yappr-core/src/config.rs`, in the same
+  // order: the shipped pair first, then the two families. One of the three
+  // hand-maintained copies of this list -- see `src/theme.ts`'s header, and
+  // the drift test that reads all three.
+  "ui.theme": [
+    "system",
+    "yappr-light",
+    "yappr-dark",
+    "catppuccin-latte",
+    "catppuccin-mocha",
+    "tokyo-night-day",
+    "tokyo-night-night",
+  ],
   "asr.model": [
     "parakeet-tdt-v3",
     "parakeet-primeline-de",
@@ -233,6 +251,28 @@ export const ENUMS: Record<string, string[]> = {
   "style_rules.styling": ["casual", "semi-casual", "semi-formal", "formal"],
   "style_rules.structure": ["prose", "lists"],
   "style_rules.context": ["general", "email"],
+};
+
+/// How an enum value is *shown*, where the raw value is not the best thing to
+/// read. Optional per key and per value: an enum with no entry here renders
+/// its raw values, which is right for `wtype` or `parakeet-tdt-v3` -- those
+/// are names, and renaming them in the GUI would hide the string the user has
+/// to type into `config.toml` or a bug report.
+///
+/// Themes are the case where it is not right: `catppuccin-mocha` is a slug
+/// for a thing with a proper name, and a dropdown of slugs reads like a
+/// config file rather than a choice of how the app looks. Nothing is lost by
+/// labelling them -- `search()` still matches the raw key and value.
+export const ENUM_LABELS: Record<string, Record<string, string>> = {
+  "ui.theme": {
+    system: "System (hell/dunkel folgen)",
+    "yappr-light": "yappr Hell",
+    "yappr-dark": "yappr Dunkel",
+    "catppuccin-latte": "Catppuccin Latte",
+    "catppuccin-mocha": "Catppuccin Mocha",
+    "tokyo-night-day": "Tokyo Night Day",
+    "tokyo-night-night": "Tokyo Night Night",
+  },
 };
 
 /// Columns for a table of objects. Needed because an *empty* array carries no
@@ -304,6 +344,7 @@ export const FIELD_ORDER: Record<string, string[]> = {
   style_default: ["styling", "structure", "context"],
   debug: ["enabled", "dir", "save_audio"],
   overlay: ["position", "width", "height"],
+  ui: ["theme"],
 };
 
 /// A section's fields as rows, in `FIELD_ORDER` where it has an opinion and in

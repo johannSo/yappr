@@ -21,6 +21,15 @@
  * direction: the two things that genuinely float -- the info popover and the
  * save capsule -- cast a shadow and are the only things that do.
  *
+ * No colour is named in this file. Every one comes from the ramp in
+ * `palettes.css`, mapped onto this window's own token names in one block
+ * below, so the seven themes are seven sets of hexes rather than seven copies
+ * of this stylesheet. Anything that depends on light-vs-dark rather than on
+ * which palette is chosen is a slot in that file too -- the grain's blend
+ * mode and the brand plate's shadow both used to be `prefers-color-scheme`
+ * overrides here, and both were wrong the moment a light theme could be
+ * pinned on a dark desktop.
+ *
  * Sizes are in `rem`, so a user who has raised their text size gets a bigger
  * window's worth of layout rather than the same layout with bigger text
  * overflowing it.
@@ -31,83 +40,79 @@
    import. They used to be defined here, which is why the overlay had a
    different idea of the product's typography than this window did. */
 @import "./fonts.css";
+@import "./palettes.css";
 
 /* ---------------------------------------------------------------- tokens */
 
 :root {
-  color-scheme: light dark;
+  /* The window's own vocabulary, mapped onto the ramp in `palettes.css`
+     exactly once. Nothing else in this file names a colour: a theme decides
+     what `--p-base` is, and every rule below follows without knowing that
+     themes exist at all.
 
-  /* Light is the base set. Dark redefines only what changes, so no colour has
-     its single definition inside a media query -- a token that exists only in
-     one branch is a token that goes missing in the other.
-
-     Every surface here is opaque. Stacked alphas were what made the old
-     palette impossible to reason about: a value's real contrast depended on
-     how many translucent layers happened to be under it that day. These are
-     the colours that actually land on screen. */
+     `color-scheme` used to be declared here as `light dark`. It moved into
+     the palettes, because it has to follow the *chosen* appearance rather
+     than the desktop's: a pinned Latte on a dark desktop needs light native
+     scrollbars and a light native select popup, and `light dark` gave it
+     dark ones. */
 
   /* -- Two tones of one material. -----------------------------------------
      The pane (`--mat`) and the rail (`--mat-rail`), meeting at one seam. The
      rail is only a shade darker: far enough to read as the margin of the
      page, close enough that the grain over both makes them one sheet. There
-     is no third "ground" tone showing between tiles any more, so `--ground`
-     is simply the pane's colour -- it is what the body paints under
-     everything, and what shows during load. `--mat-rail-deep` is the rail's
-     far edge, so it can fall off softly toward the seam. */
-  --ground: #f5f6f8;
-  --mat: #f5f6f8;
-  --mat-rail: #e6e8ec;
-  --mat-rail-deep: #dfe2e7;
-  --mat-edge: #d3d7de;
-  /* How strongly the grain shows. A few percent is all it takes; at 10% it
-     stops being paper and starts being noise. */
-  --grain: 0.055;
+     is no third "ground" tone showing between tiles, so `--ground` is simply
+     the pane's colour -- it is what the body paints under everything, and
+     what shows during load. `--mat-rail-deep` is the rail's far edge, so it
+     can fall off softly toward the seam. */
+  --ground: var(--p-base);
+  --mat: var(--p-base);
+  --mat-rail: var(--p-mantle);
+  --mat-rail-deep: var(--p-crust);
+  --mat-edge: var(--p-edge);
+  /* How strongly the grain shows, and which way it blends. Both come from the
+     palette: the blend used to be a `prefers-color-scheme` override, which a
+     light theme pinned on a dark desktop would have got backwards. */
+  --grain: var(--p-grain);
+  --grain-blend: var(--p-grain-blend);
 
   /* Fields and tracks. Filled and outlined rather than cut in with an inset
      shadow: on a flat surface the border is the whole affordance, and a fake
-     bevel under it is the thing that reads as drawn-by-a-machine. The well
-     is a touch brighter than the pane, so a field reads as a place to write
-     on the sheet. */
-  --well: #ffffff;
-  --well-edge: #b9c0ca;
-  --sunk: #e7e9ed;
-  --hairline: #dfe2e7;
-  --row-hover: rgba(15, 23, 42, 0.04);
-  /* The switch, which needs two values of its own.
-     `--track` is the off state, and it is deliberately darker than `--sunk`:
-     an unlit switch has to read as a *control* sitting on the tile, where the
-     other sunk surfaces only have to read as recessed.
-     `--knob` is the knob at rest. It cannot clear 3:1 against any track pale
-     enough to still mean "off" -- no platform's switch does -- so what
-     separates it is its shadow, and its position, and the track turning solid
-     accent when it lights. */
-  --track: #ccd1d9;
-  --knob: #ffffff;
+     bevel under it is the thing that reads as drawn-by-a-machine. The well is
+     a touch brighter than the pane in every palette, so a field reads as a
+     place to write on the sheet. */
+  --well: var(--p-well);
+  --well-edge: var(--p-well-edge);
+  --sunk: var(--p-sunk);
+  --hairline: var(--p-line);
+  --row-hover: var(--p-row-hover);
+  --track: var(--p-track);
+  --knob: var(--p-knob);
 
-  --text: #14171d;
-  --muted: #57606f;
-  --faint: #6b7382;
+  --text: var(--p-text);
+  --muted: var(--p-muted);
+  --faint: var(--p-faint);
 
   /* One accent, used where the compositor uses it: to mark what has focus.
-     Nowhere else. The bright cyan the app is known by does not clear AA as
-     text on a light ground (4.3:1), so light mode carries it taken down until
-     it does; dark mode gets the bright value back, where it measures 10.3:1
-     on its own. */
-  --accent: #06687f;
-  /* What reads on a solid `--accent` fill -- the toggle knob, chiefly. It
-     flips with the theme because the fill does: white on #06687f is 6.4:1,
-     while white on the dark theme's #33ccff is 1.9:1 and fails outright. */
-  --accent-ink: #ffffff;
-  --accent-wash: #dceef3;
-  --focus: #06687f;
+     Nowhere else. `--focus` is that same colour under the name of the one job
+     it does, so no palette can hand the app two accents by accident. */
+  --accent: var(--p-accent);
+  --accent-ink: var(--p-accent-ink);
+  --accent-wash: var(--p-accent-wash);
+  --focus: var(--p-accent);
 
-  --danger: #c02a1c;
-  --danger-wash: #fbeae8;
-  --danger-ink: #8e1d13;
-  --ok: #0c7048;
-  --warn-ink: #6f4400;
-  --warn-wash: #fbf1dd;
-  --warn-edge: #e0c391;
+  --danger: var(--p-danger);
+  --danger-wash: var(--p-danger-wash);
+  --danger-ink: var(--p-danger-ink);
+  --ok: var(--p-ok);
+  --warn-ink: var(--p-warn-ink);
+  --warn-wash: var(--p-warn-wash);
+  --warn-edge: var(--p-warn-edge);
+
+  /* The brand plate's edge on a near-white rail, a palette slot for the same
+     reason the grain blend is one. */
+  --mark-shadow: var(--p-mark-shadow);
+
+  /* ---- Metrics. No palette changes any of these. ----------------------- */
 
   --sidebar-w: 14.5rem;
   --control-w: 14.5rem;
@@ -126,55 +131,7 @@
      popover and the save capsule, both of which genuinely arrive on top of
      something. It has an offset and a soft blur, because that is what a
      shadow is; a zero-offset halo would be decoration. */
-  --e2:
-    0 6px 16px -6px rgba(15, 23, 42, 0.3),
-    0 1px 3px rgba(15, 23, 42, 0.14);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    /* The same ordering, not an inversion of it: the rail is still the darker
-       tone and the page the lighter. Dark themes that swap that round end up
-       with a sidebar glowing brighter than the content it navigates. */
-    --ground: #1c1f23;
-    --mat: #1c1f23;
-    --mat-rail: #15171b;
-    --mat-rail-deep: #101215;
-    --mat-edge: #33373e;
-    --grain: 0.07;
-
-    --well: #23272d;
-    --well-edge: #3d434c;
-    --sunk: #282c33;
-    --hairline: #2b2f36;
-    --row-hover: rgba(255, 255, 255, 0.04);
-    --track: #3a4048;
-    --knob: #b9c1cd;
-
-    --text: #e6e9ee;
-    --muted: #a0a8b5;
-    --faint: #8d95a3;
-
-    /* The bright cyan comes back: on this ground it measures 10.3:1 as text,
-       so the light theme's darkened variant would only look muddy here. The
-       knob ink flips with it -- dark on the fill, not white. */
-    --accent: #33ccff;
-    --accent-ink: #072530;
-    --accent-wash: #16323d;
-    --focus: #33ccff;
-
-    --danger: #ff6b5e;
-    --danger-wash: #37201d;
-    --danger-ink: #ffb3ad;
-    --ok: #46e0a0;
-    --warn-ink: #f0c37a;
-    --warn-wash: #33280f;
-    --warn-edge: #6b5526;
-
-    --e2:
-      0 8px 20px -6px rgba(0, 0, 0, 0.7),
-      0 1px 3px rgba(0, 0, 0, 0.5);
-  }
+  --e2: var(--p-shadow);
 }
 
 * {
@@ -204,8 +161,10 @@ body {
    read as one sheet of material rather than two fills that happen to touch.
    It is an SVG turbulence tile, so it costs no image and scales with nothing:
    the noise is always at device pixels, which is what paper does too.
-   `mix-blend-mode: multiply` darkens the grain into light surfaces; dark mode
-   flips it to `screen` below so the flecks lighten instead of vanishing. */
+   The blend comes from the palette (`--p-grain-blend`): `multiply` darkens
+   the flecks into a light surface, `screen` lightens them into a dark one. It
+   used to be a `prefers-color-scheme` override, which meant a light theme
+   pinned on a dark desktop screened its grain and showed nothing at all. */
 body::before {
   content: "";
   position: fixed;
@@ -213,15 +172,9 @@ body::before {
   z-index: 2;
   pointer-events: none;
   opacity: var(--grain);
-  mix-blend-mode: multiply;
+  mix-blend-mode: var(--grain-blend);
   background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='180' height='180'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 0.5 0 0 0 0 0.5 0 0 0 0 0.5 0 0 0 1 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
   background-size: 180px 180px;
-}
-
-@media (prefers-color-scheme: dark) {
-  body::before {
-    mix-blend-mode: screen;
-  }
 }
 
 /* Edge to edge. No inset, no gap: the rail starts at the window's left edge
@@ -280,20 +233,14 @@ body::before {
    mark should read and the padding is absorbed rather than trimmed. On the
    light rail it is a near-white plate on a near-white frost: the drop-shadow
    -- which follows the plate's alpha, unlike a box-shadow, which would trace
-   the square img box around it -- is what keeps its edge. */
+   the square img box around it -- is what keeps its edge. On a dark rail the
+   plate carries its own edge and a shadow under a bright tile only muddies
+   it, so the value is `--p-mark-shadow`'s job rather than a second rule's. */
 .brand__mark {
   width: 1.5rem;
   height: 1.5rem;
   flex: none;
-  filter: drop-shadow(0 1px 1px rgb(0 0 0 / 0.16));
-}
-
-@media (prefers-color-scheme: dark) {
-  /* On the dark rail the plate carries its own edge; a shadow under a bright
-     tile only muddies it. */
-  .brand__mark {
-    filter: none;
-  }
+  filter: var(--mark-shadow);
 }
 
 .brand__text {
@@ -1487,12 +1434,30 @@ button:disabled {
 
 /* Contrast still has somewhere to go. The rules do the structural work here,
    so raising contrast means drawing them harder, and giving the rail a hard
-   seam instead of a soft falloff. */
+   seam instead of a soft falloff.
+
+   Keyed on `[data-appearance]`, and that is load-bearing rather than tidy: a
+   plain `:root` is (0,1,0) while a palette's `:root[data-theme="..."]` is
+   (0,1,1), so this block would *lose* to every pinned theme and quietly
+   switch high contrast off for everyone not on `system`. The attribute makes
+   it a tie, and ties go to document order -- which this file wins, because it
+   imports `palettes.css` at the top rather than being imported by it. Do not
+   drop the attribute, and do not move these rules above the import.
+
+   Two generic sets rather than six palette-specific ones, because raising
+   contrast means *leaving* the palette: these are the hardest lines the
+   window can draw, not Catppuccin's idea of a hairline. */
 @media (prefers-contrast: more) {
-  :root {
+  :root[data-appearance="light"] {
     --hairline: #9aa0aa;
     --mat-edge: #7c838e;
     --well-edge: #5c636e;
+  }
+
+  :root[data-appearance="dark"] {
+    --hairline: #5b626d;
+    --mat-edge: #757d89;
+    --well-edge: #8b93a0;
   }
 
   .sidebar {
@@ -1511,14 +1476,6 @@ button:disabled {
      gone and the edges hard, give it an edge of its own. */
   .nav-selection {
     box-shadow: inset 0 0 0 1px var(--hairline);
-  }
-}
-
-@media (prefers-contrast: more) and (prefers-color-scheme: dark) {
-  :root {
-    --hairline: #5b626d;
-    --mat-edge: #757d89;
-    --well-edge: #8b93a0;
   }
 }
 

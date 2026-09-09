@@ -158,7 +158,11 @@ pub async fn wizard_finish(
     set_backend: Option<String>,
 ) -> Result<(), String> {
     if let Some(backend) = set_backend {
-        crate::settings_cmds::set_config(server, backend_patch(&backend)).await?;
+        // `app` so the save broadcasts the configured palette like any
+        // other, which the wizard needs for a reason of its own: it takes
+        // over the whole settings window, so this is the first save some
+        // installs ever make.
+        crate::settings_cmds::set_config(app.clone(), server, backend_patch(&backend)).await?;
     }
 
     write_marker(&yappr_core::paths::wizard_marker())

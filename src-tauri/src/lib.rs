@@ -406,6 +406,7 @@ pub fn run() {
             settings_cmds::set_autostart,
             settings_cmds::restart_app,
             settings_cmds::app_version,
+            settings_cmds::theme,
             provision::setup_status,
             provision::run_setup,
             wizard::wizard_state,

@@ -4,6 +4,7 @@ import { Icon } from "./icons";
 import {
   COLUMN_LABELS,
   ENUMS,
+  ENUM_LABELS,
   HELP,
   Json,
   Section,
@@ -182,15 +183,19 @@ export function Row({
 
 function EnumSelect({
   options,
+  labels,
   value,
   onChange,
 }: {
   options: string[];
+  labels?: Record<string, string>;
   value: string;
   onChange: Change;
 }) {
   // A value the enum has never heard of still has to be selectable, or opening
   // this window would silently rewrite a hand-edited config on the first save.
+  // It shows its raw self: there is no label for a value nobody declared, and
+  // inventing one would hide what is actually in the file.
   const known = options.includes(value);
   return (
     <div className="select">
@@ -198,7 +203,7 @@ function EnumSelect({
         {!known && <option value={value}>{value}</option>}
         {options.map((o) => (
           <option key={o} value={o}>
-            {o}
+            {labels?.[o] ?? o}
           </option>
         ))}
       </select>
@@ -270,7 +275,15 @@ export function ScalarInput({
   onChange: Change;
 }) {
   const options = ENUMS[path];
-  if (options) return <EnumSelect options={options} value={String(value)} onChange={onChange} />;
+  if (options)
+    return (
+      <EnumSelect
+        options={options}
+        labels={ENUM_LABELS[path]}
+        value={String(value)}
+        onChange={onChange}
+      />
+    );
   if (typeof value === "boolean") return <Toggle value={value} onChange={onChange} />;
   if (typeof value === "number") return <NumberInput value={value} onChange={onChange} />;
   return (

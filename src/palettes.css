@@ -1,0 +1,371 @@
+/* The palettes.
+ *
+ * Both windows draw themselves out of the same ramp, and this file is the
+ * only place a colour is *named*. Nothing here styles anything: each block
+ * declares a set of `--p-*` slots, and `Settings.css` and `Overlay.css` each
+ * map that ramp onto their own semantic tokens exactly once. That indirection
+ * is the whole point -- a token added to a window is added in one place, not
+ * in seven theme blocks, and the seventh theme is ~25 hexes rather than a
+ * second copy of a stylesheet.
+ *
+ * Two attributes on `<html>` select from here, both set by `theme.ts`:
+ *
+ *   data-theme       one of the six *concrete* palettes below
+ *   data-appearance  `light` or `dark`
+ *
+ * `system` never reaches CSS. `[ui] theme = "system"` is resolved in
+ * `theme.ts` to `yappr-light` or `yappr-dark` from `prefers-color-scheme`,
+ * and re-resolved when that preference changes. That is deliberate: resolving
+ * it here instead would mean writing the shipped palette twice (once for
+ * `[data-theme="yappr-dark"]`, once inside a `prefers-color-scheme` query for
+ * `system`), and it would put a media query and an attribute selector in
+ * competition over the same tokens -- see the specificity note below.
+ *
+ * `data-appearance` exists because a pinned theme decouples how the app looks
+ * from what the desktop prefers. Four rules used to key on
+ * `prefers-color-scheme`; every one of them was a bug waiting for someone to
+ * pin Latte on a dark desktop and get a light palette with a `screen`-blended
+ * grain over it. Anything that varies by appearance rather than by palette is
+ * a slot in the two appearance blocks below.
+ *
+ * ---- specificity, which is load-bearing ---------------------------------
+ *
+ * `:root[data-theme="x"]` is (0,1,1). `:root` inside a media query is (0,1,0)
+ * and *loses* to it, so the `prefers-contrast: more` and
+ * `prefers-reduced-transparency` overrides in `Settings.css` had to gain an
+ * attribute of their own or every pinned theme would silently switch the
+ * high-contrast palette off. They are written `:root[data-appearance="..."]`
+ * -- (0,1,1), a tie with the theme blocks, broken by document order, which is
+ * why they come *after* the import of this file and must stay there.
+ *
+ * The appearance blocks are first and the theme blocks second for the same
+ * reason: same specificity, so a theme overrides an appearance default. That
+ * is how `yappr-dark` keeps the exact grain and shadow it shipped with while
+ * Mocha inherits the generic dark ones.
+ *
+ * ---- where the numbers come from ----------------------------------------
+ *
+ * Catppuccin and Tokyo Night are transcribed from upstream: the palettes in
+ * `catppuccin/nvim`'s `lua/catppuccin/palettes/{mocha,latte}.lua` and the
+ * generated `tokyonight.nvim` `extras/tailwindv4/tokyonight_{night,day}.css`.
+ * The surface ramp needs more steps than either palette publishes (a well, a
+ * sunk fill, three weights of line), so those are interpolated *within* the
+ * published ramp rather than invented.
+ *
+ * The ink roles are adjusted, and this is the one place these palettes are
+ * not upstream's. Neither light theme clears WCAG AA as small text on its own
+ * base: Latte's green is 2.96:1, Tokyo Night Day's comment grey is 2.54:1,
+ * its blue 3.11:1. This window is a form. So every ink role is stepped toward
+ * black (light themes) or white (dark themes) in 2% increments until it
+ * clears 4.5:1 against the ground it actually sits on -- hue untouched, only
+ * lightness moves, and only as far as it has to. That is the same trade the
+ * shipped light palette already makes with the brand cyan ("carries it taken
+ * down until it does"), applied mechanically instead of by eye. Graphic-only
+ * slots (`--p-accent2`, the line weights) are held to 3:1 and ~1.2-1.45:1
+ * respectively, because a gradient stop and a hairline are not text.
+ *
+ * The recorded deviations, largest first: Latte's warn ink 46% toward black,
+ * Tokyo Night Day's faint 30% and its warn ink 32%, Latte's warn 25%. Nothing
+ * else moves more than a quarter of the way, and eleven of the four themes'
+ * slots do not move at all.
+ */
+
+/* ---------------------------------------------------------------- appearance
+   The defaults that depend on whether a palette is light or dark rather than
+   on which palette it is: the alpha overlays, the two shadows, and the grain.
+   A theme block below may override any of them; `yappr-light` and
+   `yappr-dark` do, to keep the values they shipped with. */
+
+:root[data-appearance="light"] {
+  color-scheme: light;
+  --p-row-hover: rgba(15, 23, 42, 0.04);
+  /* A few percent is all it takes; at 10% it stops being paper and starts
+     being noise. `multiply` darkens the flecks into a light surface. */
+  --p-grain: 0.055;
+  --p-grain-blend: multiply;
+  /* The brand plate is near-white on a near-white rail, so it needs an edge.
+     A drop-shadow follows the plate's alpha; a box-shadow would trace the
+     square `img` box around it. */
+  --p-mark-shadow: drop-shadow(0 1px 1px rgb(0 0 0 / 0.16));
+  --p-shadow:
+    0 6px 16px -6px rgba(15, 23, 42, 0.3),
+    0 1px 3px rgba(15, 23, 42, 0.14);
+  /* The HUD floats over content nobody chose. A light capsule over a light
+     wallpaper has nothing to separate it but its own edge and its shadow, so
+     both are drawn harder here than a dark capsule needs. */
+  --p-hud-edge: rgba(15, 23, 42, 0.16);
+  --p-hud-sheen: rgba(255, 255, 255, 0.9);
+  --p-hud-shadow:
+    0 18px 40px -10px rgba(15, 23, 42, 0.3),
+    0 4px 12px -2px rgba(15, 23, 42, 0.2);
+}
+
+:root[data-appearance="dark"] {
+  color-scheme: dark;
+  --p-row-hover: rgba(255, 255, 255, 0.04);
+  --p-grain: 0.07;
+  /* `screen` so the flecks lighten instead of vanishing into the ground. */
+  --p-grain-blend: screen;
+  /* On a dark rail the plate carries its own edge; a shadow under a bright
+     tile only muddies it. */
+  --p-mark-shadow: none;
+  --p-shadow:
+    0 8px 20px -6px rgba(0, 0, 0, 0.7),
+    0 1px 3px rgba(0, 0, 0, 0.5);
+  --p-hud-edge: rgba(255, 255, 255, 0.1);
+  --p-hud-sheen: rgba(255, 255, 255, 0.14);
+  --p-hud-shadow:
+    0 18px 40px -10px rgba(0, 0, 0, 0.55),
+    0 4px 12px -2px rgba(0, 0, 0, 0.35);
+}
+
+/* ------------------------------------------------------------- yappr, light
+   The palette the app shipped with, lifted out of `Settings.css` unchanged so
+   it can be *chosen* rather than only inherited from the desktop.
+
+   The two tones of one material -- the pane (`--p-base`) and the rail
+   (`--p-mantle`), meeting at one seam, with `--p-crust` the rail's far edge so
+   it can fall off softly toward it. Every surface is opaque: stacked alphas
+   were what made the old palette impossible to reason about, because a
+   value's real contrast depended on how many translucent layers happened to
+   be under it. These are the colours that land on screen. */
+
+:root[data-theme="yappr-light"] {
+  /* surfaces and the lines between them */
+  --p-crust: #dfe2e7;
+  --p-mantle: #e6e8ec;
+  --p-base: #f5f6f8;
+  /* The well is a touch brighter than the pane, so a field reads as a place
+     to write on the sheet. */
+  --p-well: #ffffff;
+  --p-sunk: #e7e9ed;
+  --p-line: #dfe2e7;
+  --p-edge: #d3d7de;
+  --p-well-edge: #b9c0ca;
+  /* Deliberately darker than `--p-sunk`: an unlit switch has to read as a
+     control sitting on the tile, where the other sunk surfaces only have to
+     read as recessed. The knob cannot clear 3:1 against any track pale enough
+     to still mean "off" -- no platform's switch does -- so what separates it
+     is its shadow, its position, and the track turning solid accent. */
+  --p-track: #ccd1d9;
+  --p-knob: #ffffff;
+  /* ink */
+  --p-text: #14171d;
+  --p-muted: #57606f;
+  --p-faint: #6b7382;
+  /* accent -- used where the compositor uses it: to mark what has focus, and
+     nowhere else. The bright cyan the app is known by measures 4.3:1 as text
+     on this ground, so light carries it taken down until it clears. */
+  --p-accent: #06687f;
+  --p-accent2: #0e8fae;
+  /* What reads on a solid accent fill -- the toggle knob, chiefly. White on
+     #06687f is 6.4:1; on the dark theme's #33ccff it is 1.9:1 and fails
+     outright, which is why this flips with the fill. */
+  --p-accent-ink: #ffffff;
+  --p-accent-wash: #dceef3;
+  /* status */
+  --p-ok: #0c7048;
+  --p-warn: #b25e00;
+  --p-danger: #c02a1c;
+  --p-danger-ink: #8e1d13;
+  --p-danger-wash: #fbeae8;
+  --p-warn-ink: #6f4400;
+  --p-warn-wash: #fbf1dd;
+  --p-warn-edge: #e0c391;
+  /* the HUD -- new. The capsule was dark in both appearances until themes
+     arrived; a light theme that left a black plate on screen would be the one
+     surface that ignored the setting. Near-white and cool, so it belongs to
+     the same family as the pane, and vivid where it has to be read at a
+     glance: the recording dot is the one thing on this surface that must
+     never be mistaken for idle. */
+  --p-hud: #f7f8fa;
+  --p-hud-ink: #14171d;
+  --p-hud-ink-2: #57606f;
+  --p-rec: #d92b1c;
+}
+
+/* -------------------------------------------------------------- yappr, dark
+   The same ordering, not an inversion of it: the rail is still the darker
+   tone and the page the lighter. Dark themes that swap that round end up with
+   a sidebar glowing brighter than the content it navigates. */
+
+:root[data-theme="yappr-dark"] {
+  /* surfaces and the lines between them */
+  --p-crust: #101215;
+  --p-mantle: #15171b;
+  --p-base: #1c1f23;
+  --p-well: #23272d;
+  --p-sunk: #282c33;
+  --p-line: #2b2f36;
+  --p-edge: #33373e;
+  --p-well-edge: #3d434c;
+  --p-track: #3a4048;
+  --p-knob: #b9c1cd;
+  /* ink */
+  --p-text: #e6e9ee;
+  --p-muted: #a0a8b5;
+  --p-faint: #8d95a3;
+  /* accent -- the bright cyan comes back: on this ground it measures 10.3:1
+     as text, so the light theme's darkened variant would only look muddy. */
+  --p-accent: #33ccff;
+  --p-accent2: #64d2ff;
+  --p-accent-ink: #072530;
+  --p-accent-wash: #16323d;
+  /* status */
+  --p-ok: #46e0a0;
+  --p-warn: #ff9f0a;
+  --p-danger: #ff6b5e;
+  --p-danger-ink: #ffb3ad;
+  --p-danger-wash: #37201d;
+  --p-warn-ink: #f0c37a;
+  --p-warn-wash: #33280f;
+  --p-warn-edge: #6b5526;
+  /* the HUD, exactly as it ships today -- a more neutral plate than the pane,
+     and the Apple system colours it was drawn with. Kept as its own slots
+     rather than folded onto the ramp above so that choosing `yappr-dark`
+     gives back the capsule the app has always had, to the hex. */
+  --p-hud: #1a1a1e;
+  --p-hud-ink: #f5f5f7;
+  --p-hud-ink-2: #afafb2;
+  --p-hud-accent: #0a84ff;
+  --p-hud-accent2: #64d2ff;
+  --p-hud-ok: #30d158;
+  --p-hud-warn: #ff9f0a;
+  --p-rec: #ff453a;
+}
+
+/* ---------------------------------------------------------------- generated
+   The four family palettes. Surfaces and accents are upstream's; the ink
+   roles are upstream's hues taken to AA as described in the header. The
+   themed capsule takes the theme's own base and accents through the
+   `--p-hud-*` fallbacks in `Overlay.css`, which is what makes the HUD look
+   like the theme rather than like a dark plate with themed text on it. */
+
+:root[data-theme="catppuccin-mocha"] {
+  /* surfaces and the lines between them */
+  --p-crust: #11111b;
+  --p-mantle: #181825;
+  --p-base: #1e1e2e;
+  --p-well: #262637;
+  --p-sunk: #313244;
+  --p-line: #2f3041;
+  --p-edge: #45475a;
+  --p-well-edge: #585b70;
+  --p-track: #45475a;
+  --p-knob: #bac2de;
+  /* ink */
+  --p-text: #cdd6f4;
+  --p-muted: #a6adc8;
+  --p-faint: #9399b2;
+  /* accent */
+  --p-accent: #89b4fa;
+  --p-accent2: #89dceb;
+  --p-accent-ink: #1b2432;
+  --p-accent-wash: #2f364f;
+  /* status */
+  --p-ok: #a6e3a1;
+  --p-warn: #fab387;
+  --p-danger: #f38ba8;
+  --p-danger-ink: #f38ba8;
+  --p-danger-wash: #3c2d3f;
+  --p-warn-ink: #f9e2af;
+  --p-warn-wash: #3d3940;
+  --p-warn-edge: #817668;
+}
+
+:root[data-theme="catppuccin-latte"] {
+  /* surfaces and the lines between them */
+  --p-crust: #dce0e8;
+  --p-mantle: #e6e9ef;
+  --p-base: #eff1f5;
+  --p-well: #fafbfc;
+  --p-sunk: #e7eaf0;
+  --p-line: #d6dae1;
+  --p-edge: #b9bdc9;
+  --p-well-edge: #acb0be;
+  --p-track: #b2b6c4;
+  --p-knob: #ffffff;
+  /* ink */
+  --p-text: #4c4f69;
+  --p-muted: #5c5f77;
+  --p-faint: #6b6d7e;
+  /* accent */
+  --p-accent: #1d62eb;
+  --p-accent2: #0494ce;
+  --p-accent-ink: #ffffff;
+  --p-accent-wash: #d2ddf4;
+  /* status */
+  --p-ok: #327d22;
+  --p-warn: #bc4a08;
+  --p-danger: #d20f39;
+  --p-danger-ink: #a40c2c;
+  --p-danger-wash: #ebd1db;
+  --p-warn-ink: #784d10;
+  --p-warn-wash: #ede3d7;
+  --p-warn-edge: #e8c494;
+}
+
+:root[data-theme="tokyo-night-night"] {
+  /* surfaces and the lines between them */
+  --p-crust: #0c0e14;
+  --p-mantle: #16161e;
+  --p-base: #1a1b26;
+  --p-well: #202331;
+  --p-sunk: #292e42;
+  --p-line: #282c3e;
+  --p-edge: #3b4261;
+  --p-well-edge: #414868;
+  --p-track: #3b4261;
+  --p-knob: #a9b1d6;
+  /* ink */
+  --p-text: #c0caf5;
+  --p-muted: #a9b1d6;
+  --p-faint: #7b82a3;
+  /* accent */
+  --p-accent: #7aa2f7;
+  --p-accent2: #7dcfff;
+  --p-accent-ink: #182031;
+  --p-accent-wash: #293147;
+  /* status */
+  --p-ok: #9ece6a;
+  --p-warn: #ff9e64;
+  --p-danger: #f7768e;
+  --p-danger-ink: #f88197;
+  --p-danger-wash: #392835;
+  --p-warn-ink: #e0af68;
+  --p-warn-wash: #36302f;
+  --p-warn-edge: #735e44;
+}
+
+:root[data-theme="tokyo-night-day"] {
+  /* surfaces and the lines between them */
+  --p-crust: #c1c9df;
+  --p-mantle: #d0d5e3;
+  --p-base: #e1e2e7;
+  --p-well: #f6f6f8;
+  --p-sunk: #d4d8e4;
+  --p-line: #c6cde0;
+  --p-edge: #aeb2cc;
+  --p-well-edge: #a1a6c5;
+  --p-track: #a4a9c7;
+  --p-knob: #ffffff;
+  /* ink */
+  --p-text: #345ab4;
+  --p-muted: #5c6388;
+  --p-faint: #5c627f;
+  /* accent */
+  --p-accent: #2462b6;
+  --p-accent2: #007197;
+  --p-accent-ink: #ffffff;
+  --p-accent-wash: #c7d0e0;
+  /* status */
+  --p-ok: #516c34;
+  --p-warn: #9c5100;
+  --p-danger: #bf214f;
+  --p-danger-ink: #8d183a;
+  --p-danger-wash: #dcc7d2;
+  --p-warn-ink: #5f492a;
+  --p-warn-wash: #d5d1cf;
+  --p-warn-edge: #bbad9b;
+}
+

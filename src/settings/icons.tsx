@@ -1,5 +1,5 @@
 /// Inline SVG rather than an icon package: an icon set is a dependency whose
-/// whole job is eight glyphs, and eight glyphs are cheaper to draw than to
+/// whole job is a couple of dozen glyphs, and those are cheaper to draw than to
 /// depend on. (`motion` earns its place because springs are not; a `<path d>`
 /// is.) All are drawn on a 24×24 grid with `currentColor` strokes, so they inherit the
 /// sidebar's active/inactive colour without a second code path.
@@ -32,6 +32,18 @@ const PATHS: Record<string, ReactNode> = {
     <>
       <circle cx="12" cy="12" r="3.1" />
       <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9v0a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z" />
+    </>
+  ),
+  /// A painter's palette for the "Darstellung" pane: a thumb-holed round with
+  /// three wells. Stroked like the rest, so the wells are rings rather than
+  /// dots -- filled circles would be the one icon in the rail carrying colour
+  /// of its own, in the pane whose whole subject is colour.
+  palette: (
+    <>
+      <path d="M12 3a9 9 0 0 0 0 18c1.1 0 1.6-.8 1.6-1.7 0-1.1-.9-1.8-.9-2.8 0-.9.7-1.6 1.7-1.6h1.9A4.7 4.7 0 0 0 21 10.2C21 6.2 16.9 3 12 3Z" />
+      <circle cx="8.2" cy="9.4" r="1.15" />
+      <circle cx="12" cy="7.4" r="1.15" />
+      <circle cx="15.8" cy="9.4" r="1.15" />
     </>
   ),
   pulse: (

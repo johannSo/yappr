@@ -201,15 +201,42 @@ Nothing is desktop-specific except shortcut registration. Bind `yappr --toggle` 
 ## Settings
 
 Left-click the tray icon, or `yappr --settings`. Everything in `config.toml` is
-editable there — microphone, dictation vocabulary, styles, thresholds — across five
-panes: **Allgemein**, **Sprache**, **Stil**, **Erweitert**, **Diagnose**. There's a
-search box; it matches German labels, help text, *and* the raw `config.toml` key names.
+editable there — microphone, dictation vocabulary, styles, thresholds, colours — across
+six panes: **Allgemein**, **Sprache**, **Stil**, **Darstellung**, **Erweitert**,
+**Diagnose**. There's a search box; it matches German labels, help text, *and* the raw
+`config.toml` key names.
 
 There is no Save button. Toggles and dropdowns save immediately, text and number fields
 700 ms after you stop typing. Saving rewrites `config.toml` from scratch; a save that
 changes nothing leaves the file byte-identical, and a config that wouldn't load is
 rejected before anything is written. Every row has a reset button that appears only when
 the value isn't the default.
+
+### Themes
+
+**Darstellung → Farbschema** picks the palette, and it applies to both windows —
+the settings window *and* the dictation overlay. It takes effect the moment you
+choose it; nothing to restart.
+
+| | |
+|---|---|
+| **System** | The palette yappr ships with, following your desktop's light/dark preference. The default. |
+| **yappr Hell**, **yappr Dunkel** | The same two palettes, pinned, so they stay put when your desktop switches. |
+| **Catppuccin Latte**, **Catppuccin Mocha** | [Catppuccin](https://catppuccin.com), light and dark. |
+| **Tokyo Night Day**, **Tokyo Night Night** | [Tokyo Night](https://github.com/folke/tokyonight.nvim), light and dark. |
+
+Two things worth knowing. The overlay is a capsule floating over whatever you're
+dictating into, so on a light theme it becomes a *light* capsule — it carries a
+harder edge and a heavier shadow to stay legible over a light wallpaper, but if
+you dictate mostly over dark windows, a dark theme will read better.
+
+And the borrowed palettes are **not quite** upstream's. Neither Latte nor Tokyo
+Night Day clears WCAG AA as small text on its own background (Latte's green
+measures 2.96:1, Tokyo Night Day's comment grey 2.54:1), and the settings window
+is a form. So text colours are the theme's own hues darkened just far enough to
+clear 4.5:1 — same hue, a little deeper. Surfaces and accent fills are upstream's
+untouched. If you'd rather have the exact upstream colours than readable ones,
+that's a knob yappr doesn't have.
 
 **`[asr]` and `[normalize]` changes can need a restart**, and the window asks you when
 they do: a prompt with a **Jetzt neu starten** button that shuts yappr down and brings it
@@ -247,6 +274,7 @@ first start, and the old `~/.config/yappr/config.toml` is left behind as
 | `[style_default]`, `[[style_rules]]` | the `styling`/`structure`/`context` axes S1-mini is prompted with, and per-application overrides matched on window class (regex) |
 | `[debug]` | `enabled` (off), `dir` (default `~/yappr`), `save_audio` — see [Troubleshooting](#troubleshooting) |
 | `[overlay]` | `position`, `width`, `height` — read, but inert: under Wayland a window can't place itself, so this changes nothing today |
+| `[ui]` | `theme` — see [Themes](#themes) |
 
 > **A config that won't load is moved aside, not ignored.** Every section is
 > `deny_unknown_fields`, so an unrecognised key is still caught rather than silently

@@ -55,7 +55,7 @@ bun run tauri dev                         # dev: Vite on :1420 + the Tauri windo
 bun run build                             # frontend only (tsc && vite build -> dist/)
 #   ^ builds BOTH pages: index.html (overlay) and settings.html (settings window).
 
-# Tests (452 passed, 0 failed, 11 #[ignore]d because they need downloaded models)
+# Tests (460 passed, 0 failed, 11 #[ignore]d because they need downloaded models)
 cargo test --workspace
 # NOT optional. These are the only tests that catch a C++ ABI mismatch between
 # sherpa-onnx and llama.cpp -- see the gotcha at the bottom of this file. A wrong
@@ -142,6 +142,13 @@ Two Cargo members, one process:
   owns `search()`, which matches a query against a row's German label, its help
   text, *and* its raw `config.toml` key — a key added in Rust and named nowhere
   here is still findable by the name Rust gives it.
+  Colour lives in two files of its own. `palettes.css` holds every theme as a set
+  of `--p-*` ramp slots and is the only place a colour is named; `Settings.css`
+  and `Overlay.css` each map that ramp onto their own semantic tokens exactly
+  once, so a seventh theme is ~25 hexes rather than a second stylesheet. `theme.ts`
+  owns the `data-theme`/`data-appearance` attributes and is the one place `[ui]
+  theme = "system"` stops being a possibility and becomes a palette — see
+  invariant 15.
 
 Wayland has no global keyboard grab, which is why argument dispatch in `main.rs` runs
 `cli::route()` *before* any Tauri/GTK/WebKit initialisation and before any model is
@@ -439,6 +446,53 @@ the whole lock file stops parsing. See
     a config key: a key would have to join a `deny_unknown_fields` struct and
     then appear in the settings GUI as a setting nobody should touch. See
     `docs/superpowers/specs/2026-08-29-first-run-wizard-design.md`.
+
+15. **A theme is chosen, so nothing may key on `prefers-color-scheme` any more —
+    and a theme selector outranks a media query.** `[ui] theme` (default
+    `system`) is one of seven values; six are palettes in `src/palettes.css`,
+    and `system` is resolved to `yappr-light`/`yappr-dark` by `theme.ts`
+    *before it reaches the DOM*, so CSS never sees it. Three things here break
+    silently:
+    - **Specificity.** `:root[data-theme="x"]` is (0,1,1); `:root` inside
+      `@media (prefers-contrast: more)` is (0,1,0) and **loses to it**. Written
+      the obvious way, every pinned theme would switch the high-contrast palette
+      off for anyone not on `system`. Both windows' contrast blocks are therefore
+      keyed `:root[data-appearance="light"|"dark"]` — a tie, broken by document
+      order, which is why they must stay *after* the `palettes.css` import.
+      `palettes.css`'s own appearance blocks come before its theme blocks for the
+      same reason: that ordering is what lets `yappr-dark` keep the exact grain
+      and shadow it shipped with while Mocha inherits the generic dark ones.
+    - **Appearance is no longer the desktop's opinion.** Four rules used to key
+      on `prefers-color-scheme` (the dark token block, the grain's
+      `multiply`→`screen` flip, the brand plate's drop-shadow, the
+      high-contrast-dark palette) and every one was wrong the moment Latte could
+      be pinned on a dark desktop. Anything that varies by appearance rather than
+      by palette is a slot in `palettes.css` (`--p-grain-blend`,
+      `--p-mark-shadow`) or is keyed on `[data-appearance]`. Do not add a fifth.
+    - **A missing slot renders nothing, not a wrong colour.** `var(--p-x)` with
+      nothing behind it is an invalid value, so the property drops out and the
+      surface gets no background or no text colour at all — invisible to `tsc`
+      and to `vite build`. The theme list itself lives in four places (`Theme::ALL`,
+      `palettes.css`, `theme.ts`'s `APPEARANCE`, `schema.ts`'s `ENUMS`/`ENUM_LABELS`).
+      Both hazards are checked mechanically by
+      `themes_are_declared_everywhere_they_have_to_be` and
+      `every_palette_declares_every_slot_the_windows_read` in `src-tauri`, which
+      read the frontend files off disk — the same trick as the overlay-event
+      fixture tests. Verified to fail on drift, not just to pass.
+
+    Two further things that are decisions, not accidents. The **overlay is themed
+    too**, so a light theme means a *light* capsule — which reverses the
+    "deliberately dark in both appearances" rationale in `Overlay.css`'s header,
+    and is why light palettes carry a harder `--p-hud-edge` and heavier
+    `--p-hud-shadow` to separate from a light wallpaper. And the **borrowed light
+    palettes are not upstream's**: neither Catppuccin Latte nor Tokyo Night Day
+    clears AA as small text on its own base, so every ink role is stepped toward
+    black/white in 2% increments until it clears 4.5:1 (hue untouched), the same
+    trade the shipped light palette already makes with the brand cyan. Surfaces
+    and accent fills are upstream's untouched. `yappr-light`/`yappr-dark` and the
+    dark capsule are byte-identical to what shipped before themes existed — that
+    was checked against `git HEAD`, and it is the property that makes this a safe
+    upgrade for someone who never asked for a theme.
 
 ## Conventions
 

@@ -546,6 +546,87 @@ impl Default for OverlayConfig {
     }
 }
 
+/// Which palette both windows draw themselves in (spec 13's `[ui]` section).
+///
+/// `System` is the pair the app has always shipped -- the hand-built light and
+/// dark palettes, chosen by the desktop's own `prefers-color-scheme`. Every
+/// other variant **pins** one appearance, which is the entire reason they
+/// exist: someone who rices their desktop Catppuccin Mocha wants Mocha at
+/// noon, not Latte because the sun came up.
+///
+/// The variant list is mirrored in two files the compiler cannot see --
+/// `src/palettes.css`, which holds each one's palette, and `src/theme.ts`,
+/// which knows which appearance each one is. That is two hand-maintained
+/// copies, so it is checked mechanically rather than trusted:
+/// `themes_are_declared_everywhere_they_have_to_be` in `src-tauri` reads both
+/// files and fails on drift, the same way the overlay-event fixture test does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Theme {
+    System,
+    YapprLight,
+    YapprDark,
+    CatppuccinLatte,
+    CatppuccinMocha,
+    TokyoNightDay,
+    TokyoNightNight,
+}
+
+impl Theme {
+    /// Every variant, in the order the settings dropdown offers them: the
+    /// shipped pair first, then the two families. Exists so the drift test
+    /// and any future caller can enumerate without a macro crate.
+    pub const ALL: [Theme; 7] = [
+        Theme::System,
+        Theme::YapprLight,
+        Theme::YapprDark,
+        Theme::CatppuccinLatte,
+        Theme::CatppuccinMocha,
+        Theme::TokyoNightDay,
+        Theme::TokyoNightNight,
+    ];
+}
+
+impl fmt::Display for Theme {
+    /// The `data-theme` attribute value, which is also the `config.toml`
+    /// spelling and the CSS selector -- one string, so a theme cannot be
+    /// named one thing in the file and another in the stylesheet.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Theme::System => "system",
+            Theme::YapprLight => "yappr-light",
+            Theme::YapprDark => "yappr-dark",
+            Theme::CatppuccinLatte => "catppuccin-latte",
+            Theme::CatppuccinMocha => "catppuccin-mocha",
+            Theme::TokyoNightDay => "tokyo-night-day",
+            Theme::TokyoNightNight => "tokyo-night-night",
+        })
+    }
+}
+
+/// Spec 13's `[ui]` section: how the app looks, as opposed to what it does.
+///
+/// One key today. It is its own section rather than a key on `[overlay]`
+/// because it governs both windows, and `[overlay]` is the section whose
+/// every key is documented as read-but-inert -- a live setting has no
+/// business sitting in there.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiConfig {
+    #[serde(default = "d_theme")]
+    pub theme: Theme,
+}
+
+fn d_theme() -> Theme {
+    Theme::System
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self { theme: d_theme() }
+    }
+}
+
 /// One hand-written correction, applied before any fuzzy matching. This is
 /// the mechanism for short acronyms, which fuzzy matching cannot serve: a
 /// three-character term is within edit distance 2 of most three-letter words
@@ -646,6 +727,8 @@ pub struct Config {
     pub inject: InjectConfig,
     #[serde(default)]
     pub overlay: OverlayConfig,
+    #[serde(default)]
+    pub ui: UiConfig,
     #[serde(default)]
     pub style_default: StyleAxes,
     #[serde(default)]
@@ -1007,6 +1090,66 @@ mod tests {
                 c.inject.terminal_classes
             );
         }
+    }
+
+    #[test]
+    fn the_default_theme_is_the_pair_the_app_has_always_shipped() {
+        // Not Mocha, however nice it looks: an upgrade must not repaint the
+        // app for someone who never asked for a theme.
+        assert_eq!(Config::from_str("").unwrap().ui.theme, Theme::System);
+    }
+
+    #[test]
+    fn a_theme_is_spelled_the_same_in_the_file_as_in_the_stylesheet() {
+        // `Display` is what reaches `data-theme`, and serde is what reaches
+        // `config.toml`. They are two impls of one name, so a rename that
+        // touched only one would leave a config the GUI can save and the CSS
+        // cannot match -- a theme that selects successfully and changes
+        // nothing on screen.
+        for theme in Theme::ALL {
+            let on_the_wire = serde_json::to_value(theme).unwrap();
+            assert_eq!(
+                on_the_wire,
+                serde_json::Value::String(theme.to_string()),
+                "{theme:?} serialises as {on_the_wire} but displays as {theme}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_theme_is_rejected_rather_than_quietly_defaulted() {
+        // A typo has to be an error the settings window can report, not a
+        // silent reset to `system` -- the user would see their choice
+        // reverted with nothing said about why.
+        let e = Config::from_str("[ui]\ntheme = \"gruvbox\"\n").unwrap_err();
+        assert!(
+            format!("{e:#}").contains("theme"),
+            "the error should name the key that was wrong: {e:#}"
+        );
+    }
+
+    #[test]
+    fn the_ui_section_rejects_an_unknown_key_like_every_other_section() {
+        assert!(Config::from_str("[ui]\ntheme = \"system\"\naccent = \"pink\"\n").is_err());
+    }
+
+    #[test]
+    fn a_config_written_before_the_ui_section_existed_still_loads() {
+        // `[ui]` is `#[serde(default)]`, so every config.toml already on disk
+        // -- none of which has this section -- keeps loading rather than
+        // being quarantined on the upgrade that adds themes (invariant 4).
+        let c = Config::from_str("[audio]\nmax_seconds = 90\n").unwrap();
+        assert_eq!(c.ui.theme, Theme::System);
+        assert_eq!(c.audio.max_seconds, 90);
+    }
+
+    #[test]
+    fn a_pinned_theme_survives_a_render_and_reload() {
+        let mut c = Config::from_str("").unwrap();
+        c.ui.theme = Theme::CatppuccinMocha;
+        let reloaded = Config::from_str(&render(&c)).unwrap();
+        assert_eq!(reloaded.ui.theme, Theme::CatppuccinMocha);
+        assert_eq!(reloaded, c);
     }
 
     #[test]

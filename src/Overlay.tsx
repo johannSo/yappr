@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { applyTheme, type ConfiguredTheme } from "./theme";
 import { getCurrentWindow, type Window as TauriWindow } from "@tauri-apps/api/window";
 import { AnimatePresence, MotionConfig, motion, type Transition } from "motion/react";
 import "./Overlay.css";
@@ -156,6 +157,26 @@ export default function Overlay() {
   // shown and positioned) for real IPC cost. `showAndPosition` is the "show
   // it" primitive; `showOnce` below is "show it, only if it isn't already".
   const visible = useRef(false);
+
+  // The palette. `theme.ts` has already put the system-resolved shipped pair
+  // on `<html>` at import time, so this is a correction, not a first paint --
+  // and it lands while the window is still hidden at app startup, long before
+  // a dictation puts the capsule on screen.
+  //
+  // `theme` rather than `get_config`: this window reads no other setting, and
+  // `get_config` needs a daemon that `--replay` mode does not have. A failure
+  // leaves the shipped pair, which is exactly what the HUD looked like before
+  // themes existed.
+  useEffect(() => {
+    invoke<ConfiguredTheme>("theme").then(applyTheme).catch(() => {});
+
+    const unlistenPromise = listen<ConfiguredTheme>("theme-changed", ({ payload }) =>
+      applyTheme(payload),
+    );
+    return () => {
+      unlistenPromise.then((unlisten) => unlisten());
+    };
+  }, []);
 
   useEffect(() => {
     const win = getCurrentWindow();

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { applyTheme, type ConfiguredTheme } from "./theme";
 import { AnimatePresence, MotionConfig, motion } from "motion/react";
 import { Icon } from "./settings/icons";
 import { Commit, Device, Field, ResetButton, Row, TableEditor, Toggle } from "./settings/controls";
@@ -48,6 +49,19 @@ const SETTLE = { type: "spring", bounce: 0, duration: 0.34 } as const;
 const GLIDE = { type: "spring", bounce: 0.18, duration: 0.42 } as const;
 
 type SaveState = "clean" | "pending" | "saving" | "saved" | "error";
+
+/// `[ui] theme` out of a config snapshot. The config arrives as untyped JSON
+/// (this window deliberately keeps no copy of the schema), and an install
+/// whose `config.toml` predates the section has no `ui` at all -- both of
+/// which land on `"system"`, which `applyTheme` resolves to the shipped pair.
+function themeIn(config: Section): ConfiguredTheme {
+  const ui = config.ui;
+  if (ui && typeof ui === "object" && !Array.isArray(ui)) {
+    const theme = (ui as Record<string, unknown>).theme;
+    if (typeof theme === "string") return theme as ConfiguredTheme;
+  }
+  return "system";
+}
 
 export default function Settings() {
   const [config, setConfig] = useState<Section | null>(null);
@@ -134,6 +148,11 @@ export default function Settings() {
       };
       setConfig(res.config);
       configRef.current = res.config;
+      // The palette, from the same read as everything else. The
+      // `theme-changed` listener below covers a change made *here*; this
+      // covers the first load and a reveal, where the file may have moved on
+      // without this window having been open to hear about it.
+      applyTheme(themeIn(res.config));
       setDefaults(res.defaults ?? null);
       // Startup found a config.toml it could not read, moved it aside and came
       // up on defaults (spec §3). This window is the only place that can say
@@ -194,6 +213,19 @@ export default function Settings() {
   // queued behind one, or a rejected save whose value invariant 9 deliberately
   // keeps on screen. Overwriting any of those would be the GUI discarding what
   // the user typed -- the one thing that autosave contract forbids.
+  // Every accepted save broadcasts the configured palette, including this
+  // window's own -- so the theme dropdown repaints through the same round
+  // trip as the overlay rather than through an optimistic local path that
+  // could disagree with what actually got written.
+  useEffect(() => {
+    const unlistenPromise = listen<ConfiguredTheme>("theme-changed", ({ payload }) =>
+      applyTheme(payload),
+    );
+    return () => {
+      unlistenPromise.then((unlisten) => unlisten());
+    };
+  }, []);
+
   useEffect(() => {
     const unlistenPromise = listen("show-settings", () => {
       if (timerRef.current !== null || savingRef.current || queuedRef.current) return;

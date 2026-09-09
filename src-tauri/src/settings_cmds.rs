@@ -67,6 +67,8 @@
 
 use std::sync::Arc;
 
+use tauri::Emitter as _;
+
 use yappr_core::proto::{Request, Response};
 use yappr_core::server::{dispatch, Daemon};
 
@@ -95,10 +97,52 @@ pub async fn get_config(server: tauri::State<'_, Server>) -> Result<serde_json::
 
 #[tauri::command]
 pub async fn set_config(
+    app: tauri::AppHandle,
     server: tauri::State<'_, Server>,
     config: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    call(&server, Request::SetConfig { config }).await
+    let res = call(&server, Request::SetConfig { config }).await?;
+    // Both windows repaint from one broadcast, and the overlay is the reason
+    // it is a broadcast rather than a return value: it is a second webview
+    // with no part in this call, and a themed settings window next to a HUD
+    // still wearing the old palette is the one bug this feature can most
+    // obviously ship with.
+    //
+    // Read back off disk rather than out of `config`, because `config` is
+    // routinely partial -- `Request::SetConfig` carries the settings window's
+    // whole snapshot, but `wizard_finish`'s patch is a single leaf, and
+    // neither is required to mention `[ui]`. Fired on every accepted save,
+    // theme or not: `applyTheme` is idempotent, and a change-detecting
+    // version would need a before-image it has no reason to hold.
+    let _ = app.emit("theme-changed", configured_theme());
+    Ok(res)
+}
+
+/// The palette `[ui] theme` currently asks for, as the string the DOM and
+/// `palettes.css` both spell it with.
+///
+/// Deliberately lenient where every other reader of this file is strict: an
+/// unreadable config gives back the shipped pair rather than an error,
+/// because the caller is a repaint and the alternative is an unpainted
+/// window (see `resolve` in `src/theme.ts`). Nothing is hidden by that --
+/// invariant 4's `load_or_quarantine` has already run in `server::start`, so
+/// a config bad enough to fail here is one the settings window is already
+/// showing a notice about.
+fn configured_theme() -> String {
+    yappr_core::config::Config::load_from(&yappr_core::paths::config_file())
+        .map(|c| c.ui.theme)
+        .unwrap_or(yappr_core::config::Theme::System)
+        .to_string()
+}
+
+/// What the overlay asks on mount. It reads no other config, so this is a
+/// command of its own rather than a second `get_config` -- which would hand
+/// a click-through HUD the whole settings tree, and would fail outright in
+/// `--replay` mode, where there is no daemon but there is still a capsule on
+/// screen.
+#[tauri::command]
+pub fn theme() -> String {
+    configured_theme()
 }
 
 #[tauri::command]
@@ -257,6 +301,185 @@ fn to_json(resp: Response) -> Result<serde_json::Value, String> {
 mod tests {
     use super::*;
     use yappr_core::proto::State as WireState;
+    use std::collections::{HashMap, HashSet};
+    use yappr_core::config::Theme;
+
+    /// A file from the frontend, read relative to this crate rather than the
+    /// cwd, so the test works from anywhere in the workspace.
+    fn frontend(name: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join(name);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} should be readable: {e}", path.display()))
+    }
+
+    /// `--p-*` slots declared per selector block in `palettes.css`, and the
+    /// slots each stylesheet reads. Deliberately crude string scanning: the
+    /// file is machine-shaped, and a CSS parser would be a dependency whose
+    /// whole job is this one test.
+    fn declared_blocks(css: &str) -> HashMap<String, HashSet<String>> {
+        let mut out = HashMap::new();
+        for block in css.split('}') {
+            let Some((head, body)) = block.split_once('{') else { continue };
+            let selector = head.rsplit("*/").next().unwrap_or(head).trim().to_string();
+            if selector.is_empty() {
+                continue;
+            }
+            let slots: HashSet<String> = body
+                .lines()
+                .filter_map(|l| l.trim().strip_prefix("--p-"))
+                .filter_map(|l| l.split_once(':'))
+                .map(|(name, _)| name.trim().to_string())
+                .collect();
+            out.entry(selector).or_insert_with(HashSet::new).extend(slots);
+        }
+        out
+    }
+
+    /// Slots a stylesheet reads with **no** fallback, i.e. the ones a palette
+    /// must actually declare. `var(--p-hud, var(--p-base))` is excluded on
+    /// purpose: that fallback is the mechanism by which a themed palette gets
+    /// a themed capsule without declaring a single HUD slot.
+    fn required_slots(css: &str) -> HashSet<String> {
+        let mut out = HashSet::new();
+        for (i, _) in css.match_indices("var(--p-") {
+            let rest = &css[i + "var(--p-".len()..];
+            let end = rest.find([')', ',']).expect("a var() must be closed");
+            if rest.as_bytes()[end] == b',' {
+                continue; // has a fallback
+            }
+            out.insert(rest[..end].trim().to_string());
+        }
+        out
+    }
+
+    /// Which appearance each palette is, read out of `theme.ts`'s
+    /// `APPEARANCE` table -- the copy of that fact the frontend actually uses.
+    fn appearances(ts: &str) -> HashMap<String, String> {
+        let body = ts
+            .split_once("export const APPEARANCE = {")
+            .expect("theme.ts should declare APPEARANCE")
+            .1
+            .split_once("} as const;")
+            .expect("APPEARANCE should be closed")
+            .0;
+        body.lines()
+            .filter_map(|l| l.trim().strip_suffix(','))
+            .filter_map(|l| l.split_once(':'))
+            .map(|(k, v)| {
+                (
+                    k.trim().trim_matches('"').to_string(),
+                    v.trim().trim_matches('"').to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// The list of themes exists in four places and the compiler sees one of
+    /// them: `Theme::ALL` here, the `[data-theme="..."]` blocks in
+    /// `palettes.css`, `APPEARANCE` in `src/theme.ts`, and
+    /// `ENUMS["ui.theme"]` plus `ENUM_LABELS` in `src/settings/schema.ts`.
+    ///
+    /// Every way they can drift produces a *silent* failure, which is why
+    /// this is a test and not a comment: a theme missing from `palettes.css`
+    /// selects fine and paints nothing, one missing from `schema.ts` cannot
+    /// be chosen at all, and one missing from `theme.ts` gets no
+    /// `data-appearance` and so loses its grain blend and its high-contrast
+    /// palette. Same reasoning as the overlay-event fixture tests in
+    /// `proto.rs` and `replay.rs`.
+    #[test]
+    fn themes_are_declared_everywhere_they_have_to_be() {
+        let css = frontend("src/palettes.css");
+        let ts = frontend("src/theme.ts");
+        let schema = frontend("src/settings/schema.ts");
+        let appearance = appearances(&ts);
+
+        for theme in Theme::ALL {
+            let name = theme.to_string();
+            let selector = format!(r#":root[data-theme="{name}"]"#);
+
+            if theme == Theme::System {
+                // `system` is a configuration value, not a palette. It must
+                // stay resolved in `theme.ts`, because a CSS block for it
+                // would be the shipped palette written a second time.
+                assert!(
+                    !css.contains(&selector),
+                    "`system` must not have a palette block: it is resolved to \
+                     the shipped pair in theme.ts"
+                );
+                assert!(!appearance.contains_key(&name), "`system` has no fixed appearance");
+            } else {
+                assert!(css.contains(&selector), "palettes.css has no block for {name}");
+                assert!(
+                    appearance.contains_key(&name),
+                    "theme.ts's APPEARANCE does not say whether {name} is light or dark"
+                );
+            }
+
+            assert!(
+                schema.contains(&format!("\"{name}\"")),
+                "schema.ts never mentions {name}, so it cannot be chosen"
+            );
+        }
+
+        // And nothing extra: a palette or an appearance entry the enum does
+        // not have is a theme the GUI can never offer and Rust would reject.
+        let known: HashSet<String> = Theme::ALL.iter().map(|t| t.to_string()).collect();
+        for name in appearance.keys() {
+            assert!(known.contains(name), "theme.ts declares an unknown theme: {name}");
+        }
+        for selector in declared_blocks(&css).keys() {
+            if let Some(name) = selector
+                .strip_prefix(r#":root[data-theme=""#)
+                .and_then(|r| r.strip_suffix(r#""]"#))
+            {
+                assert!(known.contains(name), "palettes.css declares an unknown theme: {name}");
+            }
+        }
+    }
+
+    /// Every palette declares every slot the two windows actually read.
+    ///
+    /// This is the test that makes the ramp indirection safe to add a theme
+    /// to. A slot a palette forgets is not a wrong colour -- `var(--p-x)`
+    /// with nothing behind it is an *invalid* value, so the property drops
+    /// out and the affected surface renders with no background or no text
+    /// colour at all. Nothing in a build or a type-check notices that.
+    #[test]
+    fn every_palette_declares_every_slot_the_windows_read() {
+        let css = frontend("src/palettes.css");
+        let blocks = declared_blocks(&css);
+        let appearance = appearances(&frontend("src/theme.ts"));
+
+        let mut required = required_slots(&frontend("src/Settings.css"));
+        required.extend(required_slots(&frontend("src/Overlay.css")));
+        assert!(
+            required.len() > 20,
+            "the scan found only {} slots, which means it stopped working rather \
+             than that the windows got simpler",
+            required.len()
+        );
+
+        for (name, appear) in &appearance {
+            let theme_block = blocks
+                .get(&format!(r#":root[data-theme="{name}"]"#))
+                .unwrap_or_else(|| panic!("no palette block for {name}"));
+            let appearance_block = blocks
+                .get(&format!(r#":root[data-appearance="{appear}"]"#))
+                .unwrap_or_else(|| panic!("no appearance block for {appear}"));
+
+            let missing: Vec<&String> = required
+                .iter()
+                .filter(|s| !theme_block.contains(*s) && !appearance_block.contains(*s))
+                .collect();
+            assert!(
+                missing.is_empty(),
+                "{name} declares no {missing:?} -- every surface using those \
+                 slots would render with no colour at all"
+            );
+        }
+    }
 
     /// A fresh, collision-free scratch directory for a single test. Not a
     /// dependency: `tempfile` isn't in `[dev-dependencies]` here either (see
