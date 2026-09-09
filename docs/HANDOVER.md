@@ -345,3 +345,46 @@ Invariant 12 in CLAUDE.md is the part to read before editing `server.rs`.
     nothing re-populates `daemon.audio_cfg` from a reloaded config, while
     the Settings GUI's own save path applies such changes live. Pre-existing,
     not introduced by this branch; recorded here so it isn't rediscovered.
+
+## Selectable ASR models (2026-09-08)
+
+`[asr] model` chooses between three speech-recognition models; the dropdown is
+in the settings window's Sprache pane and in the wizard's Modelle step. Design:
+`docs/superpowers/specs/2026-09-08-asr-model-selection-design.md`. Plan:
+`docs/superpowers/plans/2026-09-08-asr-model-selection.md`.
+
+Verified on this machine:
+
+- **Both new models transcribe for real**, via
+  `cargo test --workspace -- --ignored` against `fixtures/hallo_german.wav`.
+  The full gate is green: 445 passed / 0 failed / 10 ignored, the 10 ignored
+  all passing under `--ignored`, clippy clean.
+- **`feat_dim` is 128 for both encoders**, read out of the ONNX metadata
+  rather than inferred. The sherpa-onnx Rust crate defaults
+  `OnlineRecognizerConfig::feat_config.feature_dim` to 80, and a wrong value
+  here produces confident wrong text rather than an error.
+- **The cache-aware streaming model needs silence fed on *both* sides.**
+  Measured on the 2.75 s German fixture: no padding gives "Nur die Wurst",
+  tail-only gives "Nur die Wurst hat zwei", lead+tail gives the whole
+  sentence. The trailing half is what upstream's own example does; the
+  *leading* half is in no upstream example and matters here because a
+  cache-aware model spends its first chunk priming zeroed caches, and
+  `SileroTrimmer` has already stripped the silence that would have absorbed
+  it. Every real dictation hits this model with an abrupt start.
+- **The language option does nothing observable on this clip.** `"de"`,
+  `"auto"` and omitting the call entirely produced byte-identical output.
+  `[asr] language` is still exposed (the model is `EncDecRNNTBPEModelWithPrompt`
+  and multilingual), but do not assume it is load-bearing without measuring.
+
+Not verified — still open:
+
+- **No end-to-end dictation with a non-default model.** The `--ignored` tests
+  drive `asr::build` against a fixture; nobody has yet pressed SUPER+D with
+  `nemotron-3.5` selected and watched text land in a window.
+- **The wizard and Sprache-pane dropdowns are built, not clicked.**
+  `bun run build` passes for both entry points; the UI has not been exercised
+  against a running daemon.
+- **primeline-parakeet is not shipped.** It is the best German model of the
+  four (2.95 % vs the shipped v3's 3.64 % average WER) but has no first-party
+  sherpa-onnx export, so it needs one produced out of band — see §9 of the
+  design doc and Task 12 of the plan for the exact procedure.

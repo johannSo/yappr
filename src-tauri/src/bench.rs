@@ -1,5 +1,5 @@
 use anyhow::{ensure, Result};
-use yappr_core::asr::{SherpaTranscriber, Transcriber};
+use yappr_core::asr::Transcriber;
 use std::time::Instant;
 
 fn read_wav_16k_mono(path: &str) -> Result<Vec<f32>> {
@@ -74,13 +74,16 @@ pub fn run() -> Result<()> {
     let long_samples = repeat_buffer(&short_samples, 3);
 
     let t0 = Instant::now();
-    let asr = SherpaTranscriber::new(&yappr_core::paths::models_dir(), 4)?;
+    let asr = yappr_core::asr::build(
+        &yappr_core::paths::models_dir(),
+        &yappr_core::config::AsrConfig::default(),
+    )?;
     let load_ms = t0.elapsed().as_millis();
     println!("model load   {load_ms} ms  (once, at daemon start)");
     println!();
 
-    print_measurement("single clip", &measure(&asr, &short_samples)?);
-    print_measurement("~10s buffer (clip x3)", &measure(&asr, &long_samples)?);
+    print_measurement("single clip", &measure(asr.as_ref(), &short_samples)?);
+    print_measurement("~10s buffer (clip x3)", &measure(asr.as_ref(), &long_samples)?);
 
     Ok(())
 }

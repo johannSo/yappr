@@ -40,7 +40,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 
-use yappr_core::models::{self, Artifact, LockFile, ARTIFACTS};
+use yappr_core::config::AsrModel;
+use yappr_core::models::{self, Artifact, LockFile};
 use serde::Serialize;
 use tauri::Emitter;
 
@@ -55,11 +56,11 @@ pub(crate) struct MissingModel {
 }
 
 fn artifact_by_name(name: &str) -> Option<&'static Artifact> {
-    ARTIFACTS.iter().find(|a| a.name == name)
+    models::all_artifacts().into_iter().find(|a| a.name == name)
 }
 
 fn artifact_by_url(url: &str) -> Option<&'static Artifact> {
-    ARTIFACTS.iter().find(|a| a.url == url)
+    models::all_artifacts().into_iter().find(|a| a.url == url)
 }
 
 /// Turns the two independent check results into the JSON shape the Setup
@@ -96,22 +97,51 @@ pub(crate) fn build_status(
 /// process (see that function's doc comment for why this matters). `None`
 /// means "not computed yet, or invalidated by a `run_setup` that changed
 /// what's on disk" -- see [`invalidate_missing_models_cache`].
-static MISSING_MODELS_CACHE: Mutex<Option<Vec<String>>> = Mutex::new(None);
+static MISSING_MODELS_CACHE: Mutex<Option<(AsrModel, Vec<String>)>> = Mutex::new(None);
 
-fn missing_models_cache_lock() -> std::sync::MutexGuard<'static, Option<Vec<String>>> {
+fn missing_models_cache_lock() -> std::sync::MutexGuard<'static, Option<(AsrModel, Vec<String>)>> {
     MISSING_MODELS_CACHE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The selected model, re-read from disk on every call.
+///
+/// Deliberately not cached: the Settings dropdown writes `config.toml` the
+/// moment it changes (invariant 9), and re-reading here is how that becomes
+/// visible without a restart. A config that will not load is not this
+/// module's problem to report -- `load_or_quarantine` handles that at
+/// startup (invariant 4) -- so fall back to the default selection and still
+/// give the Setup pane something useful to render.
+fn selected_model() -> AsrModel {
+    match yappr_core::config::Config::load() {
+        Ok(c) => c.asr.model,
+        Err(_) => yappr_core::config::AsrConfig::default().model,
+    }
+}
+
+#[cfg(test)]
+fn set_cache_for_test(model: AsrModel, missing: Vec<String>) {
+    *missing_models_cache_lock() = Some((model, missing));
+}
+
+#[cfg(test)]
+fn cached_for_test(model: AsrModel) -> Option<Vec<String>> {
+    match missing_models_cache_lock().clone() {
+        Some((cached, missing)) if cached == model => Some(missing),
+        _ => None,
+    }
 }
 
 /// The real, uncached computation behind `missing_models_cached`: gated
 /// behind `models::looks_present`'s cheap existence+size scan, so a machine
 /// that finished setup once never pays another sha256 pass over ~1.1 GB just
 /// to reconfirm what a filesystem stat already answered.
-fn compute_missing_models() -> Result<Vec<String>, String> {
-    if models::looks_present() {
+fn compute_missing_models(model: AsrModel) -> Result<Vec<String>, String> {
+    let required = models::required_artifacts(model);
+    if models::looks_present(&required) {
         return Ok(Vec::new());
     }
     let lock = LockFile::load().map_err(|e| format!("models.lock.toml: {e:#}"))?;
-    models::verify(&lock).map_err(|e| format!("Modelle prüfen: {e:#}"))
+    models::verify(&lock, &required).map_err(|e| format!("Modelle prüfen: {e:#}"))
 }
 
 /// Which models are missing, computed at most once per process and shared
@@ -125,12 +155,14 @@ fn compute_missing_models() -> Result<Vec<String>, String> {
 /// rather than guarded against, since it is bounded (happens at most once
 /// per process, never repeatedly) and both computations agree once they
 /// both finish.
-fn missing_models_cached() -> Result<Vec<String>, String> {
-    if let Some(cached) = missing_models_cache_lock().clone() {
-        return Ok(cached);
+fn missing_models_cached(model: AsrModel) -> Result<Vec<String>, String> {
+    if let Some((cached, missing)) = missing_models_cache_lock().clone() {
+        if cached == model {
+            return Ok(missing);
+        }
     }
-    let computed = compute_missing_models()?;
-    *missing_models_cache_lock() = Some(computed.clone());
+    let computed = compute_missing_models(model)?;
+    *missing_models_cache_lock() = Some((model, computed.clone()));
     Ok(computed)
 }
 
@@ -151,7 +183,7 @@ fn invalidate_missing_models_cache() {
 /// sync.
 fn check_missing() -> Result<(Vec<&'static str>, Vec<String>), String> {
     let missing_prerequisites = crate::setup::check_prerequisites();
-    let missing_models = missing_models_cached()?;
+    let missing_models = missing_models_cached(selected_model())?;
     Ok((missing_prerequisites, missing_models))
 }
 
@@ -277,7 +309,8 @@ pub async fn run_setup(app: tauri::AppHandle) -> Result<serde_json::Value, Strin
     let emit_handle = app.clone();
     let outcome = tauri::async_runtime::spawn_blocking(move || {
         let mut state = crate::setup::ProgressState::default();
-        models::download_all(false, &mut |url: &str, done: u64, total: Option<u64>| {
+        let required = models::required_artifacts(selected_model());
+        models::download_all(&required, false, &mut |url: &str, done: u64, total: Option<u64>| {
             let (report, new_state) = crate::setup::crosses_report_threshold(
                 url,
                 done,
@@ -336,6 +369,26 @@ pub async fn run_setup(app: tauri::AppHandle) -> Result<serde_json::Value, Strin
 
 #[cfg(test)]
 mod tests {
+    /// The cache used to be computed once per process, which was correct when
+    /// the answer could not change. It can now: selecting a model in Settings
+    /// changes which artifacts are required, and a stale hit reports an
+    /// entirely absent model as ready -- surfacing as a failed dictation
+    /// rather than a missing-model message. See spec asr-model §4.
+    #[test]
+    fn the_missing_models_cache_is_keyed_on_the_selected_model() {
+        super::set_cache_for_test(super::AsrModel::ParakeetTdtV3, Vec::new());
+        assert_eq!(
+            super::cached_for_test(super::AsrModel::ParakeetTdtV3),
+            Some(Vec::new()),
+            "the model it was computed for must hit"
+        );
+        assert_eq!(
+            super::cached_for_test(super::AsrModel::Nemotron35),
+            None,
+            "a different selection must miss, not reuse the other model's answer"
+        );
+    }
+
     use super::*;
 
     /// No missing prerequisites and no missing models is the only

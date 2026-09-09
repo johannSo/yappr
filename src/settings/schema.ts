@@ -73,6 +73,8 @@ export const LABELS: Record<string, string> = {
   "audio.device": "Mikrofon",
   "audio.max_seconds": "Maximale Aufnahmedauer",
   "audio.vad_padding_ms": "Sprachpuffer",
+  "asr.model": "Modell",
+  "asr.language": "Sprache",
   "asr.num_threads": "Threads",
   "models.preload_at_startup": "Modelle beim Start laden",
   "models.idle_unload_seconds": "Modelle entladen nach",
@@ -141,6 +143,10 @@ export const HELP: Record<string, string> = {
     "Danach bricht die Aufnahme von selbst ab, damit eine hängengebliebene Taste nicht endlos mitschneidet.",
   "audio.vad_padding_ms":
     "Wie viel Ton vor und nach der erkannten Sprache erhalten bleibt. Zu wenig schneidet Wortanfänge ab, zu viel nimmt Stille mit in die Erkennung.",
+  "asr.model":
+    "Welches Modell den gesprochenen Text erkennt. Parakeet TDT v3 ist mehrsprachig und die Voreinstellung. primeline Parakeet versteht nur Deutsch, erkennt es aber deutlich genauer als alle anderen hier — die beste Wahl, wenn du nur auf Deutsch diktierst. Parakeet Unified versteht nur Englisch, erkennt es aber genauer. Nemotron 3.5 ist mehrsprachig. Ein Wechsel lädt einmalig rund 500 MB herunter; bereits geladene Modelle bleiben liegen, ein Zurückwechseln geht also ohne erneuten Download.",
+  "asr.language":
+    "Nur für mehrsprachige Modelle. „auto“ lässt das Modell die Sprache selbst erkennen; ein Kürzel wie „de“ legt sie fest. Parakeet TDT v3 und Parakeet Unified ignorieren diese Einstellung.",
   "asr.num_threads":
     "Rechenkerne für die Spracherkennung. Mehr Threads verkürzen die Wartezeit, bis die Kerne ausgelastet sind.",
   "models.preload_at_startup":
@@ -205,6 +211,12 @@ export const HELP: Record<string, string> = {
 };
 
 export const ENUMS: Record<string, string[]> = {
+  "asr.model": [
+    "parakeet-tdt-v3",
+    "parakeet-primeline-de",
+    "parakeet-unified-en",
+    "nemotron-3.5",
+  ],
   "inject.backend": ["wtype", "ydotool", "clipboard"],
   "inject.paste_chord": ["auto", "ctrl_v", "ctrl_shift_v"],
   "style_default.styling": ["casual", "semi-casual", "semi-formal", "formal"],
@@ -268,7 +280,7 @@ export const OBSOLETE_FIELDS = new Set([
 /// `OBSOLETE_FIELDS` for the one thing that can, and why it is not one.
 export const FIELD_ORDER: Record<string, string[]> = {
   audio: ["device", "max_seconds", "vad_padding_ms"],
-  asr: ["num_threads"],
+  asr: ["model", "language", "num_threads"],
   inject: ["backend", "trailing_space", "keystroke_delay_ms"],
   normalize: ["enabled", "timeout_ms", "context_size", "threads"],
   guardrail: [

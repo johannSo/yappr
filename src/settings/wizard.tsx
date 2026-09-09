@@ -21,6 +21,18 @@ import { Icon } from "./icons";
 const STEP = { type: "spring", bounce: 0, duration: 0.36 } as const;
 const FADE = { type: "spring", bounce: 0, duration: 0.24 } as const;
 
+/// The selectable ASR models, in catalogue order. Kept next to `STEPS`
+/// rather than in `schema.ts` because the wizard renders its own `<select>`
+/// -- `schema.ts`'s ENUMS drives the settings form only. The spellings must
+/// match `models::ASR_MODELS`; an unknown one is rejected by the config's
+/// deny_unknown_fields on save rather than silently defaulted.
+export const ASR_MODELS: { value: string; label: string }[] = [
+  { value: "parakeet-tdt-v3", label: "Parakeet TDT v3 — mehrsprachig (Voreinstellung)" },
+  { value: "parakeet-primeline-de", label: "primeline Parakeet — nur Deutsch, am genauesten" },
+  { value: "parakeet-unified-en", label: "Parakeet Unified — nur Englisch" },
+  { value: "nemotron-3.5", label: "Nemotron 3.5 — mehrsprachig" },
+];
+
 export const STEPS = ["welcome", "models", "shortcuts", "done"] as const;
 export type Step = (typeof STEPS)[number];
 
@@ -48,10 +60,10 @@ export type WizardState = {
 };
 
 /// `provision::MissingModel`, unchanged across the wire.
-type MissingModel = { name: string; display: string };
+export type MissingModel = { name: string; display: string };
 
 /// `provision::setup_status`'s response shape.
-type SetupStatus = {
+export type SetupStatus = {
   ready: boolean;
   missing_prerequisites: string[];
   missing_models: MissingModel[];
@@ -61,7 +73,7 @@ type SetupStatus = {
 /// only for artifacts a `"setup-progress"` event has actually mentioned, so a
 /// model nothing has reported on yet renders as "fehlt" rather than a bar
 /// stuck at 0 %.
-type DownloadProgress = { display: string; done: number; total: number | null };
+export type DownloadProgress = { display: string; done: number; total: number | null };
 
 /// `provision::SetupProgress`, unchanged across the wire.
 type SetupProgressEvent =
@@ -82,7 +94,7 @@ function downloadStatusText(progress: DownloadProgress | undefined, installing: 
 /// step itself: the `setup-progress` listener has to outlive the step, so a
 /// user who walks on to the shortcut step mid-download does not lose the
 /// running total — the same reason it used to be scoped to the whole window.
-function useSetup() {
+export function useSetup() {
   const [status, setStatus] = useState<SetupStatus | null>(null);
   const [checkError, setCheckError] = useState<string | null>(null);
   const [installing, setInstalling] = useState(false);
@@ -205,6 +217,42 @@ export function Wizard({
   const [step, setStep] = useState<Step>(state.start_step);
   const index = STEPS.indexOf(step);
   const setup = useSetup();
+  const [asrModel, setAsrModel] = useState("parakeet-tdt-v3");
+  const { check } = setup;
+
+  // Read the current selection rather than assuming the default: this wizard
+  // reopens whenever the selected model is missing (invariant 13's
+  // `should_open`), which includes a machine that already chose one.
+  useEffect(() => {
+    void (async () => {
+      try {
+        const res = (await invoke("get_config")) as {
+          config?: { asr?: { model?: string } };
+        };
+        const current = res.config?.asr?.model;
+        if (current) setAsrModel(current);
+      } catch {
+        // Leave the default showing; the step still works.
+      }
+    })();
+  }, []);
+
+  // Writes the selection, then re-runs the status check so the missing-model
+  // list below is about the model just picked. A single-leaf patch, which
+  // `config_write::save_config` merges rather than renders -- the same path
+  // `wizard_finish`'s backend patch takes (invariant 9).
+  const chooseModel = useCallback(
+    async (model: string) => {
+      setAsrModel(model);
+      try {
+        await invoke("set_config", { config: { asr: { model } } });
+      } catch (e) {
+        console.error("set_config(asr.model) failed", e);
+      }
+      await check();
+    },
+    [check],
+  );
 
   // Only a genuine first run writes the injection backend — see
   // `wizard_finish`'s doc comment. `start_step` is the frontend's evidence
@@ -251,6 +299,28 @@ export function Wizard({
                 vollständig auf diesem Rechner. Dafür braucht yappr einmalig etwa
                 1,1 GB an Modellen.
               </p>
+
+              <div className="card">
+                <label className="setup-row" htmlFor="wizard-asr-model">
+                  <span>Spracherkennungs-Modell</span>
+                  <select
+                    id="wizard-asr-model"
+                    value={asrModel}
+                    disabled={setup.installing}
+                    onChange={(e) => void chooseModel(e.target.value)}
+                  >
+                    {ASR_MODELS.map((m) => (
+                      <option key={m.value} value={m.value}>
+                        {m.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <p className="setup-command">
+                  Es wird nur das ausgewählte Modell geladen. Ein Wechsel später in
+                  den Einstellungen lädt das neue Modell nach.
+                </p>
+              </div>
 
               {setup.checkError && (
                 <div className="banner error">
@@ -332,9 +402,13 @@ export function Wizard({
               )}
 
               <div className="wizard-actions">
-                {/* The download never blocks the wizard: once it is running,
-                    the only button is Weiter, and the transfer continues
-                    while the user reads the next two steps. */}
+                {/* A running download *does* block the step. It used to not:
+                    Weiter stayed live and the transfer continued while the
+                    user read the next two steps — which reads as "this is
+                    finished" at 3 %, and lands them on the done step with no
+                    working dictation. Skipping is still allowed, but only as
+                    the deliberate "Später" below, which a running download
+                    replaces rather than hides. */}
                 {!setup.installing && setup.status && !modelsDone && (
                   <button type="button" className="add" onClick={setup.install}>
                     Jetzt laden
@@ -343,9 +417,10 @@ export function Wizard({
                 <button
                   type="button"
                   className={setup.installing || modelsDone ? "add" : "ghost"}
+                  disabled={setup.installing}
                   onClick={() => setStep("shortcuts")}
                 >
-                  {setup.installing || modelsDone ? "Weiter" : "Später"}
+                  {setup.installing ? "Lädt…" : modelsDone ? "Weiter" : "Später"}
                 </button>
               </div>
             </section>

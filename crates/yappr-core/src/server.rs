@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use crate::asr::SherpaTranscriber;
+use crate::asr;
 use crate::capture::{CaptureStats, Recorder};
 use crate::config::{self, AudioConfig, Config, DebugConfig, ModelsConfig};
 use crate::config_write;
@@ -993,7 +993,7 @@ fn load_models(cfg: Config, daemon: &Arc<Daemon>) -> Result<(Pipeline, bool)> {
     // on S1-mini is the cheaper order. The previous ordering existed to get
     // `llama-server`'s cold start overlapping the ASR build; with both loads
     // in this process and on this thread there is nothing left to overlap.
-    let asr = SherpaTranscriber::new(&models, cfg.asr.num_threads)?;
+    let asr = asr::build(&models, &cfg.asr)?;
     let trimmer = SileroTrimmer::new(&models)?;
 
     let engine = if cfg.normalize.enabled {
@@ -1043,7 +1043,7 @@ fn load_models(cfg: Config, daemon: &Arc<Daemon>) -> Result<(Pipeline, bool)> {
 
     let pipeline = Pipeline::new(
         cfg,
-        Box::new(asr),
+        asr,
         Box::new(trimmer),
         Box::new(WhatlangDetector),
         normalizer,
