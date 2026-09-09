@@ -25,6 +25,8 @@ pub enum InjectError {
     Timeout { backend: &'static str, timeout: Duration },
     #[error("mock injector configured to fail")]
     Mock,
+    #[error("no paste script configured -- set [inject] script to an executable path")]
+    NotConfigured,
 }
 
 /// Maps a [`procutil::run_with_timeout`] failure onto the right
@@ -77,23 +79,30 @@ impl TextInjector for WtypeInjector {
     }
 
     fn inject(&self, text: &str, _target_class: Option<&str>) -> Result<(), InjectError> {
-        run_typer("wtype", wtype_argv(text, self.delay_ms), WTYPE_TIMEOUT)
+        run_backend(
+            "wtype",
+            std::ffi::OsStr::new("wtype"),
+            wtype_argv(text, self.delay_ms),
+            WTYPE_TIMEOUT,
+        )
     }
 }
 
-/// Runs one argv-driven typing backend under I3's timeout and maps the
+/// Runs one argv-driven injection backend under I3's timeout and maps the
 /// outcome onto [`InjectError`].
 ///
-/// `backend` is both the error label and the program name -- true of `wtype`
-/// and `ydotool` alike, which differ only in the argv they build and the
-/// budget they are given.
-fn run_typer(
+/// `backend` is the error label and `program` the thing actually spawned.
+/// For `wtype` these are the same string; for the script backend `program`
+/// is the user's path and `backend` stays the stable `"script"` that
+/// `InjectOutcome`, the debug record and the settings GUI all name.
+fn run_backend(
     backend: &'static str,
+    program: &std::ffi::OsStr,
     argv: Vec<String>,
     timeout: Duration,
 ) -> Result<(), InjectError> {
-    tracing::debug!(backend, ?argv, ?timeout, "spawning injection backend");
-    let mut cmd = Command::new(backend);
+    tracing::debug!(backend, ?program, ?argv, ?timeout, "spawning injection backend");
+    let mut cmd = Command::new(program);
     cmd.args(&argv);
     let started = std::time::Instant::now();
     let out = procutil::run_with_timeout(cmd, timeout, None).map_err(|e| {
@@ -243,7 +252,12 @@ impl TextInjector for YdotoolInjector {
                  set [inject] paste_chord = \"ctrl_shift_v\" if you dictate into a terminal"
             );
         }
-        run_typer("ydotool", paste_key_argv(shift), PASTE_KEY_TIMEOUT)
+        run_backend(
+            "ydotool",
+            std::ffi::OsStr::new("ydotool"),
+            paste_key_argv(shift),
+            PASTE_KEY_TIMEOUT,
+        )
     }
 }
 
@@ -268,6 +282,68 @@ impl TextInjector for ClipboardInjector {
         Ok(())
     }
 }
+
+/// How long a user's paste script may take before I3's timeout claims it.
+/// Generous on purpose: `handy-paste.sh`, the script this backend was built
+/// against, waits on `wl-paste` to save the old clipboard, sleeps 200 ms for
+/// the compositor to hand over the new offer, presses six key events at
+/// 50 ms, and sleeps another 300 ms -- ~1,5 s all told. The bound exists so
+/// a *hung* script cannot wedge the pipeline thread, not to police a slow
+/// one.
+const SCRIPT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Spec 10.3's second injector, since 2026-09-09 a **user-supplied script**
+/// rather than `ydotool`.
+///
+/// It runs `[inject] script` with the finished transcript as its single
+/// argument and does nothing else -- no `wl-copy` first, no environment of
+/// its own, no paste chord. The script owns the entire injection: how the
+/// text reaches the clipboard, which chord it presses, how it names the
+/// focused window, whether it restores what was in the clipboard before.
+///
+/// Each of those omissions is deliberate:
+///
+///   - **No pre-copy.** The `ydotool` backend this replaced staged the text
+///     with [`ClipboardInjector`] before pressing a chord. A script that
+///     saves and restores the previous clipboard (as the reference one does)
+///     would then "restore" yappr's own transcript over the user's.
+///   - **No chord.** Choosing Ctrl+V vs Ctrl+Shift+V needed the focused
+///     window's class, and every provider for it can answer `None` (see
+///     [`crate::winclass`]) -- which produced a plain Ctrl+V that terminals
+///     ignore, from a `ydotool` that exited 0, so nothing failed and nothing
+///     was logged. A script asks its own desktop, its own way.
+///   - **No `$2`, no `YAPPR_*` environment.** `$1` is the whole contract, so
+///     a script written for another dictation tool works unchanged.
+///
+/// Failure of any kind -- unconfigured, missing, non-executable, non-zero
+/// exit, timeout -- is an `Err`, which `inject_with_recovery` turns into the
+/// clipboard fallback and its notification. Invariant 1 holds.
+pub struct ScriptInjector {
+    path: std::path::PathBuf,
+}
+
+impl ScriptInjector {
+    pub fn new(cfg: &InjectConfig) -> Self {
+        // `Command` performs no expansion -- only a shell does, and there is
+        // no shell on this path -- so `~/bin/paste.sh`, which is exactly what
+        // a user types into the settings field, has to be expanded here.
+        Self { path: crate::debug::expand_tilde(&cfg.script) }
+    }
+}
+
+impl TextInjector for ScriptInjector {
+    fn name(&self) -> &'static str {
+        "script"
+    }
+
+    fn inject(&self, text: &str, _target_class: Option<&str>) -> Result<(), InjectError> {
+        if self.path.as_os_str().is_empty() {
+            return Err(InjectError::NotConfigured);
+        }
+        run_backend("script", self.path.as_os_str(), vec![text.to_string()], SCRIPT_TIMEOUT)
+    }
+}
+
 
 #[derive(Default)]
 pub struct MockInjector {
@@ -453,6 +529,31 @@ pub(crate) fn inject_with_recovery(
 mod tests {
     use super::*;
     use crate::config::{InjectBackend, InjectConfig};
+
+    /// Writes an executable shell script into a fresh temp directory and
+    /// returns `(dir, script_path)`. The caller removes `dir`.
+    ///
+    /// No `tempfile` dependency: this crate has none, and the tests that
+    /// need scratch space elsewhere build their paths the same way.
+    fn script_fixture(tag: &str, body: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("yappr-script-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("paste.sh");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (dir, path)
+    }
+
+    /// An `InjectConfig` whose script backend points at `path`.
+    fn script_cfg(path: &std::path::Path) -> InjectConfig {
+        InjectConfig { script: path.display().to_string(), ..InjectConfig::default() }
+    }
 
     #[test]
     fn mock_injector_records_what_it_was_given() {
@@ -669,5 +770,118 @@ mod tests {
         assert!(!dir.join("unsent.txt").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_script_receives_the_transcript_as_its_only_argument() {
+        // The whole contract with a user's paste script: `$1` is the text,
+        // and there is no `$2`. `handy-paste.sh` -- the script this backend
+        // was built against -- reads nothing else, so anything extra here
+        // would be a promise no script has to keep.
+        let (dir, path) = script_fixture(
+            "argv",
+            r#"printf '%s' "$#" > "$(dirname "$0")/count"
+printf '%s' "$1" > "$(dirname "$0")/arg1""#,
+        );
+
+        ScriptInjector::new(&script_cfg(&path)).inject("hallo welt", Some("kitty")).unwrap();
+
+        assert_eq!(std::fs::read_to_string(dir.join("count")).unwrap(), "1");
+        assert_eq!(std::fs::read_to_string(dir.join("arg1")).unwrap(), "hallo welt");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_transcript_that_begins_with_a_dash_reaches_the_script_intact() {
+        // Same hazard `wtype_argv`'s `--` guards against, answered
+        // differently: there is no shell and no option parsing between here
+        // and the script, so the text is passed as one argv element and
+        // arrives whole. Pinned because "just run it through sh -c" is the
+        // obvious wrong turn, and it would break on this input.
+        let (dir, path) = script_fixture("dash", r#"printf '%s' "$1" > "$(dirname "$0")/arg1""#);
+
+        ScriptInjector::new(&script_cfg(&path)).inject("-n --version", None).unwrap();
+
+        assert_eq!(std::fs::read_to_string(dir.join("arg1")).unwrap(), "-n --version");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unconfigured_script_path_fails_without_spawning_anything() {
+        // `[inject] script` defaults to empty, so this is the state of every
+        // user who selects the backend before writing a script. It must be a
+        // clean, named error -- which `inject_with_recovery` turns into the
+        // clipboard fallback (invariant 1) -- not a spawn of "".
+        let err =
+            ScriptInjector::new(&InjectConfig::default()).inject("hallo", None).unwrap_err();
+        assert!(
+            matches!(err, InjectError::NotConfigured),
+            "expected NotConfigured, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("[inject] script"),
+            "the error must name the setting: {err}"
+        );
+    }
+
+    #[test]
+    fn a_script_that_exits_nonzero_is_reported_as_a_failure() {
+        // The user's own error path: ydotoold not running, no /dev/uinput,
+        // wl-copy missing. The backend must report it so the clipboard
+        // fallback runs and the notification fires.
+        let (dir, path) = script_fixture(
+            "fails",
+            r#"echo "no uinput" >&2
+exit 3"#,
+        );
+
+        let err = ScriptInjector::new(&script_cfg(&path)).inject("hallo", None).unwrap_err();
+
+        assert!(matches!(err, InjectError::Failed { .. }), "expected Failed, got {err:?}");
+        assert!(err.to_string().contains("no uinput"), "stderr must survive into the error: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_script_file_is_a_spawn_error_not_a_panic() {
+        let cfg = InjectConfig {
+            script: "/nonexistent/yappr/paste.sh".to_string(),
+            ..InjectConfig::default()
+        };
+        let err = ScriptInjector::new(&cfg).inject("hallo", None).unwrap_err();
+        assert!(matches!(err, InjectError::Spawn { .. }), "expected Spawn, got {err:?}");
+    }
+
+    #[test]
+    fn a_paste_script_that_backgrounds_its_clipboard_restore_does_not_block() {
+        // Invariant 6, in the exact shape this backend meets it.
+        // `handy-paste.sh` ends with `nohup bash -c '... | wl-copy' &`, so a
+        // grandchild outlives the script holding its stdout and stderr open.
+        // Reading those pipes to EOF would wedge the pipeline thread at
+        // INJECTING until that grandchild died -- which is the bug
+        // `PIPE_DRAIN_GRACE` exists for. 5 s is far under the grandchild's
+        // 30 s, so a regression here fails loudly rather than slowly.
+        let (dir, path) = script_fixture("grandchild", "sleep 30 &\nexit 0");
+
+        let started = std::time::Instant::now();
+        ScriptInjector::new(&script_cfg(&path)).inject("hallo", None).unwrap();
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "took {:?}; the grandchild's pipes blocked the drain",
+            started.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_script_path_beginning_with_a_tilde_is_expanded() {
+        // `~/bin/paste.sh` is what a user types into the settings field, and
+        // `Command` does no expansion -- only a shell does, and there is no
+        // shell here. Without this the field silently never works.
+        let cfg = InjectConfig { script: "~/bin/paste.sh".to_string(), ..InjectConfig::default() };
+        let err = ScriptInjector::new(&cfg).inject("hallo", None).unwrap_err();
+        let msg = err.to_string();
+        assert!(!msg.contains('~'), "the tilde must be gone by the time we spawn: {msg}");
     }
 }

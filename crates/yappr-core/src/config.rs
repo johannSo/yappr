@@ -434,6 +434,15 @@ pub struct InjectConfig {
     pub trailing_space: bool,
     #[serde(default = "d_keydelay")]
     pub keystroke_delay_ms: u32,
+    /// Path to the program `InjectBackend::Script` runs, tilde-expanded at
+    /// injection time. Empty -- the default -- means no script is
+    /// configured; the backend then fails immediately with
+    /// [`InjectError::NotConfigured`] and the clipboard fallback carries the
+    /// transcript (invariant 1).
+    ///
+    /// [`InjectError::NotConfigured`]: crate::inject::InjectError::NotConfigured
+    #[serde(default = "d_script")]
+    pub script: String,
     /// Window classes (matched case-insensitively against the class captured
     /// at recording start) whose paste chord is Ctrl+Shift+V rather than
     /// Ctrl+V -- terminals reserve plain Ctrl+V for the applications running
@@ -451,6 +460,9 @@ fn d_backend() -> InjectBackend {
 }
 fn d_keydelay() -> u32 {
     2
+}
+fn d_script() -> String {
+    String::new()
 }
 /// The window classes of the terminals a Wayland user plausibly runs, as the
 /// compositor reports them (matching is case-insensitive, so "Alacritty" and
@@ -499,6 +511,7 @@ impl Default for InjectConfig {
             backend: d_backend(),
             trailing_space: true,
             keystroke_delay_ms: d_keydelay(),
+            script: d_script(),
             terminal_classes: d_terminal_classes(),
             paste_chord: d_paste_chord(),
         }
