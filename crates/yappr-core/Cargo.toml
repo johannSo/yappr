@@ -47,8 +47,11 @@ signal-hook = "0.3"
 # `atspi-proxies` over zbus, and deliberately *not* `tokio` -- without it
 # zbus uses async-io, so the async this drags in is driven by a `block_on`
 # on one dedicated thread inside `gnome.rs` and reaches no other module.
-# `server.rs` stays synchronous.
-atspi = "0.30"
+# `server.rs` stays synchronous. The `zbus` feature is only the re-export
+# of the zbus atspi already depends on -- `gnome.rs` needs
+# `zbus::fdo::DBusProxy` to ask the bus for a peer's pid, and borrowing
+# atspi's copy is what keeps that from becoming a second zbus version.
+atspi = { version = "0.30", features = ["zbus"] }
 futures-lite = "2"
 
 [dev-dependencies]

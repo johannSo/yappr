@@ -44,12 +44,27 @@
 //! cannot go stale, against at most `POLL_INTERVAL` of lag after a window
 //! switch -- and the value is read once per utterance, seconds after the
 //! user focused whatever they are dictating into.
+//!
+//! ## Why the application's own name is not always the answer
+//!
+//! Because an application need not have one. GTK answers `Unnamed` for any
+//! application that never called `g_set_application_name`, and ghostty is
+//! one -- so no `[[style_rules]]` `match_class` written for it could ever
+//! fire, every silent GTK application shared that one class, and the debug
+//! record named none of them. It surfaced on the retired `ydotool`
+//! backend, where the same `Unnamed` picked the paste chord and a
+//! dictation into ghostty produced no text at all. The bus knows the pid
+//! behind every peer whatever the peer calls itself, so
+//! [`peer_process_name`] asks it, and only for the application already
+//! found focused.
 
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use atspi::connection::AccessibilityConnection;
 use atspi::proxy::accessible::AccessibleProxy;
+use atspi::zbus::fdo::DBusProxy;
+use atspi::zbus::names::BusName;
 use atspi::{ObjectRefOwned, State};
 
 /// Our own windows are never an answer. The overlay takes focus on Mutter
@@ -62,6 +77,14 @@ const SELF_APP: &str = "yappr";
 /// the app grid, the lock screen and every focus hand-off in between --
 /// states nobody dictates into, which would otherwise evict a real answer.
 const SHELL_APP: &str = "gnome-shell";
+
+/// GTK's placeholder for an application that never called
+/// `g_set_application_name`, and so the one name that identifies nothing.
+/// ghostty is such an application: every one of its windows arrives on the
+/// bus as `Unnamed`, which no rule written for ghostty can match and which
+/// would collide with every other silent GTK app if it did. When this is
+/// the name, [`peer_process_name`] asks the bus who the peer is instead.
+const PLACEHOLDER_APP: &str = "Unnamed";
 
 /// The shortest wait between sweeps, and so how stale the answer may get.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -91,8 +114,19 @@ pub fn window_class() -> Option<String> {
     slot().lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
 }
 
+/// Whether an application's own accessible name says which application it
+/// is. An empty one never did; [`PLACEHOLDER_APP`] looks like an answer and
+/// is not one.
+fn names_an_application(name: &str) -> bool {
+    !name.is_empty() && name != PLACEHOLDER_APP
+}
+
+fn is_ours_or_the_shell(name: &str) -> bool {
+    name == SELF_APP || name == SHELL_APP
+}
+
 fn record(name: &str) {
-    if name.is_empty() || name == SELF_APP || name == SHELL_APP {
+    if !names_an_application(name) || is_ours_or_the_shell(name) {
         return;
     }
     let mut slot = slot().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -182,7 +216,8 @@ async fn accessible(
 /// Walks applications, then their windows, stopping at the first whose state
 /// carries `Active`. The *application's* name is what a paste script's own
 /// terminal list is matched against -- `ptyxis`, `gnome-text-editor` -- not
-/// the window's own name, which is its title.
+/// the window's own name, which is its title. An application that has no
+/// name of its own is identified by [`peer_process_name`] instead.
 async fn active_app(conn: &AccessibilityConnection) -> Result<Option<String>, atspi::AtspiError> {
     let root = AccessibleProxy::builder(conn.connection())
         .destination("org.a11y.atspi.Registry")?
@@ -199,7 +234,7 @@ async fn active_app(conn: &AccessibilityConnection) -> Result<Option<String>, at
         let Ok(name) = app.name().await else {
             continue;
         };
-        if name.is_empty() || name == SELF_APP || name == SHELL_APP {
+        if is_ours_or_the_shell(&name) {
             continue;
         }
         let Ok(windows) = app.get_children().await else {
@@ -210,11 +245,52 @@ async fn active_app(conn: &AccessibilityConnection) -> Result<Option<String>, at
                 continue;
             };
             if window.get_state().await.is_ok_and(|s| s.contains(State::Active)) {
-                return Ok(Some(name));
+                if names_an_application(&name) {
+                    return Ok(Some(name));
+                }
+                // A nameless application is still the focused one -- so ask
+                // the bus who it is rather than walking on to some other
+                // application's stale `Active`. Only here, never for every
+                // application in the sweep: it costs a round trip, and the
+                // filter has to run again because our own overlay is one of
+                // the windows that can be focused at this moment.
+                return Ok(peer_process_name(conn, &app_ref)
+                    .await
+                    .filter(|n| !is_ours_or_the_shell(n)));
             }
         }
     }
     Ok(None)
+}
+
+/// The name of the process behind an accessible's bus peer, for an
+/// application whose own name identifies nothing.
+///
+/// Every AT-SPI application is a peer on the accessibility bus, and the bus
+/// knows each peer's pid (`GetConnectionUnixProcessID`) whatever the
+/// application chose to call itself -- measured against ghostty on GNOME
+/// Shell 50.0, which answers [`PLACEHOLDER_APP`] and resolves through here
+/// to `ghostty`, the name every other provider gives it.
+async fn peer_process_name(conn: &AccessibilityConnection, obj: &ObjectRefOwned) -> Option<String> {
+    let peer = BusName::try_from(obj.name_as_str()?).ok()?;
+    let bus = DBusProxy::new(conn.connection()).await.ok()?;
+    let pid = bus.get_connection_unix_process_id(peer).await.ok()?;
+    process_name(pid)
+}
+
+fn process_name(pid: u32) -> Option<String> {
+    argv0_basename(&std::fs::read(format!("/proc/{pid}/cmdline")).ok()?)
+}
+
+/// The executable's own name out of a `/proc/<pid>/cmdline`.
+///
+/// `argv[0]` rather than `/proc/<pid>/comm`, which the kernel truncates to
+/// 15 bytes -- `gnome-text-editor` arrives there as `gnome-text-edit`, and
+/// a class that is nearly right matches nothing at all.
+fn argv0_basename(cmdline: &[u8]) -> Option<String> {
+    let argv0 = cmdline.split(|b| *b == 0).next()?;
+    let name = std::str::from_utf8(argv0).ok()?.rsplit('/').next()?;
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 #[cfg(test)]
@@ -246,6 +322,45 @@ mod tests {
         record("gnome-text-editor");
         record(SHELL_APP);
         assert_eq!(window_class().as_deref(), Some("gnome-text-editor"));
+    }
+
+    #[test]
+    fn the_gtk_placeholder_name_is_never_recorded() {
+        // ghostty reports it, and so does every other GTK application that
+        // never named itself -- recording it would give them all one class.
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset();
+        record("ptyxis");
+        record(PLACEHOLDER_APP);
+        assert_eq!(window_class().as_deref(), Some("ptyxis"));
+    }
+
+    #[test]
+    fn a_process_name_is_argv0s_basename() {
+        assert_eq!(argv0_basename(b"/usr/bin/ghostty\0-e\0sh\0").as_deref(), Some("ghostty"));
+        assert_eq!(argv0_basename(b"ghostty\0").as_deref(), Some("ghostty"));
+        // `/proc/<pid>/comm` would say `gnome-text-edit` here: the kernel
+        // truncates it to 15 bytes, and a class that is nearly right
+        // matches no rule at all.
+        assert_eq!(
+            argv0_basename(b"/usr/bin/gnome-text-editor\0").as_deref(),
+            Some("gnome-text-editor")
+        );
+    }
+
+    #[test]
+    fn a_process_with_no_readable_cmdline_names_nothing() {
+        // Kernel threads and reaped processes both read back empty, and an
+        // empty class must stay `None` rather than becoming a match.
+        assert_eq!(argv0_basename(b""), None);
+        assert_eq!(argv0_basename(b"\0\0"), None);
+        assert_eq!(process_name(u32::MAX), None);
+    }
+
+    #[test]
+    fn this_process_resolves_to_its_own_executable() {
+        // The one end-to-end check of the /proc read that needs no bus.
+        assert!(process_name(std::process::id()).is_some_and(|n| !n.is_empty()));
     }
 
     #[test]

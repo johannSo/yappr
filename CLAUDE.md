@@ -56,7 +56,7 @@ bun run tauri dev                         # dev: Vite on :1420 + the Tauri windo
 bun run build                             # frontend only (tsc && vite build -> dist/)
 #   ^ builds BOTH pages: index.html (overlay) and settings.html (settings window).
 
-# Tests (460 passed, 0 failed, 11 #[ignore]d because they need downloaded models)
+# Tests (470 passed, 0 failed, 11 #[ignore]d because they need downloaded models)
 cargo test --workspace
 # NOT optional. These are the only tests that catch a C++ ABI mismatch between
 # sherpa-onnx and llama.cpp -- see the gotcha at the bottom of this file. A wrong
@@ -741,16 +741,33 @@ the whole lock file stops parsing. See
   falls back to it when `hyprctl` cannot be run. That provider now serves the style
   rules rather than a chord, but it is the same code and the same failure modes.
 
-  Read that module's header before touching it. Two things there are not guessable.
+  Read that module's header before touching it. Three things there are not guessable.
   **AT-SPI delivers no `window:activate` events on this desktop** -- registration
   succeeds and nothing ever arrives, measured with this crate and with an independent
   `pyatspi` listener, with `toolkit-accessibility` both off and on -- so it *polls*
-  the tree (a sweep costs ~7 ms; `POLL_INTERVAL` is 500 ms). An event-driven version
+  the tree (a sweep costs ~7 ms; `POLL_INTERVAL` is 1 s, raised from a measured 500 ms
+  that drew 2.3-2.6% of a core). An event-driven version
   was written first and fails viciously: its one startup sweep succeeds, so the class
   freezes on whatever was focused then, dictation keeps working in that window and
   silently stops working in every other one. **And it cannot query at `ptt-start`
   either**, because by then the overlay holds focus itself (invariant 2), so the
   answer has to be already in hand.
+
+  **The application's own accessible name is not always one.** GTK answers `Unnamed`
+  for any application that never called `g_set_application_name`, and ghostty is one:
+  on GNOME it arrived as the class `Unnamed`, so no style rule written for it could
+  fire, every other silent GTK application shared that same class, and the debug
+  record named none of them. It surfaced on the retired ydotool backend, where the
+  same `Unnamed` picked the paste chord and dictation into ghostty produced no text
+  at all. So `Unnamed` is treated as no name at all (it can
+  never be *recorded* either, whatever reports it), and the focused application is
+  identified from the pid the accessibility bus keeps for its peer
+  (`GetConnectionUnixProcessID`) — resolved through `/proc/<pid>/cmdline`'s `argv[0]`,
+  not `comm`, which the kernel truncates to 15 bytes and would turn
+  `gnome-text-editor` into `gnome-text-edit`. That lands on `ghostty`, the name every
+  other provider gives it. The lookup runs only for the application
+  already found focused, so a sweep costs no extra round trip in the ordinary case.
+  Measured on GNOME Shell 50.0 / Fedora 44, 2026-09-10.
 
   `InjectDebug` still records `window_class` (written as `null` rather than omitted,
   so "unknown" is distinguishable from "old record"), which is how you tell a style
