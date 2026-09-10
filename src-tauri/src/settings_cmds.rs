@@ -481,6 +481,88 @@ mod tests {
         }
     }
 
+    /// `schema.ts`'s `DEPENDENT_FIELDS`, as
+    /// `(section, key, dependency key, trigger values)`.
+    fn dependent_fields(ts: &str) -> Vec<(String, String, String, Vec<String>)> {
+        let body = ts
+            .split_once("export const DEPENDENT_FIELDS: Record<string, { on: string; is: Json[] }> = {")
+            .expect("schema.ts should declare DEPENDENT_FIELDS")
+            .1
+            .split_once("};")
+            .expect("DEPENDENT_FIELDS should be closed")
+            .0;
+        body.lines()
+            .filter_map(|l| l.trim().strip_prefix('"'))
+            .filter_map(|l| l.split_once("\":"))
+            .map(|(path, rule)| {
+                let (section, key) = path.split_once('.').expect("a path is section.key");
+                let on = rule
+                    .split_once("on:")
+                    .expect("a rule has an `on`")
+                    .1
+                    .split(',')
+                    .next()
+                    .unwrap()
+                    .trim()
+                    .trim_matches('"')
+                    .to_string();
+                let is = rule
+                    .split_once("is: [")
+                    .expect("a rule has an `is`")
+                    .1
+                    .split_once(']')
+                    .expect("`is` should be closed")
+                    .0
+                    .split(',')
+                    .map(|v| v.trim().trim_matches('"').to_string())
+                    .filter(|v| !v.is_empty())
+                    .collect();
+                (section.to_string(), key.to_string(), on, is)
+            })
+            .collect()
+    }
+
+    /// A conditionally shown row must depend on a key that exists and on
+    /// values Rust would actually accept for it.
+    ///
+    /// `DEPENDENT_FIELDS` is the one thing in `schema.ts` that hides a *real*
+    /// setting, and every way it can drift is silent. A trigger value spelled
+    /// the way Rust does not (`"Script"`, or a variant renamed in
+    /// `InjectBackend`) hides the row for *every* value of the dependency,
+    /// which is a setting the GUI can no longer reach; a dependency key that
+    /// no longer exists goes the other way and shows the row always. Neither
+    /// is visible to `tsc` or to `vite build`, because the frontend keeps no
+    /// copy of the schema on purpose.
+    #[test]
+    fn a_dependent_row_names_a_real_key_and_values_rust_accepts() {
+        use yappr_core::config::Config;
+
+        let rules = dependent_fields(&frontend("src/settings/schema.ts"));
+        assert!(!rules.is_empty(), "the scan found nothing, so it stopped working");
+
+        let defaults = serde_json::to_value(Config::default()).expect("a config is JSON");
+        for (section, key, on, is) in rules {
+            let table = defaults
+                .get(&section)
+                .and_then(|s| s.as_object())
+                .unwrap_or_else(|| panic!("no [{section}] section, so {section}.{key} is unreachable"));
+            assert!(table.contains_key(&key), "[{section}] has no `{key}` to hide");
+            assert!(
+                table.contains_key(&on),
+                "{section}.{key} depends on `{on}`, which [{section}] does not have"
+            );
+            assert!(!is.is_empty(), "{section}.{key} would be hidden for every value");
+
+            for want in &is {
+                let mut patched = defaults.clone();
+                patched[&section][&on] = serde_json::Value::String(want.clone());
+                serde_json::from_value::<Config>(patched).unwrap_or_else(|e| {
+                    panic!("{section}.{on} = {want:?} is not a value Rust accepts: {e}")
+                });
+            }
+        }
+    }
+
     /// A fresh, collision-free scratch directory for a single test. Not a
     /// dependency: `tempfile` isn't in `[dev-dependencies]` here either (see
     /// the identical helper in `yappr-core`'s `inject.rs` and `owf-cli`'s --

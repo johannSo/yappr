@@ -325,9 +325,42 @@ export const OBSOLETE_FIELDS = new Set([
   "inject.terminal_classes",
 ]);
 
+/// Rows that only exist for one value of another row in the same section.
+///
+/// The second thing that can hide a row, and unlike `OBSOLETE_FIELDS` it
+/// hides a *real* setting -- so the bar is narrow: the row must be inert for
+/// every other value of the row it depends on, and that row must be visible
+/// right above it, so the way to bring it back is on screen. `inject.script`
+/// is the case that forced it: `inject::build` reads it only for
+/// `InjectBackend::Script`, so under `wtype` it is a path field that changes
+/// nothing, sitting directly under the dropdown that would make it matter.
+///
+/// This does not make a setting unreachable, in either of the two ways that
+/// would matter. Choosing the backend brings its row back; and a search for
+/// "script" still lands on `inject.backend`, whose help text names all three
+/// backends, which is the row you have to change anyway.
+export const DEPENDENT_FIELDS: Record<string, { on: string; is: Json[] }> = {
+  "inject.script": { on: "backend", is: ["script"] },
+};
+
+/// Whether a row's dependency (if it has one) is currently satisfied.
+///
+/// A section that does not carry the key being depended on leaves the row
+/// visible: this is fed whatever JSON the daemon sent, and a missing
+/// `backend` must not quietly take `script` with it -- unlabelled is
+/// allowed, unreachable is not.
+function applies(section: string, key: string, value: Section): boolean {
+  const dep = DEPENDENT_FIELDS[`${section}.${key}`];
+  if (!dep) return true;
+  const on = value[dep.on];
+  if (on === undefined) return true;
+  return dep.is.some((want) => jsonEqual(want, on));
+}
+
 /// Only an ordering hint: a key missing from this table still renders, after
 /// the listed ones. Nothing here can hide a setting -- see
-/// `OBSOLETE_FIELDS` for the one thing that can, and why it is not one.
+/// `OBSOLETE_FIELDS` and `DEPENDENT_FIELDS` for the two things that can, and
+/// why neither is one.
 export const FIELD_ORDER: Record<string, string[]> = {
   audio: ["device", "max_seconds", "vad_padding_ms"],
   asr: ["model", "language", "num_threads"],
@@ -354,12 +387,13 @@ export const FIELD_ORDER: Record<string, string[]> = {
 /// and named nowhere here lands at the bottom of its section rather than
 /// nowhere at all.
 ///
-/// The single filter applied here is `OBSOLETE_FIELDS`, and `search()` goes
-/// through this function precisely so a key hidden from a pane is not still
-/// reachable through the search box.
+/// The only filters applied here are `OBSOLETE_FIELDS` and
+/// `DEPENDENT_FIELDS`, and `search()` goes through this function precisely so
+/// a key hidden from a pane is not still reachable through the search box.
 export function orderedFields(section: string, value: Section): [string, Json][] {
   const declared = FIELD_ORDER[section] ?? [];
-  const live = (k: string) => !OBSOLETE_FIELDS.has(`${section}.${k}`);
+  const live = (k: string) =>
+    !OBSOLETE_FIELDS.has(`${section}.${k}`) && applies(section, k, value);
   const listed = declared.filter((k) => k in value && live(k));
   const rest = Object.keys(value).filter((k) => !declared.includes(k) && live(k));
   return [...listed, ...rest].map((k) => [k, value[k]]);

@@ -143,7 +143,11 @@ Two Cargo members, one process:
   config schema: `schema.ts` only decides how a key that already exists is *shown*, so
   a key added in Rust and named nowhere here still renders, by its JSON type, in its
   section's pane — or in the `Weitere` pane if no category claims its section. A new
-  setting can become unlabelled; it cannot become unreachable. `schema.ts` also
+  setting can become unlabelled; it cannot become unreachable. The two tables that
+  *do* hide a row are `OBSOLETE_FIELDS` (keys Rust accepts and ignores, so not
+  settings at all) and `DEPENDENT_FIELDS` (a row inert for every value of another
+  row — `inject.script` under a backend that is not `script`; the dropdown that
+  brings it back sits right above it). `schema.ts` also
   owns `search()`, which matches a query against a row's German label, its help
   text, *and* its raw `config.toml` key — a key added in Rust and named nowhere
   here is still findable by the name Rust gives it.
@@ -201,8 +205,9 @@ Two `[normalize]` keys are **accepted and ignored**: `port` and
 `deny_unknown_fields` (invariant 4), so deleting them from `NormalizeConfig`
 would turn every pre-existing `config.toml` into a hard startup failure. They
 are gone from the annotated default and hidden from the settings GUI by
-`schema.ts`'s `OBSOLETE_FIELDS` — the one thing in that file that can hide a
-row, and only because these are not settings.
+`schema.ts`'s `OBSOLETE_FIELDS` — which hides a row only because these are not
+settings. (`DEPENDENT_FIELDS` is the other table that can hide one, and it hides
+a real setting; see the `src/settings/` notes above.)
 
 `[models]` owns the model lifetime: `preload_at_startup` (default `false`) and
 `idle_unload_seconds` (default `60`, `0` = never). `ensure_models_loaded` reads
