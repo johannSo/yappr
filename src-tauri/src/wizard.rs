@@ -62,6 +62,53 @@ pub(crate) fn write_marker(path: &Path) -> std::io::Result<()> {
     std::fs::write(path, b"")
 }
 
+/// [`write_marker`] against the real path -- **the one thing that makes
+/// [`should_open`] ever answer `false`**, and therefore the only reason the
+/// wizard stops taking over the settings window on every single launch.
+///
+/// It exists as a named function because the bug it fixes was that only
+/// *one* route out of the wizard wrote it: the last step's Fertig button. A
+/// user who loaded the models, copied the shortcut, and then left by any
+/// other door -- "Einstellungen öffnen" on the last step, "Einstellungen" on
+/// the models step, or simply closing the window, which is what a finished
+/// window invites -- got the whole wizard again at the next start, forever,
+/// with nothing on screen explaining why. Reported exactly that way on
+/// 2026-09-10, on a machine with every model present, the shortcut bound,
+/// and no `wizard-done` next to its `config.toml`.
+///
+/// So every exit funnels through here now, and the marker means what its
+/// path says: *this machine has been through setup*. The callers:
+///
+/// - [`wizard_finish`] -- Fertig, and it writes this **before** the backend
+///   patch it also does, so a `set_config` that fails cannot take the marker
+///   down with it (it used to `?` out one line above the write).
+/// - [`wizard_dismiss`] -- the two "Einstellungen" buttons, via
+///   `Settings.tsx`'s `onOpenSettings`.
+/// - `lib.rs`'s close-request hook on the settings window -- the door with
+///   no button, and the one a user who considers themselves done reaches for.
+///
+/// A failure is returned *and* logged: a state dir that cannot be written is
+/// the one case where the wizard legitimately comes back, and then the user
+/// gets told which path failed instead of watching it reappear in silence.
+pub(crate) fn remember_setup_seen() -> Result<(), String> {
+    let path = yappr_core::paths::wizard_marker();
+    write_marker(&path).map_err(|e| {
+        let msg =
+            format!("Einrichtungsstatus konnte nicht gespeichert werden ({}): {e}", path.display());
+        eprintln!("wizard: {msg}");
+        msg
+    })
+}
+
+/// Leaving the wizard without finishing it: the "Einstellungen" button on
+/// the models step and "Einstellungen öffnen" on the last one. Both are the
+/// user saying they are done with this window's wizard mode, which is
+/// exactly what the marker records -- see [`remember_setup_seen`].
+#[tauri::command]
+pub fn wizard_dismiss() -> Result<(), String> {
+    remember_setup_seen()
+}
+
 /// The injection backend that works on `d` out of the box.
 ///
 /// GNOME is the exception and Mutter is the reason: it does not implement
@@ -182,27 +229,44 @@ pub(crate) fn backend_patch(backend: &str) -> serde_json::Value {
 /// The window is hidden here rather than by the frontend because
 /// `src-tauri/capabilities/` scopes `core:window:allow-hide` to the overlay;
 /// doing it Rust-side needs no capability at all.
+///
+/// **The marker is written first, and unconditionally.** The two jobs used to
+/// run the other way round, with the backend patch `?`-ing out one line above
+/// the write -- so a `set_config` that failed for any reason at all (a
+/// config the daemon rejects, no `Daemon` managed under `--replay`, a
+/// read-only file) silently cost the user the one bit that stops the wizard
+/// reopening, while the frontend closed the wizard anyway and showed nothing.
+/// Neither half depends on the other, so neither may be able to lose the
+/// other: both errors are collected and the marker's is reported first.
 #[tauri::command]
 pub async fn wizard_finish(
     app: tauri::AppHandle,
     server: tauri::State<'_, crate::settings_cmds::Server>,
     set_backend: Option<String>,
 ) -> Result<(), String> {
-    if let Some(backend) = set_backend {
+    let remembered = remember_setup_seen();
+
+    let patched = match set_backend {
         // `app` so the save broadcasts the configured palette like any
         // other, which the wizard needs for a reason of its own: it takes
         // over the whole settings window, so this is the first save some
         // installs ever make.
-        crate::settings_cmds::set_config(app.clone(), server, backend_patch(&backend)).await?;
-    }
-
-    write_marker(&yappr_core::paths::wizard_marker())
-        .map_err(|e| format!("Einrichtungsstatus konnte nicht gespeichert werden: {e}"))?;
+        Some(backend) => {
+            crate::settings_cmds::set_config(app.clone(), server, backend_patch(&backend))
+                .await
+                // The saved config comes back for the settings form's
+                // benefit; this caller has no use for it, and `Settings.tsx`
+                // re-reads through `load(true)` right after anyway.
+                .map(|_| ())
+        }
+        None => Ok(()),
+    };
 
     if let Some(w) = tauri::Manager::get_webview_window(&app, crate::SETTINGS_LABEL) {
         let _ = w.hide();
     }
-    Ok(())
+
+    remembered.and(patched)
 }
 
 #[cfg(test)]
@@ -231,6 +295,86 @@ mod tests {
         write_marker(&marker).unwrap();
         write_marker(&marker).unwrap(); // idempotent, and it created `dir`
         assert!(!should_show_window_at(&marker));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A file from this repo, read relative to this crate rather than the
+    /// cwd, so the test works from anywhere in the workspace. Same idiom as
+    /// `settings_cmds`' theme tests and `proto.rs`'s fixture test.
+    fn source(rel: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(rel);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} should be readable: {e}", path.display()))
+    }
+
+    /// **The bug this whole module was reopened for, on 2026-09-10.** The
+    /// marker was written by exactly one thing -- the last step's Fertig
+    /// button -- and the wizard has three other exits: two "Einstellungen"
+    /// buttons and the window's own close control. Take any of them and the
+    /// marker stays unwritten, so `should_open` keeps answering `true` and
+    /// the wizard takes over the settings window on every launch, forever,
+    /// on a machine with every model downloaded and the shortcut bound.
+    ///
+    /// Deliberately crude string scanning across two languages, for the same
+    /// reason the theme tests do it: the wiring is the invariant, it spans
+    /// Rust and TSX, and nothing else can notice one of these three calls
+    /// being deleted. The Rust side of the close hook is `lib.rs`'s, inside
+    /// a window-event callback no unit test can drive.
+    #[test]
+    fn every_exit_from_the_wizard_persists_the_marker() {
+        let settings = source("src/Settings.tsx");
+        for call in ["wizard_finish", "wizard_dismiss"] {
+            assert!(
+                settings.contains(&format!("invoke(\"{call}\"")),
+                "Settings.tsx must still call {call}: every way out of the wizard has to \
+                 write the marker, or it reopens on the next launch",
+            );
+        }
+        // The wizard's own two exits, and the handlers they are wired to.
+        let wizard_tsx = source("src/settings/wizard.tsx");
+        assert_eq!(
+            // The models step's "Einstellungen" and the last step's
+            // "Einstellungen öffnen". A third button added without this
+            // handler is a fourth unmarked exit.
+            wizard_tsx.matches("onClick={onOpenSettings}").count(),
+            2,
+            "both 'Einstellungen' buttons must still go through onOpenSettings",
+        );
+        assert!(wizard_tsx.contains("onFinish(firstRun"), "Fertig must still call onFinish");
+
+        // The door with no button. `hide_instead_of_close`'s callback cannot
+        // be invoked from a test, so this asserts the wiring is present.
+        let lib = source("src-tauri/src/lib.rs");
+        assert!(
+            lib.contains("wizard::remember_setup_seen"),
+            "closing the settings window must still record that setup was seen",
+        );
+    }
+
+    /// The other half of the same bug: `wizard_finish` used to `?` out of the
+    /// backend patch *before* writing the marker, so anything that made
+    /// `set_config` fail also cost the user the marker -- and the frontend
+    /// closed the wizard regardless, which is a wizard that reappears next
+    /// launch having reported nothing. A failed write is now returned, not
+    /// dropped, and the settings window says so in its banner slot.
+    ///
+    /// The failure is provoked with a *file* where the state directory has to
+    /// be, rather than a read-only directory: deterministic, and it stays a
+    /// failure when the tests run as root.
+    #[test]
+    fn a_marker_that_cannot_be_written_is_reported_rather_than_dropped() {
+        let dir = scratch_dir("unwritable");
+        std::fs::create_dir_all(&dir).unwrap();
+        let blocked = dir.join("state-dir-is-a-file");
+        std::fs::write(&blocked, b"").unwrap();
+
+        // The kind is deliberately not asserted: `create_dir_all` over a
+        // path whose parent is a file reports `AlreadyExists` (EEXIST) here,
+        // not `NotADirectory`. What matters is that it is an `Err` at all,
+        // because the caller's whole job is to pass that on.
+        let err = write_marker(&blocked.join("wizard-done")).unwrap_err();
+        assert!(!err.to_string().is_empty(), "the failure has to be describable to the user");
 
         std::fs::remove_dir_all(&dir).ok();
     }

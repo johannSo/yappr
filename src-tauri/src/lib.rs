@@ -410,7 +410,8 @@ pub fn run() {
             provision::setup_status,
             provision::run_setup,
             wizard::wizard_state,
-            wizard::wizard_finish
+            wizard::wizard_finish,
+            wizard::wizard_dismiss
         ])
         .setup(move |app| {
             let window = app
@@ -454,9 +455,26 @@ pub fn run() {
             // destroyed) keeps Tauri's window map non-empty. The app quits
             // only via Beenden or `--quit` -- both `Request::Quit` -- never
             // by closing a window.
-            hide_instead_of_close(&window);
+            hide_instead_of_close(&window, || {});
             if let Some(settings) = app.get_webview_window(SETTINGS_LABEL) {
-                hide_instead_of_close(&settings);
+                // Closing the settings window is the wizard's exit with no
+                // button, and the one a user who has finished setup actually
+                // reaches for -- the wizard *is* this window while it is
+                // active, so its window controls are the wizard's window
+                // controls. Nothing wrote the marker on this path, which is
+                // how an install with every model present and the shortcut
+                // bound still got the whole wizard on every launch
+                // (`wizard::remember_setup_seen` records the report).
+                //
+                // Unconditional, not "only while the wizard is active": this
+                // hook cannot see the webview's mode, and it does not need
+                // to. A settings window that has been opened and closed is a
+                // machine where yappr has introduced itself, which is all the
+                // marker claims. One `write` of an empty file, on a thread
+                // that is about to hide a window anyway.
+                hide_instead_of_close(&settings, || {
+                    let _ = wizard::remember_setup_seen();
+                });
             }
 
             // Task 12: registers with `org.kde.StatusNotifierWatcher` and
@@ -576,12 +594,18 @@ pub fn run() {
 /// `run`'s `setup` -- see the comment on those two calls for why neither
 /// window may ever actually be destroyed, and `run`'s `RunEvent::Exit`
 /// comment for the exit-convergence consequence of that.
-fn hide_instead_of_close(window: &tauri::WebviewWindow) {
+///
+/// `after_hide` runs once the window is away, for the one caller that has
+/// something to record about the close itself: `settings` remembers that
+/// setup has been seen, because closing that window is the setup wizard's
+/// unbuttoned exit (see the call site). The overlay passes `|| {}`.
+fn hide_instead_of_close(window: &tauri::WebviewWindow, after_hide: impl Fn() + Send + 'static) {
     let w = window.clone();
     window.on_window_event(move |e| {
         if let tauri::WindowEvent::CloseRequested { api, .. } = e {
             api.prevent_close();
             let _ = w.hide();
+            after_hide();
         }
     });
 }

@@ -487,6 +487,40 @@ the whole lock file stops parsing. See
     incomplete, and nothing pops a window for it: seeing it costs opening
     the settings window, which is what the tray is for.
 
+    - **2026-09-10, third pass — the other side of the same coin.** Making
+      the marker the *only* input is worth nothing unless every way out of
+      the wizard writes it, and until this date exactly one did: the last
+      step's **Fertig** button. The wizard has three other exits — the
+      models step's "Einstellungen", the last step's "Einstellungen öffnen",
+      and the window's own close control, which is what a user who
+      considers themselves finished reaches for — and all three left
+      `wizard-done` unwritten, so a machine with every model downloaded,
+      the shortcut bound and the packages installed got the whole wizard
+      again on every launch, with nothing on screen saying why. Reported
+      exactly that way, against a `~/.local/state/yappr/` holding a
+      `config.toml` and no marker. Every exit funnels through
+      `wizard::remember_setup_seen` now: `wizard_finish` (Fertig),
+      `wizard_dismiss` (both "Einstellungen" buttons, via `Settings.tsx`'s
+      `onOpenSettings`), and `lib.rs`'s close-request hook on the settings
+      window — deliberately unconditional there, since that hook cannot see
+      whether the webview is in wizard mode and does not need to: a
+      settings window that has been opened and closed is a machine yappr
+      has introduced itself on. `wizard_finish` also writes the marker
+      **before** the `inject.backend` patch it applies, because it used to
+      `?` out of that patch one line above the write — a `set_config`
+      failure silently cost the marker while the frontend closed the wizard
+      anyway. `every_exit_from_the_wizard_persists_the_marker` scans
+      `Settings.tsx`, `settings/wizard.tsx` and `lib.rs` for exactly this
+      wiring, the same trick as the overlay-event fixture tests, because
+      nothing else notices one of three calls being deleted.
+
+    The one remaining reason the wizard legitimately reopens is a marker
+    that could not be *written* (a read-only state dir). That is why
+    `remember_setup_seen` returns its error instead of dropping it, logs it,
+    and `Settings.tsx` renders it in the banner slot: the symptom of this
+    whole family of bugs is "the setup screen keeps coming back for no
+    reason", so the one honest cause left must name itself.
+
     The marker is a state file, not a config key: a key would have to join a
     `deny_unknown_fields` struct and then appear in the settings GUI as a
     setting nobody should touch. See

@@ -118,6 +118,12 @@ export default function Settings() {
   // needed" — nothing may flash on screen before the first answer arrives.
   const [wizardState, setWizardState] = useState<WizardState | null>(null);
   const [wizardActive, setWizardActive] = useState(false);
+  // A marker that could not be written is the one remaining reason the wizard
+  // legitimately comes back next launch (`wizard::remember_setup_seen`), so it
+  // is said out loud in the banner slot rather than left in a console the user
+  // has no way to open. It used to be a bare `console.error`, on the very path
+  // whose whole symptom is "the setup screen keeps coming back for no reason".
+  const [wizardError, setWizardError] = useState<string | null>(null);
 
   // The save path reads the config through a ref: a debounced write fires long
   // after the render that scheduled it, and must send what the config looks
@@ -489,22 +495,42 @@ export default function Settings() {
             state={wizardState}
             onFinish={(setBackend) => {
               // Not swallowed silently, but it must not trap the user in the
-              // wizard either: the marker is a convenience, and a wizard that
-              // will not close is worse than one that reappears next launch.
+              // wizard either: a wizard that will not close is worse than one
+              // that reappears next launch. `wizard_finish` writes the marker
+              // before anything that can fail, so what a rejection here means
+              // is "the marker itself could not be stored, or the backend
+              // patch was refused" — and the banner says which.
               invoke("wizard_finish", { setBackend })
                 // `wizard_finish` puts `inject.backend` through `set_config`
                 // before it hides the window, so this window's snapshot is a
                 // key out of date the moment it returns. The reveal listener
                 // would catch that on the next open; re-reading here means it
                 // is never wrong in between.
-                .then(() => load(true))
+                .then(() => {
+                  setWizardError(null);
+                  return load(true);
+                })
                 .catch((e) => {
                   console.error("wizard_finish failed", e);
+                  setWizardError(String(e));
                 });
               void refreshWizardState();
               setWizardActive(false);
             }}
+            // Leaving for the settings form is an exit from the wizard, and
+            // every exit has to persist the marker — that is invariant 14's
+            // "finished once, never again by itself". This one wrote nothing
+            // until 2026-09-10, so a user who took the models step's
+            // "Einstellungen" button, or the last step's "Einstellungen
+            // öffnen", got the whole wizard back on every launch of a
+            // perfectly set-up install.
             onOpenSettings={() => {
+              invoke("wizard_dismiss")
+                .then(() => setWizardError(null))
+                .catch((e) => {
+                  console.error("wizard_dismiss failed", e);
+                  setWizardError(String(e));
+                });
               void refreshWizardState();
               setWizardActive(false);
             }}
@@ -666,6 +692,31 @@ export default function Settings() {
                       }}
                     >
                       Verstanden
+                    </button>
+                  </motion.div>
+                )}
+                {wizardError && (
+                  <motion.div
+                    key="wizard-error"
+                    className="banner error"
+                    layout
+                    initial={{ opacity: 0, y: -8 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -8 }}
+                    transition={SETTLE}
+                  >
+                    <Icon name="warn" className="icon-sm" />
+                    <span>{wizardError}</span>
+                    <button
+                      type="button"
+                      className="ghost"
+                      onClick={() => {
+                        invoke("wizard_dismiss")
+                          .then(() => setWizardError(null))
+                          .catch((e) => setWizardError(String(e)));
+                      }}
+                    >
+                      Erneut versuchen
                     </button>
                   </motion.div>
                 )}
