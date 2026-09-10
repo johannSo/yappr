@@ -4,7 +4,7 @@ members = ["crates/yappr-core", "src-tauri"]
 
 [workspace.package]
 edition = "2021"
-version = "0.2.5"
+version = "0.2.6"
 
 [workspace.dependencies]
 anyhow = "1"
