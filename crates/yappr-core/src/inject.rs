@@ -3,7 +3,7 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use crate::config::{InjectBackend, InjectConfig};
+use crate::config::{InjectBackend, InjectConfig, PasteChord};
 use crate::paths;
 use crate::procutil;
 
@@ -106,6 +106,20 @@ fn run_backend(
     tracing::debug!(backend, ?program, ?argv, ?timeout, "spawning injection backend");
     let mut cmd = Command::new(program);
     cmd.args(&argv);
+    run_prepared(backend, cmd, timeout)
+}
+
+/// [`run_backend`] for a caller that had to build the `Command` itself --
+/// the ydotool backend, which sets `YDOTOOL_SOCKET` on it. Same timeout,
+/// same error mapping, same logging; the only difference is who chose the
+/// argv and the environment.
+fn run_prepared(
+    backend: &'static str,
+    cmd: Command,
+    timeout: Duration,
+) -> Result<(), InjectError> {
+    let argv: Vec<String> =
+        cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
     let started = std::time::Instant::now();
     let out = procutil::run_with_timeout(cmd, timeout, None).map_err(|e| {
         let mapped = map_proc_error(backend, timeout, e);
@@ -169,6 +183,201 @@ impl TextInjector for ClipboardInjector {
             });
         }
         Ok(())
+    }
+}
+
+/// One key-event round trip to `ydotoold`; nowhere near what typing a whole
+/// transcript would need.
+const PASTE_KEY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Read the old clipboard before replacing it. Short on purpose: an empty
+/// clipboard makes `wl-paste` block, and a missed restore is a far smaller
+/// harm than a dictation that stalls.
+const CLIPBOARD_READ_TIMEOUT: Duration = Duration::from_millis(500);
+/// Between `wl-copy` returning and the chord. `wl-copy` has forked and owns
+/// the selection when it exits, but the compositor still has to hand the new
+/// offer to the focused client; the paste races that handoff without this.
+const PASTE_SETTLE: Duration = Duration::from_millis(200);
+/// Between the chord and restoring the previous clipboard, so the target has
+/// actually read the offer before it is replaced again.
+const RESTORE_DELAY: Duration = Duration::from_millis(300);
+
+/// The paste chord as raw `keycode:state` pairs for `ydotool key`:
+/// LEFTCTRL (29) [+ LEFTSHIFT (42)] + V (47), pressed and released in
+/// nested order.
+///
+/// Raw keycodes on purpose -- key *positions* are identical on QWERTZ and
+/// QWERTY, so this is the one ydotool invocation a keyboard layout cannot
+/// mangle (`ydotool type`'s char->keycode table is US-only, which is why
+/// this backend pastes instead of typing: on a German layout it swaps z/y
+/// and drops umlauts and ß entirely).
+fn paste_key_argv(shift: bool) -> Vec<String> {
+    let mut v = vec!["-d".to_string(), "50".to_string(), "29:1".to_string()];
+    if shift {
+        v.push("42:1".to_string());
+    }
+    v.push("47:1".to_string());
+    v.push("47:0".to_string());
+    if shift {
+        v.push("42:0".to_string());
+    }
+    v.push("29:0".to_string());
+    v
+}
+
+/// Whether `class` names a terminal, per the configured
+/// `inject.terminal_classes`. Case-insensitive: Hyprland reports
+/// "Alacritty" with a capital A, and nobody should have to know that.
+fn is_terminal_class(class: Option<&str>, terminal_classes: &[String]) -> bool {
+    let Some(class) = class else { return false };
+    terminal_classes.iter().any(|t| t.eq_ignore_ascii_case(class))
+}
+
+/// Whether the chord carries Shift.
+///
+/// **`Auto` treats an unknown class as a terminal**, and that inversion is
+/// the entire reason this backend works where its predecessor did not. Every
+/// window-class provider can answer `None` (see [`crate::winclass`]); the old
+/// rule resolved `None` through the terminal list, came up `false`, and sent
+/// a plain Ctrl+V that every terminal ignores -- from a `ydotool` that exits
+/// 0, so nothing failed, no fallback fired and the user simply got no text.
+///
+/// Guessing shifted is the better bet in both directions: terminals *require*
+/// Ctrl+Shift+V, while browsers and Electron apps read it as "paste as plain
+/// text", which is what dictation wants anyway. A known non-terminal still
+/// gets plain Ctrl+V, so the few apps that bind Ctrl+Shift+V to something
+/// else (LibreOffice's Paste Special) are unaffected whenever the class is
+/// actually available.
+fn wants_shift(chord: PasteChord, class: Option<&str>, terminal_classes: &[String]) -> bool {
+    match chord {
+        PasteChord::CtrlV => false,
+        PasteChord::CtrlShiftV => true,
+        PasteChord::Auto => class.is_none() || is_terminal_class(class, terminal_classes),
+    }
+}
+
+/// The `YDOTOOL_SOCKET` to hand the child when the environment has none.
+///
+/// `ydotool` defaults to a path under `$XDG_RUNTIME_DIR`, but the common
+/// user unit puts it at `~/.ydotool_socket`, and a GUI process started by the
+/// desktop does not inherit whatever the user's shell exports. `None` means
+/// the environment already has one and we must not override it.
+fn ydotool_socket(existing: Option<&str>) -> Option<std::path::PathBuf> {
+    if existing.is_some_and(|v| !v.is_empty()) {
+        return None;
+    }
+    Some(dirs::home_dir()?.join(".ydotool_socket"))
+}
+
+/// Spec 10.3's second injector: **paste via `ydotool`**, rebuilt on
+/// 2026-09-10 as the sequence a working user script arrived at.
+///
+/// The previous version of this backend was removed on 2026-09-09 because it
+/// never worked for anyone; this one is that script's steps, in order, run
+/// from Rust instead of `sh`:
+///
+///   1. read the current clipboard, so it can be put back (`wl-paste`);
+///   2. put the transcript on the clipboard (`wl-copy`);
+///   3. settle, so the compositor hands the offer over;
+///   4. name the focused window -- [`crate::winclass`] first (`hyprctl`, then
+///      the accessibility bus), which needs no GNOME extension;
+///   5. press Ctrl+V, or **Ctrl+Shift+V when the class is a terminal *or
+///      unknown*** -- see [`wants_shift`], this is the fix;
+///   6. restore the previous clipboard, detached, after a delay.
+///
+/// Step 6 is deliberately fire-and-forget: it outlives this call, so the
+/// pipeline is not held at `INJECTING` waiting for a clipboard the user is
+/// no longer looking at. Its pipes are `/dev/null`, so unlike a shell
+/// script's `nohup … &` it cannot hold a drain open at all (invariant 6).
+///
+/// A failure at any step is an `Err`, which `inject_with_recovery` turns into
+/// the clipboard fallback -- and since step 2 already ran, that fallback is
+/// exactly the manual-paste story the `clipboard` backend offers. Invariant 1
+/// holds either way.
+pub struct YdotoolInjector {
+    terminal_classes: Vec<String>,
+    paste_chord: PasteChord,
+    restore_clipboard: bool,
+}
+
+impl YdotoolInjector {
+    pub fn new(cfg: &InjectConfig) -> Self {
+        Self {
+            terminal_classes: cfg.terminal_classes.clone(),
+            paste_chord: cfg.paste_chord,
+            restore_clipboard: cfg.restore_clipboard,
+        }
+    }
+
+    /// Step 1. Best-effort: a clipboard we could not read is one we simply
+    /// do not restore, which must never fail the dictation.
+    fn read_clipboard() -> Option<Vec<u8>> {
+        let mut cmd = Command::new("wl-paste");
+        cmd.arg("--no-newline");
+        let out = procutil::run_with_timeout(cmd, CLIPBOARD_READ_TIMEOUT, None).ok()?;
+        (out.status.success() && !out.stdout.is_empty()).then_some(out.stdout)
+    }
+
+    /// Step 6. Detached, silent, and after `RESTORE_DELAY`.
+    ///
+    /// A thread rather than a `nohup`-style grandchild, so nothing can hold
+    /// a drained pipe open (invariant 6). The trade is that it dies with the
+    /// process: quit yappr inside `RESTORE_DELAY` of a dictation and the
+    /// clipboard simply keeps the transcript, which is the harmless
+    /// direction to fail in.
+    fn restore_clipboard_later(previous: Vec<u8>) {
+        std::thread::spawn(move || {
+            std::thread::sleep(RESTORE_DELAY);
+            let mut cmd = Command::new("wl-copy");
+            procutil::unbundle(&mut cmd);
+            cmd.stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            let Ok(mut child) = cmd.spawn() else { return };
+            if let Some(mut si) = child.stdin.take() {
+                use std::io::Write as _;
+                let _ = si.write_all(&previous);
+            }
+            // `wl-copy` forks a daemon to own the selection and the parent
+            // exits at once; reap that parent so it does not linger as a
+            // zombie for the life of the app.
+            let _ = child.wait();
+        });
+    }
+}
+
+impl TextInjector for YdotoolInjector {
+    fn name(&self) -> &'static str {
+        "ydotool"
+    }
+
+    fn inject(&self, text: &str, target_class: Option<&str>) -> Result<(), InjectError> {
+        let previous = self.restore_clipboard.then(Self::read_clipboard).flatten();
+
+        ClipboardInjector.inject(text, target_class)?;
+        std::thread::sleep(PASTE_SETTLE);
+
+        // `target_class` is the class captured at `ptt-start`, and it is the
+        // only one worth having. Asking `winclass` again *here* looks like a
+        // free improvement and is actively harmful: by this point the overlay
+        // may hold keyboard focus itself (invariant 2), so the answer can be
+        // yappr's own window -- which is not in `terminal_classes`, so a
+        // dictation into a terminal would resolve to plain Ctrl+V and vanish.
+        // That is precisely the failure this backend was rebuilt to end, so
+        // an absent class stays absent and `wants_shift` shifts it.
+        let shift = wants_shift(self.paste_chord, target_class, &self.terminal_classes);
+        tracing::debug!(class = ?target_class, shift, "ydotool paste chord chosen");
+
+        let mut cmd = Command::new("ydotool");
+        cmd.args(paste_key_argv(shift));
+        if let Some(sock) = ydotool_socket(std::env::var("YDOTOOL_SOCKET").ok().as_deref()) {
+            cmd.env("YDOTOOL_SOCKET", sock);
+        }
+        let res = run_prepared("ydotool", cmd, PASTE_KEY_TIMEOUT);
+
+        if let Some(previous) = previous {
+            Self::restore_clipboard_later(previous);
+        }
+        res
     }
 }
 
@@ -298,6 +507,7 @@ impl TextInjector for MockInjector {
 pub fn build(cfg: &InjectConfig) -> Box<dyn TextInjector> {
     match cfg.backend {
         InjectBackend::Wtype => Box::new(WtypeInjector::new(cfg.keystroke_delay_ms)),
+        InjectBackend::Ydotool => Box::new(YdotoolInjector::new(cfg)),
         InjectBackend::Script => Box::new(ScriptInjector::new(cfg)),
         InjectBackend::Clipboard => Box::new(ClipboardInjector),
     }
@@ -744,5 +954,88 @@ exit 3"#,
         let err = ScriptInjector::new(&cfg).inject("hallo", None).unwrap_err();
         let msg = err.to_string();
         assert!(!msg.contains('~'), "the tilde must be gone by the time we spawn: {msg}");
+    }
+
+    // ---- the built-in ydotool backend -----------------------------------
+
+    #[test]
+    fn an_unknown_window_class_pastes_with_ctrl_shift_v() {
+        // THE bug that made the previous ydotool backend useless, pinned so
+        // it cannot come back. `wants_shift` used to resolve `None` through
+        // the terminal list, which does not contain `None`, so an unknown
+        // class meant plain Ctrl+V -- which every terminal ignores, from a
+        // `ydotool` that exits 0. Nothing failed, nothing was logged, and
+        // the user got no text.
+        //
+        // Unknown is now the *shifted* case. Ctrl+Shift+V is what the
+        // reference script sends when its class lookup comes up empty, and
+        // it is the safer guess in both directions: terminals require it,
+        // and browsers and Electron read it as "paste as plain text", which
+        // is what dictation wants anyway.
+        assert!(wants_shift(PasteChord::Auto, None, &["kitty".to_string()]));
+    }
+
+    #[test]
+    fn a_known_non_terminal_still_pastes_with_plain_ctrl_v() {
+        // The shifted default must not swallow the case we *can* answer:
+        // a named window that is not a terminal gets Ctrl+V, so an app
+        // where Ctrl+Shift+V means something else (LibreOffice's Paste
+        // Special) is unaffected whenever the class is actually known.
+        assert!(!wants_shift(PasteChord::Auto, Some("firefox"), &["kitty".to_string()]));
+    }
+
+    #[test]
+    fn a_known_terminal_pastes_with_ctrl_shift_v() {
+        assert!(wants_shift(PasteChord::Auto, Some("kitty"), &["kitty".to_string()]));
+    }
+
+    #[test]
+    fn terminal_detection_matches_the_configured_classes_case_insensitively() {
+        // Hyprland reports "Alacritty" with a capital A and nobody should
+        // have to know that.
+        let classes = ["alacritty".to_string(), "org.gnome.Ptyxis".to_string()];
+        assert!(is_terminal_class(Some("Alacritty"), &classes));
+        assert!(is_terminal_class(Some("org.gnome.ptyxis"), &classes));
+        assert!(!is_terminal_class(Some("firefox"), &classes));
+    }
+
+    #[test]
+    fn a_forced_chord_overrides_the_class_in_both_directions() {
+        assert!(wants_shift(PasteChord::CtrlShiftV, Some("firefox"), &[]));
+        assert!(!wants_shift(PasteChord::CtrlV, Some("kitty"), &["kitty".to_string()]));
+    }
+
+    #[test]
+    fn the_paste_chord_is_pressed_and_released_in_nested_order() {
+        // Raw keycodes, because key *positions* are layout-independent:
+        // this is the one ydotool invocation a German keyboard cannot
+        // mangle. LEFTCTRL 29, LEFTSHIFT 42, V 47. Nested, not sequential --
+        // releasing Ctrl before V would be a different chord.
+        assert_eq!(paste_key_argv(false), vec!["-d", "50", "29:1", "47:1", "47:0", "29:0"]);
+        assert_eq!(
+            paste_key_argv(true),
+            vec!["-d", "50", "29:1", "42:1", "47:1", "47:0", "42:0", "29:0"]
+        );
+    }
+
+    #[test]
+    fn the_default_terminal_list_covers_the_terminals_the_reference_script_named() {
+        // The built-in backend replaced a shell script whose terminal regex
+        // is the list a real user arrived at; dropping a name from it is a
+        // regression for whoever dictates into that terminal.
+        let d = crate::config::InjectConfig::default().terminal_classes;
+        for class in ["ptyxis", "kitty", "alacritty", "foot", "ghostty", "konsole", "wezterm"] {
+            assert!(d.iter().any(|t| t == class), "{class} missing from {d:?}");
+        }
+    }
+
+    #[test]
+    fn the_ydotool_socket_default_is_only_applied_when_the_user_has_none() {
+        // The reference script defaults YDOTOOL_SOCKET to ~/.ydotool_socket
+        // because a GUI process started by the desktop does not inherit the
+        // one the user's shell exports. A user who *has* set it must win.
+        assert_eq!(ydotool_socket(Some("/run/user/1000/.ydotool_socket")), None);
+        let fallback = ydotool_socket(None).expect("a default must be offered");
+        assert!(fallback.ends_with(".ydotool_socket"), "got {fallback:?}");
     }
 }

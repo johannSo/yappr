@@ -177,11 +177,10 @@ compositors without layer-shell; it's inert on Hyprland, so paste it or don't.
 
 Two differences:
 
-- **`wtype` does nothing here.** Mutter doesn't implement the virtual-keyboard protocol
-  `wtype` types through. The wizard detects GNOME and sets `[inject] backend =
-  "clipboard"` for you on a first run: the transcript lands in the clipboard and you
-  press Ctrl+V. To have it inserted for you, write a paste script and use the
-  [`script` backend](#pasting-with-your-own-script) — GNOME needs no other setup.
+- **Use the `ydotool` backend.** Mutter doesn't implement the virtual-keyboard protocol
+  `wtype` types through, so `wtype` silently does nothing. The wizard detects GNOME and
+  sets `[inject] backend = "ydotool"` for you on a first run — see
+  [Pasting with ydotool](#pasting-with-ydotool) for the one-time setup.
 - **Add the shortcuts in Settings → Keyboard → Custom Shortcuts**, running
   `yappr --toggle` and `yappr --cancel`. The wizard also offers a `gsettings` script
   that *appends* to your existing custom shortcuts — never use a plain
@@ -270,7 +269,7 @@ first start, and the old `~/.config/yappr/config.toml` is left behind as
 | `[asr]` | `num_threads` for Parakeet |
 | `[normalize]` | `enabled` (`false` skips S1-mini and types rule-cleaned raw text), plus `timeout_ms`, `context_size`, `threads` |
 | `[guardrail]` | `min_word_ratio`/`max_word_ratio`, `min_overlap_english`/`min_overlap_other`, `short_input_words`, `ngram_size`/`ngram_max_repeats` |
-| `[inject]` | `backend` (`wtype`, `script`, `clipboard`), `script` (the program the `script` backend runs — see [Pasting with your own script](#pasting-with-your-own-script)), `trailing_space`, `keystroke_delay_ms` (wtype only) |
+| `[inject]` | `backend` (`wtype`, `ydotool`, `script`, `clipboard`), `script` (the program the `script` backend runs), `paste_chord` (`auto`, `ctrl_v`, `ctrl_shift_v`; ydotool only), `terminal_classes`, `restore_clipboard` (ydotool only), `trailing_space`, `keystroke_delay_ms` (wtype only) |
 | `[vocabulary]` | terms and replacements applied to the raw transcript before clean-up — put short acronyms in `replacements`, not `terms` |
 | `[style_default]`, `[[style_rules]]` | the `styling`/`structure`/`context` axes S1-mini is prompted with, and per-application overrides matched on window class (regex) |
 | `[debug]` | `enabled` (off), `dir` (default `~/yappr`), `save_audio` — see [Troubleshooting](#troubleshooting) |
@@ -291,6 +290,91 @@ changed `[asr]` or `[normalize]`, and it reports a file it cannot read rather th
 resetting it, which is the one place the app will not quietly replace your config.
 Settings saved from the window already apply live; `--reload` is for a config that
 changed some other way, such as one restored from a backup.
+
+### Pasting with `ydotool`
+
+`wtype` is the default and needs no setup: it types through the compositor's own
+virtual-keyboard protocol. But it does nothing on GNOME, and it drops keystrokes in some
+XWayland and Electron windows. The `ydotool` backend goes through the kernel's
+`/dev/uinput` instead, which no window can tell apart from a real keyboard.
+
+It doesn't type the transcript, it pastes it: the text goes to the clipboard with
+`wl-copy`, then ydotool presses a single Ctrl+V by raw keycode, then your previous
+clipboard is put back. Key *positions* are layout-independent, so this works on any
+keyboard layout, umlauts and ß included — `ydotool type` would mangle them through its
+US-only keymap.
+
+**It presses Ctrl+Shift+V when the target is a terminal — or when yappr could not work
+out what the target is.** That second half matters more than it sounds. Terminals
+reserve plain Ctrl+V for the program running inside them, so sending them Ctrl+V does
+nothing at all — and `ydotool` still exits 0, so nothing reports a failure and your
+dictation just disappears. Guessing "shifted" when the window is unknown is the safe
+direction: browsers and Electron apps read Ctrl+Shift+V as "paste as plain text", which
+is what you want for dictation anyway. Windows yappr *can* name and knows aren't
+terminals still get plain Ctrl+V.
+
+```toml
+[inject]
+backend = "ydotool"
+# paste_chord = "auto"        # "auto" (default) | "ctrl_v" | "ctrl_shift_v"
+# restore_clipboard = true    # false keeps the transcript in the clipboard
+```
+
+Pin `paste_chord = "ctrl_v"` if some app you dictate into binds Ctrl+Shift+V to
+something else (LibreOffice opens *Paste Special*). Set `restore_clipboard = false` if
+you would rather the transcript stayed in the clipboard as a safety net — if a paste
+ever does miss, that leaves you a manual Ctrl+V, which restoring takes away.
+
+```bash
+sudo pacman -S ydotool    # For Arch based distros
+sudo dnf install ydotool  # For Fedora based distros
+```
+
+`ydotoold` needs write access to `/dev/uinput`, which is `root`-only out of the box.
+Hand it to the `input` group once:
+
+```bash
+sudo tee /etc/udev/rules.d/60-uinput.rules <<'EOF'
+KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"
+EOF
+sudo udevadm control --reload-rules && sudo udevadm trigger /dev/uinput
+sudo usermod -aG input "$USER"   # log out and back in for the group to take effect
+```
+
+Then run the daemon as a **user** service. Some distros ship one — try
+`systemctl --user enable --now ydotool.service` first (the unit is named for the
+package, not for ydotoold). If `systemctl --user cat ydotool.service` finds nothing,
+as on Fedora, write your own:
+
+```ini
+# ~/.config/systemd/user/ydotoold.service
+[Unit]
+Description=ydotoold - ydotool user daemon
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ydotoold --socket-path=%t/.ydotool_socket --socket-perm=0600
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now ydotoold.service
+```
+
+yappr defaults `YDOTOOL_SOCKET` to `~/.ydotool_socket` when the variable isn't already
+set, because a GUI app started by your desktop doesn't inherit what your shell exports.
+If your unit uses a different socket path, export `YDOTOOL_SOCKET` where yappr can see
+it.
+
+Do **not** enable a system-wide `ydotoold` pointed at `/run/user/$UID/.ydotool_socket`.
+A system unit starts at boot, before logind has created `/run/user/$UID`, so it dies
+with `failed to bind socket: No such file or directory` and never retries once
+systemd's restart limit is hit.
 
 ### Pasting with your own script
 
@@ -341,18 +425,19 @@ perfectly good way to see what it decided. `yappr --debug` prints the last dicta
 record, including the target window class yappr saw (it does not pass that to your
 script — a script that wants it asks its own desktop).
 
-#### Upgrading from the `ydotool` backend
+#### `script` or `ydotool`?
 
-`backend = "ydotool"` still loads: it is read as `script`, so nothing breaks on start and
-no settings are lost. The next time anything saves your config the file is rewritten as
-`backend = "script"`. What you need to add is the `script` key pointing at a program that
-does what the old backend did — the minimal script above is that program, plus whichever
-terminal check you want. Until you do, the backend has no script to run and every
-dictation lands in the clipboard with a notification.
+Use [`ydotool`](#pasting-with-ydotool) unless it can't do what you need — it is the same
+sequence built in, with nothing to install beyond `ydotool` itself and nothing to keep
+in sync. Reach for `script` when you want something it doesn't do: a different paste
+tool, a window-class source of your own (a GNOME Shell extension over `gdbus`, say), an
+extra step before or after the paste, or a script you already use with another dictation
+tool.
 
-`[inject] paste_chord` and `[inject] terminal_classes` are still accepted so your
-existing file loads, but nothing reads them any more and they are dropped from the file
-on the next save. Your script picks the chord now.
+If you had `backend = "ydotool"` in your config from before 2026-09-09, it still means
+exactly that and needs no edit. (For one day, between 2026-09-09 and 2026-09-10, the
+built-in backend didn't exist and that word was read as `script`; if you switched to a
+paste script in that window, it still works and nothing forces you back.)
 
 ## Memory use
 
@@ -380,7 +465,8 @@ needed — `preload_at_startup` alone still unloads after the idle timeout.
 | Symptom | Likely cause |
 |---|---|
 | **Nothing happens when I press `SUPER+D`** | The app isn't running (check for the tray icon), or the shortcut isn't bound. Run `yappr --toggle` in a terminal: with no app running it exits non-zero and raises a notification. |
-| **Nothing gets typed, but the overlay says it worked** | `wtype` can't reach that window — you're on GNOME, or it's an XWayland/Electron window. Check the clipboard: the text is probably there. Fix it with the [`script` backend](#pasting-with-your-own-script). |
+| **Nothing gets typed, but the overlay says it worked** | `wtype` can't reach that window — you're on GNOME, or it's an XWayland/Electron window. Check the clipboard: the text is probably there. Switch to [`ydotool`](#pasting-with-ydotool). |
+| **`ydotool` says `failed to connect socket ... Please check if ydotoold is running`** | `ydotoold` isn't up. `systemctl --user status ydotoold` — if it's a *system* unit bound to `/run/user/$UID/…`, that can never work; see [Pasting with `ydotool`](#pasting-with-ydotool). yappr falls back to the clipboard here, so the transcript is still there to paste by hand. |
 | **The `script` backend produced nothing and a notification says it fell back to the clipboard** | Your script failed. Run it by hand — `~/bin/paste.sh "hallo"` — and watch what it says; yappr logs its stdout and stderr either way. The usual causes are a path that isn't executable (`chmod +x`), a wrong `[inject] script` path, and a helper it calls (`ydotoold`, `wl-copy`) not being up. `cargo run -p yappr-core --example script_probe -- "hallo"` runs it exactly the way yappr does. |
 | **Nothing is pasted *into a terminal*** | Your script sent plain Ctrl+V, which terminals ignore. That choice is your script's, not yappr's: have it check the focused window's class and send Ctrl+Shift+V for terminals, or send Ctrl+Shift+V unconditionally — browsers and Electron read it as "paste as plain text", which is what you want for dictation anyway. |
 | **`cargo build` fails in `gtk-layer-shell-sys`** | `sudo pacman -S gtk-layer-shell`. |

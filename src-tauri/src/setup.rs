@@ -231,17 +231,21 @@ struct Prerequisite {
 /// than a reopening wizard since 2026-09-09 (invariant 14); a permanent
 /// banner nobody can act on is no better.
 ///
-/// `ydotool` was on this list, optional, until 2026-09-09. It is not
-/// replaced by a check for the script backend's program: `[inject] script`
-/// names a file the user writes themselves, and reporting its absence as a
-/// missing prerequisite would put a permanent gap on every install that has
-/// not opted into a backend almost nobody uses -- exactly the never-ready
-/// loop above, wearing different clothes. `ScriptInjector` reports a missing
-/// script when it is actually asked to run one, and the clipboard fallback
-/// carries the transcript meanwhile (invariant 1).
+/// `ydotool` stays **optional** even on GNOME, where it is the recommended
+/// backend. Everywhere else that is because `wtype` is the default injector
+/// and needs no setup, so a machine without `ydotool` is fully working and
+/// listing it would push a package almost nobody needs into the "install
+/// these" list. On GNOME it is because making it fatal would recreate
+/// exactly the never-ready loop above: the binary existing is not enough,
+/// `ydotoold` also has to be *running*, which no package check can see. The
+/// wizard states that requirement separately, unit and all --
+/// `wizard::backend_prereqs`.
 ///
-/// `wl-copy` is fatal everywhere, and on GNOME it now carries the whole of
-/// injection rather than only the fallback.
+/// No check is added for `[inject] script`: that names a file the user
+/// writes themselves, so its absence is not a gap yappr can name.
+/// `ScriptInjector` reports a missing script when it is actually asked to
+/// run one, and the clipboard fallback carries the transcript meanwhile
+/// (invariant 1).
 fn prerequisites_for(d: &Desktop) -> Vec<Prerequisite> {
     let gnome = matches!(d, Desktop::Gnome);
     let mut checks = Vec::new();
@@ -258,6 +262,16 @@ fn prerequisites_for(d: &Desktop) -> Vec<Prerequisite> {
         why: "clipboard fallback when typing fails",
         pkg: "wl-clipboard",
         fatal: true,
+    });
+    checks.push(Prerequisite {
+        bin: "ydotool",
+        why: if gnome {
+            "pasting via /dev/uinput -- the backend Mutter leaves as the only option"
+        } else {
+            "pasting via /dev/uinput when inject.backend = \"ydotool\""
+        },
+        pkg: "ydotool",
+        fatal: false,
     });
     checks.push(Prerequisite {
         bin: "hyprctl",
@@ -466,17 +480,14 @@ mod tests {
         assert!(checks.iter().any(|c| c.bin == "hyprctl" && !c.fatal));
     }
 
-    /// Nothing yappr can install makes injection work on GNOME, so nothing
-    /// is listed for it.
+    /// `ydotool` is reported everywhere and fatal nowhere.
     ///
-    /// `ydotool` was here as an optional entry until 2026-09-09 -- optional
-    /// because making it fatal would have made `setup_status` report every
-    /// GNOME install as not ready forever (`ydotoold` also has to be
-    /// *running*, which no package check can see). With the backend retired
-    /// the entry has no meaning at all: a user's own paste script is not a
-    /// package, and its absence is not a gap yappr can name.
+    /// Optional even on GNOME, where it is recommended: making it fatal
+    /// would have `setup_status` call every GNOME install not-ready forever,
+    /// because `ydotoold` also has to be *running* and no package check can
+    /// see that. The wizard says it in prose instead.
     #[test]
-    fn no_desktop_checks_for_ydotool_any_more() {
+    fn ydotool_is_reported_but_never_fatal() {
         for d in [
             Desktop::Gnome,
             Desktop::Hyprland,
@@ -484,7 +495,10 @@ mod tests {
             Desktop::Unknown,
         ] {
             let checks = prerequisites_for(&d);
-            assert!(!checks.iter().any(|c| c.bin == "ydotool"), "{d:?} still checks for ydotool");
+            assert!(
+                checks.iter().any(|c| c.bin == "ydotool" && !c.fatal),
+                "{d:?} does not report ydotool as an optional check"
+            );
         }
     }
 

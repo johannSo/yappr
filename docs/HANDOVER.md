@@ -539,3 +539,54 @@ on the `[normalize] port` precedent: `#[serde(skip_serializing)]` and hidden by
   script the design was built against is the user's `handy-paste.sh`, which needs GNOME's
   "Window Calls Extended" extension and a running `ydotoold`; neither is present on this
   Arch/Hyprland machine.
+
+---
+
+## Added after this letter: `ydotool` is back, and why it never worked (2026-09-10)
+
+**The entry immediately above is one day old and its central claim was wrong.** It
+records the `ydotool` backend being retired because it depended on a window class no
+provider can always supply. That diagnosis named the symptom. The bug was one inverted
+default: `wants_shift` resolved an unknown class through `terminal_classes`, got
+`false`, and sent a plain Ctrl+V — which every terminal ignores, from a `ydotool` that
+exits 0, so nothing failed, no fallback notification fired, and the dictation vanished.
+The user who reported that the backend "did not work at all" was right, and their own
+working paste script differed from it in exactly one respect: an empty class falls
+through to **Ctrl+Shift+V**.
+
+So the backend is rebuilt rather than replaced, as `inject::YdotoolInjector` — the
+script's steps in order, run from Rust: read the clipboard, `wl-copy`, settle 200 ms,
+choose the chord, `ydotool key`, put the old clipboard back after 300 ms. `[inject]
+backend = "ydotool"` is a real value again (it was a read-only alias for `script` for
+one day), so no existing config needs an edit either way. `paste_chord` and
+`terminal_classes` are live settings again; `restore_clipboard` (default `true`) is new.
+The `script` backend is untouched and stays — it is the escape hatch for anything the
+built-in one does not do.
+
+Two other changes landed with it:
+
+- **`procutil::unbundle`** strips `LD_LIBRARY_PATH`, `LD_PRELOAD` and nine GTK/GLib
+  variables from every `Command` before it is spawned. An AppImage's hooks export those
+  pointing inside the mount, and a host binary that inherits them fails in ways that
+  name something else — the reference script carries its own `unset` line for exactly
+  this. Verified by probe: fake `LD_LIBRARY_PATH`/`GTK_PATH`/`GIO_EXTRA_MODULES` set on
+  the parent all arrive unset in the child.
+- **The WebKit sandbox is off by default** (`WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1`,
+  set as the first statement of `main` and only when unset). Both windows load bundled
+  local assets only, so there is nothing untrusted for it to contain.
+
+- `cargo test --workspace`: **478 passed, 0 failed, 11 ignored.** `cargo clippy
+  --workspace --all-targets`: clean. `bun run build`: clean.
+- **Verified by probe, not by dictation.** With a logging `ydotool` shim in place: an
+  unknown class sends `29:1 42:1 47:1 47:0 42:0 29:0` (Ctrl+Shift+V), `kitty` the same,
+  `firefox` sends `29:1 47:1 47:0 29:0` (Ctrl+V); `YDOTOOL_SOCKET` defaults to
+  `~/.ydotool_socket`; `restore_clipboard = true` puts a sentinel clipboard back and
+  `false` leaves the transcript. **Nobody has dictated through the real `ydotool` yet** —
+  the chord is never actually pressed in any of this, because `/dev/uinput` events go to
+  whatever session owns the keyboard and the probes ran on a working desktop.
+- One regression was written and caught during the rebuild, and is worth not
+  reintroducing: `inject` originally fell back to `winclass::active_window_class()` when
+  `target_class` was `None`. At injection time the overlay may hold focus itself
+  (invariant 2), so that returns yappr's own window — not a terminal — and restores the
+  exact silent-Ctrl+V failure being fixed. The class captured at `ptt-start` is the only
+  one this backend may use.

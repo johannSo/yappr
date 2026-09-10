@@ -28,6 +28,59 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// this module kills it.
 const NOTIFY_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// The variables an AppImage's startup hooks export to point this process at
+/// the libraries, GTK modules, GSettings schemas and icon themes *inside the
+/// mount* -- every one of which is wrong for a child process that is a host
+/// binary.
+///
+/// Read `linuxdeploy-plugin-gtk.sh` in any bundle for the full list; these
+/// are the ones that reach a child and change what it does.
+const BUNDLED_ENV: &[&str] = &[
+    // Loader-level. yappr's own bundle uses `RUNPATH $ORIGIN/../lib` rather
+    // than these, but other AppImages export them and a user may launch
+    // yappr from one; a child resolving the wrong libc or glib dies in ways
+    // that are very hard to read from the outside.
+    "LD_LIBRARY_PATH",
+    "LD_PRELOAD",
+    // GLib/GTK-level. These are the ones that actually bite: a `gdbus` or
+    // `wl-copy` from the host that inherits a *different* GLib's module
+    // path, schema directory or pixbuf cache either fails to start or fails
+    // to find an interface, and reports it as something unrelated.
+    "GIO_EXTRA_MODULES",
+    "GSETTINGS_SCHEMA_DIR",
+    "GTK_PATH",
+    "GTK_DATA_PREFIX",
+    "GTK_EXE_PREFIX",
+    "GTK_IM_MODULE_FILE",
+    "GTK_THEME",
+    "GDK_PIXBUF_MODULE_FILE",
+    "GDK_BACKEND",
+    "XDG_DATA_DIRS",
+    "APPDIR",
+];
+
+/// Strips the running bundle's environment off `command` so a child runs the
+/// way it would from a shell.
+///
+/// This is why a paste script does not need its own `unset LD_LIBRARY_PATH`
+/// line: the reference script this backend was built against carries one,
+/// with a comment recording that an AppImage's bundled glib made `gdbus`
+/// die on `undefined symbol: g_variant_builder_init_static`. That is a bug
+/// in the *caller*, not something every script author should have to know.
+///
+/// Applied unconditionally rather than only under `$APPIMAGE`: outside a
+/// bundle these are either unset (removing them is a no-op) or the user's
+/// own, and a `GTK_THEME` or `XDG_DATA_DIRS` meant for this GUI process is
+/// not something a `ydotool` invocation needs either. `PATH`, `HOME`,
+/// `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR` and `YDOTOOL_SOCKET` are untouched --
+/// children genuinely need those.
+pub fn unbundle(command: &mut Command) {
+    for key in BUNDLED_ENV {
+        command.env_remove(key);
+    }
+}
+
+
 /// Runs `command` to completion, or kills it after `timeout`.
 ///
 /// `stdin`, when given, is written and the pipe closed *before* polling
@@ -39,6 +92,7 @@ pub fn run_with_timeout(
     timeout: Duration,
     stdin: Option<&[u8]>,
 ) -> io::Result<Output> {
+    unbundle(&mut command);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     if stdin.is_some() {
         command.stdin(Stdio::piped());

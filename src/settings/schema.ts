@@ -102,6 +102,9 @@ export const LABELS: Record<string, string> = {
   "guardrail.ngram_max_repeats": "Maximale N-Gramm-Wiederholungen",
   "inject.backend": "Verfahren",
   "inject.script": "Einfüge-Skript",
+  "inject.terminal_classes": "Terminal-Fensterklassen",
+  "inject.paste_chord": "Einfüge-Tastenkombination",
+  "inject.restore_clipboard": "Zwischenablage wiederherstellen",
   "inject.trailing_space": "Leerzeichen anhängen",
   "inject.keystroke_delay_ms": "Tastenverzögerung",
   "vocabulary.enabled": "Vokabular aktiv",
@@ -184,7 +187,13 @@ export const HELP: Record<string, string> = {
   "guardrail.ngram_max_repeats":
     "Wie oft dieselbe Wortfolge vorkommen darf, bevor die Fassung als Schleife verworfen wird.",
   "inject.backend":
-    "wtype tippt den Text Zeichen für Zeichen ins Fenster und braucht keine Einrichtung — unter GNOME (Mutter) bewirkt es allerdings nichts. script übergibt den fertigen Text als erstes Argument an ein eigenes Programm, das dann selbst entscheidet, wie es ihn einfügt. clipboard legt ihn nur in die Zwischenablage, einfügen musst du selbst.",
+    "wtype tippt den Text Zeichen für Zeichen ins Fenster und braucht keine Einrichtung — unter GNOME (Mutter) bewirkt es allerdings nichts. ydotool legt ihn per wl-copy in die Zwischenablage, drückt einmal Strg+V (in Terminals und bei unbekanntem Fenster Strg+Umschalt+V) und stellt die alte Zwischenablage wieder her — layoutunabhängig, Umlaute und ß kommen richtig an, und es erreicht auch Fenster, in denen wtype nichts bewirkt; setzt aber einen laufenden ydotoold voraus. script übergibt den fertigen Text als erstes Argument an ein eigenes Programm, das dann selbst entscheidet, wie es ihn einfügt. clipboard legt ihn nur in die Zwischenablage, einfügen musst du selbst.",
+  "inject.paste_chord":
+    "Welche Tastenkombination das ydotool-Verfahren zum Einfügen drückt. automatisch entscheidet pro Fenster: Strg+Umschalt+V in Terminals — und auch dann, wenn sich die Fensterklasse nicht ermitteln lässt, weil Terminals Strg+V ignorieren und der Text sonst spurlos verschwindet. Bei bekannten Nicht-Terminals bleibt es bei Strg+V. Fest einstellen brauchst du das nur, wenn ein Programm Strg+Umschalt+V anders belegt (LibreOffice öffnet damit „Inhalte einfügen“).",
+  "inject.restore_clipboard":
+    "Stellt nach dem Einfügen wieder her, was vorher in der Zwischenablage lag (Standard). Aus lassen, wenn der Text zur Sicherheit in der Zwischenablage bleiben soll: Geht die Tastenkombination ins Leere, meldet ydotool trotzdem Erfolg — dann ist ein manuelles Strg+V die einzige Rettung, und die nimmt dir das Wiederherstellen weg.",
+  "inject.terminal_classes":
+    "Fensterklassen, in denen das ydotool-Verfahren mit Strg+Umschalt+V einfügt statt Strg+V — Terminals reservieren Strg+V für das Programm darin. Groß-/Kleinschreibung spielt keine Rolle. Unbekannte Fenster bekommen ohnehin Strg+Umschalt+V; diese Liste entscheidet nur über Fenster, die yappr benennen kann.",
   "inject.script":
     "Pfad zu dem Programm, das das script-Verfahren aufruft. Es bekommt den fertigen Text als erstes und einziges Argument ($1) und ist danach für alles zuständig: Zwischenablage, Tastenkombination, Fenstererkennung. Muss ausführbar sein; ~ wird aufgelöst. Beispiel: ~/bin/paste.sh. Schlägt es fehl oder ist hier nichts eingetragen, landet der Text wie beim clipboard-Verfahren in der Zwischenablage.",
   "inject.trailing_space":
@@ -240,7 +249,8 @@ export const ENUMS: Record<string, string[]> = {
     "parakeet-unified-en",
     "nemotron-3.5",
   ],
-  "inject.backend": ["wtype", "script", "clipboard"],
+  "inject.backend": ["wtype", "ydotool", "script", "clipboard"],
+  "inject.paste_chord": ["auto", "ctrl_v", "ctrl_shift_v"],
   "style_default.styling": ["casual", "semi-casual", "semi-formal", "formal"],
   "style_default.structure": ["prose", "lists"],
   "style_default.context": ["general", "email"],
@@ -260,6 +270,13 @@ export const ENUMS: Record<string, string[]> = {
 /// config file rather than a choice of how the app looks. Nothing is lost by
 /// labelling them -- `search()` still matches the raw key and value.
 export const ENUM_LABELS: Record<string, Record<string, string>> = {
+  // Without these the row shows the raw config values, and `inject.backend`'s
+  // help text talks about "automatisch" while the dropdown says "auto".
+  "inject.paste_chord": {
+    auto: "automatisch",
+    ctrl_v: "immer Strg+V",
+    ctrl_shift_v: "immer Strg+Umschalt+V",
+  },
   "ui.theme": {
     system: "System (hell/dunkel folgen)",
     "yappr-light": "yappr Hell",
@@ -317,12 +334,6 @@ export const COLUMN_LABELS: Record<string, string> = {
 export const OBSOLETE_FIELDS = new Set([
   "normalize.port",
   "normalize.llama_server_path",
-  // Retired with the ydotool backend on 2026-09-09. Rust still accepts both
-  // keys so a pre-existing config.toml loads (invariant 4) and still sends
-  // them over the wire (`skip_serializing` is TOML-only), but nothing reads
-  // them: a script picks its own paste chord. They are not settings.
-  "inject.paste_chord",
-  "inject.terminal_classes",
 ]);
 
 /// Only an ordering hint: a key missing from this table still renders, after
@@ -331,7 +342,15 @@ export const OBSOLETE_FIELDS = new Set([
 export const FIELD_ORDER: Record<string, string[]> = {
   audio: ["device", "max_seconds", "vad_padding_ms"],
   asr: ["model", "language", "num_threads"],
-  inject: ["backend", "script", "trailing_space", "keystroke_delay_ms"],
+  inject: [
+    "backend",
+    "script",
+    "paste_chord",
+    "terminal_classes",
+    "restore_clipboard",
+    "trailing_space",
+    "keystroke_delay_ms",
+  ],
   normalize: ["enabled", "timeout_ms", "context_size", "threads"],
   guardrail: [
     "min_word_ratio",

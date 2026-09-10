@@ -384,25 +384,41 @@ pub enum InjectBackend {
     /// text. A script asks its own desktop its own way, and yappr stops
     /// pretending it can answer for every compositor.
     ///
-    /// `#[serde(alias = "ydotool")]` is load-bearing, not a courtesy.
-    /// `InjectConfig` is `deny_unknown_fields` (invariant 4), so an
-    /// unrecognised *value* fails the load -- and `server::start` answers a
-    /// failed load by quarantining the file: every ydotool user would lose
-    /// every setting they had, over a word this app wrote into their config
-    /// itself. The alias is read and never written (the enum serializes as
-    /// `"script"`), so the first save canonicalises the file and the
-    /// retired spelling dies out on its own.
-    #[serde(alias = "ydotool")]
     Script,
+    /// Spec 10.3's paste injector: `wl-copy` the transcript, then have
+    /// `ydotool` press one Ctrl+V -- Ctrl+Shift+V for a terminal **or for a
+    /// window nobody could name** -- and put the old clipboard back. See
+    /// [`crate::inject::YdotoolInjector`].
+    ///
+    /// Removed on 2026-09-09 and rebuilt on 2026-09-10, because the removal
+    /// diagnosed the wrong culprit. The backend was retired for needing the
+    /// focused window's class when no provider can always supply one -- but
+    /// the class was never the bug. `wants_shift` resolved an unknown class
+    /// through the terminal list, got `false`, and sent a plain Ctrl+V that
+    /// every terminal ignores; `ydotool` exited 0, so nothing failed, no
+    /// clipboard-fallback notification fired, and the dictation vanished.
+    /// One inverted default, not a missing capability. Unknown now means
+    /// *shifted*, which is what a working user script had arrived at
+    /// independently, and the backend does the job again.
+    ///
+    /// Needs a running `ydotoold` with write access to `/dev/uinput`, plus
+    /// `wl-copy`. Not the default, because `wtype` needs none of that.
+    Ydotool,
     Clipboard,
 }
 
-/// **Accepted and ignored since 2026-09-09.** Which chord the retired
-/// `ydotool` backend pressed to paste.
+/// Which chord the [`InjectBackend::Ydotool`] backend presses to paste.
 ///
-/// The script backend that replaced it presses its own chord, so nothing
-/// reads this. It survives as a type only because
-/// [`InjectConfig::paste_chord`] must keep deserializing -- see that field.
+/// `Auto` decides per window and is right almost always: Ctrl+Shift+V for a
+/// terminal *or an unnameable window*, plain Ctrl+V for anything else. The
+/// two overrides exist for the residue -- an app that binds Ctrl+Shift+V to
+/// something of its own (LibreOffice opens *Paste Special*) wants `CtrlV`,
+/// and someone who only ever dictates into terminals can pin `CtrlShiftV`
+/// and stop thinking about it.
+///
+/// Live again since 2026-09-10, after one day as an accepted-and-ignored
+/// key: it was retired with the backend it configures, and came back with
+/// it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PasteChord {
@@ -432,22 +448,38 @@ pub struct InjectConfig {
     /// [`InjectError::NotConfigured`]: crate::inject::InjectError::NotConfigured
     #[serde(default = "d_script")]
     pub script: String,
-    /// **Accepted and ignored since 2026-09-09.** Window classes whose paste
-    /// chord was Ctrl+Shift+V rather than Ctrl+V, back when this app chose
-    /// the chord. The script backend chooses its own.
+    /// Window classes (matched case-insensitively against the class captured
+    /// at recording start) that the `ydotool` backend pastes into with
+    /// Ctrl+Shift+V rather than Ctrl+V -- terminals reserve plain Ctrl+V for
+    /// the application running inside them. Only that backend reads this.
     ///
-    /// Kept for the same reason as `[normalize] port`: this section is
-    /// `deny_unknown_fields` (invariant 4) and `config::render` wrote this
-    /// key into every user's file, so removing the field would turn every
-    /// pre-existing `config.toml` into a quarantined one. `skip_serializing`
-    /// keeps it out of newly written files; `schema.ts`'s `OBSOLETE_FIELDS`
-    /// keeps it out of the GUI. It is not a setting.
-    #[serde(default = "d_terminal_classes", skip_serializing)]
+    /// Note this list only decides *known* windows. A window no provider
+    /// could name is shifted regardless -- see [`PasteChord`].
+    #[serde(default = "d_terminal_classes")]
     pub terminal_classes: Vec<String>,
-    /// **Accepted and ignored since 2026-09-09.** See
-    /// [`InjectConfig::terminal_classes`] -- same retirement, same reason.
-    #[serde(default = "d_paste_chord", skip_serializing)]
+    /// Which chord the `ydotool` backend presses. Only that backend reads
+    /// this. See [`PasteChord`].
+    #[serde(default = "d_paste_chord")]
     pub paste_chord: PasteChord,
+    /// Whether the `ydotool` backend puts the previous clipboard back after
+    /// pasting. Only that backend reads it.
+    ///
+    /// `true` -- the default, and what the paste script this backend was
+    /// rebuilt from does -- treats the clipboard as the user's, borrowed for
+    /// a moment. The cost is a real one, so it is a setting rather than a
+    /// decision: while the transcript sits in the clipboard it is a manual
+    /// `Ctrl+V` away, and restoring throws that away ~300 ms later. If the
+    /// chord silently misses -- the wrong window focused at the wrong
+    /// moment -- `ydotool` still exits 0, so nothing reports a failure and
+    /// nothing is written to `unsent.txt`; with the transcript already
+    /// overwritten there is then nothing left to recover by hand.
+    ///
+    /// Set `false` to keep the transcript in the clipboard, which is what
+    /// this backend did before 2026-09-10 and is the safer half of that
+    /// trade. The shifted-unknown default (see [`PasteChord`]) is what makes
+    /// `true` defensible at all.
+    #[serde(default = "d_true")]
+    pub restore_clipboard: bool,
 }
 
 fn d_backend() -> InjectBackend {
@@ -459,12 +491,50 @@ fn d_keydelay() -> u32 {
 fn d_script() -> String {
     String::new()
 }
-/// Empty since 2026-09-09: [`InjectConfig::terminal_classes`] has no reader
-/// left, so a shipped list of terminals would be a default nothing consults.
-/// The function survives only as the `#[serde(default)]` for a key old files
-/// still carry.
+/// The window classes of the terminals a Wayland user plausibly runs, as the
+/// compositor reports them (matching is case-insensitive, so "Alacritty" and
+/// "org.gnome.Terminal" are covered by their lowercase spellings).
+///
+/// Seeded from the regex in the paste script this backend was rebuilt from,
+/// which is a list a real user converged on rather than a guess.
 fn d_terminal_classes() -> Vec<String> {
-    Vec::new()
+    [
+        "alacritty",
+        "kitty",
+        "foot",
+        "footclient",
+        "wezterm",
+        "org.wezfurlong.wezterm",
+        "ghostty",
+        "com.mitchellh.ghostty",
+        "konsole",
+        "org.kde.konsole",
+        "org.gnome.terminal",
+        "gnome-terminal-server",
+        "org.gnome.console",
+        "kgx",
+        // GNOME's default terminal since Fedora 41, and the one the
+        // accessibility provider is most likely to report on that desktop --
+        // as the bare `ptyxis`, which is the AT-SPI application name, not the
+        // app id. Both spellings, because a future class source may differ.
+        "ptyxis",
+        "org.gnome.Ptyxis",
+        "xterm",
+        "urxvt",
+        "st-256color",
+        "terminator",
+        "tilix",
+        "xfce4-terminal",
+        // Named by the reference script and absent from the old default.
+        "rio",
+        "contour",
+        "blackbox",
+        "tilda",
+        "guake",
+        "yakuake",
+    ]
+    .map(str::to_string)
+    .to_vec()
 }
 fn d_paste_chord() -> PasteChord {
     PasteChord::Auto
@@ -479,6 +549,7 @@ impl Default for InjectConfig {
             script: d_script(),
             terminal_classes: d_terminal_classes(),
             paste_chord: d_paste_chord(),
+            restore_clipboard: true,
         }
     }
 }
@@ -1059,55 +1130,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_config_that_still_says_ydotool_loads_as_the_script_backend() {
-        // The upgrade path, and the reason the alias exists at all.
-        // `InjectConfig` is `deny_unknown_fields`, so an unrecognised value
-        // fails the load -- and `server::start` answers a failed load by
-        // renaming the user's only settings file to `config.toml.broken-*`
-        // and writing a fresh default (invariant 4). Dropping the spelling
-        // would cost every ydotool user every setting they have.
+    fn a_config_that_says_ydotool_selects_the_builtin_paste_backend() {
+        // Every existing user who ever chose this backend has this word in
+        // their file, and `InjectConfig` is `deny_unknown_fields`, so an
+        // unrecognised value fails the load -- and `server::start` answers a
+        // failed load by renaming the user's only settings file to
+        // `config.toml.broken-*` (invariant 4). Between 2026-09-09 and
+        // 2026-09-10 this spelling was a read-only alias for `script`; it is
+        // a backend of its own again, so those files need no edit at all.
         let c = Config::from_str("[inject]\nbackend = \"ydotool\"\n").unwrap();
-        assert_eq!(c.inject.backend, InjectBackend::Script);
+        assert_eq!(c.inject.backend, InjectBackend::Ydotool);
     }
 
     #[test]
-    fn the_script_backend_is_never_written_back_as_ydotool() {
-        // The alias is read-only: the first save canonicalises the file, so
-        // the retired word does not live on in configs forever.
+    fn the_ydotool_backend_round_trips_as_itself() {
+        // It is a real value now, not an alias, so a save must preserve the
+        // user's choice rather than canonicalising it to something else.
         let c = Config::from_str("[inject]\nbackend = \"ydotool\"\n").unwrap();
         let rendered = render(&c);
-        assert!(rendered.contains("backend = \"script\""), "got: {rendered}");
-        assert!(
-            !rendered.contains("ydotool"),
-            "the retired spelling must not be written: {rendered}"
-        );
+        assert!(rendered.contains("backend = \"ydotool\""), "got: {rendered}");
+        let reloaded = Config::from_str(&rendered).expect("a rendered config must reload");
+        assert_eq!(reloaded.inject.backend, InjectBackend::Ydotool);
     }
 
     #[test]
-    fn the_retired_inject_keys_still_load_but_are_never_written() {
-        // Same treatment as `[normalize] port` / `llama_server_path`, for the
-        // same reason: `paste_chord` and `terminal_classes` had exactly one
-        // reader (the ydotool backend's chord decision) and now have none,
-        // but `deny_unknown_fields` makes deleting them a hard load failure
-        // for every user who has them -- which is all of them, since
-        // `config::render` wrote them.
+    fn the_chord_settings_are_read_and_written_again() {
+        // They spent one day as accepted-and-ignored keys, dropped from
+        // every file the GUI saved. They configure a live backend again, so
+        // a save has to keep them -- silently discarding a user's forced
+        // chord would be exactly the "produced no text, reported success"
+        // failure this backend was rebuilt to end.
         let c = Config::from_str(
             "[inject]\npaste_chord = \"ctrl_shift_v\"\nterminal_classes = [\"kitty\"]\n",
         )
-        .expect("a pre-existing file naming the retired keys must still load");
+        .expect("a pre-existing file naming these keys must load");
+        assert_eq!(c.inject.paste_chord, PasteChord::CtrlShiftV);
+        assert_eq!(c.inject.terminal_classes, vec!["kitty".to_string()]);
+
         let rendered = render(&c);
-        assert!(!rendered.contains("paste_chord"), "got: {rendered}");
-        assert!(!rendered.contains("terminal_classes"), "got: {rendered}");
+        assert!(rendered.contains("paste_chord = \"ctrl_shift_v\""), "got: {rendered}");
+        assert!(rendered.contains("kitty"), "got: {rendered}");
+        let reloaded = Config::from_str(&rendered).expect("a rendered config must reload");
+        assert_eq!(reloaded.inject.paste_chord, PasteChord::CtrlShiftV);
     }
 
     #[test]
-    fn a_rendered_config_round_trips_through_the_loader() {
-        // `render` drops the two retired keys, so the file it writes must
-        // still be one `Config::load_from` accepts -- otherwise the first
-        // autosave would produce a file the next start quarantines.
-        let c = Config::from_str("[inject]\nbackend = \"ydotool\"\n").unwrap();
-        let reloaded = Config::from_str(&render(&c)).expect("a rendered config must reload");
-        assert_eq!(reloaded.inject.backend, InjectBackend::Script);
+    fn the_default_chord_is_auto() {
+        assert_eq!(Config::from_str("").unwrap().inject.paste_chord, PasteChord::Auto);
     }
 
     #[test]
@@ -1560,11 +1629,9 @@ to = "KDD"
         // `src/settings/schema.ts` both hand-repeat these strings; this pins
         // what they have to agree with. `deny_unknown_fields` makes a
         // misspelling a hard startup failure, not a silent fallback.
-        // `"ydotool"` is deliberately absent: it is an alias, covered by
-        // `a_config_that_still_says_ydotool_loads_as_the_script_backend`,
-        // and it must never reach the GUI's dropdown as a choice.
         for (spelling, expected) in [
             ("wtype", InjectBackend::Wtype),
+            ("ydotool", InjectBackend::Ydotool),
             ("script", InjectBackend::Script),
             ("clipboard", InjectBackend::Clipboard),
         ] {

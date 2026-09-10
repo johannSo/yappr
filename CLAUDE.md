@@ -8,16 +8,26 @@ Press-to-start, press-to-stop dictation for Hyprland/Wayland. Press `SUPER+D`, s
 press `SUPER+D` again; the audio is captured, VAD-trimmed, transcribed (one of several
 `sherpa-onnx` models, chosen by `[asr] model`; Parakeet TDT 0.6b v3 by default),
 rewritten by S1-mini (llama.cpp, in-process), checked by a guardrail, and
-typed into the focused window with `wtype` (or, if `[inject] backend` selects it,
-handed to a *user-supplied script* — a `script` backend since 2026-09-09, replacing the
-`ydotool` one: yappr runs `[inject] script` with the finished transcript as `$1` and
-passes nothing else, so the script owns the clipboard, the paste chord and any window
-detection; a failure of any kind falls back to the clipboard, per invariant 1). Fully
+typed into the focused window by one of three injectors, chosen by `[inject] backend`:
+`wtype` (the default, types character by character, does nothing under GNOME/Mutter);
+`ydotool` (a *paste* backend — `wl-copy`, then one layout-independent Ctrl+V via
+`/dev/uinput`, **Ctrl+Shift+V when the target is a terminal or could not be named at
+all**, then the previous clipboard is put back unless `[inject] restore_clipboard =
+false`); or `script`, which hands the finished transcript to `[inject] script` as `$1`
+and nothing else, leaving that program to own the clipboard, the chord and any window
+detection. Any injector failing falls back to the clipboard, per invariant 1. Fully
 local at dictation time. `SUPER+ALT+D`
 cancels a recording in progress; nothing else can end one deliberately — see invariant 11.
-`[inject] paste_chord` and `[inject] terminal_classes` still load, but nothing reads
-them: choosing a chord needed a window class yappr cannot always get, which is what
-retired the old backend — see the window-class gotcha at the bottom of this file.
+
+The `ydotool` backend was deleted on 2026-09-09 and rebuilt on 2026-09-10, and the
+reason is the single most useful thing to know about it. It was retired for depending on
+a window class no provider can always supply — but the class was never the bug.
+`wants_shift` resolved an unknown class through `terminal_classes`, got `false`, and
+sent a plain Ctrl+V that every terminal ignores; `ydotool` exits 0, so nothing failed,
+no fallback notification fired, and the dictation silently vanished. One inverted
+default, not a missing capability. **Unknown now means shifted**, which is what a
+working user paste script had converged on independently, and the backend does its job
+again. See the window-class gotcha at the bottom of this file.
 
 yappr is one binary, `yappr`, and one process. Running it with no
 arguments starts everything: a tray icon (no window), the Unix socket, the models, and
@@ -703,19 +713,19 @@ the whole lock file stops parsing. See
   script repacks the AppImage in place with the 256×256 at the root (the AppImage spec's
   recommended `.DirIcon` size), reusing the original runtime; verified 2026-09-01. The
   release CI runs it after `tauri build` — a locally built AppImage needs it run by hand.
-- **Every way a window-class provider can fail collapses to the same `None`, and the
-  per-application style rules then fall back to their defaults.**
-  `winclass::active_window_class()` is the *only* source of the target window's class,
-  and since 2026-09-09 `style::resolve` is its only consumer — a `None` means no
-  `[[style_rules]]` entry matches and S1-mini is prompted with `[style_default]`
-  instead. That is a quiet wrong-tone, not a lost dictation.
+- **Every way a window-class provider can fail collapses to the same `None`, and two
+  things read that `None`.** `winclass::active_window_class()` is the *only* source of
+  the target window's class. `style::resolve` reads it as "no `[[style_rules]]` entry
+  matches", so S1-mini is prompted with `[style_default]` — a quiet wrong-tone, not a
+  lost dictation. `inject::wants_shift` reads it as **"send Ctrl+Shift+V"**, which is
+  the safe direction and is deliberately the opposite of what it used to do.
 
-  It used to be much worse, and the table below is the measurement that retired the
-  ydotool backend: `inject::wants_shift` read `None` as "not a terminal", so yappr
-  pressed plain Ctrl+V, which every terminal ignores — and `ydotool` exited 0, so
+  The table below is the measurement behind that inversion. Until 2026-09-09
+  `wants_shift` resolved `None` through `terminal_classes`, came up `false`, and sent a
+  plain Ctrl+V that every terminal ignores — and `ydotool` exits 0, so
   `inject_with_recovery` recorded success, no clipboard-fallback notification fired,
-  and the user saw a dictation that produced no text. yappr no longer chooses a chord
-  at all; a paste script asks its own desktop. Measured against Hyprland 0.56.2 on
+  and the user saw a dictation that produced no text. That cost the backend its life for
+  a day before the actual one-line cause was found. Measured against Hyprland 0.56.2 on
   2026-09-07, the three ways to get that `None` are **not** interchangeable and only
   one of them is a clean exit:
 
@@ -734,12 +744,21 @@ the whole lock file stops parsing. See
   once per dictation forever, for every user, including the majority on `wtype` for
   whom the class changes nothing.
 
-  GNOME used to be the case that mattered most — `wtype` does nothing there and
-  `hyprctl` can never exist on it, so the chord's `auto` could never work. Since
-  2026-09-08 the class is answerable there: `gnome.rs` answers from the accessibility
-  bus, which needs no extension and no gsetting, and `winclass::active_window_class`
-  falls back to it when `hyprctl` cannot be run. That provider now serves the style
-  rules rather than a chord, but it is the same code and the same failure modes.
+  GNOME is the case that matters most — `wtype` does nothing there, `hyprctl` can never
+  exist on it, and it is the desktop the ydotool backend is recommended for. Since
+  2026-09-08 the class is answerable there anyway: `gnome.rs` answers from the
+  accessibility bus, which needs no extension and no gsetting, and
+  `winclass::active_window_class` falls back to it when `hyprctl` cannot be run. With
+  the shifted-unknown default the class is now an *optimisation* — it buys a plain
+  Ctrl+V for windows that would rather have one — instead of the thing the backend
+  stands or falls on.
+
+  **Never re-query the class at injection time.** `YdotoolInjector::inject` uses the
+  `target_class` handed to it, captured at `ptt-start`, and deliberately does not fall
+  back to asking `winclass` again: by then the overlay may hold keyboard focus itself
+  (invariant 2), so the answer can be yappr's own window — which is not in
+  `terminal_classes`, so a dictation into a terminal would resolve to plain Ctrl+V and
+  vanish. That exact regression was written and caught by probe during the rebuild.
 
   Read that module's header before touching it. Two things there are not guessable.
   **AT-SPI delivers no `window:activate` events on this desktop** -- registration
@@ -754,11 +773,32 @@ the whole lock file stops parsing. See
 
   `InjectDebug` still records `window_class` (written as `null` rather than omitted,
   so "unknown" is distinguishable from "old record"), which is how you tell a style
-  rule that did not fire from one that fired wrong. An Electron or Qt app that
-  registers with no accessibility bus is the setup that still answers `None` on GNOME.
-  The chord measurements this note used to end on — `/dev/input/event*` reads of the
-  `ydotoold virtual device`, verified end to end in kitty, ghostty and foot — belong
-  to the retired backend and are kept only in git history.
+  rule that did not fire from one that fired wrong, and which chord was sent. An
+  Electron or Qt app that registers with no accessibility bus is the setup that still
+  answers `None` on GNOME — and now gets Ctrl+Shift+V for it, which is what such an app
+  usually wants anyway.
+- **Child processes do not inherit the bundle's environment.**
+  `procutil::unbundle` strips `LD_LIBRARY_PATH`, `LD_PRELOAD` and nine GTK/GLib
+  variables (`GIO_EXTRA_MODULES`, `GSETTINGS_SCHEMA_DIR`, `GTK_PATH`,
+  `GDK_PIXBUF_MODULE_FILE`, `XDG_DATA_DIRS`, `APPDIR`, …) from every `Command` before
+  `run_with_timeout` spawns it. An AppImage's startup hooks export all of those pointing
+  *inside the mount*, and a host binary that inherits them either fails to start or
+  fails in a way that names something else entirely — the reference paste script carries
+  its own `unset LD_LIBRARY_PATH` line with a comment recording `gdbus` dying on
+  `undefined symbol: g_variant_builder_init_static`. That is the caller's bug to fix,
+  not something every script author should have to rediscover. Applied unconditionally,
+  not just under `$APPIMAGE`: outside a bundle these are either unset or the user's own,
+  and neither is something `ydotool` needs. `PATH`, `HOME`, `WAYLAND_DISPLAY`,
+  `XDG_RUNTIME_DIR` and `YDOTOOL_SOCKET` are deliberately left alone.
+- **The WebKit sandbox is off by default** (`main.rs`'s `disable_webkit_sandbox`, the
+  first statement of `main`, before any GTK/WebKit init). WebKitGTK no longer honours
+  `WEBKIT_FORCE_SANDBOX=0` and says so itself, so
+  `WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1` is the only remaining switch. Defensible
+  here in a way it would not be in a browser: both windows load bundled local assets
+  only (`frontendDist`, embedded by `custom-protocol`), so there is no untrusted content
+  for the sandbox to contain — while inside an AppImage mount the sandbox's `bwrap`
+  re-exec is itself a failure mode. Set the variable yourself to override; the app only
+  fills it in when unset.
 - **Do not trust `cpal`'s advertised sample-rate range.** It advertised 16 kHz on hardware
   that rejected the stream build; `capture.rs` now probes by building a throwaway stream and
   falls back to 48 kHz plus `rubato` resampling.
