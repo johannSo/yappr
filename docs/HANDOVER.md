@@ -592,34 +592,61 @@ Two other changes landed with it:
   one this backend may use.
 
 
-### Correction, same day: the socket default was wrong and broke the first real dictation
+### Correction, same day: the rebuilt backend never ran at all
 
-The first end-to-end run of the rebuilt backend on the reporter's machine failed with
+The first end-to-end run on the reporter's machine failed with
 `ydotool exited with status exit status: 1:` — note the empty tail — and fell through to
-the clipboard. Two separate bugs, both mine, both now fixed:
+the clipboard. **The cause was a missing subcommand.** `paste_key_argv` was rewritten
+during the rebuild and lost the leading `"key"`, so the backend spawned
 
-1. **`ydotool_socket` imposed `~/.ydotool_socket` whenever `YDOTOOL_SOCKET` was unset.**
-   That path was lifted from the reference paste script's
-   `${YDOTOOL_SOCKET:-$HOME/.ydotool_socket}`, which is a fallback for one person's
-   shell, not a default an app may impose. The usual user unit is
-   `--socket-path=%t/.ydotool_socket`, and `%t` is **`$XDG_RUNTIME_DIR`**, not `$HOME`
-   (`man 5 systemd.unit`: "Runtime directory root … either /run/ (for the system
-   manager) or the path $XDG_RUNTIME_DIR resolves to (for user managers)") — which is
-   also ydotool's own compiled-in default. So yappr was pointing ydotool at a socket
-   that did not exist on a correctly configured machine. It now *probes*
-   (`$XDG_RUNTIME_DIR` then `$HOME`), passes the first that exists, and passes nothing
-   when neither does, so ydotool's own default and its own error survive.
-2. **`InjectError::Failed` was built from stderr alone.** `ydotool` prints its failures
-   on **stdout** — `failed to connect socket \`...\': No such file or directory` — with
-   stderr empty, exactly as `hyprctl` does. That is why the report above carried an exit
-   code and nothing else. `run_prepared` now falls back to stdout when stderr is empty.
+    ydotool -d 50 29:1 42:1 47:1 47:0 42:0 29:0
 
-Both are pinned: `no_socket_anywhere_means_we_impose_nothing`,
-`the_first_socket_that_actually_exists_is_chosen`,
-`an_explicit_ydotool_socket_is_never_overridden`, and
-`a_backend_that_reports_its_failure_on_stdout_still_gets_a_readable_error`.
+`ydotool` reads `argv[1]` as a *command name*, so that is `Unknown command: -d`, exit 1,
+printed on **stdout** with stderr empty. Restored to `key -d 50 …` and verified against
+the real binary: both chords now reach the socket stage (exit 2, "failed to connect
+socket") instead of dying at argument parsing.
 
-Worth recording as a process note: the socket path was "verified" by a probe that
-asserted `YDOTOOL_SOCKET=/home/joni/.ydotool_socket` was set on the child. It was — the
-probe checked that the value arrived, never that anything was listening there. A probe
-that can only confirm what the code already intends is not evidence.
+Two things made this survive longer than it should have, and both are worth not
+repeating:
+
+- **The unit test asserted the bug.** It read
+  `assert_eq!(paste_key_argv(false), vec!["-d", "50", "29:1", …])` — the argv the
+  function happened to build. It compared the code against itself and was green
+  throughout. It is now split: `the_argv_begins_with_the_key_subcommand` asserts the
+  *property* (`argv[0] == "key"`, and never a leading `-`), separately from the chord,
+  so it cannot be repaired by pasting in a new expected vector.
+- **The integration probe used a `ydotool` shim that exits 0.** It faithfully logged
+  `argv: -d 50 29:1 …` and the reviewer — me — read that as correct. A stub that cannot
+  reject its input proves only that the call happened.
+
+Exit codes on ydotool 1.x, measured, since the mapping is not obvious: **1** is
+`Unknown command` (argument parsing); **2** is every socket failure — missing
+(`No such file or directory`), stale (`Connection refused`), and unreadable
+(`Permission denied`) alike. All of them print on stdout, stderr empty.
+
+Two real fixes landed alongside, neither of which was the cause:
+
+1. **`InjectError::Failed` was built from stderr alone**, which is why the report above
+   carried an exit code and nothing else — `ydotool` reports on stdout, exactly as
+   `hyprctl` does. `run_prepared` now falls back to stdout when stderr is empty. Had
+   this been right from the start, the `Unknown command: -d` would have been in the very
+   first bug report.
+2. **`ydotool_socket` imposed `~/.ydotool_socket` whenever `YDOTOOL_SOCKET` was unset**,
+   lifted from the reference script's `${YDOTOOL_SOCKET:-$HOME/.ydotool_socket}`. It now
+   probes `$XDG_RUNTIME_DIR/.ydotool_socket` then `~/.ydotool_socket`, passes the first
+   that **exists**, and passes nothing when neither does, so ydotool's own default and
+   its own error survive. Note this was *not* the reported failure: the reporter's unit
+   uses `--socket-path=%h/.ydotool_socket`, and `%h` **is** the home directory, so the
+   imposed path happened to be right there. It is wrong for anyone using `%t` or
+   ydotool's default, which is why it changed anyway. (An intermediate diagnosis blamed
+   this and was wrong — `%t` was misread from a paraphrased unit file.)
+
+Pinned by `the_argv_begins_with_the_key_subcommand`,
+`the_key_delay_is_passed_as_an_option_to_the_subcommand`,
+`a_backend_that_reports_its_failure_on_stdout_still_gets_a_readable_error`,
+`no_socket_anywhere_means_we_impose_nothing`,
+`the_first_socket_that_actually_exists_is_chosen` and
+`an_explicit_ydotool_socket_is_never_overridden`.
+
+**Still not verified by a real dictation.** The chord has never been pressed by this
+code — every check above stops at the socket or uses a stub.

@@ -790,15 +790,25 @@ the whole lock file stops parsing. See
   not just under `$APPIMAGE`: outside a bundle these are either unset or the user's own,
   and neither is something `ydotool` needs. `PATH`, `HOME`, `WAYLAND_DISPLAY`,
   `XDG_RUNTIME_DIR` and `YDOTOOL_SOCKET` are deliberately left alone.
+- **`ydotool`'s argv must begin with its subcommand, and exit 1 means it did not.**
+  `paste_key_argv` builds `key -d 50 <chord>`; `ydotool` reads `argv[1]` as a command
+  name, so an argv starting with `-d` is `Unknown command: -d`, exit 1, on stdout with
+  stderr empty. That shipped once and cost a user their first real dictation. Measured
+  exit codes on ydotool 1.x: **1** = argument parsing, **2** = every socket failure
+  (missing, stale, unreadable), all reported on stdout. The test that should have caught
+  it asserted the argv the function happened to build — it compared the code with itself
+  and stayed green; `the_argv_begins_with_the_key_subcommand` now asserts the property
+  instead. The integration probe missed it too, because its `ydotool` stub exited 0
+  whatever it was handed.
 - **Do not guess `YDOTOOL_SOCKET`.** `inject::ydotool_socket` probes
   `$XDG_RUNTIME_DIR/.ydotool_socket` then `~/.ydotool_socket`, passes the first that
   **exists**, and passes *nothing* when neither does. It briefly imposed
   `~/.ydotool_socket` unconditionally — copied from a paste script's
   `${YDOTOOL_SOCKET:-$HOME/.ydotool_socket}` — which broke the first real dictation on a
-  machine running the ordinary user unit: `--socket-path=%t/.ydotool_socket` expands
-  `%t` to `$XDG_RUNTIME_DIR`, **not** `$HOME` (`man 5 systemd.unit`), and that is also
-  ydotool's own default. Imposing a merely plausible path converts "ydotoold is not
-  running" into "no such file".
+  machine running the ordinary user unit. Note `%t` and `%h` are different specifiers:
+  `%t` is `$XDG_RUNTIME_DIR` (also ydotool's own default), `%h` is the home directory
+  (`man 5 systemd.unit`) -- so units in the wild legitimately point at either. Imposing
+  a merely plausible path converts "ydotoold is not running" into "no such file".
 - **`ydotool` reports its failures on stdout, like `hyprctl`.** `run_prepared` builds
   `InjectError::Failed` from stderr, falling back to stdout when stderr is empty —
   without that fallback the socket failure above surfaced as

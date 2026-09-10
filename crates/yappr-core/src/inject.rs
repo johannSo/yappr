@@ -213,6 +213,11 @@ const PASTE_SETTLE: Duration = Duration::from_millis(200);
 /// actually read the offer before it is replaced again.
 const RESTORE_DELAY: Duration = Duration::from_millis(300);
 
+/// Milliseconds between the chord's key events. `ydotool key`'s own default
+/// is 12 ms; the reference paste script uses 50, which is what a real
+/// setup was tuned to and cheap enough at six events.
+const KEY_DELAY_MS: u32 = 50;
+
 /// The paste chord as raw `keycode:state` pairs for `ydotool key`:
 /// LEFTCTRL (29) [+ LEFTSHIFT (42)] + V (47), pressed and released in
 /// nested order.
@@ -223,7 +228,17 @@ const RESTORE_DELAY: Duration = Duration::from_millis(300);
 /// this backend pastes instead of typing: on a German layout it swaps z/y
 /// and drops umlauts and ß entirely).
 fn paste_key_argv(shift: bool) -> Vec<String> {
-    let mut v = vec!["-d".to_string(), "50".to_string(), "29:1".to_string()];
+    // `key` first: it is a *subcommand*, not a flag. `ydotool` reads argv[1]
+    // as the command name, so an argv starting with `-d` makes it print
+    // "Unknown command: -d" and exit 1 -- on stdout, with stderr empty. That
+    // is not a hypothetical; it shipped, and it is what a user's first real
+    // dictation through this backend hit.
+    let mut v = vec![
+        "key".to_string(),
+        "-d".to_string(),
+        KEY_DELAY_MS.to_string(),
+        "29:1".to_string(),
+    ];
     if shift {
         v.push("42:1".to_string());
     }
@@ -1059,16 +1074,41 @@ exit 3"#,
     }
 
     #[test]
+    fn the_argv_begins_with_the_key_subcommand() {
+        // Regression, and the most embarrassing kind: the previous version of
+        // this test asserted the argv *this function happened to build*,
+        // which began `-d 50`. `ydotool` reads argv[1] as a subcommand name,
+        // so that invocation was "Unknown command: -d", exit 1, message on
+        // stdout and stderr empty -- and the test was green the whole time,
+        // because it only ever compared the code against itself.
+        //
+        // Asserted as a property, separately from the chord below, so it
+        // cannot be "fixed" by pasting a new expected vector.
+        for shift in [false, true] {
+            let argv = paste_key_argv(shift);
+            assert_eq!(argv[0], "key", "argv must name the subcommand first: {argv:?}");
+            assert!(
+                !argv[0].starts_with('-'),
+                "a leading option is parsed as a command name: {argv:?}"
+            );
+        }
+    }
+
+    #[test]
     fn the_paste_chord_is_pressed_and_released_in_nested_order() {
         // Raw keycodes, because key *positions* are layout-independent:
         // this is the one ydotool invocation a German keyboard cannot
         // mangle. LEFTCTRL 29, LEFTSHIFT 42, V 47. Nested, not sequential --
         // releasing Ctrl before V would be a different chord.
-        assert_eq!(paste_key_argv(false), vec!["-d", "50", "29:1", "47:1", "47:0", "29:0"]);
-        assert_eq!(
-            paste_key_argv(true),
-            vec!["-d", "50", "29:1", "42:1", "47:1", "47:0", "42:0", "29:0"]
-        );
+        let chord = |shift| paste_key_argv(shift).split_off(3);
+        assert_eq!(chord(false), vec!["29:1", "47:1", "47:0", "29:0"]);
+        assert_eq!(chord(true), vec!["29:1", "42:1", "47:1", "47:0", "42:0", "29:0"]);
+    }
+
+    #[test]
+    fn the_key_delay_is_passed_as_an_option_to_the_subcommand() {
+        let argv = paste_key_argv(false);
+        assert_eq!(&argv[1..3], ["-d".to_string(), KEY_DELAY_MS.to_string()]);
     }
 
     #[test]
