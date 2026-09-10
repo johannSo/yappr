@@ -366,10 +366,18 @@ systemctl --user daemon-reload
 systemctl --user enable --now ydotoold.service
 ```
 
-yappr defaults `YDOTOOL_SOCKET` to `~/.ydotool_socket` when the variable isn't already
-set, because a GUI app started by your desktop doesn't inherit what your shell exports.
-If your unit uses a different socket path, export `YDOTOOL_SOCKET` where yappr can see
-it.
+If `YDOTOOL_SOCKET` isn't already set — and it usually isn't for a GUI app started by
+your desktop, which inherits nothing your shell exports — yappr looks for an existing
+socket at `$XDG_RUNTIME_DIR/.ydotool_socket` and then `~/.ydotool_socket`, and passes
+the first one that's actually there. If neither exists it passes nothing and lets
+`ydotool` use its own default, so the error you get is ydotool's real one rather than a
+path yappr invented.
+
+Note `%t` in the unit above is **`$XDG_RUNTIME_DIR`** (`/run/user/$UID`), not your home
+directory — that's what `man 5 systemd.unit` means by "runtime directory root". So that
+unit and ydotool's built-in default are the same path, and the first candidate above
+covers both. If you deliberately put the socket somewhere else, export `YDOTOOL_SOCKET`
+where yappr can see it.
 
 Do **not** enable a system-wide `ydotoold` pointed at `/run/user/$UID/.ydotool_socket`.
 A system unit starts at boot, before logind has created `/run/user/$UID`, so it dies

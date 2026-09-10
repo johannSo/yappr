@@ -146,7 +146,19 @@ fn run_prepared(
             stderr = %stderr,
             "injection backend failed"
         );
-        return Err(InjectError::Failed { backend, status: out.status.to_string(), stderr });
+        // `ydotool` reports its own failures on **stdout**, not stderr --
+        // "failed to connect socket `...': No such file or directory" arrives
+        // there with stderr empty, exactly as `hyprctl` does (see
+        // `hypr::window_class`). An error built from stderr alone is then a
+        // bare exit code, which is what a real report of this backend failing
+        // looked like: `ydotool exited with status exit status: 1: `. Prefer
+        // stderr when there is any, fall back to stdout when there is not.
+        let detail = if stderr.is_empty() { stdout } else { stderr };
+        return Err(InjectError::Failed {
+            backend,
+            status: out.status.to_string(),
+            stderr: detail,
+        });
     }
     if !stdout.is_empty() || !stderr.is_empty() {
         // A user's paste script is the likely source here, and its output is
@@ -255,17 +267,58 @@ fn wants_shift(chord: PasteChord, class: Option<&str>, terminal_classes: &[Strin
     }
 }
 
-/// The `YDOTOOL_SOCKET` to hand the child when the environment has none.
+/// Where `ydotoold` might be listening, most likely first.
 ///
-/// `ydotool` defaults to a path under `$XDG_RUNTIME_DIR`, but the common
-/// user unit puts it at `~/.ydotool_socket`, and a GUI process started by the
-/// desktop does not inherit whatever the user's shell exports. `None` means
-/// the environment already has one and we must not override it.
-fn ydotool_socket(existing: Option<&str>) -> Option<std::path::PathBuf> {
+/// `$XDG_RUNTIME_DIR/.ydotool_socket` leads because it is both `ydotool`'s
+/// own compiled-in default *and* what the usual user unit resolves to:
+/// `--socket-path=%t/.ydotool_socket` expands `%t` to `$XDG_RUNTIME_DIR` for
+/// a user manager (`man 5 systemd.unit`), which reads like `$HOME` and is
+/// not. `~/.ydotool_socket` is second because some setups really do put it
+/// there.
+fn ydotool_socket_candidates() -> Vec<std::path::PathBuf> {
+    let mut v = Vec::new();
+    if let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR") {
+        v.push(std::path::PathBuf::from(rt).join(".ydotool_socket"));
+    }
+    if let Some(home) = dirs::home_dir() {
+        v.push(home.join(".ydotool_socket"));
+    }
+    v
+}
+
+/// The `YDOTOOL_SOCKET` to hand the child, or `None` to hand it nothing.
+///
+/// Three outcomes, and the third is the one that matters:
+///
+///   - the environment already names a socket -> `None`, leave it alone;
+///   - it does not, and one of `candidates` **exists** -> use that, because a
+///     GUI process started by the desktop inherits none of what the user's
+///     shell exports;
+///   - it does not, and none exists -> `None`. Guessing here is worse than
+///     silence: `ydotool` has a sensible default of its own, and overriding
+///     it with a path that is merely plausible turns "ydotoold is not
+///     running" into "no such file", which is a different and more confusing
+///     failure.
+///
+/// That last case is not hypothetical. This function used to return
+/// `~/.ydotool_socket` unconditionally, lifted from a user paste script's
+/// `${YDOTOOL_SOCKET:-$HOME/.ydotool_socket}`. A shell fallback for one
+/// person's machine is not a default an app may impose: on a box whose
+/// `ydotoold` ran from the ordinary user unit it pointed `ydotool` at a
+/// socket that did not exist, and every dictation fell through to the
+/// clipboard.
+fn ydotool_socket_in(
+    existing: Option<&str>,
+    candidates: &[std::path::PathBuf],
+) -> Option<std::path::PathBuf> {
     if existing.is_some_and(|v| !v.is_empty()) {
         return None;
     }
-    Some(dirs::home_dir()?.join(".ydotool_socket"))
+    candidates.iter().find(|p| p.exists()).cloned()
+}
+
+fn ydotool_socket(existing: Option<&str>) -> Option<std::path::PathBuf> {
+    ydotool_socket_in(existing, &ydotool_socket_candidates())
 }
 
 /// Spec 10.3's second injector: **paste via `ydotool`**, rebuilt on
@@ -1030,12 +1083,59 @@ exit 3"#,
     }
 
     #[test]
-    fn the_ydotool_socket_default_is_only_applied_when_the_user_has_none() {
-        // The reference script defaults YDOTOOL_SOCKET to ~/.ydotool_socket
-        // because a GUI process started by the desktop does not inherit the
-        // one the user's shell exports. A user who *has* set it must win.
-        assert_eq!(ydotool_socket(Some("/run/user/1000/.ydotool_socket")), None);
-        let fallback = ydotool_socket(None).expect("a default must be offered");
-        assert!(fallback.ends_with(".ydotool_socket"), "got {fallback:?}");
+    fn an_explicit_ydotool_socket_is_never_overridden() {
+        let (dir, _) = script_fixture("sock-explicit", "true");
+        let existing = dir.join(".ydotool_socket");
+        std::fs::write(&existing, b"").unwrap();
+        assert_eq!(ydotool_socket_in(Some("/somewhere/else"), &[existing]), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_first_socket_that_actually_exists_is_chosen() {
+        // Order matters: `$XDG_RUNTIME_DIR` first, because that is both
+        // ydotool's own default and what a user unit's `%t` resolves to.
+        let (dir, _) = script_fixture("sock-pick", "true");
+        let missing = dir.join("missing.sock");
+        let present = dir.join("present.sock");
+        std::fs::write(&present, b"").unwrap();
+        assert_eq!(
+            ydotool_socket_in(None, &[missing.clone(), present.clone()]),
+            Some(present)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_socket_anywhere_means_we_impose_nothing() {
+        // The regression this replaced: returning `~/.ydotool_socket` on a
+        // machine whose ydotoold listens in `$XDG_RUNTIME_DIR` pointed
+        // `ydotool` at a path that did not exist, so every dictation fell
+        // through to the clipboard with "exit status: 1" and no reason.
+        // Handing over nothing lets ydotool use its own default and report
+        // its own, accurate error.
+        let (dir, _) = script_fixture("sock-none", "true");
+        let a = dir.join("nope-a.sock");
+        let b = dir.join("nope-b.sock");
+        assert_eq!(ydotool_socket_in(None, &[a, b]), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_backend_that_reports_its_failure_on_stdout_still_gets_a_readable_error() {
+        // ydotool and hyprctl both do this. stderr-only error building turned
+        // "failed to connect socket ...: No such file or directory" into a
+        // bare "exited with status exit status: 1: ".
+        let (dir, path) = script_fixture(
+            "stdout-err",
+            r#"echo "failed to connect socket: No such file or directory"
+exit 1"#,
+        );
+        let err = inject_script(&script_cfg(&path), "hallo", None).unwrap_err();
+        assert!(
+            err.to_string().contains("failed to connect socket"),
+            "stdout must reach the error when stderr is empty: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

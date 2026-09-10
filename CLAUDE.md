@@ -790,6 +790,19 @@ the whole lock file stops parsing. See
   not just under `$APPIMAGE`: outside a bundle these are either unset or the user's own,
   and neither is something `ydotool` needs. `PATH`, `HOME`, `WAYLAND_DISPLAY`,
   `XDG_RUNTIME_DIR` and `YDOTOOL_SOCKET` are deliberately left alone.
+- **Do not guess `YDOTOOL_SOCKET`.** `inject::ydotool_socket` probes
+  `$XDG_RUNTIME_DIR/.ydotool_socket` then `~/.ydotool_socket`, passes the first that
+  **exists**, and passes *nothing* when neither does. It briefly imposed
+  `~/.ydotool_socket` unconditionally — copied from a paste script's
+  `${YDOTOOL_SOCKET:-$HOME/.ydotool_socket}` — which broke the first real dictation on a
+  machine running the ordinary user unit: `--socket-path=%t/.ydotool_socket` expands
+  `%t` to `$XDG_RUNTIME_DIR`, **not** `$HOME` (`man 5 systemd.unit`), and that is also
+  ydotool's own default. Imposing a merely plausible path converts "ydotoold is not
+  running" into "no such file".
+- **`ydotool` reports its failures on stdout, like `hyprctl`.** `run_prepared` builds
+  `InjectError::Failed` from stderr, falling back to stdout when stderr is empty —
+  without that fallback the socket failure above surfaced as
+  `ydotool exited with status exit status: 1: ` with nothing after the colon.
 - **The WebKit sandbox is off by default** (`main.rs`'s `disable_webkit_sandbox`, the
   first statement of `main`, before any GTK/WebKit init). WebKitGTK no longer honours
   `WEBKIT_FORCE_SANDBOX=0` and says so itself, so

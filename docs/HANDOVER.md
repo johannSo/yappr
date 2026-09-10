@@ -579,8 +579,8 @@ Two other changes landed with it:
   --workspace --all-targets`: clean. `bun run build`: clean.
 - **Verified by probe, not by dictation.** With a logging `ydotool` shim in place: an
   unknown class sends `29:1 42:1 47:1 47:0 42:0 29:0` (Ctrl+Shift+V), `kitty` the same,
-  `firefox` sends `29:1 47:1 47:0 29:0` (Ctrl+V); `YDOTOOL_SOCKET` defaults to
-  `~/.ydotool_socket`; `restore_clipboard = true` puts a sentinel clipboard back and
+  `firefox` sends `29:1 47:1 47:0 29:0` (Ctrl+V);
+  `restore_clipboard = true` puts a sentinel clipboard back and
   `false` leaves the transcript. **Nobody has dictated through the real `ydotool` yet** —
   the chord is never actually pressed in any of this, because `/dev/uinput` events go to
   whatever session owns the keyboard and the probes ran on a working desktop.
@@ -590,3 +590,36 @@ Two other changes landed with it:
   (invariant 2), so that returns yappr's own window — not a terminal — and restores the
   exact silent-Ctrl+V failure being fixed. The class captured at `ptt-start` is the only
   one this backend may use.
+
+
+### Correction, same day: the socket default was wrong and broke the first real dictation
+
+The first end-to-end run of the rebuilt backend on the reporter's machine failed with
+`ydotool exited with status exit status: 1:` — note the empty tail — and fell through to
+the clipboard. Two separate bugs, both mine, both now fixed:
+
+1. **`ydotool_socket` imposed `~/.ydotool_socket` whenever `YDOTOOL_SOCKET` was unset.**
+   That path was lifted from the reference paste script's
+   `${YDOTOOL_SOCKET:-$HOME/.ydotool_socket}`, which is a fallback for one person's
+   shell, not a default an app may impose. The usual user unit is
+   `--socket-path=%t/.ydotool_socket`, and `%t` is **`$XDG_RUNTIME_DIR`**, not `$HOME`
+   (`man 5 systemd.unit`: "Runtime directory root … either /run/ (for the system
+   manager) or the path $XDG_RUNTIME_DIR resolves to (for user managers)") — which is
+   also ydotool's own compiled-in default. So yappr was pointing ydotool at a socket
+   that did not exist on a correctly configured machine. It now *probes*
+   (`$XDG_RUNTIME_DIR` then `$HOME`), passes the first that exists, and passes nothing
+   when neither does, so ydotool's own default and its own error survive.
+2. **`InjectError::Failed` was built from stderr alone.** `ydotool` prints its failures
+   on **stdout** — `failed to connect socket \`...\': No such file or directory` — with
+   stderr empty, exactly as `hyprctl` does. That is why the report above carried an exit
+   code and nothing else. `run_prepared` now falls back to stdout when stderr is empty.
+
+Both are pinned: `no_socket_anywhere_means_we_impose_nothing`,
+`the_first_socket_that_actually_exists_is_chosen`,
+`an_explicit_ydotool_socket_is_never_overridden`, and
+`a_backend_that_reports_its_failure_on_stdout_still_gets_a_readable_error`.
+
+Worth recording as a process note: the socket path was "verified" by a probe that
+asserted `YDOTOOL_SOCKET=/home/joni/.ydotool_socket` was set on the child. It was — the
+probe checked that the value arrived, never that anything was listening there. A probe
+that can only confirm what the code already intends is not evidence.
