@@ -776,6 +776,21 @@ the whole lock file stops parsing. See
   The chord measurements this note used to end on — `/dev/input/event*` reads of the
   `ydotoold virtual device`, verified end to end in kitty, ghostty and foot — belong
   to the retired backend and are kept only in git history.
+- **A failed backend may say why on *stdout*, so `run_backend` records both streams.**
+  `inject::diagnostic` joins them, stderr first, so a backend that reports failures
+  the usual way reads exactly as it always did. The case that forced it: a paste
+  script's `ydotool` prints "failed to connect socket ...: No such file or directory /
+  Please check if ydotoold is running." on stdout and exits 2, stderr empty — the
+  debug record then said `script exited with status exit status: 2: ` and named
+  neither a cause nor anything to fix. `hyprctl` has the same habit (see the stdout
+  note above), so this is the second time the same trap has been paid for.
+  The underlying misconfiguration is worth recognising too, because a script inherits
+  it silently: `ydotoold` takes `--socket-path`, the *client* looks at
+  `$YDOTOOL_SOCKET` and else `$XDG_RUNTIME_DIR/.ydotool_socket`, and a unit that
+  starts the daemon anywhere else (`%h/.ydotool_socket` is a widely copy-pasted
+  example) breaks every paste. Nothing in the app can fix that from its side: yappr
+  starts from the tray or a `.desktop` entry and inherits no shell export, so the
+  daemon has to listen where the client looks. Measured on Fedora 44, 2026-09-10.
 - **Do not trust `cpal`'s advertised sample-rate range.** It advertised 16 kHz on hardware
   that rejected the stream build; `capture.rs` now probes by building a throwaway stream and
   falls back to 48 kHz plus `rubato` resampling.

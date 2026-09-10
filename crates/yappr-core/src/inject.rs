@@ -17,8 +17,8 @@ const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]
 pub enum InjectError {
-    #[error("{backend} exited with status {status}: {stderr}")]
-    Failed { backend: &'static str, status: String, stderr: String },
+    #[error("{backend} exited with status {status}: {output}")]
+    Failed { backend: &'static str, status: String, output: String },
     #[error("could not run {backend}: {source}")]
     Spawn { backend: &'static str, source: std::io::Error },
     #[error("{backend} did not respond within {timeout:?}")]
@@ -27,6 +27,23 @@ pub enum InjectError {
     Mock,
     #[error("no paste script configured -- set [inject] script to an executable path")]
     NotConfigured,
+}
+
+/// What a failed backend actually said, from whichever stream it said it on.
+///
+/// Reading stderr alone is not enough: `ydotool` reports "failed to connect
+/// socket `...`: No such file or directory / Please check if ydotoold is
+/// running." on **stdout** and exits 2, exactly the habit `hyprctl` has
+/// (see `hypr::window_class`, which reads stdout before the status check
+/// for the same reason). That left the debug record's `primary_error` as
+/// `ydotool exited with status exit status: 2: ` -- a failure naming
+/// neither its cause nor anything to fix, measured on Fedora 44 against a
+/// `ydotoold` listening on a non-default socket path.
+///
+/// stderr comes first, so a backend that reports failures the usual way
+/// reads exactly as it always did.
+fn diagnostic(stdout: &str, stderr: &str) -> String {
+    [stderr, stdout].iter().filter(|s| !s.is_empty()).copied().collect::<Vec<_>>().join("; ")
 }
 
 /// Maps a [`procutil::run_with_timeout`] failure onto the right
@@ -132,7 +149,11 @@ fn run_backend(
             stderr = %stderr,
             "injection backend failed"
         );
-        return Err(InjectError::Failed { backend, status: out.status.to_string(), stderr });
+        return Err(InjectError::Failed {
+            backend,
+            status: out.status.to_string(),
+            output: diagnostic(&stdout, &stderr),
+        });
     }
     if !stdout.is_empty() || !stderr.is_empty() {
         // A user's paste script is the likely source here, and its output is
@@ -165,7 +186,10 @@ impl TextInjector for ClipboardInjector {
             return Err(InjectError::Failed {
                 backend: "clipboard",
                 status: out.status.to_string(),
-                stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+                output: diagnostic(
+                    String::from_utf8_lossy(&out.stdout).trim(),
+                    String::from_utf8_lossy(&out.stderr).trim(),
+                ),
             });
         }
         Ok(())
@@ -323,10 +347,8 @@ fn write_recovery_file_inner(state_dir: &std::path::Path, text: &str) -> std::io
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(state_dir.join("unsent.txt"))?;
+    let mut f =
+        std::fs::OpenOptions::new().create(true).append(true).open(state_dir.join("unsent.txt"))?;
     writeln!(f, "[{ts}] {text}")
 }
 
@@ -415,6 +437,8 @@ pub(crate) fn inject_with_recovery(
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
+
     use super::*;
     use crate::config::{InjectBackend, InjectConfig};
 
@@ -480,6 +504,37 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn a_backend_that_reports_its_failure_on_stdout_still_names_the_cause() {
+        // What a paste script's `ydotool` does when it cannot reach
+        // `ydotoold`: the message goes to stdout, exit is 2, stderr is
+        // empty. Reading stderr alone recorded `script exited with status
+        // exit status: 2: ` and named no cause at all.
+        let argv = vec![
+            "-c".to_string(),
+            "echo 'Please check if ydotoold is running.'; exit 2".to_string(),
+        ];
+        let err =
+            run_backend("script", OsStr::new("sh"), argv, Duration::from_secs(5)).unwrap_err();
+        assert!(err.to_string().contains("ydotoold is running"), "{err}");
+    }
+
+    #[test]
+    fn a_backend_that_reports_its_failure_on_stderr_reads_as_it_always_did() {
+        let argv = vec!["-c".to_string(), "echo 'compositor said no' >&2; exit 1".to_string()];
+        let err =
+            run_backend("script", OsStr::new("sh"), argv, Duration::from_secs(5)).unwrap_err();
+        assert_eq!(err.to_string(), "script exited with status exit status: 1: compositor said no");
+    }
+
+    #[test]
+    fn a_backend_that_uses_both_streams_loses_neither() {
+        assert_eq!(diagnostic("on stdout", "on stderr"), "on stderr; on stdout");
+        assert_eq!(diagnostic("on stdout", ""), "on stdout");
+        assert_eq!(diagnostic("", "on stderr"), "on stderr");
+        assert_eq!(diagnostic("", ""), "");
     }
 
     #[test]
@@ -626,7 +681,10 @@ mod tests {
         let fallback = MockInjector::named("fallback-mock");
 
         let out = inject_with_recovery(&primary, &fallback, "hello", None, &dir).unwrap();
-        assert_eq!(out.backend, "fallback-mock", "must report that the fallback, not the primary, ran");
+        assert_eq!(
+            out.backend, "fallback-mock",
+            "must report that the fallback, not the primary, ran"
+        );
         assert_eq!(fallback.injected(), vec!["hello".to_string()]);
         assert!(!dir.join("unsent.txt").exists());
 
