@@ -102,6 +102,8 @@ export const LABELS: Record<string, string> = {
   "guardrail.ngram_max_repeats": "Maximale N-Gramm-Wiederholungen",
   "inject.backend": "Verfahren",
   "inject.script": "Einfüge-Skript",
+  "inject.paste_chord": "Einfüge-Tastenkombination",
+  "inject.terminal_classes": "Terminal-Fensterklassen",
   "inject.trailing_space": "Leerzeichen anhängen",
   "inject.keystroke_delay_ms": "Tastenverzögerung",
   "vocabulary.enabled": "Vokabular aktiv",
@@ -184,9 +186,13 @@ export const HELP: Record<string, string> = {
   "guardrail.ngram_max_repeats":
     "Wie oft dieselbe Wortfolge vorkommen darf, bevor die Fassung als Schleife verworfen wird.",
   "inject.backend":
-    "wtype tippt den Text Zeichen für Zeichen ins Fenster und braucht keine Einrichtung — unter GNOME (Mutter) bewirkt es allerdings nichts. script übergibt den fertigen Text als erstes Argument an ein eigenes Programm, das dann selbst entscheidet, wie es ihn einfügt. clipboard legt ihn nur in die Zwischenablage, einfügen musst du selbst.",
+    "wtype tippt den Text Zeichen für Zeichen ins Fenster und braucht keine Einrichtung — unter GNOME (Mutter) bewirkt es allerdings nichts. ydotool legt den Text in die Zwischenablage und drückt einmal Strg+V (in Terminals Strg+Umschalt+V); das funktioniert auch dort, wo wtype nichts ausrichtet, setzt aber einen laufenden ydotoold mit Schreibrecht auf /dev/uinput voraus. script übergibt den fertigen Text als erstes Argument an ein eigenes Programm, das dann selbst entscheidet, wie es ihn einfügt. clipboard legt ihn nur in die Zwischenablage, einfügen musst du selbst.",
   "inject.script":
     "Pfad zu dem Programm, das das script-Verfahren aufruft. Es bekommt den fertigen Text als erstes und einziges Argument ($1) und ist danach für alles zuständig: Zwischenablage, Tastenkombination, Fenstererkennung. Muss ausführbar sein; ~ wird aufgelöst. Beispiel: ~/bin/paste.sh. Schlägt es fehl oder ist hier nichts eingetragen, landet der Text wie beim clipboard-Verfahren in der Zwischenablage.",
+  "inject.paste_chord":
+    "Welche Tastenkombination das ydotool-Verfahren drückt. auto entscheidet nach der Fensterklasse: Strg+Umschalt+V für alles, was unten als Terminal eingetragen ist, sonst Strg+V. Kann yappr das fokussierte Fenster nicht benennen, wird daraus Strg+V — was Terminals ignorieren, ohne dass ein Fehler gemeldet wird. Wenn du hauptsächlich in Terminals diktierst und nichts ankommt, stell hier fest auf Strg+Umschalt+V.",
+  "inject.terminal_classes":
+    "Fensterklassen, die als Terminal gelten und deshalb unter auto Strg+Umschalt+V bekommen. Groß-/Kleinschreibung ist egal. Die Klasse deines Fensters steht im Debug-Datensatz unter window_class.",
   "inject.trailing_space":
     "Hängt ein Leerzeichen an, damit das nächste Diktat nicht am vorherigen klebt.",
   "inject.keystroke_delay_ms":
@@ -240,7 +246,8 @@ export const ENUMS: Record<string, string[]> = {
     "parakeet-unified-en",
     "nemotron-3.5",
   ],
-  "inject.backend": ["wtype", "script", "clipboard"],
+  "inject.backend": ["wtype", "ydotool", "script", "clipboard"],
+  "inject.paste_chord": ["auto", "ctrl_v", "ctrl_shift_v"],
   "style_default.styling": ["casual", "semi-casual", "semi-formal", "formal"],
   "style_default.structure": ["prose", "lists"],
   "style_default.context": ["general", "email"],
@@ -268,6 +275,11 @@ export const ENUM_LABELS: Record<string, Record<string, string>> = {
     "catppuccin-mocha": "Catppuccin Mocha",
     "tokyo-night-day": "Tokyo Night Day",
     "tokyo-night-night": "Tokyo Night Night",
+  },
+  "inject.paste_chord": {
+    auto: "Automatisch (nach Fensterklasse)",
+    ctrl_v: "Immer Strg+V",
+    ctrl_shift_v: "Immer Strg+Umschalt+V",
   },
 };
 
@@ -317,12 +329,11 @@ export const COLUMN_LABELS: Record<string, string> = {
 export const OBSOLETE_FIELDS = new Set([
   "normalize.port",
   "normalize.llama_server_path",
-  // Retired with the ydotool backend on 2026-09-09. Rust still accepts both
-  // keys so a pre-existing config.toml loads (invariant 4) and still sends
-  // them over the wire (`skip_serializing` is TOML-only), but nothing reads
-  // them: a script picks its own paste chord. They are not settings.
-  "inject.paste_chord",
-  "inject.terminal_classes",
+  // `inject.paste_chord` and `inject.terminal_classes` were briefly here,
+  // between the ydotool backend's retirement on 2026-09-09 and its return on
+  // 2026-09-11. They are real settings again, with a real reader, and they
+  // are hidden by `DEPENDENT_FIELDS` under the backends that ignore them --
+  // which is the table for a setting that is merely inert, not retired.
 ]);
 
 /// Rows that only exist for one value of another row in the same section.
@@ -334,13 +345,19 @@ export const OBSOLETE_FIELDS = new Set([
 /// is the case that forced it: `inject::build` reads it only for
 /// `InjectBackend::Script`, so under `wtype` it is a path field that changes
 /// nothing, sitting directly under the dropdown that would make it matter.
+/// `paste_chord` and `terminal_classes` are the same shape -- only
+/// `YdotoolInjector` reads them -- and they are the reason the bar is worth
+/// restating: they spent two days in `OBSOLETE_FIELDS` instead, which is
+/// where a setting goes to be forgotten rather than merely hidden.
 ///
 /// This does not make a setting unreachable, in either of the two ways that
-/// would matter. Choosing the backend brings its row back; and a search for
-/// "script" still lands on `inject.backend`, whose help text names all three
-/// backends, which is the row you have to change anyway.
+/// would matter. Choosing the backend brings its rows back; and a search for
+/// "script" or "chord" still lands on `inject.backend`, whose help text names
+/// all four backends, which is the row you have to change anyway.
 export const DEPENDENT_FIELDS: Record<string, { on: string; is: Json[] }> = {
   "inject.script": { on: "backend", is: ["script"] },
+  "inject.paste_chord": { on: "backend", is: ["ydotool"] },
+  "inject.terminal_classes": { on: "backend", is: ["ydotool"] },
 };
 
 /// Whether a row's dependency (if it has one) is currently satisfied.
@@ -364,7 +381,14 @@ function applies(section: string, key: string, value: Section): boolean {
 export const FIELD_ORDER: Record<string, string[]> = {
   audio: ["device", "max_seconds", "vad_padding_ms"],
   asr: ["model", "language", "num_threads"],
-  inject: ["backend", "script", "trailing_space", "keystroke_delay_ms"],
+  inject: [
+    "backend",
+    "script",
+    "paste_chord",
+    "terminal_classes",
+    "trailing_space",
+    "keystroke_delay_ms",
+  ],
   normalize: ["enabled", "timeout_ms", "context_size", "threads"],
   guardrail: [
     "min_word_ratio",

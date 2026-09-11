@@ -3,7 +3,7 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use crate::config::{InjectBackend, InjectConfig};
+use crate::config::{InjectBackend, InjectConfig, PasteChord};
 use crate::paths;
 use crate::procutil;
 
@@ -62,11 +62,11 @@ pub trait TextInjector: Send + Sync {
     /// Injects `text` into the window that was focused when the recording
     /// started. `target_class` is that window's class as captured at
     /// `ptt-start` (`daemon.window_class`, the same value the style rules
-    /// match on), or `None` when no provider could name it. No shipped
-    /// injector reads it any more -- the ydotool backend that did was
-    /// retired on 2026-09-09 -- but it describes the *target*, `MockInjector`
-    /// records it, and the debug record writes it, so it still travels with
-    /// every injection.
+    /// match on), or `None` when no provider could name it. The ydotool
+    /// backend reads it to pick its paste chord (terminals paste with
+    /// Ctrl+Shift+V); the others do not, but it describes the *target*, the
+    /// style rules resolve against it, `MockInjector` records it and the
+    /// debug record writes it, so it travels with every injection.
     fn inject(&self, text: &str, target_class: Option<&str>) -> Result<(), InjectError>;
     fn name(&self) -> &'static str;
 }
@@ -196,6 +196,121 @@ impl TextInjector for ClipboardInjector {
     }
 }
 
+/// How long the ydotool backend's single paste chord may take -- one key
+/// event round trip to ydotoold, nowhere near what typing a whole
+/// transcript would need.
+const PASTE_KEY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Pause between `wl-copy` returning and the paste chord being pressed.
+/// `wl-copy` has forked and owns the selection when it exits, but the
+/// compositor still has to hand the new offer to the focused client; paste
+/// races that handoff without a small settle.
+const PASTE_SETTLE: Duration = Duration::from_millis(100);
+
+/// The paste chord for [`YdotoolInjector`], as raw `keycode:state` pairs
+/// for `ydotool key`: LEFTCTRL (29) [+ LEFTSHIFT (42)] + V (47), pressed
+/// and released in nested order. Raw keycodes on purpose -- key *positions*
+/// are identical on QWERTZ and QWERTY, so this is the one ydotool
+/// invocation a keyboard layout cannot mangle (`ydotool type`'s
+/// char->keycode table is US-only, which is why this backend pastes instead
+/// of typing). `terminal` selects Ctrl+Shift+V: terminals reserve plain
+/// Ctrl+V for the application running inside them.
+fn paste_key_argv(terminal: bool) -> Vec<String> {
+    let mut argv = vec!["key".to_string(), "29:1".to_string()];
+    if terminal {
+        argv.push("42:1".to_string());
+    }
+    argv.push("47:1".to_string());
+    argv.push("47:0".to_string());
+    if terminal {
+        argv.push("42:0".to_string());
+    }
+    argv.push("29:0".to_string());
+    argv
+}
+
+/// Whether `class` names a terminal, per the configured
+/// `inject.terminal_classes` list. Case-insensitive: Hyprland reports
+/// "Alacritty" with a capital A, and nobody should have to know that.
+fn is_terminal_class(class: Option<&str>, terminal_classes: &[String]) -> bool {
+    let Some(class) = class else { return false };
+    terminal_classes.iter().any(|t| t.eq_ignore_ascii_case(class))
+}
+
+/// Whether the paste chord carries Shift, given the configured
+/// [`PasteChord`] and the target window's class.
+///
+/// The `Auto` arm is the class-based rule this backend has always used. The
+/// two forced arms exist because `class` is `None` whenever no provider can
+/// name the focused window -- see [`crate::winclass`] for the four ways
+/// that happens -- and an unknown class under `Auto` means plain Ctrl+V,
+/// which no terminal accepts. See [`PasteChord`] for the full account.
+fn wants_shift(chord: PasteChord, class: Option<&str>, terminal_classes: &[String]) -> bool {
+    match chord {
+        PasteChord::CtrlV => false,
+        PasteChord::CtrlShiftV => true,
+        PasteChord::Auto => is_terminal_class(class, terminal_classes),
+    }
+}
+
+/// Spec 10.3's paste injector, for the surfaces `wtype` cannot reach
+/// (GNOME/Mutter, XWayland, some Electron windows): `wl-copy` the
+/// transcript, then press one Ctrl+V (Ctrl+Shift+V for terminals) via
+/// `ydotool key`. See `InjectBackend::Ydotool` for why it pastes rather
+/// than running `ydotool type` (US-only keymap: z/y swapped, umlauts and ß
+/// dropped), and for the 2026-09-09 retirement this restores.
+///
+/// Unlike `wtype` this is not self-contained: it talks to a `ydotoold`
+/// daemon over `$YDOTOOL_SOCKET` (else `$XDG_RUNTIME_DIR/.ydotool_socket`),
+/// and that daemon needs write access to `/dev/uinput`. When either is
+/// missing, `ydotool` exits non-zero and the clipboard fallback (spec 10.4)
+/// carries the transcript instead -- and since the transcript was already
+/// copied here, that fallback amounts to exactly the manual-paste story the
+/// clipboard backend offers (invariant 1 holds). Setting ydotoold up is the
+/// user's call, not the app's (same reason `hypr.rs` prints a config block
+/// rather than applying one).
+pub struct YdotoolInjector {
+    terminal_classes: Vec<String>,
+    paste_chord: PasteChord,
+}
+
+impl YdotoolInjector {
+    pub fn new(cfg: &InjectConfig) -> Self {
+        Self { terminal_classes: cfg.terminal_classes.clone(), paste_chord: cfg.paste_chord }
+    }
+}
+
+impl TextInjector for YdotoolInjector {
+    fn name(&self) -> &'static str {
+        "ydotool"
+    }
+
+    fn inject(&self, text: &str, target_class: Option<&str>) -> Result<(), InjectError> {
+        ClipboardInjector.inject(text, target_class)?;
+        std::thread::sleep(PASTE_SETTLE);
+        let shift = wants_shift(self.paste_chord, target_class, &self.terminal_classes);
+        if target_class.is_none() && self.paste_chord == PasteChord::Auto {
+            // Not a failure -- `ydotool` will exit 0 and this function will
+            // return `Ok` -- which is exactly why it has to be said out loud.
+            // A terminal ignores the plain Ctrl+V that is about to be sent,
+            // so the user gets no text and no error. Naming the override
+            // here is the only warning they will ever see, and this silent
+            // hole is what retired the backend once already.
+            tracing::warn!(
+                "no target window class (no provider could name the focused window: \
+                 no hyprctl, and no accessibility bus or an app not on it); \
+                 pasting with plain Ctrl+V, which terminals ignore -- \
+                 set [inject] paste_chord = \"ctrl_shift_v\" if you dictate into a terminal"
+            );
+        }
+        run_backend(
+            "ydotool",
+            std::ffi::OsStr::new("ydotool"),
+            paste_key_argv(shift),
+            PASTE_KEY_TIMEOUT,
+        )
+    }
+}
+
 /// How long a user's paste script may take before I3's timeout claims it.
 /// Generous on purpose: `handy-paste.sh`, the script this backend was built
 /// against, waits on `wl-paste` to save the old clipboard, sleeps 200 ms for
@@ -322,6 +437,7 @@ impl TextInjector for MockInjector {
 pub fn build(cfg: &InjectConfig) -> Box<dyn TextInjector> {
     match cfg.backend {
         InjectBackend::Wtype => Box::new(WtypeInjector::new(cfg.keystroke_delay_ms)),
+        InjectBackend::Ydotool => Box::new(YdotoolInjector::new(cfg)),
         InjectBackend::Script => Box::new(ScriptInjector::new(cfg)),
         InjectBackend::Clipboard => Box::new(ClipboardInjector),
     }
@@ -573,6 +689,8 @@ mod tests {
     fn build_selects_the_configured_backend() {
         let mut cfg = InjectConfig::default();
         assert_eq!(build(&cfg).name(), "wtype");
+        cfg.backend = InjectBackend::Ydotool;
+        assert_eq!(build(&cfg).name(), "ydotool");
         cfg.backend = InjectBackend::Script;
         assert_eq!(build(&cfg).name(), "script");
         cfg.backend = InjectBackend::Clipboard;
@@ -580,9 +698,89 @@ mod tests {
     }
 
     #[test]
+    fn the_paste_chord_for_a_normal_window_is_ctrl_v_in_nested_order() {
+        // 29 = KEY_LEFTCTRL, 47 = KEY_V -- raw keycodes, deliberately: key
+        // POSITIONS are the same on QWERTZ and QWERTY, which is the whole
+        // point of pasting (ydotool's own char->keycode table is US-only,
+        // so `type` mangles German text; a single Ctrl+V does not).
+        let argv = paste_key_argv(false);
+        assert_eq!(argv, vec!["key", "29:1", "47:1", "47:0", "29:0"]);
+    }
+
+    #[test]
+    fn the_paste_chord_for_a_terminal_adds_shift_in_nested_order() {
+        // 42 = KEY_LEFTSHIFT. Terminals reserve plain Ctrl+V for the
+        // application running inside them; their paste is Ctrl+Shift+V.
+        let argv = paste_key_argv(true);
+        assert_eq!(argv, vec!["key", "29:1", "42:1", "47:1", "47:0", "42:0", "29:0"]);
+    }
+
+    #[test]
+    fn an_unknown_window_class_falls_back_to_plain_ctrl_v_under_auto() {
+        // The hole this backend was retired over, pinned rather than fixed:
+        // `winclass` can answer `None` (no hyprctl and no accessibility
+        // bus, a Hyprland session without HYPRLAND_INSTANCE_SIGNATURE,
+        // nothing focused, an Electron/Qt app on no bus), and under `Auto`
+        // that reads as "not a terminal", so a terminal gets a plain Ctrl+V
+        // it ignores. `YdotoolInjector::inject` warns on exactly this
+        // combination and `paste_chord` is how a user closes it.
+        let list = vec!["kitty".to_string()];
+        assert!(!wants_shift(PasteChord::Auto, None, &list));
+    }
+
+    #[test]
+    fn a_forced_ctrl_shift_v_pastes_into_a_terminal_whose_class_is_unknown() {
+        // The fix: a user whose compositor cannot report a window class can
+        // still say "I dictate into terminals", and get the chord terminals
+        // actually accept.
+        let list = vec!["kitty".to_string()];
+        assert!(wants_shift(PasteChord::CtrlShiftV, None, &list));
+        assert!(wants_shift(PasteChord::CtrlShiftV, Some("firefox"), &list));
+    }
+
+    #[test]
+    fn a_forced_ctrl_v_never_adds_shift_even_for_a_known_terminal() {
+        let list = vec!["kitty".to_string()];
+        assert!(!wants_shift(PasteChord::CtrlV, Some("kitty"), &list));
+        assert!(!wants_shift(PasteChord::CtrlV, None, &list));
+    }
+
+    #[test]
+    fn auto_still_reads_the_class_when_one_is_available() {
+        let list = vec!["kitty".to_string()];
+        assert!(wants_shift(PasteChord::Auto, Some("kitty"), &list));
+        assert!(!wants_shift(PasteChord::Auto, Some("firefox"), &list));
+    }
+
+    #[test]
+    fn terminal_detection_matches_the_configured_classes_case_insensitively() {
+        // Hyprland reports "Alacritty" with a capital A; the configured list
+        // is lowercase. Nobody should have to know which spelling wins.
+        let list = vec!["alacritty".to_string(), "org.wezfurlong.wezterm".to_string()];
+        assert!(is_terminal_class(Some("Alacritty"), &list));
+        assert!(is_terminal_class(Some("org.wezfurlong.wezterm"), &list));
+        assert!(!is_terminal_class(Some("firefox"), &list));
+        assert!(!is_terminal_class(None, &list), "no class means no shift");
+    }
+
+    #[test]
+    fn the_shipped_terminal_list_covers_the_terminals_the_class_providers_report() {
+        // The default matters more than it looks: under `Auto` a terminal
+        // missing from this list gets a plain Ctrl+V it ignores, which is a
+        // dictation that produces no text and no error. `ptyxis` is the
+        // AT-SPI name GNOME's default terminal arrives under (see
+        // `gnome.rs`), `ghostty` the one its pid lookup resolves to.
+        let list = InjectConfig::default().terminal_classes;
+        for t in ["kitty", "foot", "alacritty", "ghostty", "ptyxis", "org.gnome.terminal"] {
+            assert!(is_terminal_class(Some(t), &list), "{t} must be a known terminal");
+        }
+        assert!(!is_terminal_class(Some("firefox"), &list));
+    }
+
+    #[test]
     fn the_target_window_class_travels_to_both_injectors() {
-        // The class captured at ptt-start describes the target window, and
-        // the per-window style rules resolve against it, so
+        // The class captured at ptt-start decides the ydotool backend's
+        // paste chord and the per-window style rules resolve against it, so
         // inject_with_recovery must hand it to the primary -- and to the
         // fallback, which is an injector like any other.
         let dir = scratch_dir("class-through");

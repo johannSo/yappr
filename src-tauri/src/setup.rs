@@ -231,14 +231,26 @@ struct Prerequisite {
 /// than a reopening wizard since 2026-09-09 (invariant 14); a permanent
 /// banner nobody can act on is no better.
 ///
-/// `ydotool` was on this list, optional, until 2026-09-09. It is not
-/// replaced by a check for the script backend's program: `[inject] script`
-/// names a file the user writes themselves, and reporting its absence as a
-/// missing prerequisite would put a permanent gap on every install that has
-/// not opted into a backend almost nobody uses -- exactly the never-ready
-/// loop above, wearing different clothes. `ScriptInjector` reports a missing
-/// script when it is actually asked to run one, and the clipboard fallback
-/// carries the transcript meanwhile (invariant 1).
+/// `ydotool` is on this list **optional**, and the distinction is the whole
+/// of why it is safe to check for at all: an optional gap is one
+/// `status_line` on stderr, while a fatal one goes into
+/// `missing_prerequisites` and makes `setup_status` report the install as
+/// not ready -- which for a backend nobody is obliged to choose would be
+/// invariant 14's never-ready banner, on every machine, forever. So this
+/// entry buys exactly one thing: the startup report says whether the binary
+/// is there. What it cannot check either way is `ydotoold` *running* on the
+/// socket its client looks at (`$YDOTOOL_SOCKET`, else
+/// `$XDG_RUNTIME_DIR/.ydotool_socket`); `YdotoolInjector` reports that when
+/// it is actually asked to paste, stdout included (see
+/// `inject::diagnostic`), and the clipboard fallback carries the transcript
+/// meanwhile.
+///
+/// There is deliberately no check for the script backend's program:
+/// `[inject] script` names a file the user writes themselves, and reporting
+/// its absence as a missing prerequisite would put a permanent gap on every
+/// install that has not opted into it. `ScriptInjector` reports a missing
+/// script when it is asked to run one, and the clipboard fallback carries
+/// the transcript meanwhile (invariant 1).
 ///
 /// `wl-copy` is fatal everywhere, and on GNOME it now carries the whole of
 /// injection rather than only the fallback.
@@ -258,6 +270,12 @@ fn prerequisites_for(d: &Desktop) -> Vec<Prerequisite> {
         why: "clipboard fallback when typing fails",
         pkg: "wl-clipboard",
         fatal: true,
+    });
+    checks.push(Prerequisite {
+        bin: "ydotool",
+        why: "the ydotool injection backend",
+        pkg: "ydotool",
+        fatal: false,
     });
     checks.push(Prerequisite {
         bin: "hyprctl",
@@ -466,17 +484,18 @@ mod tests {
         assert!(checks.iter().any(|c| c.bin == "hyprctl" && !c.fatal));
     }
 
-    /// Nothing yappr can install makes injection work on GNOME, so nothing
-    /// is listed for it.
+    /// `ydotool` is checked on every desktop and is **optional** on all of
+    /// them.
     ///
-    /// `ydotool` was here as an optional entry until 2026-09-09 -- optional
-    /// because making it fatal would have made `setup_status` report every
-    /// GNOME install as not ready forever (`ydotoold` also has to be
-    /// *running*, which no package check can see). With the backend retired
-    /// the entry has no meaning at all: a user's own paste script is not a
-    /// package, and its absence is not a gap yappr can name.
+    /// Optional is the load-bearing half. A fatal gap makes `setup_status`
+    /// report the whole install as not ready, and `ydotoold` also has to be
+    /// *running*, which no package check can see -- so a fatal entry would
+    /// have meant "Einrichtung unvollständig" forever on every machine that
+    /// never chose this backend. Optional, it is one line in the startup
+    /// report and nothing else, which is what a backend the user opts into
+    /// is worth.
     #[test]
-    fn no_desktop_checks_for_ydotool_any_more() {
+    fn every_desktop_checks_for_ydotool_without_requiring_it() {
         for d in [
             Desktop::Gnome,
             Desktop::Hyprland,
@@ -484,7 +503,10 @@ mod tests {
             Desktop::Unknown,
         ] {
             let checks = prerequisites_for(&d);
-            assert!(!checks.iter().any(|c| c.bin == "ydotool"), "{d:?} still checks for ydotool");
+            assert!(
+                checks.iter().any(|c| c.bin == "ydotool" && !c.fatal),
+                "{d:?} must check for ydotool, and must not require it"
+            );
         }
     }
 

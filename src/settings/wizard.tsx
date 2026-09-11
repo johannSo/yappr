@@ -535,12 +535,15 @@ export function Wizard({
               {state.recommended_backend === "clipboard" && (
                 <div className="card">
                   <p className="setup-command">
-                    Automatisch einfügen geht trotzdem, aber nur mit einem eigenen Skript:
-                    unter Allgemein → Texteingabe das Verfahren auf <code>script</code> stellen
-                    und bei <em>Einfüge-Skript</em> den Pfad eintragen. yappr ruft es mit dem
-                    fertigen Text als erstem Argument auf (<code>$1</code>); alles Weitere —
-                    Zwischenablage, Tastenkombination, Fenstererkennung — macht das Skript
-                    selbst.
+                    Automatisch einfügen geht trotzdem, über Allgemein → Texteingabe →
+                    Verfahren. <code>ydotool</code> drückt das Einfügen selbst; dafür
+                    müssen das Paket <code>ydotool</code> installiert und{" "}
+                    <code>ydotoold</code> gestartet sein, mit Schreibrecht auf{" "}
+                    <code>/dev/uinput</code>. <code>script</code> übergibt den fertigen
+                    Text stattdessen an ein eigenes Programm (Pfad bei{" "}
+                    <em>Einfüge-Skript</em>), als erstes Argument (<code>$1</code>); alles
+                    Weitere — Zwischenablage, Tastenkombination, Fenstererkennung — macht
+                    das Skript dann selbst.
                   </p>
                 </div>
               )}

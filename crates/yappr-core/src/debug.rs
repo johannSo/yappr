@@ -193,13 +193,12 @@ pub struct InjectDebug {
     /// when no provider could name it. `#[serde(default)]` so records
     /// written before this field existed still deserialize.
     ///
-    /// Added because its absence made a real bug undiagnosable: the retired
-    /// ydotool backend picked Ctrl+V vs Ctrl+Shift+V from this value, and
-    /// with it missing there was no way to tell, after the fact, whether a
-    /// dictation that produced no text in a terminal had been sent the wrong
-    /// chord. No injector reads it since 2026-09-09 -- a paste script asks
-    /// its own desktop -- but the per-window style rules still resolve
-    /// against it, so it stays a real diagnostic.
+    /// Added because its absence made a real bug undiagnosable: the ydotool
+    /// backend picks Ctrl+V vs Ctrl+Shift+V from this value, and with it
+    /// missing there was no way to tell, after the fact, whether a dictation
+    /// that produced no text in a terminal had been sent the wrong chord.
+    /// It is also what the per-window style rules resolve against, so it is
+    /// a real diagnostic under every backend.
     ///
     /// Deliberately *not* `skip_serializing_if`, unlike the two fields
     /// below: an omitted key would make "the class was unknown" byte-

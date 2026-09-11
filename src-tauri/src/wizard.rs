@@ -117,12 +117,18 @@ pub fn wizard_dismiss() -> Result<(), String> {
 /// daemon, no `/dev/uinput`.
 ///
 /// GNOME's answer was `ydotool` until 2026-09-09, at the cost of a package,
-/// a systemd unit and write access to `/dev/uinput`. With that backend
-/// retired the honest answer is `clipboard`: the transcript lands in the
-/// clipboard and the user pastes it. Automating that is `[inject] script`
-/// and a script of their own -- which is a paragraph in the wizard, not a
-/// recommendation, because a default cannot point at a file that does not
-/// exist yet.
+/// a systemd unit and write access to `/dev/uinput`, and `clipboard` after
+/// it: the transcript lands in the clipboard and the user pastes it.
+///
+/// `ydotool` is a selectable backend again since 2026-09-11, and this still
+/// does not recommend it. A *recommendation* is what a first run applies
+/// without asking, and this one cannot check the thing that decides whether
+/// it works -- `ydotoold` running, reachable on the socket its client looks
+/// at. Recommending it would hand a new GNOME user a backend that fails
+/// silently into the clipboard fallback anyway, which is what `clipboard`
+/// does honestly. Both it and `[inject] script` are a paragraph in the
+/// wizard, pointing at the Verfahren dropdown, which is where a choice the
+/// user makes for themselves belongs.
 pub(crate) fn recommended_backend(d: &Desktop) -> &'static str {
     match d {
         Desktop::Gnome => "clipboard",
@@ -135,8 +141,10 @@ pub(crate) fn recommended_backend(d: &Desktop) -> &'static str {
 /// Empty on every desktop since 2026-09-09, and kept rather than deleted
 /// because the *shape* of the question is still right. It existed for one
 /// thing no package check could express -- `ydotoold` having to be running,
-/// on top of `pacman -S ydotool` -- and both recommendations left now need
-/// nothing beyond the fatal prerequisites `setup.rs` already reports. The
+/// on top of `pacman -S ydotool` -- and it stays empty now that backend is
+/// selectable again, because nothing *recommends* ydotool: the two
+/// recommendations left need nothing beyond the fatal prerequisites
+/// `setup.rs` already reports. The
 /// wizard renders its card only when this is non-empty, so an empty list
 /// means the card is simply absent.
 pub(crate) fn backend_prereqs(_d: &Desktop) -> Vec<&'static str> {
@@ -195,6 +203,7 @@ pub async fn wizard_state() -> Result<serde_json::Value, String> {
         // things. A broken install is what the wizard is *for*.
         let current = yappr_core::config::Config::load()
             .map(|c| match c.inject.backend {
+                yappr_core::config::InjectBackend::Ydotool => "ydotool",
                 yappr_core::config::InjectBackend::Script => "script",
                 yappr_core::config::InjectBackend::Clipboard => "clipboard",
                 yappr_core::config::InjectBackend::Wtype => "wtype",
@@ -443,9 +452,10 @@ mod tests {
     #[test]
     fn no_desktop_asks_the_user_to_install_anything_for_its_backend() {
         // `backend_prereqs` exists to name what a `pacman -S` line cannot
-        // finish -- it was `ydotoold` having to be *running*. With that
-        // backend gone nothing qualifies, and the wizard's card must not
-        // reappear for some other desktop by accident.
+        // finish -- it was `ydotoold` having to be *running*. That backend
+        // is selectable again since 2026-09-11 but is not recommended by
+        // any desktop, so nothing here qualifies, and the wizard's card must
+        // not reappear for some other desktop by accident.
         for d in [
             Desktop::Gnome,
             Desktop::Hyprland,

@@ -174,10 +174,10 @@ mod tests {
         seed.asr.num_threads = 7;
         let (dir, path) = seeded("partial-patch", &seed);
 
-        save_config(&path, &json!({"inject": {"backend": "script"}})).unwrap();
+        save_config(&path, &json!({"inject": {"backend": "ydotool"}})).unwrap();
 
         let after = Config::load_from(&path).unwrap();
-        assert_eq!(after.inject.backend, crate::config::InjectBackend::Script);
+        assert_eq!(after.inject.backend, crate::config::InjectBackend::Ydotool);
         assert_eq!(after.audio.max_seconds, 90, "an unnamed key keeps its on-disk value");
         assert_eq!(after.asr.num_threads, 7, "it must not fall back to the default");
 
