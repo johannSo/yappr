@@ -48,6 +48,13 @@ jobs:
     # webkit2gtk-4.1 (Tauri's own recommendation) or the bundle runs on
     # rolling-release hosts only. See CLAUDE.md's portability note.
     container: ubuntu:22.04
+    defaults:
+      run:
+        # Not optional, and the failure is late and confusing: inside a
+        # container the runner picks `sh -e {0}`, so `set -o pipefail` and
+        # the bash array in the upload step below die with "Illegal option"
+        # after the 8-minute build has already succeeded.
+        shell: bash
     # The workspace compiles llama.cpp from source and links sherpa-onnx; a
     # cold build is comfortably over the 6 h default only in theory, but the
     # explicit cap keeps a wedged job from burning a day.
