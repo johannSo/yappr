@@ -1,0 +1,191 @@
+# Release pipeline. There is deliberately no branch CI here — the test gate
+# (`cargo test --workspace` including `-- --ignored`, see CLAUDE.md) needs
+# downloaded models and real hardware quirks, so it stays local. This file
+# does exactly one thing: build a Linux AppImage when a release is cut.
+#
+# How to cut a release (from your machine):
+#
+#     gh release create v0.2.0 --notes "what changed"
+#
+# That creates the tag and the release; the tag workflow below builds the
+# AppImage and attaches it to that release. Watch it with `gh run watch`.
+# (A bare `git push --tags` also works — the job then creates the release
+# itself instead of uploading into an existing one.)
+#
+# Ported from .gitlab-ci.yml on 2026-09-11 with the repo move to GitHub. The
+# build half is the same list of steps in the same order for the same reasons;
+# only the release upload changed, because GitHub has no package registry in
+# the middle of it — the Releases API accepts the job's own token directly,
+# which is what the GitLab version needed the generic package registry to work
+# around.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# The one permission the asset upload needs. Everything else stays read-only.
+permissions:
+  contents: write
+
+jobs:
+  build-appimage:
+    runs-on: ubuntu-latest
+    # The image, not the runner label, is what pins glibc: an AppImage links
+    # against whatever built it and glibc is backwards- but never forwards-
+    # compatible, so this has to be the oldest base that still ships
+    # webkit2gtk-4.1 (Tauri's own recommendation) or the bundle runs on
+    # rolling-release hosts only. See CLAUDE.md's portability note.
+    container: ubuntu:22.04
+    # The workspace compiles llama.cpp from source and links sherpa-onnx; a
+    # cold build is comfortably over the 6 h default only in theory, but the
+    # explicit cap keeps a wedged job from burning a day.
+    timeout-minutes: 180
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      # Cargo's caches live inside the workspace so actions/cache can see them.
+      # `target/` is deliberately NOT cached — it is far over the 10 GB cache
+      # budget for this workspace, and cargo does not fingerprint the C/C++
+      # toolchain anyway (the same reason CLAUDE.md's distrobox recipe uses a
+      # separate CARGO_TARGET_DIR).
+      CARGO_HOME: ${{ github.workspace }}/.cargo-home
+      # linuxdeploy (which `tauri build` downloads and runs) is itself an
+      # AppImage, and there is no FUSE inside a container: this makes it
+      # self-extract instead of failing to mount.
+      APPIMAGE_EXTRACT_AND_RUN: "1"
+      # Matches the verified invocation from CLAUDE.md's AppImage notes: the
+      # strip step is a known way to lose the whole bundle, and the size it
+      # would save is noise next to the statically linked models runtime.
+      NO_STRIP: "1"
+    steps:
+      # --- toolchains -----------------------------------------------------
+      # webkit2gtk/gtk/layer-shell/librsvg: Tauri v2 + layer.rs (gtk-layer-shell
+      # is a hard link-time dependency — the build fails outright without it).
+      # libasound2-dev: cpal. cmake/clang/libclang: llama-cpp-sys-2 (cmake build
+      # + bindgen). jq: parsing the Releases API answers below. The C++ ABI flag
+      # that keeps sherpa-onnx and llama.cpp compatible comes from the checked-in
+      # .cargo/config.toml (force = true), so nothing here needs to set
+      # CXXFLAGS — and nothing here may.
+      #
+      # This runs before actions/checkout on purpose: a bare ubuntu:22.04 has no
+      # git, and checkout silently falls back to downloading a tarball instead,
+      # which is a worse starting point than installing the package first.
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential pkg-config cmake clang libclang-dev \
+            curl wget ca-certificates git file unzip xz-utils xdg-utils jq \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libgtk-layer-shell-dev \
+            librsvg2-dev libssl-dev libxdo-dev libayatana-appindicator3-dev \
+            libasound2-dev
+
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cargo-home/registry/
+            .cargo-home/git/
+          key: cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-
+
+      - name: Install Rust and bun
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+          curl -fsSL https://bun.sh/install | bash
+          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
+
+      # --- build ------------------------------------------------------------
+      # `tauri build` enables the custom-protocol feature itself (the embedded
+      # frontendDist — see CLAUDE.md on why a plain cargo build gives a blank
+      # window) and runs `bun run build` as beforeBuildCommand.
+      - name: Build the AppImage
+        run: |
+          bun install --frozen-lockfile
+          bun run tauri build --bundles appimage
+
+      # The linuxdeploy build Tauri pins (1-alpha) symlinks the AppDir root icon
+      # to whichever hicolor size it happens to list first — 32x32 in practice —
+      # and that root icon/.DirIcon is what desktop integrators (Gear Lever,
+      # appimaged) extract for the app menu. Repack with the 256x256 at the
+      # root, per the AppImage spec's .DirIcon recommendation.
+      #
+      # linuxdeploy-plugin-gtk then forces GDK_BACKEND=x11 (killing layer-shell,
+      # so the overlay loses its protocol-level focus refusal) and bundles this
+      # distro's libwayland, which breaks the host mesa's EGL vendor load on any
+      # rolling-release host ("Could not create default EGL display"). Repack
+      # defaulting to the Wayland backend with libwayland dropped — see each
+      # script's header for the full verified diagnosis.
+      - name: Repack the AppImage (icon, then Wayland backend)
+        run: |
+          bash scripts/fix-appimage-icon.sh target/release/bundle/appimage/*.AppImage
+          bash scripts/fix-appimage-wayland.sh target/release/bundle/appimage/*.AppImage
+          ls -lh target/release/bundle/appimage/
+
+      # --- attach to the release --------------------------------------------
+      # The Releases API takes GITHUB_TOKEN directly, so unlike the GitLab
+      # version there is no package-registry detour and no stored secret to
+      # rotate. Normal path: `gh release create` on your machine already made
+      # the release, so the GET below finds it. Bare-tag path: it 404s and the
+      # POST creates one.
+      #
+      # Re-running a job must not fail on its own previous upload, hence the
+      # delete-if-present: the assets endpoint answers 422 for a duplicate name,
+      # not 200.
+      - name: Attach the AppImage to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          API: https://api.github.com/repos/${{ github.repository }}
+          UPLOADS: https://uploads.github.com/repos/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          APPIMAGE=$(basename target/release/bundle/appimage/*.AppImage)
+          auth=(--header "Authorization: Bearer $GH_TOKEN"
+                --header "Accept: application/vnd.github+json")
+
+          code=$(curl --silent --output /tmp/release.json --write-out '%{http_code}' \
+            "${auth[@]}" "$API/releases/tags/$TAG")
+          case "$code" in
+            200) echo "release already exists (created by gh locally) — good" ;;
+            404)
+              curl --fail-with-body --silent --output /tmp/release.json \
+                "${auth[@]}" --request POST \
+                --data "$(jq -nc --arg t "$TAG" \
+                  '{tag_name: $t, name: $t, body: "Automated release build for \($t)."}')" \
+                "$API/releases"
+              echo "release created"
+              ;;
+            *) echo "looking up the release failed with HTTP $code:"; cat /tmp/release.json; exit 1 ;;
+          esac
+
+          id=$(jq -r '.id' /tmp/release.json)
+          old=$(jq -r --arg n "$APPIMAGE" '.assets[] | select(.name == $n) | .id' /tmp/release.json)
+          if [ -n "$old" ]; then
+            echo "replacing an asset of the same name from an earlier run"
+            curl --fail-with-body --silent "${auth[@]}" --request DELETE "$API/releases/assets/$old"
+          fi
+
+          # `--upload-file` rather than `--data-binary @…`: the latter reads the
+          # whole several-hundred-MB bundle into memory before sending a byte.
+          curl --fail-with-body --silent --output /dev/null \
+            "${auth[@]}" --header "Content-Type: application/octet-stream" \
+            --request POST --upload-file "target/release/bundle/appimage/$APPIMAGE" \
+            "$UPLOADS/releases/$id/assets?name=$APPIMAGE"
+          echo "uploaded $APPIMAGE"
+
+      # Keep the AppImage on the job too — `if: always()`, so a failed upload
+      # step doesn't cost a 20+ minute rebuild to retry.
+      - name: Keep the AppImage as a job artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: appimage
+          path: target/release/bundle/appimage/*.AppImage
+          retention-days: 7
+          if-no-files-found: ignore

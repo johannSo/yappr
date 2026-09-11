@@ -729,7 +729,7 @@ the whole lock file stops parsing. See
       build-essential pkg-config cmake clang libclang-dev curl wget ca-certificates \
       git file unzip xz-utils xdg-utils libwebkit2gtk-4.1-dev libgtk-3-dev \
       libgtk-layer-shell-dev librsvg2-dev libssl-dev libxdo-dev \
-      libayatana-appindicator3-dev libasound2-dev     # same list as .gitlab-ci.yml
+      libayatana-appindicator3-dev libasound2-dev     # same list as .github/workflows/release.yml
   distrobox enter yappr-build -- sh -c 'cd ~/Work/JS_TS/OpenWhisprFlow \
       && export PATH="$HOME/.cargo/bin:$HOME/.local/share/mise/installs/bun/latest/bin:$PATH" \
       && CARGO_TARGET_DIR=$PWD/target-portable NO_STRIP=1 APPIMAGE_EXTRACT_AND_RUN=1 \
