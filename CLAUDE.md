@@ -53,6 +53,14 @@ that genuinely had those names, not stale spellings.
 `README.md` is the user-facing setup guide. `docs/HANDOVER.md` is the current state-of-play,
 including what has and has not been verified on real hardware.
 
+## Answering
+
+- Short bullet points, not essays. State the result, then anything that changes
+  what the reader does next.
+- One line per fact. Cut restated context, rationale the reader already has, and
+  alternatives not taken.
+- Prose only where a caveat needs a sentence to be true.
+
 ## Commands
 
 ```bash
