@@ -8,16 +8,28 @@ Press-to-start, press-to-stop dictation for Hyprland/Wayland. Press `SUPER+D`, s
 press `SUPER+D` again; the audio is captured, VAD-trimmed, transcribed (one of several
 `sherpa-onnx` models, chosen by `[asr] model`; Parakeet TDT 0.6b v3 by default),
 rewritten by S1-mini (llama.cpp, in-process), checked by a guardrail, and
-typed into the focused window with `wtype` (or, if `[inject] backend` selects it,
-handed to a *user-supplied script* — a `script` backend since 2026-09-09, replacing the
-`ydotool` one: yappr runs `[inject] script` with the finished transcript as `$1` and
-passes nothing else, so the script owns the clipboard, the paste chord and any window
-detection; a failure of any kind falls back to the clipboard, per invariant 1). Fully
-local at dictation time. `SUPER+ALT+D`
+typed into the focused window with `wtype` — or, if `[inject] backend` selects it,
+pasted by `ydotool` (`wl-copy` plus one Ctrl+V, Ctrl+Shift+V for a window class in
+`[inject] terminal_classes`, overridable with `[inject] paste_chord`), or handed to a
+*user-supplied script* (yappr runs `[inject] script` with the finished transcript as
+`$1` and passes nothing else, so the script owns the clipboard, the chord and any
+window detection). A failure of any kind falls back to the clipboard, per invariant 1.
+Fully local at dictation time. `SUPER+ALT+D`
 cancels a recording in progress; nothing else can end one deliberately — see invariant 11.
-`[inject] paste_chord` and `[inject] terminal_classes` still load, but nothing reads
-them: choosing a chord needed a window class yappr cannot always get, which is what
-retired the old backend — see the window-class gotcha at the bottom of this file.
+
+**The `ydotool` backend was retired on 2026-09-09 and restored on 2026-09-11**, so
+anything in this file or the git history that calls it "the retired backend" is dated.
+It was removed because `paste_chord = "auto"` needs a window class yappr cannot always
+get, and an unknown class means a plain Ctrl+V terminals ignore while `ydotool` exits 0
+— a dictation that produces no text and no error. That hole is real and still open (it
+is what `paste_chord`'s two forced arms are for), but it is not worth the option: the
+class is answerable on GNOME since 2026-09-08 (`gnome.rs`) and on wlroots via
+`hyprctl`, and removing the backend cost the users it worked for — including the
+desktop the first verified end-to-end dictation ran on — their working setup, with the
+`script` backend's empty default silently sending them to the clipboard instead. The
+retirement is why `"ydotool"` spent two releases as a serde *alias* for `script`; that
+alias is gone, and a config saved in 0.2.5/0.2.6 was canonicalised to `script`, which
+nothing un-canonicalises. See the window-class gotcha at the bottom of this file.
 
 yappr is one binary, `yappr`, and one process. Running it with no
 arguments starts everything: a tray icon (no window), the Unix socket, the models, and
@@ -80,8 +92,9 @@ cargo run -p yappr-core --example script_probe -- "hi"                    # inje
 cargo run -p yappr-core --example script_probe -- "hi" ~/bin/paste.sh    # override the path
 #   ^ runs your real paste script, which presses real keys into the focused window and
 #     will replace your clipboard; prints the program, its argv[1] and what it exited
-#     with. Replaced `paste_probe` on 2026-09-09 -- yappr no longer chooses a chord, so
-#     there is no chord left to probe.
+#     with. Replaced `paste_probe` on 2026-09-09; the ydotool backend came back on
+#     2026-09-11 but the probe did not, so there is no no-mic exercise for the chord --
+#     `--replay` and the `inject.rs` chord tests are what there is.
 cargo run --release -p yappr -- --bench   # ASR latency table
 
 # Runtime inspection / control (against a running instance)
@@ -146,8 +159,9 @@ Two Cargo members, one process:
   setting can become unlabelled; it cannot become unreachable. The two tables that
   *do* hide a row are `OBSOLETE_FIELDS` (keys Rust accepts and ignores, so not
   settings at all) and `DEPENDENT_FIELDS` (a row inert for every value of another
-  row — `inject.script` under a backend that is not `script`; the dropdown that
-  brings it back sits right above it). `schema.ts` also
+  row — `inject.script` under a backend that is not `script`, `inject.paste_chord`
+  and `inject.terminal_classes` under one that is not `ydotool`; the dropdown that
+  brings them back sits right above them). `schema.ts` also
   owns `search()`, which matches a query against a row's German label, its help
   text, *and* its raw `config.toml` key — a key added in Rust and named nowhere
   here is still findable by the name Rust gives it.
@@ -321,7 +335,7 @@ the whole lock file stops parsing. See
    child that forks a daemon (`wl-copy` does, on every successful copy) leaves a
    grandchild holding the pipes open, and `read_to_end` on that blocked the pipeline
    thread at `INJECTING` until the clipboard was next replaced — the ydotool paste
-   backend never reached `ydotool` at all. This is now the *script* backend's ordinary
+   backend never reached `ydotool` at all. This is also the *script* backend's ordinary
    case, not a corner one: a paste script that restores the previous clipboard does it
    from a backgrounded `nohup … &`, so the grandchild is there on every successful
    dictation. Pinned twice:
@@ -745,18 +759,24 @@ the whole lock file stops parsing. See
 - **Every way a window-class provider can fail collapses to the same `None`, and the
   per-application style rules then fall back to their defaults.**
   `winclass::active_window_class()` is the *only* source of the target window's class,
-  and since 2026-09-09 `style::resolve` is its only consumer — a `None` means no
-  `[[style_rules]]` entry matches and S1-mini is prompted with `[style_default]`
-  instead. That is a quiet wrong-tone, not a lost dictation.
+  and it has two consumers: `style::resolve`, where a `None` means no `[[style_rules]]`
+  entry matches and S1-mini is prompted with `[style_default]` (a quiet wrong-tone, not
+  a lost dictation), and `inject::wants_shift` under the `ydotool` backend, where it is
+  much worse.
 
-  It used to be much worse, and the table below is the measurement that retired the
-  ydotool backend: `inject::wants_shift` read `None` as "not a terminal", so yappr
-  pressed plain Ctrl+V, which every terminal ignores — and `ydotool` exited 0, so
-  `inject_with_recovery` recorded success, no clipboard-fallback notification fired,
-  and the user saw a dictation that produced no text. yappr no longer chooses a chord
-  at all; a paste script asks its own desktop. Measured against Hyprland 0.56.2 on
-  2026-09-07, the three ways to get that `None` are **not** interchangeable and only
-  one of them is a clean exit:
+  **That second one is the measurement the table below records, and it is why the
+  ydotool backend was retired on 2026-09-09.** `wants_shift` reads `None` as "not a
+  terminal", so yappr presses plain Ctrl+V, which every terminal ignores — and
+  `ydotool` exits 0, so `inject_with_recovery` records success, no clipboard-fallback
+  notification fires, and the user sees a dictation that produced no text. Restoring
+  the backend on 2026-09-11 restored that hole with it, deliberately and with three
+  mitigations, none of which is a fix: `paste_chord`'s `ctrl_v`/`ctrl_shift_v` arms
+  bypass the class entirely, `YdotoolInjector::inject` logs a warning on exactly the
+  `None` + `Auto` combination (the only signal there is), and `gnome.rs` closed the
+  desktop where `None` used to be unconditional. Do not make `Auto` "smarter" by
+  guessing — an unknown class is unknown; the answer is the forced arm.
+  Measured against Hyprland 0.56.2 on 2026-09-07, the three ways to get that `None` are
+  **not** interchangeable and only one of them is a clean exit:
 
   | Situation | stdout | exit |
   |---|---|---|
@@ -777,8 +797,9 @@ the whole lock file stops parsing. See
   `hyprctl` can never exist on it, so the chord's `auto` could never work. Since
   2026-09-08 the class is answerable there: `gnome.rs` answers from the accessibility
   bus, which needs no extension and no gsetting, and `winclass::active_window_class`
-  falls back to it when `hyprctl` cannot be run. That provider now serves the style
-  rules rather than a chord, but it is the same code and the same failure modes.
+  falls back to it when `hyprctl` cannot be run. That provider serves the style rules
+  and, since the backend came back, the chord again — same code, same failure modes,
+  and it is the single biggest reason `auto` is defensible on GNOME at all.
 
   Read that module's header before touching it. Three things there are not guessable.
   **AT-SPI delivers no `window:activate` events on this desktop** -- registration
@@ -796,9 +817,9 @@ the whole lock file stops parsing. See
   for any application that never called `g_set_application_name`, and ghostty is one:
   on GNOME it arrived as the class `Unnamed`, so no style rule written for it could
   fire, every other silent GTK application shared that same class, and the debug
-  record named none of them. It surfaced on the retired ydotool backend, where the
+  record named none of them. It surfaced on the ydotool backend, where the
   same `Unnamed` picked the paste chord and dictation into ghostty produced no text
-  at all. So `Unnamed` is treated as no name at all (it can
+  at all — a live failure again since that backend came back, not a historical one. So `Unnamed` is treated as no name at all (it can
   never be *recorded* either, whatever reports it), and the focused application is
   identified from the pid the accessibility bus keeps for its peer
   (`GetConnectionUnixProcessID`) — resolved through `/proc/<pid>/cmdline`'s `argv[0]`,
@@ -811,10 +832,12 @@ the whole lock file stops parsing. See
   `InjectDebug` still records `window_class` (written as `null` rather than omitted,
   so "unknown" is distinguishable from "old record"), which is how you tell a style
   rule that did not fire from one that fired wrong. An Electron or Qt app that
-  registers with no accessibility bus is the setup that still answers `None` on GNOME.
+  registers with no accessibility bus is the setup that still answers `None` on GNOME —
+  and under `ydotool` + `auto` that is a silent no-text paste, not a wrong tone.
   The chord measurements this note used to end on — `/dev/input/event*` reads of the
-  `ydotoold virtual device`, verified end to end in kitty, ghostty and foot — belong
-  to the retired backend and are kept only in git history.
+  `ydotoold virtual device`, verified end to end in kitty, ghostty and foot — are in
+  git history between 2026-09-07 and the 2026-09-09 retirement, and describe the
+  restored backend unchanged: it is the same code.
 - **A failed backend may say why on *stdout*, so `run_backend` records both streams.**
   `inject::diagnostic` joins them, stderr first, so a backend that reports failures
   the usual way reads exactly as it always did. The case that forced it: a paste
@@ -823,7 +846,8 @@ the whole lock file stops parsing. See
   debug record then said `script exited with status exit status: 2: ` and named
   neither a cause nor anything to fix. `hyprctl` has the same habit (see the stdout
   note above), so this is the second time the same trap has been paid for.
-  The underlying misconfiguration is worth recognising too, because a script inherits
+  The underlying misconfiguration is worth recognising too, because the `ydotool`
+  backend and any script that shells out to `ydotool` inherit
   it silently: `ydotoold` takes `--socket-path`, the *client* looks at
   `$YDOTOOL_SOCKET` and else `$XDG_RUNTIME_DIR/.ydotool_socket`, and a unit that
   starts the daemon anywhere else (`%h/.ydotool_socket` is a widely copy-pasted
@@ -840,4 +864,8 @@ the whole lock file stops parsing. See
 - **Real dictation was first verified end to end on 2026-09-07**, on Fedora 44/GNOME 50
   with the `ydotool` backend: spoken German, transcribed, normalised and pasted into
   Ptyxis and GNOME Text Editor. `docs/HANDOVER.md` predates that and still says
-  otherwise. Still do not record from the microphone without explicit permission.
+  otherwise. That verification is also the reason the backend's 2026-09-09 retirement
+  was reverted on 2026-09-11: it was the one configuration known to work on real
+  hardware, and it was removed from under the user it worked for. The restored code is
+  byte-for-byte the code that was verified. Still do not record from the microphone
+  without explicit permission.
