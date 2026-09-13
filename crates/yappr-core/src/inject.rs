@@ -23,6 +23,12 @@ pub enum InjectError {
     Spawn { backend: &'static str, source: std::io::Error },
     #[error("{backend} did not respond within {timeout:?}")]
     Timeout { backend: &'static str, timeout: Duration },
+    /// A backend that talks to a service rather than spawning a program, so
+    /// there is no exit status to report and no stream the diagnosis came in
+    /// on -- only what the service said. The `libei` backend's whole failure
+    /// surface (see [`crate::libei::PortalError`]).
+    #[error("{backend} could not use the desktop portal: {detail}")]
+    Portal { backend: &'static str, detail: String },
     #[error("mock injector configured to fail")]
     Mock,
     #[error("no paste script configured -- set [inject] script to an executable path")]
@@ -373,6 +379,74 @@ impl TextInjector for ScriptInjector {
 }
 
 
+/// The same paste [`YdotoolInjector`] performs, pressed through the XDG
+/// Desktop Portal's RemoteDesktop interface rather than a `ydotool` daemon:
+/// `wl-copy` the transcript, settle, then one Ctrl+V -- Ctrl+Shift+V when
+/// [`wants_shift`] says the target is a terminal.
+///
+/// Everything interesting about it is in [`crate::libei`]: the session is
+/// created once for the whole process, before any dictation, and held there
+/// rather than here, because `Request::SetConfig` rebuilds this struct on
+/// every settings autosave.
+///
+/// This is a thin thing on purpose. It reads `paste_chord` and
+/// `terminal_classes` with the same [`wants_shift`] the ydotool backend
+/// uses, and it inherits that backend's one real hole with them -- see the
+/// warning in [`LibeiInjector::inject`].
+pub struct LibeiInjector {
+    terminal_classes: Vec<String>,
+    paste_chord: PasteChord,
+}
+
+impl LibeiInjector {
+    /// Builds the injector and **starts no portal session**. `inject::build`
+    /// runs in `cargo test` (`build_selects_the_configured_backend`), and a
+    /// unit test that raises an approval dialog on the developer's desktop
+    /// is not one. Establishing is `libei::prewarm_if_selected`'s job, from
+    /// the places a user has actually chosen this backend -- see
+    /// [`crate::libei::start`].
+    pub fn new(cfg: &InjectConfig) -> Self {
+        Self { terminal_classes: cfg.terminal_classes.clone(), paste_chord: cfg.paste_chord }
+    }
+}
+
+impl TextInjector for LibeiInjector {
+    fn name(&self) -> &'static str {
+        // What `debug.rs`, `InjectOutcome` and the fallback notification
+        // record, and the spelling `config.toml` uses. The transport is the
+        // RemoteDesktop portal rather than libei proper; the name is the
+        // setting's, so a bug report and a config file say the same word.
+        "libei"
+    }
+
+    fn inject(&self, text: &str, target_class: Option<&str>) -> Result<(), InjectError> {
+        ClipboardInjector.inject(text, target_class)?;
+        std::thread::sleep(PASTE_SETTLE);
+        let shift = wants_shift(self.paste_chord, target_class, &self.terminal_classes);
+        if target_class.is_none() && self.paste_chord == PasteChord::Auto {
+            // Verbatim the hole `YdotoolInjector` warns about, for the same
+            // reason and with the same consequence: the portal will deliver
+            // the plain Ctrl+V that is about to be sent and report success,
+            // a terminal will ignore it, and the user gets no text and no
+            // error. This warning is the only signal there is.
+            tracing::warn!(
+                "no target window class (no provider could name the focused window: \
+                 no hyprctl, and no accessibility bus or an app not on it); \
+                 pasting with plain Ctrl+V, which terminals ignore -- \
+                 set [inject] paste_chord = \"ctrl_shift_v\" if you dictate into a terminal"
+            );
+        }
+        crate::libei::press_chord(shift).map_err(|e| match e {
+            crate::libei::PortalError::Timeout(timeout) => {
+                InjectError::Timeout { backend: "libei", timeout }
+            }
+            crate::libei::PortalError::Failed(detail) => {
+                InjectError::Portal { backend: "libei", detail }
+            }
+        })
+    }
+}
+
 #[derive(Default)]
 pub struct MockInjector {
     calls: Mutex<Vec<String>>,
@@ -439,6 +513,7 @@ pub fn build(cfg: &InjectConfig) -> Box<dyn TextInjector> {
         InjectBackend::Wtype => Box::new(WtypeInjector::new(cfg.keystroke_delay_ms)),
         InjectBackend::Ydotool => Box::new(YdotoolInjector::new(cfg)),
         InjectBackend::Script => Box::new(ScriptInjector::new(cfg)),
+        InjectBackend::Libei => Box::new(LibeiInjector::new(cfg)),
         InjectBackend::Clipboard => Box::new(ClipboardInjector),
     }
 }
@@ -693,6 +768,8 @@ mod tests {
         assert_eq!(build(&cfg).name(), "ydotool");
         cfg.backend = InjectBackend::Script;
         assert_eq!(build(&cfg).name(), "script");
+        cfg.backend = InjectBackend::Libei;
+        assert_eq!(build(&cfg).name(), "libei");
         cfg.backend = InjectBackend::Clipboard;
         assert_eq!(build(&cfg).name(), "clipboard");
     }
@@ -750,6 +827,45 @@ mod tests {
         let list = vec!["kitty".to_string()];
         assert!(wants_shift(PasteChord::Auto, Some("kitty"), &list));
         assert!(!wants_shift(PasteChord::Auto, Some("firefox"), &list));
+    }
+
+    #[test]
+    fn the_libei_backend_decides_its_chord_with_the_same_rule_as_ydotool() {
+        // Two backends, two wire encodings of the same chord -- evdev
+        // keycodes for `ydotool key`, X11 keysyms for the portal -- and one
+        // decision, `wants_shift`. Nothing would notice them drifting apart
+        // except a user whose terminal silently stopped receiving pastes
+        // after switching backend, so the agreement is pinned rather than
+        // assumed.
+        let list = vec!["kitty".to_string()];
+        for chord in [PasteChord::Auto, PasteChord::CtrlV, PasteChord::CtrlShiftV] {
+            for class in [None, Some("kitty"), Some("firefox")] {
+                let shift = wants_shift(chord, class, &list);
+                let ydotool_has_shift = paste_key_argv(shift).contains(&"42:1".to_string());
+                let libei_has_shift = crate::libei::paste_keysyms(shift)
+                    .iter()
+                    .any(|(keysym, pressed)| *keysym == 0xffe1 && *pressed);
+                assert_eq!(
+                    ydotool_has_shift, libei_has_shift,
+                    "chord {chord:?} into {class:?} must press the same modifiers on both backends"
+                );
+                assert_eq!(libei_has_shift, shift);
+            }
+        }
+    }
+
+    #[test]
+    fn a_portal_failure_names_the_backend_and_what_the_portal_said() {
+        // The `libei` analogue of `diagnostic`: there is no exit status and
+        // no stream to read, so the D-Bus error text is the entire account
+        // of what went wrong and has to survive into the debug record.
+        let err = InjectError::Portal {
+            backend: "libei",
+            detail: "Session creation inhibited".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("libei"), "{msg}");
+        assert!(msg.contains("Session creation inhibited"), "{msg}");
     }
 
     #[test]
