@@ -18,7 +18,7 @@ No cloud, no account, no network calls while you dictate.
 | **Everything else** | right-click the tray icon |
 
 **Jump to:** [Install](#install) · [First run](#first-run) · [Using it](#using-it) ·
-[Settings](#settings) · [Troubleshooting](#troubleshooting) ·
+[Settings](#settings) · [OpenClaw](#dictating-in-openclaw) · [Troubleshooting](#troubleshooting) ·
 [How it works](#how-it-works) · [Limitations](#known-limitations)
 
 ## Install
@@ -205,8 +205,9 @@ Nothing is desktop-specific except shortcut registration. Bind `yappr --toggle` 
 
 Left-click the tray icon, or `yappr --settings`. Everything in `config.toml` is
 editable there — microphone, dictation vocabulary, styles, thresholds, colours — across
-six panes: **General**, **Language**, **Style**, **Appearance**, **Advanced**,
-**Diagnostics**. There's a search box; it matches labels, help text, *and* the raw
+seven panes: **General**, **Language**, **Style**, **AI**, **Advanced**,
+**Appearance**, **Diagnostics**. There's a search box; it matches labels, help text,
+*and* the raw
 `config.toml` key names.
 
 There is no Save button. Toggles and dropdowns save immediately, text and number fields
@@ -252,6 +253,70 @@ the new model or normalizer on your next dictation, so nothing is asked. Everyth
 — the microphone included — applies at your next dictation, or immediately with
 `yappr --reload`.
 
+### Dictating in OpenClaw
+
+[OpenClaw](https://openclaw.ai) is a separate, locally installed AI agent. Its
+dictation normally goes to a cloud speech service. The **AI** pane turns that
+around: one button installs a yappr plugin into OpenClaw and points its dictation
+at this machine's models instead — same Parakeet, same S1-mini clean-up, same
+vocabulary and style rules as the text yappr types into your editor, and nothing
+leaves the machine.
+
+**Set up** does five things, and reports each one separately:
+
+1. writes the plugin to `~/.local/share/yappr/openclaw-plugin/`
+2. switches on yappr's local endpoint (`[realtime] enabled = true`)
+3. runs `openclaw plugins install --link` against that directory
+4. runs `openclaw plugins enable yappr`
+5. writes yappr into OpenClaw's own config as its streaming transcription provider
+
+Steps 3–5 call the `openclaw` CLI, which is what writes OpenClaw's config file —
+yappr never edits it directly. If OpenClaw isn't installed, the button says so and
+does nothing; install it separately (`npm i -g openclaw`) and press **Check
+again**.
+
+**One manual step is left, deliberately:** OpenClaw only loads a newly linked
+plugin when its gateway restarts (`openclaw gateway restart`). yappr doesn't do
+that for you — that process is serving live agent sessions, and ending them is not
+a side effect a dictation app's settings window should have.
+
+**Remove** undoes the OpenClaw side (unselects the provider, removes its entry,
+disables and unlinks the plugin) and deliberately leaves `[realtime]` alone: that
+is yappr's own setting, and you may have switched the endpoint on for something
+else.
+
+#### What the endpoint is
+
+`[realtime]` opens a WebSocket on **127.0.0.1 only** — there is no setting that
+puts it on a network interface. A program connects, streams microphone audio, and
+gets finished sentences back:
+
+| | |
+|---|---|
+| **Address** | `ws://127.0.0.1:17869/v1/transcribe` (`[realtime] port`) |
+| **Audio in** | PCM s16le or G.711 µ-law, mono, any sample rate from 8 kHz up — declared as `?sample_rate=&encoding=`. OpenClaw always sends µ-law at 8 kHz; that is its relay's fixed contract, not a setting |
+| **Text out** | one JSON `{"type":"final","text":…}` per utterance, cut by the same Silero VAD yappr uses on its own recordings |
+| **Interim results** | none. yappr transcribes whole utterances; there is nothing to show mid-sentence |
+| **Access** | any local program, unless you set `[realtime] token` — then `Authorization: Bearer <token>` or `?token=` is required |
+
+`silence_ms` (700 ms) is how long a pause ends a sentence, and
+`max_utterance_seconds` (20 s) is where a stretch of unbroken speech gets cut
+anyway — what gets cut is still transcribed, never dropped. `normalize` decides
+whether those transcripts get the S1-mini rewrite or stop at the raw ASR plus
+capitalisation and punctuation; it can only turn clean-up *off*, never on when
+`[normalize] enabled = false`.
+
+The endpoint costs nothing while nothing is connected, and it opens no microphone
+of its own — the audio comes from whatever connected to it. Changes to `[realtime]`
+take effect immediately; there is no restart to do.
+
+If you change the port or the token *after* installing, OpenClaw is left pointing at
+the old ones and the card says so (“stale connection details”) — press **Set up
+again** to write them across.
+
+The plugin's own source, protocol notes and manual install instructions are in
+[`openclaw-plugin/README.md`](openclaw-plugin/README.md).
+
 ## config.toml
 
 Lives at `~/.local/state/yappr/config.toml`, written on first run.
@@ -272,12 +337,13 @@ first start, and the old `~/.config/yappr/config.toml` is left behind as
 | `[asr]` | `num_threads` for Parakeet |
 | `[normalize]` | `enabled` (`false` skips S1-mini and types rule-cleaned raw text), plus `timeout_ms`, `context_size`, `threads` |
 | `[guardrail]` | `min_word_ratio`/`max_word_ratio`, `min_overlap_english`/`min_overlap_other`, `short_input_words`, `ngram_size`/`ngram_max_repeats` |
-| `[inject]` | `backend` (`wtype`, `libei`, `ydotool`, `script`, `clipboard`), `script` (the program the `script` backend runs), `paste_chord`/`terminal_classes` (`ydotool` and `libei` only) — see [Pasting where `wtype` can't type](#pasting-where-wtype-cant-type) — plus `trailing_space`, `keystroke_delay_ms` (wtype only) |
+| `[inject]` | `backend` (`wtype`, `libei`, `ydotool`, `script`, `clipboard`), `script` (the program the `script` backend runs), `paste_chord`/`terminal_classes`/`restore_clipboard` (`ydotool` and `libei` only) — see [Pasting where `wtype` can't type](#pasting-where-wtype-cant-type) — plus `trailing_space`, `keystroke_delay_ms` (wtype only) |
 | `[vocabulary]` | terms and replacements applied to the raw transcript before clean-up — put short acronyms in `replacements`, not `terms` |
 | `[style_default]`, `[[style_rules]]` | the `styling`/`structure`/`context` axes S1-mini is prompted with, and per-application overrides matched on window class (regex) |
 | `[debug]` | `enabled` (off), `dir` (default `~/yappr`), `save_audio` — see [Troubleshooting](#troubleshooting) |
 | `[overlay]` | `position`, `width`, `height` — read, but inert: under Wayland a window can't place itself, so this changes nothing today |
 | `[ui]` | `theme` — see [Themes](#themes) |
+| `[realtime]` | `enabled` (off), `port`, `token`, `silence_ms`, `max_utterance_seconds`, `normalize` — the local endpoint other programs dictate through; see [Dictating in OpenClaw](#dictating-in-openclaw) |
 
 > **A config that won't load is moved aside, not ignored.** Every section is
 > `deny_unknown_fields`, so an unrecognised key is still caught rather than silently
@@ -309,10 +375,20 @@ Settings → General → Text entry → *Method*:
 | `script` | Hands the text to a program of yours, which does the inserting. | A script you write. |
 | `clipboard` | Copies the text; you paste it. | Nothing. |
 
-`libei` and `ydotool` do the same thing by different routes and share the same two
-settings, `paste_chord` and `terminal_classes`. `ydotool` is the one verified end to end
-on real hardware, which is the only reason it is listed first in this section; `libei`
-is the one that asks nothing of you beyond a click.
+`libei` and `ydotool` do the same thing by different routes and share the same three
+settings, `paste_chord`, `terminal_classes` and `restore_clipboard`. `ydotool` is the
+one verified end to end on real hardware, which is the only reason it is listed first in
+this section; `libei` is the one that asks nothing of you beyond a click.
+
+Both paste by putting the transcript on the clipboard, so both **put back what was in
+the clipboard before** once the paste has landed (`[inject] restore_clipboard`, on by
+default). What you had copied is the current clipboard entry again, and the dictation
+sits one place below it in whatever clipboard history you run — so the next Ctrl+V you
+press by hand is still *your* text, not the last thing you dictated. Turn it off if a
+program reads the clipboard so late that it ends up pasting the old contents instead of
+the dictation; nothing can detect that from yappr's side. An empty clipboard and a
+failed paste both restore nothing on purpose — in the second case the transcript is the
+clipboard fallback you are being notified about.
 
 #### `libei`
 
@@ -320,6 +396,7 @@ is the one that asks nothing of you beyond a click.
 [inject]
 backend = "libei"
 paste_chord = "auto"          # or "ctrl_v" / "ctrl_shift_v"
+restore_clipboard = true      # put back what you had copied, after pasting
 ```
 
 Same paste as `ydotool` — `wl-copy`, then one Ctrl+V (Ctrl+Shift+V for a terminal) —
@@ -357,6 +434,7 @@ window and replaces your clipboard, so focus a scratch window first.
 [inject]
 backend = "ydotool"
 paste_chord = "auto"          # or "ctrl_v" / "ctrl_shift_v"
+restore_clipboard = true      # put back what you had copied, after pasting
 ```
 
 It copies the transcript with `wl-copy` and then presses **one Ctrl+V** by raw keycode

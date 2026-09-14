@@ -49,6 +49,28 @@ pub struct Outcome {
     pub timings: Timings,
 }
 
+/// What [`Pipeline::refine`] hands back: finished text, plus everything the
+/// debug record wants to know about how it got there.
+///
+/// Not `pub`: the two callers are both in this file. `Outcome` stays the
+/// public shape, because it also carries the injection result, which is the
+/// part `refine` knows nothing about.
+struct Refined {
+    /// Through `finish`; no trailing space (that is `[inject]`'s business,
+    /// applied by the caller that injects).
+    text: String,
+    /// The transcript *after* the vocabulary, which is what the guardrail
+    /// compared against and what `Outcome::raw` reports.
+    raw: String,
+    normalized: bool,
+    reject_reason: Option<String>,
+    vocab: Option<Vec<vocab::Substitution>>,
+    lang: Lang,
+    normalize_debug: debug::NormalizeDebug,
+    guardrail_debug: Option<debug::GuardrailDebug>,
+    normalize_ms: u128,
+}
+
 pub struct Pipeline {
     cfg: Config,
     asr: Box<dyn Transcriber>,
@@ -244,6 +266,193 @@ impl Pipeline {
         self.normalizer = normalizer;
     }
 
+    /// One realtime utterance: the pipeline's text half, with no injector
+    /// at the end of it.
+    ///
+    /// This is what `realtime.rs` hands a Silero-cut segment to, and the
+    /// only difference from [`Pipeline::process_with_capture`] is where the
+    /// text goes -- vocabulary, language detection, the style control line,
+    /// S1-mini, the guardrail and `finish` are the same code on the same
+    /// config, via `refine`. A transcript produced here is therefore the
+    /// transcript yappr would have typed, which is the whole claim the
+    /// OpenClaw provider makes.
+    ///
+    /// Four deliberate differences, none of them about the text:
+    ///
+    /// - **No VAD pass.** The caller has already cut this segment with the
+    ///   same Silero model (`vad::SileroSegmenter`); trimming it again
+    ///   would cost a second sweep and could answer `None` for audio the
+    ///   streaming pass already called speech -- i.e. drop an utterance
+    ///   that was heard.
+    /// - **No `window_class`.** There is no focused window in this story:
+    ///   the text is going down a socket to another program, so
+    ///   `[style_rules]` cannot mean anything and `[style_default]` is what
+    ///   applies (`style::resolve(cfg, None)`).
+    /// - **No stage events.** The overlay is yappr's *own* dictation HUD.
+    ///   Showing it here would put a capsule on screen for a dictation the
+    ///   user is doing somewhere else entirely -- and on a compositor
+    ///   without layer-shell, invariant 2's mitigation hides a focused
+    ///   overlay by blocking the pipeline thread, which this path has no
+    ///   business triggering.
+    /// - **No trailing space and no debug record.** `[inject]
+    ///   trailing_space` describes typing into a text field; the consumer
+    ///   here appends its own separator. The debug record is skipped
+    ///   because `DebugRecordGuard` is built around capture stats and an
+    ///   injection outcome, neither of which exists on this path.
+    ///
+    /// `Ok(None)` means the ASR found nothing to say in this segment, which
+    /// is ordinary: the streaming VAD errs towards cutting, and a segment
+    /// of breath decodes to the empty string.
+    pub fn dictate_text(&self, samples: &[f32], normalize: bool) -> Result<Option<String>> {
+        if samples.is_empty() {
+            return Ok(None);
+        }
+        let t = Instant::now();
+        let raw = self.asr.transcribe(samples)?;
+        let asr_ms = t.elapsed().as_millis();
+        if raw.trim().is_empty() {
+            tracing::debug!(asr_ms, "realtime segment held no words");
+            return Ok(None);
+        }
+        let r = self.refine(&raw, None, self.cfg.normalize.enabled && normalize, false);
+        tracing::info!(
+            asr_ms,
+            normalize_ms = r.normalize_ms,
+            normalized = r.normalized,
+            reject_reason = ?r.reject_reason,
+            chars = r.text.len(),
+            "realtime utterance complete"
+        );
+        Ok(Some(r.text))
+    }
+
+    /// The stretch between a raw transcript and finished text: vocabulary,
+    /// language detection, the style control line, S1-mini, the guardrail,
+    /// and `finish`.
+    ///
+    /// Extracted from `process_with_capture` when the realtime endpoint
+    /// arrived, rather than copied into it. A second implementation of
+    /// this sequence is how the two would come to disagree about invariant
+    /// 1 (a normalizer error must degrade to the raw transcript), invariant
+    /// 8 (`finish` runs exactly once, at one choke point) and the
+    /// rejections dataset -- and a disagreement there is silent by nature:
+    /// both versions still produce text.
+    ///
+    /// `normalize` is the caller's own switch ANDed with `[normalize]
+    /// enabled` before it gets here, and `stage_events` is false for any
+    /// caller whose work must not light up the overlay.
+    fn refine(
+        &self,
+        raw: &str,
+        window_class: Option<&str>,
+        normalize: bool,
+        stage_events: bool,
+    ) -> Refined {
+        // Before language detection, normalization and the guardrail, so all
+        // three see the corrected text: S1-mini produces better output when
+        // the words in front of it are real ones, and the guardrail's overlap
+        // check then compares the same transcript on both sides instead of
+        // penalising the normalizer for keeping a term the vocabulary had
+        // already fixed. The caller keeps what the ASR actually said (as
+        // `dbg.asr_raw`), which is the value you need when a vocabulary rule
+        // misfires.
+        let corrections = vocab::apply(&self.cfg.vocabulary, raw);
+        let raw = corrections.text;
+        let vocab = if corrections.substitutions.is_empty() {
+            None
+        } else {
+            tracing::debug!(count = corrections.substitutions.len(), "vocabulary corrections applied");
+            Some(corrections.substitutions)
+        };
+
+        let lang = self.detector.detect(&raw);
+        let axes = style::resolve(&self.cfg, window_class);
+        let control = style::control_line(&axes);
+
+        let mut normalized = false;
+        let mut reject_reason: Option<String> = None;
+        let mut text = guardrail::rule_based_fallback(&raw);
+        let mut normalize_debug = debug::NormalizeDebug {
+            control: control.clone(),
+            ran: false,
+            cleaned: None,
+            error: None,
+        };
+        let mut guardrail_debug: Option<debug::GuardrailDebug> = None;
+        let mut normalize_ms = 0;
+
+        if normalize {
+            if stage_events {
+                if let Some(sink) = &self.stage_events {
+                    sink(OverlayEvent::Normalizing);
+                }
+            }
+            // Scoped tightly around just the normalizer call: `evaluate` and
+            // `log_rejection` are cheap and unrelated to normalizer latency,
+            // which is exactly what M3 threshold tuning wants out of this
+            // number.
+            let t = Instant::now();
+            let normalize_result = self.normalizer.normalize(&control, &raw);
+            normalize_ms = t.elapsed().as_millis();
+            normalize_debug.ran = true;
+
+            match normalize_result {
+                Ok(cleaned) => {
+                    normalize_debug.cleaned = Some(cleaned.clone());
+                    match guardrail::evaluate(&raw, &cleaned, lang, &self.cfg.guardrail) {
+                        Verdict::Accept => {
+                            guardrail_debug = Some(debug::GuardrailDebug::accept());
+                            text = cleaned;
+                            normalized = true;
+                        }
+                        Verdict::Reject(reason) => {
+                            guardrail_debug =
+                                Some(debug::GuardrailDebug::reject(&raw, &cleaned, &reason));
+                            reject_reason = Some(reason.code().to_string());
+                            log_rejection_to(&self.rejections_path(), &raw, &cleaned, &reason, lang, &control);
+                        }
+                    }
+                }
+                Err(e) => {
+                    // A failed cleanup must never cost the transcript, and it
+                    // is not a guardrail rejection: `reject_reason` stays
+                    // `None` here. Pinned by
+                    // `a_dead_normalizer_still_produces_text` in
+                    // tests/pipeline_e2e.rs.
+                    normalize_debug.error = Some(e.to_string());
+                    tracing::warn!(error = %e, "normalization failed; using raw transcript");
+                }
+            }
+        }
+
+        // Invariant 8's choke point, and the only place capitalisation and
+        // terminal punctuation can be guaranteed rather than hoped for.
+        // Doing it here instead of at each site that assigns `text` is the
+        // same argument `DebugRecordGuard` makes: `text` is written on three
+        // paths above (rule-based fallback, accepted cleanup, and fallback
+        // again after a rejection or a normalizer error) and only the
+        // fallback ones were finished, so an accepted S1-mini cleanup was
+        // injected exactly as the model returned it -- routinely lowercased
+        // at the opening letter and stripped of its final stop, which the
+        // guardrail cannot see (`guardrail::tokenize` lowercases and drops
+        // punctuation before comparing). `finish` is idempotent, so the
+        // paths that already went through `rule_based_fallback` are
+        // unaffected.
+        let text = finish(&text);
+
+        Refined {
+            text,
+            raw,
+            normalized,
+            reject_reason,
+            vocab,
+            lang,
+            normalize_debug,
+            guardrail_debug,
+            normalize_ms,
+        }
+    }
+
     /// Runs a complete utterance. `Ok(None)` means there was nothing to say
     /// and nothing was injected.
     ///
@@ -317,103 +526,30 @@ impl Pipeline {
             return Ok(None); // dbg drops here: writes a record with the (empty) transcript.
         }
 
-        // Before language detection, normalization and the guardrail, so all
-        // three see the corrected text: S1-mini produces better output when
-        // the words in front of it are real ones, and the guardrail's overlap
-        // check then compares the same transcript on both sides instead of
-        // penalising the normalizer for keeping a term the vocabulary had
-        // already fixed. `raw` is shadowed deliberately -- `dbg.asr_raw`
-        // above still holds what the ASR actually said, which is the value
-        // you need when a vocabulary rule misfires.
-        let corrections = vocab::apply(&self.cfg.vocabulary, &raw);
-        let raw = corrections.text;
-        if !corrections.substitutions.is_empty() {
-            tracing::debug!(count = corrections.substitutions.len(), "vocabulary corrections applied");
-            if dbg.ctx.is_some() {
-                dbg.vocab = Some(corrections.substitutions);
-            }
+        // Everything from here to injection is `refine`, shared unchanged
+        // with `dictate_text` -- including `finish`, which invariant 8 says
+        // is applied at exactly one choke point. Moving it inside `refine`
+        // is what keeps that true for the second caller: a realtime
+        // utterance that skipped it would be injected-by-someone-else text
+        // with a lowercased first letter and no closing stop, which is the
+        // exact bug invariant 8 exists to have fixed once.
+        let r = self.refine(&raw, window_class, self.cfg.normalize.enabled, true);
+        dbg.timings.normalize_ms = r.normalize_ms;
+        let raw = r.raw;
+        if dbg.ctx.is_some() {
+            dbg.vocab = r.vocab;
         }
-
-        let lang = self.detector.detect(&raw);
-        dbg.lang = Some(lang);
-        let axes = style::resolve(&self.cfg, window_class);
-        let control = style::control_line(&axes);
-
-        let mut normalized = false;
-        let mut reject_reason: Option<String> = None;
-        let mut text = guardrail::rule_based_fallback(&raw);
-        let mut normalize_debug = debug::NormalizeDebug {
-            control: control.clone(),
-            ran: false,
-            cleaned: None,
-            error: None,
-        };
-        let mut guardrail_debug: Option<debug::GuardrailDebug> = None;
-
-        if self.cfg.normalize.enabled {
-            if let Some(sink) = &self.stage_events {
-                sink(OverlayEvent::Normalizing);
-            }
-            // Scoped tightly around just the normalizer call: `evaluate` and
-            // `log_rejection` are cheap and unrelated to normalizer latency,
-            // which is exactly what M3 threshold tuning wants out of this
-            // number.
-            let t = Instant::now();
-            let normalize_result = self.normalizer.normalize(&control, &raw);
-            dbg.timings.normalize_ms = t.elapsed().as_millis();
-            normalize_debug.ran = true;
-
-            match normalize_result {
-                Ok(cleaned) => {
-                    normalize_debug.cleaned = Some(cleaned.clone());
-                    match guardrail::evaluate(&raw, &cleaned, lang, &self.cfg.guardrail) {
-                        Verdict::Accept => {
-                            guardrail_debug = Some(debug::GuardrailDebug::accept());
-                            text = cleaned;
-                            normalized = true;
-                        }
-                        Verdict::Reject(reason) => {
-                            guardrail_debug =
-                                Some(debug::GuardrailDebug::reject(&raw, &cleaned, &reason));
-                            reject_reason = Some(reason.code().to_string());
-                            log_rejection_to(&self.rejections_path(), &raw, &cleaned, &reason, lang, &control);
-                        }
-                    }
-                }
-                Err(e) => {
-                    // A failed cleanup must never cost the transcript, and it
-                    // is not a guardrail rejection: `reject_reason` stays
-                    // `None` here. Pinned by
-                    // `a_dead_normalizer_still_produces_text` in
-                    // tests/pipeline_e2e.rs.
-                    normalize_debug.error = Some(e.to_string());
-                    tracing::warn!(error = %e, "normalization failed; using raw transcript");
-                }
-            }
-        }
-        // Recorded now (a plain move -- `normalize_debug`/`guardrail_debug`
-        // aren't read again) so that if injection below fails, the record
-        // `dbg` writes on drop still carries the raw transcript, the
-        // normalization result, and the guardrail verdict -- precisely the
-        // three things you'd most want when *both* injectors have failed.
-        dbg.normalize = Some(normalize_debug);
-        dbg.guardrail = guardrail_debug;
-
-        // The single point every path out of this function converges on
-        // before injection, and therefore the only place capitalisation and
-        // terminal punctuation can be guaranteed rather than hoped for.
-        // Doing it here instead of at each site that assigns `text` is the
-        // same argument `DebugRecordGuard` makes: `text` is written on three
-        // paths today (rule-based fallback, accepted cleanup, and fallback
-        // again after a rejection or a normalizer error) and only the
-        // fallback ones were finished, so an accepted S1-mini cleanup was
-        // injected exactly as the model returned it -- routinely lowercased
-        // at the opening letter and stripped of its final stop, which the
-        // guardrail cannot see (`guardrail::tokenize` lowercases and drops
-        // punctuation before comparing). `finish` is idempotent, so the
-        // paths that already went through `rule_based_fallback` are
-        // unaffected.
-        text = finish(&text);
+        dbg.lang = Some(r.lang);
+        let normalized = r.normalized;
+        let reject_reason = r.reject_reason;
+        // Recorded now (a plain move -- neither field is read again) so that
+        // if injection below fails, the record `dbg` writes on drop still
+        // carries the raw transcript, the normalization result, and the
+        // guardrail verdict -- precisely the three things you'd most want
+        // when *both* injectors have failed.
+        dbg.normalize = Some(r.normalize_debug);
+        dbg.guardrail = r.guardrail_debug;
+        let mut text = r.text;
 
         if self.cfg.inject.trailing_space {
             text.push(' ');

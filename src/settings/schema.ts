@@ -22,14 +22,19 @@ export type Category = {
   sections: string[];
 };
 
-/// The five panes of the sidebar. Sections are grouped by what a user is
+/// The panes of the sidebar. Sections are grouped by what a user is
 /// trying to change, not by which Rust struct they live in — `audio` and
 /// `inject` are both "the mechanics of one dictation", however far apart they
 /// sit in the pipeline.
+///
+/// `ai` sits between `style` and `advanced` on purpose: it is a feature a
+/// user goes looking for ("can OpenClaw use this?"), not a knob they tune
+/// once a year, and `advanced` is where the tuning lives.
 export const CATEGORIES: Category[] = [
   { id: "general", title: "General", icon: "sliders", sections: ["audio", "inject"] },
   { id: "language", title: "Language", icon: "waveform", sections: ["asr", "vocabulary"] },
   { id: "style", title: "Style", icon: "pen", sections: ["style_default", "style_rules"] },
+  { id: "ai", title: "AI", icon: "spark", sections: ["realtime"] },
   { id: "advanced", title: "Advanced", icon: "gear", sections: ["models", "normalize", "guardrail"] },
   { id: "appearance", title: "Appearance", icon: "palette", sections: ["ui"] },
   { id: "diagnostics", title: "Diagnostics", icon: "pulse", sections: ["debug", "overlay"] },
@@ -59,6 +64,7 @@ export const SECTION_TITLES: Record<string, string> = {
   debug: "Diagnostics",
   overlay: "Overlay",
   ui: "Colours & theme",
+  realtime: "Local transcription for other programs",
 };
 
 /**
@@ -77,6 +83,12 @@ export const SECTION_NOTES: Record<string, string> = {
     "The window class is a regular expression; the first matching rule wins. Axes a rule leaves unset inherit from the style above.",
   overlay:
     "Read, but not in control of anything yet: under Wayland a window cannot set its own position — that comes from a compositor rule.",
+  // No "Restart may be needed" tag and no entry in `RESTART_SECTIONS`: the daemon
+  // stops and restarts the listener on save, so every key here is applied
+  // live. Saying so in the note is the point — a port field that looked like
+  // it needed a restart would get one asked for that nothing owes.
+  realtime:
+    "Accepts audio from other programs on this machine and returns text as it goes — reachable from this machine only. Changes take effect immediately, with no restart.",
 };
 
 export const LABELS: Record<string, string> = {
@@ -104,6 +116,7 @@ export const LABELS: Record<string, string> = {
   "inject.script": "Paste script",
   "inject.paste_chord": "Paste shortcut",
   "inject.terminal_classes": "Terminal window classes",
+  "inject.restore_clipboard": "Restore the clipboard",
   "inject.trailing_space": "Append a space",
   "inject.keystroke_delay_ms": "Keystroke delay",
   "vocabulary.enabled": "Vocabulary on",
@@ -120,6 +133,12 @@ export const LABELS: Record<string, string> = {
   "overlay.position": "Position",
   "overlay.width": "Width",
   "overlay.height": "Height",
+  "realtime.enabled": "Endpoint on",
+  "realtime.port": "Port",
+  "realtime.token": "Access key",
+  "realtime.silence_ms": "Pause that ends an utterance",
+  "realtime.max_utterance_seconds": "Maximum utterance length",
+  "realtime.normalize": "Apply post-processing",
   // Not a `config.toml` key — see `Settings.tsx`'s `AutostartCard` and
   // `settings_cmds.rs`'s module doc for why this is filesystem state
   // (`~/.config/autostart/yappr.desktop` existing or not) rather
@@ -142,6 +161,8 @@ export const UNITS: Record<string, string> = {
   "vocabulary.min_term_chars": "characters",
   "overlay.width": "px",
   "overlay.height": "px",
+  "realtime.silence_ms": "ms",
+  "realtime.max_utterance_seconds": "s",
 };
 
 /// One or two sentences behind each row's ⓘ. Deliberately near-complete: the
@@ -193,6 +214,8 @@ export const HELP: Record<string, string> = {
     "Which key chord the ydotool and libei methods press. auto decides by window class: Ctrl+Shift+V for anything listed as a terminal below, Ctrl+V otherwise. If yappr cannot name the focused window, that becomes a plain Ctrl+V \u2014 which terminals ignore, with no error reported. If you mostly dictate into terminals and nothing arrives, fix this to Ctrl+Shift+V.",
   "inject.terminal_classes":
     "Window classes that count as a terminal and therefore get Ctrl+Shift+V under auto. Case does not matter. Your window's class is in the debug record under window_class.",
+  "inject.restore_clipboard":
+    "The ydotool and libei methods put the text on the clipboard in order to paste it. With this on, whatever was there before is put back afterwards — so your own entry is the current one again and the dictation drops to second place in your clipboard history. Off means the dictation stays on the clipboard. Turn it off if a program picks the text up too late and therefore pastes the old contents.",
   "inject.trailing_space":
     "Appends a space, so the next dictation does not run into the previous one.",
   "inject.keystroke_delay_ms":
@@ -222,6 +245,18 @@ export const HELP: Record<string, string> = {
     "Applies to both windows, including the dictation overlay. \u201cSystem\u201d follows the desktop's light/dark setting; any other scheme pins a variant and stays there even when the desktop switches. Takes effect immediately, no restart needed.",
   "overlay.width": "Read, but controls nothing.",
   "overlay.height": "Read, but controls nothing.",
+  "realtime.enabled":
+    "Opens a way in for other programs on this machine to send audio to yappr and get text back as it goes — this is how OpenClaw uses yappr for dictation. Off means the way in is shut, and only dictation by shortcut works.",
+  "realtime.port":
+    "The number the endpoint answers on. If it is already taken the endpoint does not come up; enter a different one here. Whoever uses it has to know the same number — OpenClaw is told it during setup.",
+  "realtime.token":
+    "A shared password, optional. Empty means every program on this machine may dictate. With something entered here, only a caller that sends the same value is accepted. \u201cSet up\u201d also enters the key in OpenClaw — if you change it later, run the setup again or OpenClaw will no longer get through.",
+  "realtime.silence_ms":
+    "This much silence ends an utterance, and the text goes out. Shorter answers sooner but cuts sentences apart at pauses for thought. Longer holds the sentence together and keeps you waiting for it.",
+  "realtime.max_utterance_seconds":
+    "Anyone who keeps talking without a pause is cut off here at the latest. What was recorded is still recognised — nothing is lost, the text just arrives in two parts.",
+  "realtime.normalize":
+    "Sends these utterances through the language model and the guardrail as well — that is, exactly the text yappr would otherwise type. Off means plain recognised text, with capitalisation and punctuation only. That is faster and needs less memory, but it reads like dictation rather than like written text. If post-processing is switched off entirely under \u201cAdvanced\u201d, it stays off here too.",
   "autostart.enabled":
     "Creates ~/.config/autostart/yappr.desktop; systemd starts yappr from it automatically at your next login. Off means the file does not exist, and nothing starts by itself.",
 };
@@ -363,6 +398,7 @@ export const DEPENDENT_FIELDS: Record<string, { on: string; is: Json[] }> = {
   "inject.script": { on: "backend", is: ["script"] },
   "inject.paste_chord": { on: "backend", is: ["ydotool", "libei"] },
   "inject.terminal_classes": { on: "backend", is: ["ydotool", "libei"] },
+  "inject.restore_clipboard": { on: "backend", is: ["ydotool", "libei"] },
 };
 
 /// Whether a row's dependency (if it has one) is currently satisfied.
@@ -391,6 +427,7 @@ export const FIELD_ORDER: Record<string, string[]> = {
     "script",
     "paste_chord",
     "terminal_classes",
+    "restore_clipboard",
     "trailing_space",
     "keystroke_delay_ms",
   ],
@@ -408,6 +445,14 @@ export const FIELD_ORDER: Record<string, string[]> = {
   style_default: ["styling", "structure", "context"],
   debug: ["enabled", "dir", "save_audio"],
   overlay: ["position", "width", "height"],
+  realtime: [
+    "enabled",
+    "port",
+    "token",
+    "silence_ms",
+    "max_utterance_seconds",
+    "normalize",
+  ],
   ui: ["theme"],
 };
 

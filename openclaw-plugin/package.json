@@ -1,0 +1,32 @@
+{
+  "name": "openclaw-yappr",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OpenClaw realtime transcription provider backed by a local yappr instance.",
+  "type": "module",
+  "license": "MIT",
+  "files": [
+    "index.js",
+    "capability-catalog.js",
+    "provider-factory.js",
+    "config.js",
+    "openclaw.plugin.json",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "openclaw": ">=2026.9.4"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.js"
+    ],
+    "compat": {
+      "pluginApi": ">=2026.9.4",
+      "minGatewayVersion": "2026.9.4"
+    },
+    "build": {
+      "openclawVersion": "2026.9.4",
+      "pluginSdkVersion": "2026.9.4"
+    }
+  }
+}

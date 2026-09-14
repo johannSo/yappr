@@ -1,0 +1,57 @@
+{
+  "id": "yappr",
+  "name": "yappr",
+  "description": "Realtime speech recognition via a local yappr instance. Streams microphone PCM to yappr's loopback websocket and returns finished, punctuated utterances. yappr's own settings window fills these in when you set the plugin up from there.",
+  "categories": [
+    "voice",
+    "media"
+  ],
+  "capabilityCatalogEntry": "./capability-catalog.js",
+  "activation": {
+    "onStartup": false
+  },
+  "enabledByDefault": false,
+  "contracts": {
+    "realtimeTranscriptionProviders": [
+      "yappr"
+    ]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "host": {
+        "type": "string",
+        "description": "Host yappr listens on. Always 127.0.0.1 unless you have tunnelled it: yappr binds loopback and has no setting that changes that. Blank this field to declare yappr unavailable and let OpenClaw pick another transcription provider."
+      },
+      "port": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 65535,
+        "description": "Port yappr listens on. Must match [realtime] port in yappr's own settings window; yappr's AI pane writes both sides at once when you press Set up."
+      },
+      "token": {
+        "type": "string",
+        "description": "Shared token, only if [realtime] token is set in yappr. Sent as an Authorization bearer header and as a token query parameter. SecretRef values cannot be resolved by this plugin; use the YAPPR_REALTIME_TOKEN environment variable instead."
+      },
+      "sampleRate": {
+        "type": "integer",
+        "minimum": 8000,
+        "maximum": 192000,
+        "description": "Sample rate of the audio OpenClaw streams. 16000 for browser and native dictation, 8000 for a Twilio media stream. yappr resamples anything else to 16 kHz."
+      },
+      "encoding": {
+        "type": "string",
+        "enum": [
+          "linear16",
+          "mulaw"
+        ],
+        "description": "Audio encoding. linear16 (PCM s16le) for dictation, mulaw for G.711 telephony. Anything else is refused rather than guessed."
+      },
+      "url": {
+        "type": "string",
+        "description": "Full websocket URL, overriding host and port. Only needed for a tunnelled or non-default endpoint: ws, wss, http and https are accepted, http/https are mapped to ws/wss, and any other scheme is an error."
+      }
+    }
+  }
+}

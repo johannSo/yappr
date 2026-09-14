@@ -732,3 +732,241 @@ silent, ~5,5 ms, and returned the identical token; a stale token, by contrast, p
 several probe processes that share that one file, each rotating it. `SessionReport` now
 carries `token_reused` and the establishment log line prints it, so the next occurrence
 is one line of diagnosis instead of an afternoon of it.
+
+## The clipboard is handed back after a paste (2026-09-14)
+
+Both backends that paste rather than type -- `ydotool` and `libei` -- work by `wl-copy`ing
+the transcript and pressing one chord, which left the transcript sitting in the clipboard
+afterwards: whatever the user had copied before dictating was gone, and the next Ctrl+V
+they pressed by hand repeated the dictation. They now read the clipboard first and write
+it back once the paste has landed (`[inject] restore_clipboard`, default on), so the
+user's own entry is current again and the dictation is the *second* entry in whatever
+clipboard history they run.
+
+`inject::paste_through_clipboard` is the shared body of both backends, and the ordering is
+the whole feature: snapshot before staging (staging is what destroys it), restore after the
+chord plus `CLIPBOARD_RESTORE_SETTLE` (300 ms -- the target still has to ask for the
+selection and read it). Three cases restore nothing, all deliberately: the setting off, an
+empty clipboard (`wl-copy --clear` would leave a user without a history manager nothing to
+paste), and a failed press -- there the transcript staying put *is* the clipboard fallback
+the user is about to be notified about, invariant 1.
+
+### What is verified, and what is not
+
+Verified: the ordering, the three skip cases and the type selection, by unit test
+(`inject.rs`, through a `Clipboard` trait so `cargo test` never touches the developer's own
+clipboard). `cargo test --workspace` and `cargo clippy --workspace --all-targets` are clean;
+the `--ignored` half passes except the four ASR fixtures whose models are not downloaded on
+this machine.
+
+**Not verified: a real paste on real hardware.** Nobody has dictated through this yet. The
+one way it can go wrong is invisible from inside yappr -- an application that asks for the
+selection *after* the restore has happened pastes the old clipboard instead of the
+dictation, and nothing reports which bytes a client read. 300 ms is `handy-paste.sh`'s
+number and it has been good enough for that script's users; `restore_clipboard = false` is
+the escape hatch, and it is why the behaviour is a setting rather than a heuristic.
+`cargo run -p yappr-core --example libei_probe -- "hallo welt"` exercises the whole path
+without a microphone and now prints the setting's value.
+
+Also unverified: the non-text path. A copied image is snapshotted under its own MIME type
+and handed back with `wl-copy --type`, which is the right shape, but only text has actually
+been through it.
+
+## Added after this letter: OpenClaw dictates through yappr (2026-09-14)
+
+Two new things, and they only make sense together.
+
+**A local streaming-transcription endpoint** (`crates/yappr-core/src/realtime.rs`,
+`[realtime]`, off by default): a WebSocket bound to `127.0.0.1` that another
+program streams PCM into and gets finished utterances back from. Silero cuts the
+stream into utterances — the streaming half of the same model the dictation VAD
+uses, added as `vad::SileroSegmenter` next to `SileroTrimmer` — and each one goes
+through `Pipeline::dictate_text`, which is `process_with_capture` minus the
+injector. Both now share `refine`, the extracted vocabulary → language → S1-mini
+→ guardrail → `finish` sequence, and that sharing is the only reason the text
+another program receives is the text yappr would have typed. `tungstenite 0.30`
+is the one new dependency (sync, `handshake` only, no TLS flavour, no runtime).
+
+**A button that installs an OpenClaw plugin** (`openclaw-plugin/`,
+`src-tauri/src/openclaw.rs`, the new **AI** pane): OpenClaw's dictation is a
+pluggable *realtime transcription provider*, so the plugin is one, and the
+button materialises it from `include_str!` data into
+`~/.local/share/yappr/openclaw-plugin/`, links it with `openclaw plugins install
+--link`, enables it, and writes yappr into OpenClaw's own config as its
+streaming provider. Every step is reported separately, failures included: it is
+five subprocess calls against another program's CLI and any of them can fail
+alone.
+
+### Three decisions worth knowing
+
+**Finals only, no partials.** yappr transcribes whole utterances; there is no
+interim state to report, so `onPartial` is never called and the plugin says so
+in a comment rather than fabricating deltas from finals.
+
+**Nothing parses `~/.openclaw/openclaw.json`.** Every read and write goes
+through `openclaw config get`/`config set`, which resolves
+`$OPENCLAW_CONFIG_PATH`, parses the JSON5 that file may be, validates against
+the live schema, and refuses under `OPENCLAW_CONFIG_READONLY=1`. This is
+`hypr.rs`'s rule one step further along: there we print the lines and let the
+user paste them, here we call the other program's own writer.
+
+**The gateway is not restarted.** OpenClaw only loads a newly linked plugin when
+its gateway restarts, and that process is serving live agent sessions. The
+install's last step is a note naming `openclaw gateway restart`, not a command
+this app runs.
+
+### What is verified
+
+- `cargo test --workspace`: **538 passed, 0 failed, 13 ignored.** `cargo clippy
+  --workspace --all-targets`: clean. `bun run build`: clean.
+- **The endpoint, end to end, against real models.**
+  `realtime::tests::a_wav_file_streamed_through_the_socket_comes_back_as_text`
+  (`#[ignore]`d) streams `fixtures/hallo_german.wav` through a real socket as
+  s16le in 1023-byte frames — a size chosen to sit on neither a sample nor a
+  VAD-window boundary — and gets words back. It passed on this machine on
+  2026-09-14 with its config pointed at `parakeet-primeline-de`, the only ASR
+  model on disk here; the committed version uses `AsrConfig::default()` like
+  every other model-backed test, which on this machine fails for want of that
+  model exactly as `asr_fixture`'s four already do.
+- **The plugin, inside OpenClaw 2026.9.4.** Installed with the real argv the
+  button uses, then `openclaw plugins inspect yappr --runtime --json`:
+  `status: "loaded"`, `shape: "plain-capability"`, `capabilities:
+  [{kind: "realtime-transcription", ids: ["yappr"]}]`, `diagnostics: []`. So
+  the hand-written `definePluginEntry` equivalent, the manifest contract and
+  the capability-catalog entry are all accepted by the host — the plugin
+  imports nothing, because it is loaded from a directory with no
+  `node_modules` above it.
+- **The config write, and the way back.** `openclaw config set
+  plugins.entries.voice-call.config.streaming …` round-tripped exactly. Note
+  the warning it prints: `plugin not installed: voice-call`. It is cosmetic
+  here — `getVoiceCallProviderConfig` in the host's `talk-*.mjs` reads that
+  path straight out of the config tree — but it is why the streaming config
+  is the *documented temporary* home for this, per OpenClaw's own
+  `docs/nodes/talk.md`.
+- **Remove leaves nothing behind**, which took two rounds to get right. The
+  first version ran `plugins disable` before `plugins uninstall` and left
+  `plugins.entries.yappr.enabled = false` in OpenClaw's config; dropping the
+  disable step did not fix it, because `uninstall` writes that flag itself.
+  There are now two guarded sweeps — `own_entry_is_vestigial` and
+  `streaming_is_vestigial`/`entry_is_empty` — each of which refuses to delete
+  anything holding a key this app did not write. Verified by installing and
+  removing against the real CLI and diffing `openclaw.json` against a copy
+  taken beforehand: identical.
+
+### What is NOT verified
+
+- **No dictation has been done in OpenClaw through this.** Doing so needs the
+  gateway restarted and a microphone spoken into, neither of which this session
+  did. What is proven is every layer under it: the plugin loads and registers,
+  the config is written and read back, and the endpoint transcribes a real wav
+  file through a real socket with real models.
+- **The `mulaw` path has no model behind it.** `mulaw_to_f32` is unit-tested
+  against the G.711 extremes (including the trap that the sign bit is read
+  from the *complemented* byte, which the first version of that test got
+  backwards), and 8 kHz is proven to arrive resampled, but no telephony audio
+  has been transcribed.
+- **The `[realtime] token` path has never refused a real client.** It is
+  covered by unit tests on `negotiate` and by one session test that is
+  genuinely refused the WebSocket upgrade with 401, but no OpenClaw install
+  has been configured with one.
+
+### Follow-up, same day: the plugin's settings page (2026-09-14)
+
+Reported within the hour, against the install the button had just made: "in our
+OpenClaw plugin settings menu is almost every option twice", with a screenshot
+of "Asr model" above "Asr Model" and "Auth token" above "Auth Token".
+
+**Cause:** `openclaw.plugin.json` declared every *alias* `config.js` accepts as
+its own schema property. The Control UI renders one row per declared property
+and humanises the key, so each alias pair became two rows with the same label in
+different cases. The duplication was the smaller half of the problem, though —
+the form wrote `plugins.entries.yappr.config`, a path the host never hands to a
+transcription provider (`rawConfig` comes from
+`plugins.entries.voice-call.config.streaming.providers.<id>` and nowhere else),
+so every row in it was also inert.
+
+**Fix, in three parts:**
+
+1. The manifest declares six rows — `host`, `port`, `token`, `sampleRate`,
+   `encoding`, `url` — canonical spellings only. The aliases stay accepted in
+   `config.js`; `model` (advisory) and `language` (accepted and ignored) are no
+   longer declared at all, because a row that changes nothing is worse than no
+   row.
+2. `config.js` gained `readOwnEntryConfig`: `resolveConfig` receives the whole
+   `cfg`, so the plugin now merges `plugins.entries.yappr.config` **over** the
+   `rawConfig` the host resolved. The form wins, deliberately — a field edited
+   in front of you that does nothing is the worse failure — and the two copies
+   are written together, from one `provider_entry`, by the install.
+3. `openclaw_install` writes that second copy, so the page arrives **pre-filled
+   with this machine's** host, port, sample rate and encoding rather than empty
+   beside a working install. `status` now checks both copies for drift, and the
+   entry copy matters more: it is the one that wins at runtime.
+
+**Also reported:** "under Talk → Realtime voice yappr isn't even an option". It
+is not, and should not be. That picker is `registerRealtimeVoiceProvider` —
+bidirectional voice, where the assistant talks back — which is a different
+contract from `registerRealtimeTranscriptionProvider`. yappr transcribes; it does
+not speak. The dictation surface is the composer microphone, whose "Transcription
+setup" link leads to the streaming provider config.
+
+### Verified live this time
+
+Against the real gateway on this machine, after `gateway restart`:
+
+- `plugins inspect yappr --runtime --json`: `status: "loaded"`, `capabilities:
+  [{kind: "realtime-transcription", ids: ["yappr"]}]`, `diagnostics: []`, and
+  `configJsonSchema.properties` is exactly the six keys — so the rendered form is
+  those six and no duplicates.
+- `config get plugins.entries.yappr.config --json` answers
+  `{host: "127.0.0.1", port: 17869, sampleRate: 16000, encoding: "linear16"}`:
+  the page is pre-filled.
+- `gateway call talk.catalog` → `transcription: { ready: true, activeProvider:
+  "yappr" }`, with yappr `configured: true` and the other two providers
+  `configured: false`. **This is the proof the dictation path is wired**, and it
+  is what should have been checked the first time instead of reasoning from the
+  config file.
+
+Still not verified: nobody has dictated into OpenClaw and read the result.
+
+### Second follow-up: the relay's audio format (2026-09-14)
+
+First actual dictation attempt in OpenClaw:
+
+> Error: Gateway transcription relay requires g711_ulaw/8000 audio
+
+**Cause, and it was ours.** The install wrote `sampleRate: 16000, encoding:
+"linear16"`, on the reasoning recorded in the plugin's own README: the consumer
+is a browser microphone rather than a telephone, and yappr's pipeline is built
+around 16 kHz. Both halves of that are true and the conclusion was still wrong.
+The host's `talk-*.mjs` holds
+
+```js
+const RELAY_INPUT_ENCODING = "g711_ulaw";
+const RELAY_INPUT_SAMPLE_RATE_HZ = 8e3;
+```
+
+and `assertRelayInputAudioConfig` throws that exact sentence for any provider
+config declaring otherwise — for the **browser dictation mic**, not just for
+Twilio. So bundled Deepgram's 8 kHz mulaw default was never a telephony choice;
+it is what this seam speaks. There is no transcode path to negotiate around.
+
+Fixed on both sides — `provider_entry` in `openclaw.rs` and the plugin's
+`YAPPR_DEFAULT_*` constants — and pinned by
+`the_written_audio_format_is_the_one_the_relay_emits`, because 16 kHz linear16
+is the obvious-looking "improvement" and it breaks every dictation.
+
+**What the narrowband costs, measured rather than asserted.** The first version
+of this fix's comments claimed mulaw would "transcribe measurably worse". That
+was an assumption, so it was checked: `fixtures/hallo_german.wav` through the
+real socket with real models, in both formats, returned the *identical*
+transcript — "Alles hat ein Ende, nur die Wurst hat zwei." The claim was removed
+rather than softened. `realtime.rs` now carries both as `#[ignore]`d tests, and
+the mu-law one is the path production takes: a broken companding or resampler
+fails there while the 16 kHz test still passes. A `f32_to_mulaw` helper lives in
+the test module (yappr itself only ever decodes) and is round-trip checked
+against the shipped decoder, so an encoder bug cannot masquerade as a decoder
+bug.
+
+**What this still does not prove.** Nobody has yet spoken into OpenClaw's mic and
+read the result. The format that failed is fixed and the whole path is verified
+with a wav file; the last step is a human and a microphone.

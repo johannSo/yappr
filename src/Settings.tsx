@@ -7,6 +7,7 @@ import { Icon } from "./settings/icons";
 import { Commit, Device, Field, ResetButton, Row, TableEditor, Toggle } from "./settings/controls";
 import { setupGapSummary, Wizard, WizardState } from "./settings/wizard";
 import { AsrModelDownload } from "./settings/model-download";
+import { OpenClawCard } from "./settings/openclaw";
 import {
   HELP,
   Json,
@@ -796,6 +797,31 @@ export default function Settings() {
                   animate={{ opacity: 1, y: 0 }}
                   transition={SETTLE}
                 >
+                  {/* Above the `[realtime]` section, not after it: installing
+                      the plugin is what a user opens this pane to do, and the
+                      section below it is that feature's plumbing. Not rendered
+                      while searching, for the same reason `AutostartCard` is
+                      not — a search result list is rows that matched a query,
+                      and this card matched nothing. */}
+                  {!searching && current.id === "ai" && (
+                    <OpenClawCard
+                      revision={savedRevision}
+                      // `openclaw_install`/`openclaw_remove` write
+                      // `[realtime]` themselves, so this window's snapshot is
+                      // a key out of date the moment either returns — and
+                      // `flush` posts that whole snapshot, so the next
+                      // unrelated toggle would write the old value back. Same
+                      // guards as the reveal listener above: nothing is
+                      // re-read on top of an edit this window holds and the
+                      // file does not.
+                      onConfigChanged={() => {
+                        if (timerRef.current !== null || savingRef.current || queuedRef.current)
+                          return;
+                        if (saveStateRef.current === "error") return;
+                        void load(true);
+                      }}
+                    />
+                  )}
                   {shown.map(({ section, keys }) => (
                     <SectionCard
                       key={section}

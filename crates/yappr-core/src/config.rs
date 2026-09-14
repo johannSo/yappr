@@ -237,6 +237,86 @@ impl Default for ModelsConfig {
     }
 }
 
+/// The local streaming-transcription endpoint (`realtime.rs`), added
+/// 2026-09-14 so something that is not yappr's own injector can ask this
+/// machine's models for text -- concretely, OpenClaw's dictation, whose
+/// gateway is a Node process that streams microphone audio to a
+/// *realtime transcription provider*.
+///
+/// Off by default, and deliberately not a thing a user has to find: the
+/// OpenClaw card in the AI pane turns it on as part of installing the
+/// plugin, which is the only consumer that exists. Every field here is the
+/// server side of a contract the plugin depends on, so changing a default
+/// means changing `openclaw-plugin/config.js` with it.
+///
+/// `bind` is not a field. The listener is loopback-only, unconditionally:
+/// this endpoint hands out transcripts of whatever audio is sent to it and
+/// keeps the microphone out of it entirely, but it is still an unattended
+/// ear on the models, and a config key is one typo away from putting it on
+/// a LAN. `token` is the in-band answer for a shared machine instead --
+/// empty means "any local process may use it", which is the same trust
+/// boundary `$XDG_RUNTIME_DIR/yappr.sock` already draws.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RealtimeConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "d_realtime_port")]
+    pub port: u16,
+    /// Empty (the default) accepts any loopback client. Set, it is required
+    /// as `Authorization: Bearer <token>` or `?token=` on the WebSocket
+    /// handshake -- and the OpenClaw card copies whatever is here into the
+    /// plugin's own config, so the two cannot drift by being edited here.
+    #[serde(default)]
+    pub token: String,
+    /// How much silence closes an utterance. This is Silero's
+    /// `min_silence_duration`, not a timer over signal level, so it is the
+    /// same judgement the dictation VAD already makes -- see
+    /// `vad::SileroSegmenter`.
+    #[serde(default = "d_realtime_silence_ms")]
+    pub silence_ms: u32,
+    /// The cap Silero cuts an unbroken stretch of speech at. Invariant 11's
+    /// argument in miniature: a stream with no pause in it must still
+    /// produce text rather than growing forever, and what gets cut is
+    /// transcribed, never discarded.
+    #[serde(default = "d_realtime_max_utterance_seconds")]
+    pub max_utterance_seconds: u32,
+    /// Whether a realtime utterance gets the S1-mini rewrite and the
+    /// guardrail, or stops at the ASR plus `finish`'s capitalisation and
+    /// terminal punctuation. `true` means the text OpenClaw receives is the
+    /// text yappr would have typed; it costs the normalizer's latency at
+    /// the end of every utterance and keeps S1-mini resident for the length
+    /// of a dictation session.
+    ///
+    /// ANDed with `[normalize] enabled`, never ORed: turning normalization
+    /// off globally must not leave a second switch that turns it back on.
+    #[serde(default = "d_true")]
+    pub normalize: bool,
+}
+
+fn d_realtime_port() -> u16 {
+    17869
+}
+fn d_realtime_silence_ms() -> u32 {
+    700
+}
+fn d_realtime_max_utterance_seconds() -> u32 {
+    20
+}
+
+impl Default for RealtimeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: d_realtime_port(),
+            token: String::new(),
+            silence_ms: d_realtime_silence_ms(),
+            max_utterance_seconds: d_realtime_max_utterance_seconds(),
+            normalize: d_true(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NormalizeConfig {
@@ -516,6 +596,31 @@ pub struct InjectConfig {
     /// at all.
     #[serde(default = "d_paste_chord")]
     pub paste_chord: PasteChord,
+    /// Whether the `ydotool` and `libei` backends hand the clipboard back
+    /// the way they found it once the paste has landed. Only those two read
+    /// it -- they are the only backends that stage the transcript on the
+    /// clipboard themselves. On by default.
+    ///
+    /// Both pastes work by `wl-copy`ing the transcript and pressing one
+    /// chord, which leaves the transcript sitting in the clipboard
+    /// afterwards: whatever the user had copied before dictating is gone,
+    /// and the next Ctrl+V they press by hand repeats the dictation. With
+    /// this on, the previous contents are read first and written back
+    /// `inject::CLIPBOARD_RESTORE_SETTLE` after the chord -- so the *old*
+    /// entry is current again and the transcript is one step down in
+    /// whatever clipboard history the user runs (cliphist, clipman, Klipper).
+    ///
+    /// Off is for the desktop where that settle is not enough: an
+    /// application that reads the selection lazily, after the restore has
+    /// already happened, pastes the old text instead of the dictation.
+    /// Nothing in yappr can observe that, which is why the escape hatch is a
+    /// setting rather than a heuristic. Two cases restore nothing at all and
+    /// leave the transcript in place, deliberately: a clipboard that was
+    /// empty before the dictation (clearing it would put the transcript
+    /// beyond reach of a user with no history manager), and a paste that
+    /// failed (the transcript is the clipboard fallback, invariant 1).
+    #[serde(default = "d_true")]
+    pub restore_clipboard: bool,
 }
 
 fn d_backend() -> InjectBackend {
@@ -577,6 +682,7 @@ impl Default for InjectConfig {
             script: d_script(),
             terminal_classes: d_terminal_classes(),
             paste_chord: d_paste_chord(),
+            restore_clipboard: true,
         }
     }
 }
@@ -798,6 +904,8 @@ pub struct Config {
     #[serde(default)]
     pub normalize: NormalizeConfig,
     #[serde(default)]
+    pub realtime: RealtimeConfig,
+    #[serde(default)]
     pub guardrail: GuardrailConfig,
     #[serde(default)]
     pub inject: InjectConfig,
@@ -899,6 +1007,20 @@ impl Config {
         }
         if self.normalize.threads == 0 {
             bail!("normalize.threads must be at least 1");
+        }
+        // `[realtime]`: a port of 0 would bind an ephemeral one the plugin
+        // could never find again, and either duration at 0 would make the
+        // segmenter produce nothing at all -- an endpoint that is up, accepts
+        // audio and answers with silence, which is the hardest possible
+        // shape of "it does not work" to diagnose from the OpenClaw side.
+        if self.realtime.port == 0 {
+            bail!("realtime.port must be greater than 0");
+        }
+        if self.realtime.silence_ms == 0 {
+            bail!("realtime.silence_ms must be greater than 0");
+        }
+        if self.realtime.max_utterance_seconds == 0 {
+            bail!("realtime.max_utterance_seconds must be greater than 0");
         }
         if self.overlay.width == 0 {
             bail!("overlay.width must be greater than 0");
@@ -1638,9 +1760,24 @@ to = "KDD"
         // -- so they are `skip_serializing`. Reading one must still work: the
         // section is `deny_unknown_fields`, so a pre-existing file naming them
         // would otherwise be quarantined and have its settings reset.
+        // Scoped to the `[normalize]` table rather than the whole file: a
+        // bare `contains("port")` passed only for as long as no *other*
+        // section had a key by that name, and `[realtime] port` is one.
+        // What is being asserted is that these two keys are gone from the
+        // section they belong to, not that the word never occurs.
         let rendered = render(&Config::default());
-        assert!(!rendered.contains("port"), "normalize.port must not be written any more");
-        assert!(!rendered.contains("llama_server_path"));
+        let normalize_table = rendered
+            .split("[normalize]")
+            .nth(1)
+            .expect("the rendered config must have a [normalize] table")
+            .split("\n[")
+            .next()
+            .expect("split always yields at least one piece");
+        assert!(
+            !normalize_table.contains("port"),
+            "normalize.port must not be written any more, got:{normalize_table}"
+        );
+        assert!(!normalize_table.contains("llama_server_path"));
 
         assert!(
             Config::from_str("[normalize]\nport = 8730\nllama_server_path = \"llama-server\"\n")

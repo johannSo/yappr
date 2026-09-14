@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use crate::asr;
 use crate::capture::{CaptureStats, Recorder};
-use crate::config::{self, AudioConfig, Config, DebugConfig, ModelsConfig};
+use crate::config::{self, AudioConfig, Config, DebugConfig, ModelsConfig, RealtimeConfig};
 use crate::config_write;
 use crate::inject;
 use crate::lang::WhatlangDetector;
@@ -28,7 +28,8 @@ use crate::normalize::Normalizer;
 use crate::paths;
 use crate::pipeline::{Pipeline, Timings};
 use crate::proto::{OverlayEvent, Request, Response, State};
-use crate::vad::SileroTrimmer;
+use crate::realtime::{EngineInfo, RealtimeEngine, RealtimeHandle};
+use crate::vad::{Segmenter, SileroSegmenter, SileroTrimmer};
 
 const WARMING: u8 = 0;
 const IDLE: u8 = 1;
@@ -314,6 +315,11 @@ pub struct Daemon {
     /// `[models]`, mirrored here so a Settings change takes effect without a
     /// restart -- the same reason, and the same shape, as `audio_cfg`.
     models_cfg: Mutex<ModelsConfig>,
+    /// `[realtime]`, mirrored for the same reason once more -- and read by
+    /// one caller the others do not have: a realtime session thread, which
+    /// must never block on `pipeline` to learn its own segmentation
+    /// settings (invariant 12's rule, applied to a second reader).
+    realtime_cfg: Mutex<RealtimeConfig>,
     window_class: Mutex<Option<String>>,
     /// Where `get-config`/`set-config` read and write. A field rather than a
     /// call to `paths::config_file()` at each use site so tests can point it
@@ -361,6 +367,21 @@ pub struct Daemon {
     /// state is `FAILED`, and a config that had to be replaced is not a failed
     /// daemon -- reusing it would report a working app as broken.
     config_notice: Mutex<Option<String>>,
+    /// The realtime transcription endpoint (`realtime.rs`), when
+    /// `[realtime] enabled` is on and the port was free. `None` otherwise,
+    /// which is the default and the overwhelmingly common case -- nothing
+    /// in dictation touches this.
+    ///
+    /// Owned here rather than by `start`'s caller because it has to survive
+    /// a `SetConfig`: `sync_realtime` stops the old listener and starts a
+    /// new one whenever `[realtime]` changes, so that turning the endpoint
+    /// on from the settings window does not need a restart. That is also
+    /// why `RealtimeHandle` remembers the config it was started from.
+    realtime: Mutex<Option<RealtimeHandle>>,
+    /// Why the endpoint is not listening while `[realtime] enabled` is on.
+    /// `None` whenever the last `sync_realtime` succeeded or switched it
+    /// off. See `realtime_status`.
+    realtime_error: Mutex<Option<String>>,
     /// The background thread reaping dead subscribers and (when enabled)
     /// supervising `llama-server` -- see `spawn_housekeeping`. `None` until
     /// `main` installs it, and again after `shutdown` stops it.
@@ -825,6 +846,7 @@ pub fn start(sink: Arc<dyn EventSink>) -> Result<(Arc<Daemon>, UnixListener)> {
         models_loaded: AtomicBool::new(false),
         last_activity: Mutex::new(Instant::now()),
         models_cfg: Mutex::new(cfg.models.clone()),
+        realtime_cfg: Mutex::new(cfg.realtime.clone()),
         window_class: Mutex::new(None),
         config_path: paths::config_file(),
         recording_epoch: AtomicU64::new(0),
@@ -833,6 +855,8 @@ pub fn start(sink: Arc<dyn EventSink>) -> Result<(Arc<Daemon>, UnixListener)> {
         normalize_available: AtomicBool::new(false),
         fatal_error: Mutex::new(None),
         config_notice: Mutex::new(startup_notice),
+        realtime: Mutex::new(None),
+        realtime_error: Mutex::new(None),
         housekeeping: Mutex::new(None),
         last_timings: Mutex::new(None),
         sink,
@@ -840,6 +864,9 @@ pub fn start(sink: Arc<dyn EventSink>) -> Result<(Arc<Daemon>, UnixListener)> {
         runtime_lock_path: lock_path,
         _runtime_lock: lock,
     });
+
+    // Taken before `cfg` is moved into the warm-up thread below.
+    let cfg_for_realtime = cfg.realtime.clone();
 
     // Warm up off the accept loop so `status` answers immediately.
     {
@@ -896,6 +923,13 @@ pub fn start(sink: Arc<dyn EventSink>) -> Result<(Arc<Daemon>, UnixListener)> {
             }
         });
     }
+
+    // The realtime endpoint, if `[realtime] enabled`. After the warm-up
+    // thread is spawned rather than before it: binding a port is
+    // instantaneous, and a session that connects immediately calls
+    // `ensure_models_loaded` itself, so there is nothing here that has to
+    // wait for warm-up to finish.
+    sync_realtime(&daemon, &cfg_for_realtime);
 
     // Reaps dead subscribers (Task 3, Work Item 2) and attempts the
     // idle-unload deadline on the same tick (Task 6, `unload_models`).
@@ -1220,6 +1254,191 @@ fn ensure_models_loaded_with(
     }
 }
 
+/// The daemon, as the realtime endpoint sees it.
+///
+/// A `Weak`, not an `Arc`: the listener's threads outlive nothing, but they
+/// are the only holders of this handle, and a strong reference here would
+/// make the `Daemon` -- and with it the loaded models -- unreachable for
+/// `Drop` while a session thread is still winding down. Every method
+/// degrades to a stated error if the daemon is already gone, which is what
+/// a session sees when the app quits underneath it.
+struct DaemonEngine(std::sync::Weak<Daemon>);
+
+impl DaemonEngine {
+    fn daemon(&self) -> Result<Arc<Daemon>, String> {
+        self.0.upgrade().ok_or_else(|| "yappr is shutting down".to_string())
+    }
+}
+
+impl RealtimeEngine for DaemonEngine {
+    fn ensure_ready(&self) -> Result<(), String> {
+        let daemon = self.daemon()?;
+        // The same call `run_utterance` makes, with the same retry
+        // semantics: a failure here is this session's problem, never a
+        // latched `FAILED` for the whole app (invariant 12).
+        ensure_models_loaded(&daemon)
+    }
+
+    fn segmenter(&self) -> Result<Box<dyn Segmenter>, String> {
+        let daemon = self.daemon()?;
+        let cfg = lock_ignoring_poison(&daemon.realtime_cfg).clone();
+        SileroSegmenter::new(&paths::models_dir(), cfg.silence_ms, cfg.max_utterance_seconds)
+            .map(|s| Box::new(s) as Box<dyn Segmenter>)
+            .map_err(|e| format!("{e:#}"))
+    }
+
+    fn transcribe(&self, samples: &[f32]) -> Result<Option<String>, String> {
+        let daemon = self.daemon()?;
+        // Held for the whole call, exactly as `process_utterance` holds it,
+        // and for the same reason: `SherpaTranscriber` is `Sync` only by a
+        // bare `unsafe impl`, and one utterance at a time inside the
+        // recognizer is what this lock guarantees. The consequence worth
+        // knowing is that a realtime utterance and a push-to-talk one
+        // serialise against each other -- dictating in two places at once
+        // makes the second wait, rather than corrupting either.
+        let guard = lock_ignoring_poison(&daemon.pipeline);
+        let Some(p) = guard.as_ref() else {
+            return Err("the models are not loaded".to_string());
+        };
+        p.dictate_text(samples, p.config().realtime.normalize)
+            .map_err(|e| format!("{e:#}"))
+    }
+
+    fn touch(&self) {
+        if let Ok(daemon) = self.daemon() {
+            touch_activity(&daemon);
+        }
+    }
+
+    fn describe(&self) -> EngineInfo {
+        let Ok(daemon) = self.daemon() else {
+            return EngineInfo { model: String::new(), normalize: false };
+        };
+        // Answered from the resident pipeline when there is one, and from
+        // the file otherwise. Both are honest; the pipeline's copy is the
+        // one that will actually run this session's audio, which is what a
+        // client logging the answer wants.
+        let from_pipeline = lock_ignoring_poison(&daemon.pipeline).as_ref().map(|p| {
+            let cfg = p.config();
+            EngineInfo {
+                model: asr_model_id(cfg.asr.model),
+                normalize: cfg.normalize.enabled && cfg.realtime.normalize,
+            }
+        });
+        from_pipeline.unwrap_or_else(|| match Config::load_from(&daemon.config_path) {
+            Ok(cfg) => EngineInfo {
+                model: asr_model_id(cfg.asr.model),
+                normalize: cfg.normalize.enabled && cfg.realtime.normalize,
+            },
+            Err(_) => EngineInfo { model: String::new(), normalize: false },
+        })
+    }
+}
+
+/// `[asr] model` as the string `config.toml` spells it, for the `ready`
+/// frame.
+///
+/// `AsrModel` has no `Display`, and the serde rename is the only spelling
+/// that is a *contract* -- it is what the user's config file says and what
+/// `openclaw-plugin`'s `models` list has to match. Going through serde
+/// rather than a hand-written match is what keeps a fifth model from
+/// silently reporting the wrong name here.
+fn asr_model_id(model: config::AsrModel) -> String {
+    serde_json::to_value(model)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// Brings the realtime listener in line with `cfg`, starting it, stopping
+/// it, or restarting it on a new port as needed.
+///
+/// Called from `start` and from every accepted `SetConfig`/`Reload`, which
+/// is what makes `[realtime]` take effect without a restart -- and that is
+/// not a nicety: the OpenClaw card's install button flips
+/// `realtime.enabled` as its last step, and an endpoint that only came up
+/// on the next launch would make the button's own success message a lie.
+///
+/// A failed bind is logged and left as `None`. It is a real state the
+/// settings window reports ("enabled, not running") rather than an error
+/// that fails the save: the commonest cause is a port already in use, and
+/// refusing the save would leave the user unable to change the port that
+/// caused it.
+fn sync_realtime(daemon: &Arc<Daemon>, cfg: &RealtimeConfig) {
+    *lock_ignoring_poison(&daemon.realtime_cfg) = cfg.clone();
+    let mut slot = lock_ignoring_poison(&daemon.realtime);
+
+    if let Some(running) = slot.as_ref() {
+        if running.config() == cfg {
+            return; // nothing about the endpoint changed
+        }
+        if let Some(h) = slot.take() {
+            h.stop();
+        }
+    }
+    if !cfg.enabled {
+        *lock_ignoring_poison(&daemon.realtime_error) = None;
+        return;
+    }
+    let engine = Arc::new(DaemonEngine(Arc::downgrade(daemon)));
+    match crate::realtime::start(cfg, engine) {
+        Ok(handle) => {
+            *slot = Some(handle);
+            *lock_ignoring_poison(&daemon.realtime_error) = None;
+        }
+        Err(e) => {
+            // Kept, not just logged. "Enabled but not listening" is the one
+            // realtime state a user cannot diagnose by looking -- the port
+            // is almost always already in use -- and the settings window
+            // has no other way to learn which it was.
+            let reason = format!("{e:#}");
+            tracing::error!(error = %reason, "the realtime endpoint could not start");
+            *lock_ignoring_poison(&daemon.realtime_error) = Some(reason);
+        }
+    }
+}
+
+/// What the settings window's OpenClaw card reports: whether the endpoint is
+/// configured on, which port it was asked for, and whether it is actually
+/// listening.
+///
+/// The third is not the first: a port already in use leaves `enabled` true
+/// and `running` false, and that gap is precisely the thing a user needs
+/// told. A plain method rather than a `Request` variant because the caller
+/// is in-process (`src-tauri/src/openclaw.rs`) and this adds nothing to the
+/// wire format.
+pub fn realtime_status(daemon: &Daemon) -> RealtimeStatus {
+    let cfg = lock_ignoring_poison(&daemon.realtime_cfg).clone();
+    let running = lock_ignoring_poison(&daemon.realtime)
+        .as_ref()
+        .map(|h| h.addr().port())
+        .unwrap_or(0);
+    RealtimeStatus {
+        enabled: cfg.enabled,
+        port: if running != 0 { running } else { cfg.port },
+        running: running != 0,
+        error: lock_ignoring_poison(&daemon.realtime_error).clone(),
+    }
+}
+
+/// [`realtime_status`]'s answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealtimeStatus {
+    pub enabled: bool,
+    /// The port actually bound when `running`, the configured one otherwise
+    /// -- so a card showing this never names a port nothing is on.
+    pub port: u16,
+    pub running: bool,
+    /// Why the last start attempt failed, when `enabled && !running`.
+    ///
+    /// The token deliberately has no field here, not even as a "is one
+    /// set" bool: the one caller that needs to know reads `[realtime]`
+    /// itself, because the question it is really asking is "would a re-run
+    /// of the install write something different", and that is a question
+    /// about the file the install reads.
+    pub error: Option<String>,
+}
+
 /// Guards `shutdown` against running its cleanup twice.
 ///
 /// In the intended path this is redundant -- `shutdown` is followed
@@ -1278,6 +1497,13 @@ pub fn shutdown(daemon: &Daemon) {
     // there is no longer a restart attempt that could hold it up -- a stop
     // signal is acted on as soon as the current tick's work finishes.
     stop_housekeeping(&daemon.housekeeping);
+    // Before the recorder and the runtime files, for one reason: a session
+    // in `dictate_text` holds the pipeline lock, and stopping the listener
+    // is what stops new ones arriving to queue behind it. In-flight
+    // sessions end on their own within `READ_TIMEOUT`.
+    if let Some(h) = lock_ignoring_poison(&daemon.realtime).take() {
+        h.stop();
+    }
     if let Some(r) = lock_ignoring_poison(&daemon.recorder).as_ref() {
         let _ = r.stop();
     }
@@ -2085,6 +2311,14 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
                     // lock nesting of any kind (invariant 12).
                     *lock_ignoring_poison(&daemon.models_cfg) = new_cfg.models.clone();
 
+                    // Same argument as `[models]` above, one section over:
+                    // `--reload` is documented as applying every reloadable
+                    // section, and `[realtime]` is one. A hand-edited port
+                    // that needed a restart while the same change made in
+                    // the settings window did not would be the exact
+                    // inconsistency this block already exists to prevent.
+                    sync_realtime(daemon, &new_cfg.realtime);
+
                     // The other moment a user picks this backend, and the
                     // other moment there is someone at the keyboard to
                     // answer the portal's dialog. Idempotent and cheap.
@@ -2192,6 +2426,12 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
             // thread reads the idle timeout on every tick, and a user who
             // changes it in Settings must not have to restart for it.
             *lock_ignoring_poison(&daemon.models_cfg) = new_cfg.models.clone();
+
+            // Starts, stops or re-binds the realtime endpoint. A no-op
+            // unless `[realtime]` actually changed -- see `sync_realtime`,
+            // which compares against the config the running listener was
+            // started from rather than trusting the caller to have noticed.
+            sync_realtime(daemon, &new_cfg.realtime);
 
             if new_cfg.audio != old.audio {
                 *lock_ignoring_poison(&daemon.audio_cfg) = new_cfg.audio.clone();
@@ -3340,6 +3580,7 @@ mod tests {
             models_loaded: AtomicBool::new(false),
             last_activity: Mutex::new(Instant::now()),
             models_cfg: Mutex::new(ModelsConfig::default()),
+            realtime_cfg: Mutex::new(RealtimeConfig::default()),
             window_class: Mutex::new(None),
             config_path: config_path.clone(),
             recording_epoch: AtomicU64::new(0),
@@ -3347,7 +3588,9 @@ mod tests {
             normalize_enabled,
             normalize_available: AtomicBool::new(false),
             fatal_error: Mutex::new(None),
-        config_notice: Mutex::new(None),
+            config_notice: Mutex::new(None),
+            realtime: Mutex::new(None),
+            realtime_error: Mutex::new(None),
             housekeeping: Mutex::new(None),
             last_timings: Mutex::new(None),
             sink,
@@ -3434,6 +3677,7 @@ mod tests {
             models_loaded: AtomicBool::new(false),
             last_activity: Mutex::new(Instant::now()),
             models_cfg: Mutex::new(ModelsConfig::default()),
+            realtime_cfg: Mutex::new(RealtimeConfig::default()),
             window_class: Mutex::new(None),
             config_path: PathBuf::from("/nonexistent/yappr-test/config.toml"),
             recording_epoch: AtomicU64::new(0),
@@ -3441,7 +3685,9 @@ mod tests {
             normalize_enabled: false,
             normalize_available: AtomicBool::new(false),
             fatal_error: Mutex::new(None),
-        config_notice: Mutex::new(None),
+            config_notice: Mutex::new(None),
+            realtime: Mutex::new(None),
+            realtime_error: Mutex::new(None),
             housekeeping: Mutex::new(None),
             last_timings: Mutex::new(None),
             sink,

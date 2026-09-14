@@ -212,6 +212,256 @@ const PASTE_KEY_TIMEOUT: Duration = Duration::from_secs(5);
 /// races that handoff without a small settle.
 const PASTE_SETTLE: Duration = Duration::from_millis(100);
 
+/// Pause between the paste chord being delivered and the previous clipboard
+/// contents being written back (`[inject] restore_clipboard`).
+///
+/// The chord returns once the key events have been *sent*; the target
+/// application still has to receive them, ask the compositor for the
+/// selection and read it. Restoring inside that window hands it the old text
+/// instead of the dictation, which is the one way this feature can go wrong
+/// and is invisible from here -- nothing reports which bytes a client read.
+/// 300 ms is what `handy-paste.sh`, the reference paste script this
+/// behaviour is borrowed from, sleeps before doing the same thing;
+/// `restore_clipboard = false` is the way out for an application slower
+/// than that.
+const CLIPBOARD_RESTORE_SETTLE: Duration = Duration::from_millis(300);
+
+/// Above this the previous clipboard is left alone rather than carried
+/// through memory and pushed back down a pipe. A dictation is not the moment
+/// to copy someone's 200 MB screenshot twice, and the cost of skipping is
+/// one manual re-copy of something they still have open.
+const CLIPBOARD_SNAPSHOT_MAX: usize = 4 * 1024 * 1024;
+
+/// What the clipboard held before a transcript was staged there, in the one
+/// MIME type it will be handed back as.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClipboardSnapshot {
+    mime: String,
+    bytes: Vec<u8>,
+}
+
+/// Whether `mime` names text, for the two places the answer changes what is
+/// done with it: `wl-paste` appends a newline to text output (and only text
+/// output), and a text snapshot is the one that has to survive a round trip
+/// byte-for-byte. The bare X11 atom names are in the list because
+/// `wl-paste --list-types` reports them for anything an XWayland client
+/// copied.
+fn is_text_mime(mime: &str) -> bool {
+    mime.starts_with("text/")
+        || ["utf8_string", "string", "text"].contains(&mime.to_ascii_lowercase().as_str())
+}
+
+/// Which of the offered MIME types to snapshot, given `wl-paste
+/// --list-types`' output.
+///
+/// Text first, then whatever was listed first -- which is `wl-paste`'s own
+/// rule when it is given no `--type`, so the snapshot is exactly what a
+/// manual Ctrl+V would have produced. Only one type is taken: an offer
+/// carries several (an HTML selection lists `text/html` *and* `text/plain`)
+/// and yappr has no way to re-offer all of them, so the one a paste would
+/// have used is the honest reconstruction.
+fn preferred_mime(list_types: &str) -> Option<String> {
+    let types: Vec<&str> =
+        list_types.lines().map(str::trim).filter(|line| !line.is_empty()).collect();
+    let exact = |want: &str| types.iter().find(|t| t.eq_ignore_ascii_case(want)).copied();
+    exact("text/plain;charset=utf-8")
+        .or_else(|| exact("text/plain"))
+        .or_else(|| types.iter().find(|t| is_text_mime(t)).copied())
+        .or_else(|| types.first().copied())
+        .map(str::to_string)
+}
+
+/// Runs `wl-paste` under I3's timeout and returns its stdout, or `None` for
+/// every way it can decline to answer.
+///
+/// All of those ways are ordinary: an empty clipboard exits non-zero with
+/// "No selection", and a desktop without `wl-clipboard` installed cannot
+/// spawn it at all. Neither is a dictation failure -- the transcript is
+/// already in the clipboard by the time this matters -- so they are logged
+/// at debug and the restore is simply skipped. A warning here would fire on
+/// every dictation for a user who has nothing copied.
+fn wl_paste(args: &[&str]) -> Option<Vec<u8>> {
+    let mut cmd = Command::new("wl-paste");
+    cmd.args(args);
+    let out = match procutil::run_with_timeout(cmd, CLIPBOARD_TIMEOUT, None) {
+        Ok(out) => out,
+        Err(e) => {
+            tracing::debug!(?args, error = %e, "wl-paste did not run; clipboard not restored");
+            return None;
+        }
+    };
+    if !out.status.success() {
+        tracing::debug!(
+            ?args,
+            status = %out.status,
+            output = %diagnostic(
+                String::from_utf8_lossy(&out.stdout).trim(),
+                String::from_utf8_lossy(&out.stderr).trim(),
+            ),
+            "wl-paste declined; clipboard not restored"
+        );
+        return None;
+    }
+    Some(out.stdout)
+}
+
+/// Reads the clipboard as it stands, before a transcript is staged over it.
+///
+/// `None` means "restore nothing", which leaves the transcript in the
+/// clipboard -- the behaviour every one of these backends had before the
+/// restore existed.
+fn clipboard_snapshot() -> Option<ClipboardSnapshot> {
+    let listed = wl_paste(&["--list-types"])?;
+    let mime = preferred_mime(&String::from_utf8_lossy(&listed))?;
+    // `--no-newline` for text only: `wl-paste` appends one to text output,
+    // and without this every dictation would grow the restored entry by a
+    // newline. Binary data is taken as it comes.
+    let mut args = vec!["--type", mime.as_str()];
+    if is_text_mime(&mime) {
+        args.push("--no-newline");
+    }
+    let bytes = wl_paste(&args)?;
+    if bytes.is_empty() {
+        return None;
+    }
+    if bytes.len() > CLIPBOARD_SNAPSHOT_MAX {
+        tracing::debug!(
+            bytes = bytes.len(),
+            limit = CLIPBOARD_SNAPSHOT_MAX,
+            %mime,
+            "clipboard contents too large to put back; leaving the transcript in place"
+        );
+        return None;
+    }
+    Some(ClipboardSnapshot { mime, bytes })
+}
+
+/// Writes a snapshot back, which is what pushes the user's own entry to the
+/// top of their clipboard history again and leaves the transcript one step
+/// down in it.
+///
+/// The type is passed explicitly rather than letting `wl-copy` infer one
+/// from the bytes: inference reads the *content*, so a restored shell
+/// snippet or XML document would come back under a different MIME type than
+/// it went in with.
+///
+/// Failure is logged and swallowed. The paste has already happened by the
+/// time this runs -- the user has their dictation -- so nothing here may
+/// turn a successful injection into a clipboard fallback.
+fn clipboard_restore(snapshot: &ClipboardSnapshot) {
+    let mut cmd = Command::new("wl-copy");
+    cmd.arg("--type").arg(&snapshot.mime);
+    match procutil::run_with_timeout(cmd, CLIPBOARD_TIMEOUT, Some(&snapshot.bytes)) {
+        Ok(out) if out.status.success() => tracing::debug!(
+            mime = %snapshot.mime,
+            bytes = snapshot.bytes.len(),
+            "previous clipboard contents restored"
+        ),
+        Ok(out) => tracing::warn!(
+            mime = %snapshot.mime,
+            status = %out.status,
+            output = %diagnostic(
+                String::from_utf8_lossy(&out.stdout).trim(),
+                String::from_utf8_lossy(&out.stderr).trim(),
+            ),
+            "could not put the previous clipboard contents back; the transcript is still there"
+        ),
+        Err(e) => tracing::warn!(
+            mime = %snapshot.mime,
+            error = %e,
+            "could not put the previous clipboard contents back; the transcript is still there"
+        ),
+    }
+}
+
+/// The three clipboard operations a chord-pressing backend performs, behind
+/// a trait for exactly one reason: the ordering below is the feature, and a
+/// test of it must not swap out what the developer running `cargo test` has
+/// copied.
+trait Clipboard {
+    fn snapshot(&self) -> Option<ClipboardSnapshot>;
+    fn stage(&self, text: &str, target_class: Option<&str>) -> Result<(), InjectError>;
+    fn restore(&self, snapshot: &ClipboardSnapshot);
+}
+
+/// The real one: `wl-paste` to read, [`ClipboardInjector`] to write.
+struct WlClipboard;
+
+impl Clipboard for WlClipboard {
+    fn snapshot(&self) -> Option<ClipboardSnapshot> {
+        clipboard_snapshot()
+    }
+
+    fn stage(&self, text: &str, target_class: Option<&str>) -> Result<(), InjectError> {
+        ClipboardInjector.inject(text, target_class)
+    }
+
+    fn restore(&self, snapshot: &ClipboardSnapshot) {
+        clipboard_restore(snapshot);
+    }
+}
+
+/// The shared body of the two backends that paste rather than type: read
+/// what the clipboard holds, stage the transcript over it, let the
+/// compositor hand the new offer to the focused client, press `press`, and
+/// then put the old contents back.
+///
+/// The order is the whole of it, which is why this is one function rather
+/// than a copy in each backend. Three parts of it are decisions:
+///
+///   - **The snapshot is taken before staging**, because staging is what
+///     destroys it. A restore-capable paste script has to do the same thing
+///     in the same order (see [`ScriptInjector`], which is why yappr does
+///     not pre-copy for it).
+///   - **A failed press restores nothing.** The transcript staying in the
+///     clipboard *is* the fallback the user is about to be notified about
+///     (invariant 1); handing the old contents back would take it away.
+///   - **An empty clipboard restores nothing either** -- `snapshot` answers
+///     `None` -- because the alternative is `wl-copy --clear`, which would
+///     leave a user with no clipboard-history manager nothing to paste.
+///
+/// `settle` and `restore_settle` are parameters rather than the two consts
+/// directly so the ordering test does not have to sleep through them.
+fn paste_through_clipboard(
+    clipboard: &dyn Clipboard,
+    text: &str,
+    target_class: Option<&str>,
+    restore_previous: bool,
+    settle: Duration,
+    restore_settle: Duration,
+    press: &dyn Fn() -> Result<(), InjectError>,
+) -> Result<(), InjectError> {
+    let previous = if restore_previous { clipboard.snapshot() } else { None };
+    clipboard.stage(text, target_class)?;
+    std::thread::sleep(settle);
+    let pressed = press();
+    if pressed.is_ok() {
+        if let Some(previous) = previous {
+            std::thread::sleep(restore_settle);
+            clipboard.restore(&previous);
+        }
+    }
+    pressed
+}
+
+/// The warning both chord-pressing backends emit when they are about to
+/// press a chord chosen from a window class nobody could name.
+///
+/// Verbatim in both because it is the same hole with the same consequence:
+/// `ydotool` exits 0 and the portal reports success, so the plain Ctrl+V a
+/// terminal ignores produces no text and no error. This warning is the only
+/// signal there is, and it is what retired the ydotool backend once already.
+fn warn_if_the_chord_was_guessed(chord: PasteChord, target_class: Option<&str>) {
+    if target_class.is_none() && chord == PasteChord::Auto {
+        tracing::warn!(
+            "no target window class (no provider could name the focused window: \
+             no hyprctl, and no accessibility bus or an app not on it); \
+             pasting with plain Ctrl+V, which terminals ignore -- \
+             set [inject] paste_chord = \"ctrl_shift_v\" if you dictate into a terminal"
+        );
+    }
+}
+
 /// The paste chord for [`YdotoolInjector`], as raw `keycode:state` pairs
 /// for `ydotool key`: LEFTCTRL (29) [+ LEFTSHIFT (42)] + V (47), pressed
 /// and released in nested order. Raw keycodes on purpose -- key *positions*
@@ -274,14 +524,24 @@ fn wants_shift(chord: PasteChord, class: Option<&str>, terminal_classes: &[Strin
 /// clipboard backend offers (invariant 1 holds). Setting ydotoold up is the
 /// user's call, not the app's (same reason `hypr.rs` prints a config block
 /// rather than applying one).
+///
+/// Unless `[inject] restore_clipboard` is off, what the clipboard held
+/// before the dictation is read first and written back once the paste has
+/// landed -- see [`paste_through_clipboard`], which is the shared body of
+/// this backend and [`LibeiInjector`].
 pub struct YdotoolInjector {
     terminal_classes: Vec<String>,
     paste_chord: PasteChord,
+    restore_clipboard: bool,
 }
 
 impl YdotoolInjector {
     pub fn new(cfg: &InjectConfig) -> Self {
-        Self { terminal_classes: cfg.terminal_classes.clone(), paste_chord: cfg.paste_chord }
+        Self {
+            terminal_classes: cfg.terminal_classes.clone(),
+            paste_chord: cfg.paste_chord,
+            restore_clipboard: cfg.restore_clipboard,
+        }
     }
 }
 
@@ -291,28 +551,23 @@ impl TextInjector for YdotoolInjector {
     }
 
     fn inject(&self, text: &str, target_class: Option<&str>) -> Result<(), InjectError> {
-        ClipboardInjector.inject(text, target_class)?;
-        std::thread::sleep(PASTE_SETTLE);
         let shift = wants_shift(self.paste_chord, target_class, &self.terminal_classes);
-        if target_class.is_none() && self.paste_chord == PasteChord::Auto {
-            // Not a failure -- `ydotool` will exit 0 and this function will
-            // return `Ok` -- which is exactly why it has to be said out loud.
-            // A terminal ignores the plain Ctrl+V that is about to be sent,
-            // so the user gets no text and no error. Naming the override
-            // here is the only warning they will ever see, and this silent
-            // hole is what retired the backend once already.
-            tracing::warn!(
-                "no target window class (no provider could name the focused window: \
-                 no hyprctl, and no accessibility bus or an app not on it); \
-                 pasting with plain Ctrl+V, which terminals ignore -- \
-                 set [inject] paste_chord = \"ctrl_shift_v\" if you dictate into a terminal"
-            );
-        }
-        run_backend(
-            "ydotool",
-            std::ffi::OsStr::new("ydotool"),
-            paste_key_argv(shift),
-            PASTE_KEY_TIMEOUT,
+        warn_if_the_chord_was_guessed(self.paste_chord, target_class);
+        paste_through_clipboard(
+            &WlClipboard,
+            text,
+            target_class,
+            self.restore_clipboard,
+            PASTE_SETTLE,
+            CLIPBOARD_RESTORE_SETTLE,
+            &|| {
+                run_backend(
+                    "ydotool",
+                    std::ffi::OsStr::new("ydotool"),
+                    paste_key_argv(shift),
+                    PASTE_KEY_TIMEOUT,
+                )
+            },
         )
     }
 }
@@ -396,6 +651,7 @@ impl TextInjector for ScriptInjector {
 pub struct LibeiInjector {
     terminal_classes: Vec<String>,
     paste_chord: PasteChord,
+    restore_clipboard: bool,
 }
 
 impl LibeiInjector {
@@ -406,7 +662,11 @@ impl LibeiInjector {
     /// the places a user has actually chosen this backend -- see
     /// [`crate::libei::start`].
     pub fn new(cfg: &InjectConfig) -> Self {
-        Self { terminal_classes: cfg.terminal_classes.clone(), paste_chord: cfg.paste_chord }
+        Self {
+            terminal_classes: cfg.terminal_classes.clone(),
+            paste_chord: cfg.paste_chord,
+            restore_clipboard: cfg.restore_clipboard,
+        }
     }
 }
 
@@ -420,30 +680,30 @@ impl TextInjector for LibeiInjector {
     }
 
     fn inject(&self, text: &str, target_class: Option<&str>) -> Result<(), InjectError> {
-        ClipboardInjector.inject(text, target_class)?;
-        std::thread::sleep(PASTE_SETTLE);
         let shift = wants_shift(self.paste_chord, target_class, &self.terminal_classes);
-        if target_class.is_none() && self.paste_chord == PasteChord::Auto {
-            // Verbatim the hole `YdotoolInjector` warns about, for the same
-            // reason and with the same consequence: the portal will deliver
-            // the plain Ctrl+V that is about to be sent and report success,
-            // a terminal will ignore it, and the user gets no text and no
-            // error. This warning is the only signal there is.
-            tracing::warn!(
-                "no target window class (no provider could name the focused window: \
-                 no hyprctl, and no accessibility bus or an app not on it); \
-                 pasting with plain Ctrl+V, which terminals ignore -- \
-                 set [inject] paste_chord = \"ctrl_shift_v\" if you dictate into a terminal"
-            );
-        }
-        crate::libei::press_chord(shift).map_err(|e| match e {
-            crate::libei::PortalError::Timeout(timeout) => {
-                InjectError::Timeout { backend: "libei", timeout }
-            }
-            crate::libei::PortalError::Failed(detail) => {
-                InjectError::Portal { backend: "libei", detail }
-            }
-        })
+        // The same hole `YdotoolInjector` warns about, for the same reason
+        // and with the same consequence: the portal delivers the plain
+        // Ctrl+V and reports success, a terminal ignores it, and the user
+        // gets no text and no error.
+        warn_if_the_chord_was_guessed(self.paste_chord, target_class);
+        paste_through_clipboard(
+            &WlClipboard,
+            text,
+            target_class,
+            self.restore_clipboard,
+            PASTE_SETTLE,
+            CLIPBOARD_RESTORE_SETTLE,
+            &|| {
+                crate::libei::press_chord(shift).map_err(|e| match e {
+                    crate::libei::PortalError::Timeout(timeout) => {
+                        InjectError::Timeout { backend: "libei", timeout }
+                    }
+                    crate::libei::PortalError::Failed(detail) => {
+                        InjectError::Portal { backend: "libei", detail }
+                    }
+                })
+            },
+        )
     }
 }
 
@@ -1105,6 +1365,173 @@ exit 3"#,
             started.elapsed()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A [`Clipboard`] that touches nothing and writes down what it was
+    /// asked to do, in order. The real one runs `wl-paste`/`wl-copy`, and a
+    /// test that ran those would swap out whatever the developer had copied.
+    #[derive(Default)]
+    struct RecordingClipboard {
+        /// `"snapshot"`, `"stage:<text>"`, `"restore:<bytes>"`, in call order.
+        log: Mutex<Vec<String>>,
+        /// What `snapshot` answers. `None` is an empty clipboard.
+        held: Option<ClipboardSnapshot>,
+    }
+
+    impl RecordingClipboard {
+        fn holding(text: &str) -> Self {
+            Self {
+                held: Some(ClipboardSnapshot {
+                    mime: "text/plain;charset=utf-8".to_string(),
+                    bytes: text.as_bytes().to_vec(),
+                }),
+                ..Self::default()
+            }
+        }
+
+        fn log(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
+        }
+    }
+
+    impl Clipboard for RecordingClipboard {
+        fn snapshot(&self) -> Option<ClipboardSnapshot> {
+            self.log.lock().unwrap().push("snapshot".to_string());
+            self.held.clone()
+        }
+
+        fn stage(&self, text: &str, _target_class: Option<&str>) -> Result<(), InjectError> {
+            self.log.lock().unwrap().push(format!("stage:{text}"));
+            Ok(())
+        }
+
+        fn restore(&self, snapshot: &ClipboardSnapshot) {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("restore:{}", String::from_utf8_lossy(&snapshot.bytes)));
+        }
+    }
+
+    /// `paste_through_clipboard` with both settles skipped and a press that
+    /// records itself into the same log.
+    fn paste_with(
+        clipboard: &RecordingClipboard,
+        restore: bool,
+        press: Result<(), InjectError>,
+    ) -> Result<(), InjectError> {
+        let pressed = Mutex::new(Some(press));
+        paste_through_clipboard(
+            clipboard,
+            "diktat",
+            Some("kitty"),
+            restore,
+            Duration::ZERO,
+            Duration::ZERO,
+            &|| {
+                clipboard.log.lock().unwrap().push("press".to_string());
+                pressed.lock().unwrap().take().expect("the chord is pressed once")
+            },
+        )
+    }
+
+    #[test]
+    fn the_previous_clipboard_is_read_before_staging_and_put_back_after_the_paste() {
+        // The whole feature, and it is entirely an ordering: read first
+        // (staging destroys it), write back last (the target has to have
+        // read the transcript). The user's own entry ends up current again
+        // and the transcript one step down in their clipboard history.
+        let clipboard = RecordingClipboard::holding("was der nutzer kopiert hatte");
+        paste_with(&clipboard, true, Ok(())).unwrap();
+        assert_eq!(
+            clipboard.log(),
+            vec![
+                "snapshot",
+                "stage:diktat",
+                "press",
+                "restore:was der nutzer kopiert hatte",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_paste_leaves_the_transcript_on_the_clipboard() {
+        // Invariant 1 in the shape this feature meets it: the press failed,
+        // so `inject_with_recovery` is about to notify "transcript copied to
+        // clipboard" -- and the transcript has to still be there for that
+        // notification to be true. Restoring here would take it away.
+        let clipboard = RecordingClipboard::holding("was der nutzer kopiert hatte");
+        let err = paste_with(&clipboard, true, Err(InjectError::Mock)).unwrap_err();
+        assert!(matches!(err, InjectError::Mock), "{err:?}");
+        assert_eq!(clipboard.log(), vec!["snapshot", "stage:diktat", "press"]);
+    }
+
+    #[test]
+    fn an_empty_clipboard_is_not_restored_over_the_transcript() {
+        // `wl-copy --clear` would be the alternative, and it would leave a
+        // user without a clipboard-history manager nothing at all to paste.
+        let clipboard = RecordingClipboard::default();
+        paste_with(&clipboard, true, Ok(())).unwrap();
+        assert_eq!(clipboard.log(), vec!["snapshot", "stage:diktat", "press"]);
+    }
+
+    #[test]
+    fn the_clipboard_is_not_even_read_when_the_setting_is_off() {
+        // `restore_clipboard = false` is the escape hatch for an application
+        // that reads the selection after the restore has already happened,
+        // so it must cost nothing at all -- not a `wl-paste` that runs and
+        // is then ignored.
+        let clipboard = RecordingClipboard::holding("was der nutzer kopiert hatte");
+        paste_with(&clipboard, false, Ok(())).unwrap();
+        assert_eq!(clipboard.log(), vec!["stage:diktat", "press"]);
+    }
+
+    #[test]
+    fn both_chord_backends_restore_the_clipboard_by_default() {
+        // The setting a user never touches. Both backends that stage the
+        // transcript themselves read it; nothing else does.
+        let cfg = InjectConfig::default();
+        assert!(cfg.restore_clipboard);
+        assert!(YdotoolInjector::new(&cfg).restore_clipboard);
+        assert!(LibeiInjector::new(&cfg).restore_clipboard);
+        let off = InjectConfig { restore_clipboard: false, ..InjectConfig::default() };
+        assert!(!YdotoolInjector::new(&off).restore_clipboard);
+        assert!(!LibeiInjector::new(&off).restore_clipboard);
+    }
+
+    #[test]
+    fn the_snapshotted_type_is_the_one_a_manual_paste_would_have_used() {
+        // An offer carries several types and only one can be handed back.
+        // Text wins, because that is what `wl-paste` itself picks with no
+        // `--type` -- so the restored entry is what Ctrl+V would have given.
+        assert_eq!(
+            preferred_mime("text/html\ntext/plain;charset=utf-8\ntext/plain\nSTRING\n").as_deref(),
+            Some("text/plain;charset=utf-8")
+        );
+        assert_eq!(preferred_mime("text/html\ntext/plain\n").as_deref(), Some("text/plain"));
+        assert_eq!(preferred_mime("text/html\n").as_deref(), Some("text/html"));
+    }
+
+    #[test]
+    fn a_clipboard_holding_only_an_image_is_snapshotted_under_its_own_type() {
+        // Nothing about the restore is text-specific: a copied screenshot
+        // has to survive a dictation too, which is why the type travels
+        // with the bytes instead of being assumed.
+        assert_eq!(preferred_mime("image/png\n").as_deref(), Some("image/png"));
+        assert!(!is_text_mime("image/png"));
+        assert_eq!(preferred_mime("").as_deref(), None, "an empty offer restores nothing");
+    }
+
+    #[test]
+    fn the_x11_atom_spellings_of_text_count_as_text() {
+        // `wl-paste --list-types` reports these for anything an XWayland
+        // client copied, and they decide whether `--no-newline` is passed --
+        // without it every dictation would grow the restored entry by a
+        // newline.
+        for atom in ["UTF8_STRING", "STRING", "TEXT", "text/plain", "text/html"] {
+            assert!(is_text_mime(atom), "{atom} is text");
+        }
+        assert!(!is_text_mime("application/octet-stream"));
     }
 
     #[test]
