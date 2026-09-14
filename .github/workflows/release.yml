@@ -46,7 +46,11 @@ permissions:
 
 jobs:
   build-appimage:
-    runs-on: blacksmith-4vcpu-ubuntu-2204
+    # GitHub-hosted, deliberately. Blacksmith's `blacksmith-*` labels are
+    # available to organizations only, and this repo is under a user account:
+    # a job asking for one queues forever rather than failing, which looks
+    # exactly like a busy runner pool.
+    runs-on: ubuntu-latest
     # The image, not the runner label, is what pins glibc: an AppImage links
     # against whatever built it and glibc is backwards- but never forwards-
     # compatible, so this has to be the oldest base that still ships
