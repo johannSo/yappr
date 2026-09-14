@@ -26,7 +26,7 @@ const PATHS: Record<string, ReactNode> = {
       <path d="M14.5 6.5l3 3" />
     </>
   ),
-  /// The "KI" pane: two four-point sparks, the shape that has come to mean
+  /// The "AI" pane: two four-point sparks, the shape that has come to mean
   /// "a machine did this". Stroked and hollow like everything else in the
   /// rail -- the filled version reads as a star, and a star in a sidebar
   /// reads as "favourites". Each point is a quadratic whose control point is
@@ -39,14 +39,14 @@ const PATHS: Record<string, ReactNode> = {
     </>
   ),
   /// A toothed ring, not a circle with rays: the eight-spoke version read as a
-  /// sun at 18px, which is a poor label for the "Erweitert" pane.
+  /// sun at 18px, which is a poor label for the "Advanced" pane.
   gear: (
     <>
       <circle cx="12" cy="12" r="3.1" />
       <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9v0a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z" />
     </>
   ),
-  /// A painter's palette for the "Darstellung" pane: a thumb-holed round with
+  /// A painter's palette for the "Appearance" pane: a thumb-holed round with
   /// three wells. Stroked like the rest, so the wells are rings rather than
   /// dots -- filled circles would be the one icon in the rail carrying colour
   /// of its own, in the pane whose whole subject is colour.

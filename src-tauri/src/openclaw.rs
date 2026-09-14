@@ -1,4 +1,4 @@
-//! The KI pane's OpenClaw card: install the plugin, register yappr as
+//! The AI pane's OpenClaw card: install the plugin, register yappr as
 //! OpenClaw's dictation provider, and report honestly on all of it.
 //!
 //! OpenClaw is a separate product with its own config file, its own plugin
@@ -123,7 +123,7 @@ fn find_cli() -> Result<PathBuf, String> {
             return Ok(c);
         }
     }
-    Err("OpenClaw wurde nicht gefunden. Installiere es mit `npm i -g openclaw` und öffne diese Einstellungen erneut.".to_string())
+    Err("OpenClaw was not found. Install it with `npm i -g openclaw` and open these settings again.".to_string())
 }
 
 /// What one CLI call produced: both streams, kept apart, plus the status.
@@ -485,14 +485,14 @@ fn install(daemon: Option<&Arc<Daemon>>) -> Result<Value, String> {
 
     match materialize(&dir) {
         Ok(0) => steps.push(step(
-            "Plugin-Dateien",
+            "Plugin files",
             true,
-            format!("Bereits aktuell in {}", dir.display()),
+            format!("Already up to date in {}", dir.display()),
         )),
         Ok(n) => steps.push(step(
-            "Plugin-Dateien",
+            "Plugin files",
             true,
-            format!("{n} Datei(en) nach {} geschrieben", dir.display()),
+            format!("Wrote {n} file(s) to {}", dir.display()),
         )),
         // Nothing after this can work without the files, and the cause is
         // always local (no permission, no disk), so this one really is
@@ -511,25 +511,25 @@ fn install(daemon: Option<&Arc<Daemon>>) -> Result<Value, String> {
             if resp.ok {
                 let rt = realtime_status(d);
                 if rt.running {
-                    step("Lokaler Endpunkt", true, format!("Läuft auf 127.0.0.1:{}", rt.port))
+                    step("Local endpoint", true, format!("Running on 127.0.0.1:{}", rt.port))
                 } else {
                     step(
-                        "Lokaler Endpunkt",
+                        "Local endpoint",
                         false,
                         rt.error.unwrap_or_else(|| {
-                            format!("Eingeschaltet, aber Port {} antwortet nicht", rt.port)
+                            format!("On, but port {} does not answer", rt.port)
                         }),
                     )
                 }
             } else {
                 step(
-                    "Lokaler Endpunkt",
+                    "Local endpoint",
                     false,
-                    resp.err.unwrap_or_else(|| "unbekannter Fehler".into()),
+                    resp.err.unwrap_or_else(|| "unknown error".into()),
                 )
             }
         }
-        None => step("Lokaler Endpunkt", false, "Kein Daemon in diesem Prozess"),
+        None => step("Local endpoint", false, "No daemon in this process"),
     };
     steps.push(realtime_step);
 
@@ -540,9 +540,9 @@ fn install(daemon: Option<&Arc<Daemon>>) -> Result<Value, String> {
         WRITE_TIMEOUT,
     )?;
     steps.push(step(
-        "In OpenClaw einbinden",
+        "Link into OpenClaw",
         run.ok,
-        if run.ok { format!("Verknüpft mit {dir_arg}") } else { run.diagnostic() },
+        if run.ok { format!("Linked to {dir_arg}") } else { run.diagnostic() },
     ));
 
     let run = run_cli(
@@ -551,9 +551,9 @@ fn install(daemon: Option<&Arc<Daemon>>) -> Result<Value, String> {
         WRITE_TIMEOUT,
     )?;
     steps.push(step(
-        "Plugin aktivieren",
+        "Enable the plugin",
         run.ok,
-        if run.ok { "Aktiviert".to_string() } else { run.diagnostic() },
+        if run.ok { "Enabled".to_string() } else { run.diagnostic() },
     ));
 
     let realtime = realtime_config();
@@ -564,7 +564,7 @@ fn install(daemon: Option<&Arc<Daemon>>) -> Result<Value, String> {
         WRITE_TIMEOUT,
     )?;
     steps.push(step(
-        "Als Diktat-Anbieter eintragen",
+        "Register as the dictation provider",
         run.ok,
         if run.ok {
             format!("{STREAMING_PATH}.provider = \"{PLUGIN_ID}\"")
@@ -595,19 +595,19 @@ fn install(daemon: Option<&Arc<Daemon>>) -> Result<Value, String> {
         WRITE_TIMEOUT,
     )?;
     steps.push(step(
-        "Plugin-Einstellungen ausfüllen",
+        "Fill in the plugin settings",
         run.ok,
         if run.ok {
-            format!("127.0.0.1:{} in OpenClaws Plugin-Seite eingetragen", realtime.port)
+            format!("Entered 127.0.0.1:{} on OpenClaw's plugin page", realtime.port)
         } else {
             run.diagnostic()
         },
     ));
 
     steps.push(step(
-        "Hinweis",
+        "Note",
         true,
-        "OpenClaw lädt neu eingebundene Plugins erst beim nächsten Start des Gateways: `openclaw gateway restart`.",
+        "OpenClaw loads a newly linked plugin only on the gateway's next start: `openclaw gateway restart`.",
     ));
 
     Ok(json!({ "steps": steps, "status": status(daemon) }))
@@ -634,10 +634,10 @@ fn remove(daemon: Option<&Arc<Daemon>>) -> Result<Value, String> {
             WRITE_TIMEOUT,
         )?;
         steps.push(step(
-            "Auswahl zurücknehmen",
+            "Undo the selection",
             run.ok,
             if run.ok {
-                "OpenClaw wählt wieder automatisch".to_string()
+                "OpenClaw picks one automatically again".to_string()
             } else {
                 run.diagnostic()
             },
@@ -649,9 +649,9 @@ fn remove(daemon: Option<&Arc<Daemon>>) -> Result<Value, String> {
         WRITE_TIMEOUT,
     )?;
     steps.push(step(
-        "Anbieter-Eintrag entfernen",
+        "Remove the provider entry",
         run.ok,
-        if run.ok { "Entfernt".to_string() } else { run.diagnostic() },
+        if run.ok { "Removed".to_string() } else { run.diagnostic() },
     ));
 
     // `plugins uninstall` alone, deliberately: it removes the install
@@ -663,9 +663,9 @@ fn remove(daemon: Option<&Arc<Daemon>>) -> Result<Value, String> {
     // 2026-09-14.
     let run = run_cli(&cli, &["plugins", "uninstall", PLUGIN_ID, "--force"], WRITE_TIMEOUT)?;
     steps.push(step(
-        "Plugin entfernen",
+        "Remove the plugin",
         run.ok,
-        if run.ok { "Aus OpenClaw entfernt".to_string() } else { run.diagnostic() },
+        if run.ok { "Removed from OpenClaw".to_string() } else { run.diagnostic() },
     ));
 
     // `plugins uninstall` leaves `plugins.entries.yappr.enabled = false`
@@ -676,9 +676,9 @@ fn remove(daemon: Option<&Arc<Daemon>>) -> Result<Value, String> {
     // nothing but that flag: a `config` block under it would be the user's.
     if let Some(run) = clean_own_entry(&cli) {
         steps.push(step(
-            "Eintrag entfernen",
+            "Remove the entry",
             run.ok,
-            if run.ok { "Entfernt".to_string() } else { run.diagnostic() },
+            if run.ok { "Removed".to_string() } else { run.diagnostic() },
         ));
     }
 
@@ -689,10 +689,10 @@ fn remove(daemon: Option<&Arc<Daemon>>) -> Result<Value, String> {
     // provider keeps theirs untouched.
     if let Some(run) = clean_empty_streaming(&cli) {
         steps.push(step(
-            "Aufräumen",
+            "Tidy up",
             run.ok,
             if run.ok {
-                "Leeren Abschnitt entfernt".to_string()
+                "Removed the empty section".to_string()
             } else {
                 run.diagnostic()
             },
@@ -700,9 +700,9 @@ fn remove(daemon: Option<&Arc<Daemon>>) -> Result<Value, String> {
     }
 
     steps.push(step(
-        "Lokaler Endpunkt",
+        "Local endpoint",
         true,
-        "Bleibt unverändert — das ist yapprs eigene Einstellung und steht unten.",
+        "Left untouched — that is yappr's own setting, and it is below.",
     ));
 
     Ok(json!({ "steps": steps, "status": status(daemon) }))

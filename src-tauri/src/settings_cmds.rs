@@ -1,5 +1,5 @@
 //! The settings window's commands: the original three config/device calls,
-//! the pair backing the "Beim Anmelden starten" toggle (task 16), and the
+//! the pair backing the "Start at login" toggle (task 16), and the
 //! version string its sidebar foot shows.
 //!
 //! The first three were socket calls in `settings-tauri`; they are direct
@@ -63,7 +63,7 @@
 //!   open it regardless of mode. Both branches of `setup()` now `app.manage`
 //!   a [`Server`] unconditionally, so a settings command's `State` extraction
 //!   can never fail; a `None` inside it means "no daemon in this process"
-//!   and turns into a stated German error instead.
+//!   and turns into a stated error instead.
 
 use std::sync::Arc;
 
@@ -74,12 +74,12 @@ use yappr_core::server::{dispatch, Daemon};
 
 /// What `setup()` in `lib.rs` manages in both the normal and `--replay`
 /// branches, so a settings command's `tauri::State` extraction always
-/// succeeds -- only the body's own German error varies with whether a
+/// succeeds -- only the body's own error varies with whether a
 /// daemon actually exists in this process.
 pub struct Server(pub Option<Arc<Daemon>>);
 
 const NO_DAEMON: &str =
-    "Kein Daemon in diesem Prozess (Replay-Modus) -- Einstellungen sind nicht verfügbar.";
+    "No daemon in this process (replay mode) -- settings are unavailable.";
 
 impl Server {
     /// The daemon to dispatch against, or [`NO_DAEMON`] -- pulled out as its
@@ -165,7 +165,7 @@ const AUTOSTART_DESKTOP_ENTRY: &str = "\
 Type=Application
 Version=1.0
 Name=yappr
-Comment=Startet das Diktat-Overlay im Hintergrund
+Comment=Starts the dictation overlay in the background
 Exec=yappr
 StartupNotify=false
 Terminal=false
@@ -258,14 +258,14 @@ pub fn autostart_status() -> serde_json::Value {
     serde_json::json!({ "enabled": enabled })
 }
 
-/// Turns "Beim Anmelden starten" on or off by writing or removing the real
+/// Turns "Start at login" on or off by writing or removing the real
 /// autostart entry. Same reasoning as [`autostart_status`] on why this is a
 /// plain synchronous command: a single small write or remove, not the kind
 /// of work `settings_cmds.rs`'s module doc reserves `spawn_blocking` for.
 #[tauri::command]
 pub fn set_autostart(enabled: bool) -> Result<(), String> {
     set_autostart_at(&yappr_core::paths::autostart_desktop_file(), enabled).map_err(|e| {
-        format!("Autostart-Eintrag konnte nicht geschrieben werden: {e}")
+        format!("the autostart entry could not be written: {e}")
     })
 }
 
@@ -281,7 +281,7 @@ async fn call(
     let daemon = server.daemon()?;
     let resp = tauri::async_runtime::spawn_blocking(move || dispatch(&daemon, req))
         .await
-        .map_err(|e| format!("interner Fehler: {e}"))?;
+        .map_err(|e| format!("internal error: {e}"))?;
     to_json(resp)
 }
 
@@ -293,7 +293,7 @@ fn to_json(resp: Response) -> Result<serde_json::Value, String> {
     if resp.ok {
         Ok(v)
     } else {
-        Err(resp.err.unwrap_or_else(|| "Unbekannter Fehler".into()))
+        Err(resp.err.unwrap_or_else(|| "Unknown error".into()))
     }
 }
 
@@ -719,7 +719,7 @@ mod tests {
 
     /// The exact scenario Task 9 exists to close off: `--replay` mode
     /// manages `Server(None)` (see `lib.rs`'s `setup()`), and a settings
-    /// command must turn that into a stated German error rather than
+    /// command must turn that into a stated error rather than
     /// panicking or failing Tauri's own generic "state not managed" way --
     /// which is what a bare `tauri::State<'_, Arc<Daemon>>` parameter would
     /// have done the moment a tray's left click could reach this window in
@@ -766,9 +766,9 @@ mod tests {
     /// fallback exists for the case it doesn't -- pinned directly since nothing
     /// else exercises that branch.
     #[test]
-    fn a_rejection_with_no_reason_falls_back_to_a_generic_german_message() {
+    fn a_rejection_with_no_reason_falls_back_to_a_generic_message() {
         let mut resp = Response::err("placeholder");
         resp.err = None;
-        assert_eq!(to_json(resp).unwrap_err(), "Unbekannter Fehler");
+        assert_eq!(to_json(resp).unwrap_err(), "Unknown error");
     }
 }

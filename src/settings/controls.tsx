@@ -60,7 +60,7 @@ export function InfoTip({ text }: { text: string }) {
       <button
         type="button"
         className="infotip-btn"
-        aria-label="Hinweis"
+        aria-label="More information"
         aria-describedby={open ? id : undefined}
         onFocus={() => setOpen(true)}
         onBlur={() => setOpen(false)}
@@ -94,8 +94,8 @@ export function ResetButton({ onClick }: { onClick: () => void }) {
       type="button"
       className="reset"
       onClick={onClick}
-      title="Auf Standard zurücksetzen"
-      aria-label="Auf Standard zurücksetzen"
+      title="Reset to default"
+      aria-label="Reset to default"
       // The gutter it sits in is permanently reserved (see `.row-reset`), so
       // this can scale in and out without moving anything around it.
       initial={{ opacity: 0, scale: 0.6 }}
@@ -225,16 +225,16 @@ export function DeviceSelect({
   return (
     <div className="select">
       <select value={value} onChange={(e) => onChange(e.target.value, "now")}>
-        <option value={SYSTEM_DEFAULT_DEVICE}>Systemstandard</option>
+        <option value={SYSTEM_DEFAULT_DEVICE}>System default</option>
         {/* A device configured by name that `cpal` cannot currently see — an
             unplugged interface, say — must stay selected rather than being
             quietly replaced by the first entry of the list. */}
         {!listed && value !== SYSTEM_DEFAULT_DEVICE && (
-          <option value={value}>{value} (nicht gefunden)</option>
+          <option value={value}>{value} (not found)</option>
         )}
         {devices.map((d) => (
           <option key={d.name} value={d.name}>
-            {d.is_default ? `${d.name} (Systemstandard)` : d.name}
+            {d.is_default ? `${d.name} (system default)` : d.name}
           </option>
         ))}
       </select>
@@ -331,7 +331,7 @@ export function StringListRow({
         <div className="add-inline">
           <input
             type="text"
-            placeholder="Neuer Begriff"
+            placeholder="New term"
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             onKeyDown={(e) => {
@@ -342,13 +342,13 @@ export function StringListRow({
             }}
           />
           <button type="button" className="add" onClick={add} disabled={!draft.trim()}>
-            Hinzufügen
+            Add
           </button>
         </div>
       }
       block={
         items.length === 0 ? (
-          <p className="empty">Noch keine Begriffe.</p>
+          <p className="empty">No terms yet.</p>
         ) : (
           <div className="chips">
             {/* `layout` on each chip, so removing one from the middle closes
@@ -369,7 +369,7 @@ export function StringListRow({
                   <button
                     type="button"
                     onClick={() => onChange(items.filter((_, j) => j !== i))}
-                    aria-label={`${item} entfernen`}
+                    aria-label={`Remove ${item}`}
                   >
                     <Icon name="close" className="icon-xs" />
                   </button>
@@ -447,7 +447,7 @@ export function TableEditor({
                     value={value === null || value === undefined ? "" : String(value)}
                     onChange={(e) => setCell(i, c, e.target.value === "" ? null : e.target.value)}
                   >
-                    <option value="">(vererbt)</option>
+                    <option value="">(inherited)</option>
                     {options.map((o) => (
                       <option key={o} value={o}>
                         {o}
@@ -469,19 +469,19 @@ export function TableEditor({
               type="button"
               className="icon-btn danger"
               onClick={() => onChange(rows.filter((_, j) => j !== i))}
-              title="Zeile entfernen"
-              aria-label="Zeile entfernen"
+              title="Remove row"
+              aria-label="Remove row"
             >
               <Icon name="trash" className="icon-sm" />
             </button>
           </motion.div>
         ))}
       </AnimatePresence>
-      {rows.length === 0 && <p className="empty">Noch keine Einträge.</p>}
+      {rows.length === 0 && <p className="empty">No entries yet.</p>}
       <div className="table-foot">
         <button type="button" className="add" onClick={addRow}>
           <Icon name="plus" className="icon-sm" />
-          Zeile hinzufügen
+          Add row
         </button>
       </div>
     </div>

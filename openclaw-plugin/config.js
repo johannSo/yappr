@@ -267,7 +267,7 @@ export function normalizeProviderConfig(rawConfig, cfg) {
 	//
 	// The form wins. A user editing a field in front of them and seeing nothing
 	// happen is the worse failure by far, and the two copies only diverge if
-	// someone edits one of them: yappr's "Einrichten" writes both, with the same
+	// someone edits one of them: yappr's "Set up" writes both, with the same
 	// values, in the same run.
 	const raw = {
 		...readNestedYapprConfig(rawConfig),

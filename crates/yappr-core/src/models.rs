@@ -45,7 +45,7 @@ pub struct AsrModelSpec {
     pub key: AsrModel,
     pub artifact: Artifact,
     pub flavor: AsrFlavor,
-    /// German dropdown label. Names the language, because that is what
+    /// The dropdown label. Names the language, because that is what
     /// actually decides the choice.
     pub display: &'static str,
 }
@@ -62,7 +62,7 @@ pub static ASR_MODELS: [AsrModelSpec; 4] = [
             archive: true,
         },
         flavor: AsrFlavor::Offline,
-        display: "Parakeet TDT 0.6b v3 — mehrsprachig",
+        display: "Parakeet TDT 0.6b v3 — multilingual",
     },
     AsrModelSpec {
         key: AsrModel::ParakeetUnifiedEn,
@@ -74,7 +74,7 @@ pub static ASR_MODELS: [AsrModelSpec; 4] = [
             archive: true,
         },
         flavor: AsrFlavor::Offline,
-        display: "Parakeet Unified 0.6b — nur Englisch",
+        display: "Parakeet Unified 0.6b — English only",
     },
     AsrModelSpec {
         key: AsrModel::Nemotron35,
@@ -91,7 +91,7 @@ pub static ASR_MODELS: [AsrModelSpec; 4] = [
             archive: true,
         },
         flavor: AsrFlavor::CacheAwareStreaming,
-        display: "Nemotron 3.5 ASR 0.6b — mehrsprachig",
+        display: "Nemotron 3.5 ASR 0.6b — multilingual",
     },
     AsrModelSpec {
         key: AsrModel::ParakeetPrimelineDe,
@@ -108,7 +108,7 @@ pub static ASR_MODELS: [AsrModelSpec; 4] = [
             archive: true,
         },
         flavor: AsrFlavor::Offline,
-        display: "primeline Parakeet 0.6b — nur Deutsch, genaueste deutsche Erkennung",
+        display: "primeline Parakeet 0.6b — German only, most accurate for German",
     },
 ];
 

@@ -654,11 +654,11 @@ body::before {
 }
 
 /* Sentence case at reading size, not 11px tracked-out capitals. `titleFor`
-   already returns a written German title ("Aufnahme", "Texteingabe"); the old
-   rule shouted it, which is how a settings window ends up looking like a
-   dashboard. Capitals also cost the most where they are used most: a
-   condensed German compound in all caps is the hardest thing in this window
-   to read at a glance. */
+   already returns a written title ("Microphone & recording", "Text entry");
+   the old rule shouted it, which is how a settings window ends up looking
+   like a dashboard. Capitals also cost the most where they are used most: a
+   long compound heading in all caps is the hardest thing in this window to
+   read at a glance. */
 .group-head h2 {
   margin: 0;
   font-family: var(--font-display);

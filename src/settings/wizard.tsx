@@ -27,10 +27,10 @@ const FADE = { type: "spring", bounce: 0, duration: 0.24 } as const;
 /// match `models::ASR_MODELS`; an unknown one is rejected by the config's
 /// deny_unknown_fields on save rather than silently defaulted.
 export const ASR_MODELS: { value: string; label: string }[] = [
-  { value: "parakeet-tdt-v3", label: "Parakeet TDT v3 — mehrsprachig (Voreinstellung)" },
-  { value: "parakeet-primeline-de", label: "primeline Parakeet — nur Deutsch, am genauesten" },
-  { value: "parakeet-unified-en", label: "Parakeet Unified — nur Englisch" },
-  { value: "nemotron-3.5", label: "Nemotron 3.5 — mehrsprachig" },
+  { value: "parakeet-tdt-v3", label: "Parakeet TDT v3 — multilingual (default)" },
+  { value: "parakeet-primeline-de", label: "primeline Parakeet — German only, most accurate" },
+  { value: "parakeet-unified-en", label: "Parakeet Unified — English only" },
+  { value: "nemotron-3.5", label: "Nemotron 3.5 — multilingual" },
 ];
 
 export const STEPS = ["welcome", "models", "shortcuts", "done"] as const;
@@ -79,8 +79,8 @@ export type SetupStatus = {
 /// What to tell the user when `setup.ready` is false, naming the actual gap.
 ///
 /// The wording used to blame the selected ASR model for every cause, which
-/// on a machine missing only a *package* read as "das Modell fehlt" beside a
-/// models step reporting "Alle Modelle sind vorhanden" — the contradiction
+/// on a machine missing only a *package* read as "the model is missing" beside
+/// a models step reporting "All models are present" — the contradiction
 /// that got the startup gate narrowed (`wizard::should_open`). The
 /// cause-unknown arm is `provision::status_or_assume_incomplete`'s error
 /// case: both lists empty and `ready` still false. Saying so is the point;
@@ -89,29 +89,29 @@ export function setupGapSummary(setup: SetupStatus): string {
   const models = setup.missing_models.map((m) => m.display);
   const pkgs = setup.missing_prerequisites;
   if (models.length === 0 && pkgs.length === 0) {
-    return "Die Einrichtung ist unvollständig — die Ursache konnte nicht ermittelt werden.";
+    return "Setup is incomplete — the cause could not be determined.";
   }
   const parts: string[] = [];
   if (models.length > 0) {
     parts.push(
       models.length === 1
-        ? `es fehlt noch das Modell ${models[0]}`
-        : `es fehlen noch die Modelle ${models.join(", ")}`,
+        ? `the model ${models[0]} is still missing`
+        : `the models ${models.join(", ")} are still missing`,
     );
   }
   if (pkgs.length > 0) {
     parts.push(
       pkgs.length === 1
-        ? `es fehlt noch das Programm ${pkgs[0]}`
-        : `es fehlen noch die Programme ${pkgs.join(", ")}`,
+        ? `the program ${pkgs[0]} is still missing`
+        : `the programs ${pkgs.join(", ")} are still missing`,
     );
   }
-  return `Die Einrichtung ist unvollständig — ${parts.join("; ")}. Bis dahin schlägt jedes Diktat fehl.`;
+  return `Setup is incomplete — ${parts.join("; ")}. Until then every dictation fails.`;
 }
 
 /// One artifact's live download progress, keyed by `MissingModel.name` — kept
 /// only for artifacts a `"setup-progress"` event has actually mentioned, so a
-/// model nothing has reported on yet renders as "fehlt" rather than a bar
+/// model nothing has reported on yet renders as "missing" rather than a bar
 /// stuck at 0 %.
 export type DownloadProgress = { display: string; done: number; total: number | null };
 
@@ -122,7 +122,7 @@ type SetupProgressEvent =
   | { kind: "failed"; message: string };
 
 function downloadStatusText(progress: DownloadProgress | undefined, installing: boolean): string {
-  if (!progress) return installing ? "wartet…" : "fehlt";
+  if (!progress) return installing ? "waiting…" : "missing";
   if (progress.total !== null) {
     const pct = Math.min(100, Math.round((progress.done / progress.total) * 100));
     return `${pct} %`;
@@ -130,7 +130,7 @@ function downloadStatusText(progress: DownloadProgress | undefined, installing: 
   return `${Math.round(progress.done / (1 << 20))} MB`;
 }
 
-/// Everything the Modelle step needs, owned by `Wizard` rather than by the
+/// Everything the models step needs, owned by `Wizard` rather than by the
 /// step itself: the `setup-progress` listener has to outlive the step, so a
 /// user who walks on to the shortcut step mid-download does not lose the
 /// running total — the same reason it used to be scoped to the whole window.
@@ -193,7 +193,7 @@ export function useSetup() {
       // A failure inside `download_all` also arrives as a "failed" event. The
       // reentrancy guard rejects *before* `download_all` runs, though, so no
       // event fires for that one at all — without this the button would stay
-      // on "Installation läuft…" forever. The functional update keeps a more
+      // on "Installing…" forever. The functional update keeps a more
       // specific error the event already reported.
       setInstalling(false);
       setInstallError((prev) => prev ?? String(e));
@@ -239,7 +239,7 @@ function CopyButton({ text }: { text: string }) {
       }}
     >
       <Icon name={copied ? "check" : "copy"} className="icon-sm" />
-      <span>{copied ? "Kopiert" : "Kopieren"}</span>
+      <span>{copied ? "Copied" : "Copy"}</span>
     </button>
   );
 }
@@ -317,15 +317,15 @@ export function Wizard({
           {step === "welcome" && (
             <section className="wizard-body">
               <img className="wizard-mark" src="/yappr.png" alt="" aria-hidden="true" />
-              <h1>Willkommen bei yappr</h1>
+              <h1>Welcome to yappr</h1>
               <p className="wizard-lead">
-                Diktieren in jedes Fenster — vollständig lokal, ohne Cloud. In den
-                nächsten drei Schritten lädst du die Sprachmodelle, richtest deinen
-                Kurzbefehl ein, und bist fertig.
+                Dictation into any window — entirely local, no cloud. Over the next
+                three steps you download the models, set up your shortcut, and
+                you're done.
               </p>
               <div className="wizard-actions">
                 <button type="button" className="add" onClick={() => setStep("models")}>
-                  Los geht’s
+                  Let’s go
                 </button>
               </div>
             </section>
@@ -333,16 +333,16 @@ export function Wizard({
 
           {step === "models" && (
             <section className="wizard-body">
-              <h1>Modelle laden</h1>
+              <h1>Download the models</h1>
               <p className="wizard-lead">
-                Spracherkennung, Sprachpausen-Erkennung und Nachbearbeitung laufen
-                vollständig auf diesem Rechner. Dafür braucht yappr einmalig etwa
-                1,1 GB an Modellen.
+                Speech recognition, speech detection and post-processing all run
+                entirely on this machine. For that, yappr needs about 1.1 GB of
+                models, once.
               </p>
 
               <div className="card">
                 <label className="setup-row" htmlFor="wizard-asr-model">
-                  <span>Spracherkennungs-Modell</span>
+                  <span>Speech recognition model</span>
                   <select
                     id="wizard-asr-model"
                     value={asrModel}
@@ -357,17 +357,17 @@ export function Wizard({
                   </select>
                 </label>
                 <p className="setup-command">
-                  Es wird nur das ausgewählte Modell geladen. Ein Wechsel später in
-                  den Einstellungen lädt das neue Modell nach.
+                  Only the selected model is downloaded. Switching later in the
+                  settings fetches the new one then.
                 </p>
               </div>
 
               {setup.checkError && (
                 <div className="banner error">
                   <Icon name="warn" className="icon-sm" />
-                  <span>Setup-Status konnte nicht ermittelt werden: {setup.checkError}</span>
+                  <span>Could not determine the setup status: {setup.checkError}</span>
                   <button type="button" className="ghost" onClick={() => void setup.check()}>
-                    Erneut versuchen
+                    Try again
                   </button>
                 </div>
               )}
@@ -379,11 +379,11 @@ export function Wizard({
                       {setup.status.missing_prerequisites.map((pkg) => (
                         <div className="setup-row missing" key={pkg}>
                           <Icon name="warn" className="icon-sm" />
-                          <span>{pkg} fehlt.</span>
+                          <span>{pkg} is missing.</span>
                         </div>
                       ))}
                       <p className="setup-command">
-                        Installieren mit:{" "}
+                        Install with:{" "}
                         <code>
                           sudo pacman -S {setup.status.missing_prerequisites.join(" ")}
                         </code>
@@ -395,7 +395,7 @@ export function Wizard({
                     {setup.status.missing_models.length === 0 ? (
                       <div className="setup-row ok">
                         <Icon name="check" className="icon-sm" />
-                        <span>Alle Modelle sind vorhanden.</span>
+                        <span>All models are present.</span>
                       </div>
                     ) : (
                       setup.status.missing_models.map((m) => {
@@ -447,11 +447,11 @@ export function Wizard({
                     user read the next two steps — which reads as "this is
                     finished" at 3 %, and lands them on the done step with no
                     working dictation. Skipping is still allowed, but only as
-                    the deliberate "Später" below, which a running download
+                    the deliberate "Later" below, which a running download
                     replaces rather than hides. */}
                 {!setup.installing && setup.status && !modelsDone && (
                   <button type="button" className="add" onClick={setup.install}>
-                    Jetzt laden
+                    Download now
                   </button>
                 )}
                 <button
@@ -460,7 +460,7 @@ export function Wizard({
                   disabled={setup.installing}
                   onClick={() => setStep("shortcuts")}
                 >
-                  {setup.installing ? "Lädt…" : modelsDone ? "Weiter" : "Später"}
+                  {setup.installing ? "Downloading…" : modelsDone ? "Continue" : "Later"}
                 </button>
                 {/* A returning user reaches this step from the settings
                     banner, for one errand: load the model. Making them walk
@@ -475,7 +475,7 @@ export function Wizard({
                     disabled={setup.installing}
                     onClick={onOpenSettings}
                   >
-                    Einstellungen
+                    Settings
                   </button>
                 )}
               </div>
@@ -484,12 +484,12 @@ export function Wizard({
 
           {step === "shortcuts" && (
             <section className="wizard-body">
-              <h1>Kurzbefehl einrichten</h1>
+              <h1>Set up the shortcut</h1>
               <p className="wizard-lead">
-                Deine Arbeitsumgebung: <strong>{state.desktop_name}</strong>.{" "}
+                Your desktop: <strong>{state.desktop_name}</strong>.{" "}
                 {unsupported
-                  ? "Offiziell unterstützt sind Hyprland und GNOME — die beiden Befehle unten funktionieren trotzdem, du musst sie nur selbst auf eine Taste legen."
-                  : "Wayland kennt keinen globalen Tastatur-Grab, deshalb legt yappr den Kurzbefehl nicht selbst an — du fügst ihn dort ein, wo dein Desktop ihn erwartet."}
+                  ? "Hyprland and GNOME are the officially supported ones — the two commands below still work, you just have to bind them to a key yourself."
+                  : "Wayland has no global keyboard grab, so yappr does not create the shortcut itself — you add it wherever your desktop expects it."}
               </p>
 
               {state.shortcut.target && (
@@ -519,40 +519,40 @@ export function Wizard({
 
               <details className="wizard-snippet" open={state.shortcut.bindings.length === 0}>
                 <summary>
-                  {state.desktop === "gnome" ? "oder per Terminal" : "Diese Zeilen einfügen"}
+                  {state.desktop === "gnome" ? "or from a terminal" : "Paste these lines"}
                 </summary>
                 <pre className="wizard-pre">{state.shortcut.snippet}</pre>
                 <CopyButton text={state.shortcut.snippet} />
               </details>
 
               <p className="note">
-                Texteingabe: <code>{state.recommended_backend}</code>
+                Text entry: <code>{state.recommended_backend}</code>
                 {state.recommended_backend === "clipboard"
-                  ? " — GNOME (Mutter) unterstützt das Protokoll nicht, über das wtype tippt. yappr legt den Text deshalb in die Zwischenablage; einfügen musst du selbst mit Strg+V."
-                  : " — braucht keine weitere Einrichtung."}
+                  ? " — GNOME (Mutter) does not support the protocol wtype types through. yappr puts the text on the clipboard instead; you paste it yourself with Ctrl+V."
+                  : " — needs no further setup."}
               </p>
 
               {state.recommended_backend === "clipboard" && (
                 <div className="card">
                   <p className="setup-command">
-                    Automatisch einfügen geht trotzdem, über Allgemein → Texteingabe →
-                    Verfahren. <code>libei</code> drückt das Einfügen über das
-                    Desktop-Portal: nichts zu installieren, nichts zu starten — beim
-                    ersten Mal fragt der Schreibtisch einmal um Erlaubnis, danach nie
-                    wieder. <code>ydotool</code> drückt es selbst; dafür müssen das Paket{" "}
-                    <code>ydotool</code> installiert und <code>ydotoold</code> gestartet
-                    sein, mit Schreibrecht auf <code>/dev/uinput</code>.{" "}
-                    <code>script</code> übergibt den fertigen Text stattdessen an ein
-                    eigenes Programm (Pfad bei <em>Einfüge-Skript</em>), als erstes
-                    Argument (<code>$1</code>); alles Weitere — Zwischenablage,
-                    Tastenkombination, Fenstererkennung — macht das Skript dann selbst.
+                    Pasting automatically is still possible, under General → Text entry
+                    → Method. <code>libei</code> presses the paste through the desktop
+                    portal: nothing to install, nothing to start — the first time, the
+                    desktop asks for permission once, and never again afterwards.{" "}
+                    <code>ydotool</code> presses it itself; that needs the{" "}
+                    <code>ydotool</code> package installed and <code>ydotoold</code>{" "}
+                    running, with write access to <code>/dev/uinput</code>.{" "}
+                    <code>script</code> hands the finished text to a program of your own
+                    instead (path under <em>Paste script</em>), as its first argument
+                    (<code>$1</code>); everything after that — clipboard, key chord,
+                    window detection — is then up to the script.
                   </p>
                 </div>
               )}
 
               <div className="wizard-actions">
                 <button type="button" className="add" onClick={() => setStep("done")}>
-                  Weiter
+                  Continue
                 </button>
               </div>
             </section>
@@ -568,10 +568,10 @@ export function Wizard({
               >
                 <Icon name="check" className="icon" />
               </motion.div>
-              <h1>Alles eingerichtet</h1>
+              <h1>All set up</h1>
               <p className="wizard-lead">
-                Drücke <kbd>Super</kbd>+<kbd>D</kbd>, sprich, und drücke noch einmal.
-                yappr läuft weiter im Systemtray.
+                Press <kbd>Super</kbd>+<kbd>D</kbd>, speak, and press again. yappr
+                keeps running in the system tray.
               </p>
               <div className="wizard-actions">
                 <button
@@ -579,10 +579,10 @@ export function Wizard({
                   className="add"
                   onClick={() => onFinish(firstRun ? state.recommended_backend : null)}
                 >
-                  Fertig
+                  Done
                 </button>
                 <button type="button" className="ghost" onClick={onOpenSettings}>
-                  Einstellungen öffnen
+                  Open settings
                 </button>
               </div>
             </section>

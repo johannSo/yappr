@@ -93,14 +93,14 @@ fn position_overlay(window: tauri::WebviewWindow) {
 ///
 /// Shared by `TauriSink::show_settings` (`Request::ShowSettings`, the CLI's
 /// `--settings` flag's path) and `tray.rs`'s `OwfTray` (left click and its
-/// Einstellungen menu item, which call this directly rather than going
+/// Settings menu item, which call this directly rather than going
 /// through a `Daemon` -- see `tray.rs`'s module doc for why) so there is
 /// one definition of "show Settings", not two independently-maintained
 /// copies of the same two lines.
 /// Shows the settings window with the first-run wizard on top of it.
 ///
 /// Shared by `TauriSink::show_wizard` (`Request::ShowWizard`, the CLI's
-/// `--wizard` flag's path) and `tray.rs`'s Einrichtung menu item, for the
+/// `--wizard` flag's path) and `tray.rs`'s Setup menu item, for the
 /// same reason `show_settings_window` is shared: one definition of "show the
 /// wizard", not two that can drift.
 ///
@@ -457,7 +457,7 @@ pub fn run() {
             // per `run`'s `RunEvent::Exit` comment below, does *not* cause
             // the app to exit either, since `settings` (hidden, not
             // destroyed) keeps Tauri's window map non-empty. The app quits
-            // only via Beenden or `--quit` -- both `Request::Quit` -- never
+            // only via Quit or `--quit` -- both `Request::Quit` -- never
             // by closing a window.
             hide_instead_of_close(&window, || {});
             if let Some(settings) = app.get_webview_window(SETTINGS_LABEL) {
@@ -485,7 +485,7 @@ pub fn run() {
             // serves on `ksni`'s own OS thread -- never this one, and never
             // the Tauri event loop once it starts (see `tray.rs`'s module
             // doc). Spawned once, unconditionally, before the branch below:
-            // both arms need a `tray::Handle`, and Beenden must exist as a
+            // both arms need a `tray::Handle`, and Quit must exist as a
             // menu item under `--replay` too (see `tray::OwfTray::quit`).
             let tray_handle = tray::spawn(app.handle().clone());
 
@@ -497,7 +497,7 @@ pub fn run() {
                     // No `Daemon` exists in replay mode at all. Managed
                     // unconditionally (see both arms) so a settings command's
                     // `State<Server>` extraction never fails here either --
-                    // it reports a German error instead.
+                    // it reports a stated error instead.
                     app.manage(settings_cmds::Server(None));
                     let handle = app.handle().clone();
                     let tray_for_replay = tray_handle.clone();
@@ -529,7 +529,7 @@ pub fn run() {
                     // window and an unclickable tray.
                     std::thread::spawn(move || yappr_core::server::serve(daemon, listener));
 
-                    // Now that the tray (Task 12) exists, Einstellungen is
+                    // Now that the tray (Task 12) exists, Settings is
                     // always reachable -- this is a redundant safety net,
                     // not the only way in, for a first-run user who has not
                     // yet noticed the tray icon. One `stat` of the wizard
@@ -557,7 +557,7 @@ pub fn run() {
 
     // Task 10 / spec §8: every exit route must converge on
     // `yappr_core::server::shutdown`, not just the signal handler inside
-    // `yappr_core::server::start`. `Request::Quit` (Beenden -- Task 12's
+    // `yappr_core::server::start`. `Request::Quit` (Quit -- Task 12's
     // `tray::OwfTray::quit` dispatches this and nothing else, deliberately,
     // see that function's doc comment -- and `--quit`) already calls
     // `shutdown` directly, on its own background thread, before its

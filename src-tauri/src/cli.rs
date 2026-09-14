@@ -81,8 +81,8 @@ mod tests {
         assert_eq!(route(&["--wizard"]), Route::Send(Request::ShowWizard));
         // Two flags, two destinations: `--settings` lands in the settings
         // form, `--wizard` at the top of the setup flow. Collapsing them
-        // would make the tray's Einrichtung item indistinguishable from
-        // Einstellungen.
+        // would make the tray's Setup item indistinguishable from
+        // Settings.
         assert_ne!(route(&["--wizard"]), route(&["--settings"]));
         assert_eq!(route(&["--quit"]), Route::Send(Request::Quit));
         assert_eq!(route(&["--status"]), Route::Send(Request::Status));

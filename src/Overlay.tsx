@@ -18,7 +18,7 @@ import "./Overlay.css";
 type OverlayEvent =
   | { event: "warming" }
   | { event: "idle" }
-  // Task 13: the tray's "Diktat pausieren" is checked. No rendering exists
+  // Task 13: the tray's "Pause dictation" is checked. No rendering exists
   // for this yet (future UI work); the `default` case below is what keeps
   // an unhandled event a safe no-op rather than a stuck capsule.
   | { event: "paused" }

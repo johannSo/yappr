@@ -5,7 +5,7 @@
  *
  * yappr embeds these files in its Rust binary with `include_str!` and writes
  * them to `~/.local/share/yappr/openclaw-plugin/` the moment the user clicks the
- * button in the settings window's KI pane, then runs
+ * button in the settings window's AI pane, then runs
  * `openclaw plugins install --link <that dir>`. There is no npm install on that
  * path, no `node_modules` beside the files, and nothing that walks up to the
  * global openclaw install -- so a bare specifier such as

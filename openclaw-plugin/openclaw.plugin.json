@@ -28,7 +28,7 @@
         "type": "integer",
         "minimum": 1,
         "maximum": 65535,
-        "description": "Port yappr listens on. Must match [realtime] port in yappr's own settings window; yappr's KI pane writes both sides at once when you press Einrichten."
+        "description": "Port yappr listens on. Must match [realtime] port in yappr's own settings window; yappr's AI pane writes both sides at once when you press Set up."
       },
       "token": {
         "type": "string",

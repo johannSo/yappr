@@ -19,7 +19,7 @@ pub enum Request {
     /// state, never against a client-side memory of the last press -- the
     /// client is a fresh process every time and has no memory to consult.
     Toggle,
-    /// Shut the whole app down. The tray's Beenden sends the same request.
+    /// Shut the whole app down. The tray's Quit sends the same request.
     Quit,
     /// Shut the whole app down and start it again. Identical to
     /// [`Request::Quit`] up to the last instruction -- the same `quitting`
@@ -37,7 +37,7 @@ pub enum Request {
     /// Show and focus the settings window.
     ShowSettings,
     /// Show the settings window with the first-run wizard on top of it
-    /// (`yappr --wizard`, and the tray's Einrichtung item). Distinct from
+    /// (`yappr --wizard`, and the tray's Setup item). Distinct from
     /// [`Request::ShowSettings`] because the two land the user in different
     /// places -- one in the settings form, one at the top of the setup flow.
     ShowWizard,
@@ -116,7 +116,7 @@ pub enum OverlayEvent {
     Warming,
     Idle,
     /// Task 13: mirrors `State::Paused` -- the daemon is paused via the
-    /// tray's "Diktat pausieren" and will accept no `ptt-start`/`toggle`
+    /// tray's "Pause dictation" and will accept no `ptt-start`/`toggle`
     /// until it is unchecked. Sent as the initial snapshot to a subscriber
     /// connecting while paused (`snapshot_event`), and broadcast the moment
     /// `Request::SetPaused` actually takes effect.
@@ -196,8 +196,9 @@ pub struct Response {
     pub config_path: Option<String>,
     /// `GetConfig` and `Status`: set when startup found a `config.toml` it
     /// could not load, moved it aside and came up on defaults instead (spec
-    /// §3). German, because the settings window renders it verbatim in the
-    /// notice banner it already has. `None` on every healthy run.
+    /// §3). A finished sentence, because the settings window renders it
+    /// verbatim in the notice banner it already has. `None` on every healthy
+    /// run.
     ///
     /// Deliberately not `err`, and deliberately not `Daemon::fatal_error`: a
     /// quarantine is not a failure. The daemon is running and dictation works

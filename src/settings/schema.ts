@@ -3,7 +3,7 @@
 /// Nothing here restates the config schema — the config arrives from the
 /// daemon as plain JSON and leaves the same way. These tables only decide how
 /// a key that already exists is *shown*: which pane it lives in, what it is
-/// called in German, whether it deserves an editor better than a text box.
+/// called, whether it deserves an editor better than a text box.
 ///
 /// The consequence worth protecting: a config key added in Rust and not
 /// mentioned here still appears in this window, rendered by its JSON type, in
@@ -27,17 +27,17 @@ export type Category = {
 /// `inject` are both "the mechanics of one dictation", however far apart they
 /// sit in the pipeline.
 ///
-/// `ki` sits between `stil` and `erweitert` on purpose: it is a feature a
-/// user goes looking for ("kann OpenClaw das hier benutzen?"), not a knob
-/// they tune once a year, and `erweitert` is where the tuning lives.
+/// `ai` sits between `style` and `advanced` on purpose: it is a feature a
+/// user goes looking for ("can OpenClaw use this?"), not a knob they tune
+/// once a year, and `advanced` is where the tuning lives.
 export const CATEGORIES: Category[] = [
-  { id: "allgemein", title: "Allgemein", icon: "sliders", sections: ["audio", "inject"] },
-  { id: "sprache", title: "Sprache", icon: "waveform", sections: ["asr", "vocabulary"] },
-  { id: "stil", title: "Stil", icon: "pen", sections: ["style_default", "style_rules"] },
-  { id: "ki", title: "KI", icon: "spark", sections: ["realtime"] },
-  { id: "erweitert", title: "Erweitert", icon: "gear", sections: ["models", "normalize", "guardrail"] },
-  { id: "darstellung", title: "Darstellung", icon: "palette", sections: ["ui"] },
-  { id: "diagnose", title: "Diagnose", icon: "pulse", sections: ["debug", "overlay"] },
+  { id: "general", title: "General", icon: "sliders", sections: ["audio", "inject"] },
+  { id: "language", title: "Language", icon: "waveform", sections: ["asr", "vocabulary"] },
+  { id: "style", title: "Style", icon: "pen", sections: ["style_default", "style_rules"] },
+  { id: "ai", title: "AI", icon: "spark", sections: ["realtime"] },
+  { id: "advanced", title: "Advanced", icon: "gear", sections: ["models", "normalize", "guardrail"] },
+  { id: "appearance", title: "Appearance", icon: "palette", sections: ["ui"] },
+  { id: "diagnostics", title: "Diagnostics", icon: "pulse", sections: ["debug", "overlay"] },
 ];
 
 /// The pane that catches sections no `CATEGORIES` entry names. Rendered only
@@ -45,26 +45,26 @@ export const CATEGORIES: Category[] = [
 /// config section makes it necessary — at which point that section is still
 /// reachable rather than silently dropped.
 export const CATCH_ALL: Category = {
-  id: "weitere",
-  title: "Weitere",
+  id: "other",
+  title: "Other",
   icon: "dots",
   sections: [],
 };
 
 export const SECTION_TITLES: Record<string, string> = {
-  audio: "Mikrofon & Aufnahme",
-  vocabulary: "Vokabular",
-  style_default: "Stil",
-  style_rules: "Stilregeln pro Fenster",
-  models: "Modelle & Speicher",
-  normalize: "Nachbearbeitung",
-  inject: "Texteingabe",
-  asr: "Spracherkennung",
-  guardrail: "Schutzschwellen",
-  debug: "Diagnose",
+  audio: "Microphone & recording",
+  vocabulary: "Vocabulary",
+  style_default: "Style",
+  style_rules: "Per-window style rules",
+  models: "Models & memory",
+  normalize: "Post-processing",
+  inject: "Text entry",
+  asr: "Speech recognition",
+  guardrail: "Guardrail thresholds",
+  debug: "Diagnostics",
   overlay: "Overlay",
-  ui: "Farben & Thema",
-  realtime: "Lokale Transkription für andere Programme",
+  ui: "Colours & theme",
+  realtime: "Local transcription for other programs",
 };
 
 /**
@@ -80,85 +80,85 @@ export const RESTART_SECTIONS = new Set(["asr", "normalize"]);
 
 export const SECTION_NOTES: Record<string, string> = {
   style_rules:
-    "Die Fensterklasse ist ein regulärer Ausdruck; die erste passende Regel gewinnt. Nicht gesetzte Achsen erben aus dem Stil darüber.",
+    "The window class is a regular expression; the first matching rule wins. Axes a rule leaves unset inherit from the style above.",
   overlay:
-    "Wird eingelesen, steuert aber noch nichts: unter Wayland kann ein Fenster seine eigene Position nicht setzen, die kommt aus einer Compositor-Regel.",
-  // No "Neustart möglich" tag and no entry in `RESTART_SECTIONS`: the daemon
+    "Read, but not in control of anything yet: under Wayland a window cannot set its own position — that comes from a compositor rule.",
+  // No "Restart may be needed" tag and no entry in `RESTART_SECTIONS`: the daemon
   // stops and restarts the listener on save, so every key here is applied
   // live. Saying so in the note is the point — a port field that looked like
   // it needed a restart would get one asked for that nothing owes.
   realtime:
-    "Nimmt Ton von anderen Programmen auf diesem Rechner entgegen und liefert laufend Text zurück — erreichbar nur von diesem Rechner aus. Änderungen greifen sofort, ohne Neustart.",
+    "Accepts audio from other programs on this machine and returns text as it goes — reachable from this machine only. Changes take effect immediately, with no restart.",
 };
 
 export const LABELS: Record<string, string> = {
-  "ui.theme": "Farbschema",
-  "audio.device": "Mikrofon",
-  "audio.max_seconds": "Maximale Aufnahmedauer",
-  "audio.vad_padding_ms": "Sprachpuffer",
-  "asr.model": "Modell",
-  "asr.language": "Sprache",
+  "ui.theme": "Colour scheme",
+  "audio.device": "Microphone",
+  "audio.max_seconds": "Maximum recording length",
+  "audio.vad_padding_ms": "Speech padding",
+  "asr.model": "Model",
+  "asr.language": "Language",
   "asr.num_threads": "Threads",
-  "models.preload_at_startup": "Modelle beim Start laden",
-  "models.idle_unload_seconds": "Modelle entladen nach",
-  "normalize.enabled": "Nachbearbeitung aktiv",
-  "normalize.timeout_ms": "Zeitlimit",
-  "normalize.context_size": "Kontextgröße",
+  "models.preload_at_startup": "Load models at startup",
+  "models.idle_unload_seconds": "Unload models after",
+  "normalize.enabled": "Post-processing on",
+  "normalize.timeout_ms": "Time limit",
+  "normalize.context_size": "Context size",
   "normalize.threads": "Threads",
-  "guardrail.min_word_ratio": "Minimales Wortverhältnis",
-  "guardrail.max_word_ratio": "Maximales Wortverhältnis",
-  "guardrail.min_overlap_english": "Mindestüberlappung (Englisch)",
-  "guardrail.min_overlap_other": "Mindestüberlappung (andere Sprachen)",
-  "guardrail.short_input_words": "Grenze „kurze Eingabe“",
-  "guardrail.ngram_size": "N-Gramm-Größe",
-  "guardrail.ngram_max_repeats": "Maximale N-Gramm-Wiederholungen",
-  "inject.backend": "Verfahren",
-  "inject.script": "Einfüge-Skript",
-  "inject.paste_chord": "Einfüge-Tastenkombination",
-  "inject.terminal_classes": "Terminal-Fensterklassen",
-  "inject.restore_clipboard": "Zwischenablage wiederherstellen",
-  "inject.trailing_space": "Leerzeichen anhängen",
-  "inject.keystroke_delay_ms": "Tastenverzögerung",
-  "vocabulary.enabled": "Vokabular aktiv",
-  "vocabulary.terms": "Begriffe",
-  "vocabulary.replacements": "Feste Ersetzungen",
-  "vocabulary.max_error_ratio": "Zulässige Abweichung",
-  "vocabulary.min_term_chars": "Mindestlänge für unscharfe Treffer",
-  "style_default.styling": "Tonfall",
-  "style_default.structure": "Struktur",
-  "style_default.context": "Kontext",
-  "debug.enabled": "Diagnose aktiv",
-  "debug.dir": "Verzeichnis",
-  "debug.save_audio": "Audio mitschreiben",
+  "guardrail.min_word_ratio": "Minimum word ratio",
+  "guardrail.max_word_ratio": "Maximum word ratio",
+  "guardrail.min_overlap_english": "Minimum overlap (English)",
+  "guardrail.min_overlap_other": "Minimum overlap (other languages)",
+  "guardrail.short_input_words": "\u201cShort input\u201d cutoff",
+  "guardrail.ngram_size": "N-gram size",
+  "guardrail.ngram_max_repeats": "Maximum n-gram repeats",
+  "inject.backend": "Method",
+  "inject.script": "Paste script",
+  "inject.paste_chord": "Paste shortcut",
+  "inject.terminal_classes": "Terminal window classes",
+  "inject.restore_clipboard": "Restore the clipboard",
+  "inject.trailing_space": "Append a space",
+  "inject.keystroke_delay_ms": "Keystroke delay",
+  "vocabulary.enabled": "Vocabulary on",
+  "vocabulary.terms": "Terms",
+  "vocabulary.replacements": "Fixed replacements",
+  "vocabulary.max_error_ratio": "Allowed deviation",
+  "vocabulary.min_term_chars": "Minimum length for fuzzy matches",
+  "style_default.styling": "Tone",
+  "style_default.structure": "Structure",
+  "style_default.context": "Context",
+  "debug.enabled": "Diagnostics on",
+  "debug.dir": "Directory",
+  "debug.save_audio": "Save audio too",
   "overlay.position": "Position",
-  "overlay.width": "Breite",
-  "overlay.height": "Höhe",
-  "realtime.enabled": "Endpunkt aktiv",
+  "overlay.width": "Width",
+  "overlay.height": "Height",
+  "realtime.enabled": "Endpoint on",
   "realtime.port": "Port",
-  "realtime.token": "Zugangsschlüssel",
-  "realtime.silence_ms": "Pause bis zum Abschnittsende",
-  "realtime.max_utterance_seconds": "Maximale Abschnittslänge",
-  "realtime.normalize": "Nachbearbeitung anwenden",
+  "realtime.token": "Access key",
+  "realtime.silence_ms": "Pause that ends an utterance",
+  "realtime.max_utterance_seconds": "Maximum utterance length",
+  "realtime.normalize": "Apply post-processing",
   // Not a `config.toml` key — see `Settings.tsx`'s `AutostartCard` and
   // `settings_cmds.rs`'s module doc for why this is filesystem state
   // (`~/.config/autostart/yappr.desktop` existing or not) rather
   // than a section here. The path `"autostart.enabled"` exists only so this
   // row can borrow the same `LABELS`/`HELP` lookup every config row uses.
-  "autostart.enabled": "Beim Anmelden starten",
+  "autostart.enabled": "Start at login",
 };
 
 /// Rendered after the input rather than inside the label, so a row reads
-/// "Zeitlimit  [6000] ms" instead of putting the unit in a parenthesis the
+/// "Time limit  [6000] ms" instead of putting the unit in a parenthesis the
 /// eye has to jump back to.
 export const UNITS: Record<string, string> = {
   "audio.max_seconds": "s",
   "audio.vad_padding_ms": "ms",
   "models.idle_unload_seconds": "s",
   "normalize.timeout_ms": "ms",
-  "normalize.context_size": "Token",
+  "normalize.context_size": "tokens",
   "inject.keystroke_delay_ms": "ms",
-  "guardrail.short_input_words": "Wörter",
-  "vocabulary.min_term_chars": "Zeichen",
+  "guardrail.short_input_words": "words",
+  "vocabulary.min_term_chars": "characters",
   "overlay.width": "px",
   "overlay.height": "px",
   "realtime.silence_ms": "ms",
@@ -171,95 +171,96 @@ export const UNITS: Record<string, string> = {
 /// the meaning of from its name.
 export const HELP: Record<string, string> = {
   "audio.device":
-    "„Systemstandard“ nimmt, was das System gerade als Standardeingang meldet. Ob ein Gerät wirklich funktioniert, zeigt sich beim nächsten Diktat — der Daemon meldet einen Fehler, wenn er es nicht öffnen kann.",
+    "\u201cSystem default\u201d takes whatever the system currently reports as its default input. Whether a device actually works shows up on the next dictation \u2014 the daemon reports an error if it cannot open it.",
   "audio.max_seconds":
-    "Danach bricht die Aufnahme von selbst ab, damit eine hängengebliebene Taste nicht endlos mitschneidet.",
+    "A recording stops by itself after this long, so a forgotten one cannot keep the microphone open indefinitely.",
   "audio.vad_padding_ms":
-    "Wie viel Ton vor und nach der erkannten Sprache erhalten bleibt. Zu wenig schneidet Wortanfänge ab, zu viel nimmt Stille mit in die Erkennung.",
+    "How much audio either side of the detected speech is kept. Too little clips the starts of words, too much feeds silence into recognition.",
   "asr.model":
-    "Welches Modell den gesprochenen Text erkennt. Parakeet TDT v3 ist mehrsprachig und die Voreinstellung. primeline Parakeet versteht nur Deutsch, erkennt es aber deutlich genauer als alle anderen hier — die beste Wahl, wenn du nur auf Deutsch diktierst. Parakeet Unified versteht nur Englisch, erkennt es aber genauer. Nemotron 3.5 ist mehrsprachig. Ein Wechsel lädt einmalig rund 500 MB herunter; bereits geladene Modelle bleiben liegen, ein Zurückwechseln geht also ohne erneuten Download.",
+    "Which model recognises the spoken text. Parakeet TDT v3 is multilingual and the default. primeline Parakeet understands German only, but recognises it far more accurately than anything else here \u2014 the best choice if you dictate in German only. Parakeet Unified understands English only, but recognises it more accurately. Nemotron 3.5 is multilingual. Switching downloads about 500 MB once; models already on disk are left alone, so switching back needs no new download.",
   "asr.language":
-    "Nur für mehrsprachige Modelle. „auto“ lässt das Modell die Sprache selbst erkennen; ein Kürzel wie „de“ legt sie fest. Parakeet TDT v3 und Parakeet Unified ignorieren diese Einstellung.",
+    "For multilingual models only. \u201cauto\u201d lets the model detect the language itself; a code such as \u201cen\u201d fixes it. Parakeet TDT v3 and Parakeet Unified ignore this setting.",
   "asr.num_threads":
-    "Rechenkerne für die Spracherkennung. Mehr Threads verkürzen die Wartezeit, bis die Kerne ausgelastet sind.",
+    "CPU cores used for speech recognition. More threads shorten the wait, up to the point where the cores are saturated.",
   "models.preload_at_startup":
-    "Lädt Spracherkennung und Sprachmodell schon beim Programmstart. Aus heißt: sie werden erst beim ersten Tastendruck geladen — das spart im Leerlauf über ein Gigabyte, kostet aber beim ersten Diktat einmalig Wartezeit.",
+    "Loads the speech recognition and language models as soon as the app starts. Off means they are loaded on the first keypress instead \u2014 that saves over a gigabyte while idle, at the cost of a one-off wait on the first dictation.",
   "models.idle_unload_seconds":
-    "So lange nach dem letzten Diktat bleiben die Modelle im Speicher. Danach werden sie entladen und beim nächsten Tastendruck neu geladen. 0 heißt: nie entladen.",
+    "How long after the last dictation the models stay in memory. After that they are unloaded and reloaded on the next keypress. 0 means never unload.",
   "normalize.enabled":
-    "Lässt das lokale Sprachmodell den erkannten Text glätten. Aus heißt: der Text wird nur nach Regeln bereinigt und sofort eingefügt.",
+    "Lets the local language model tidy up the recognised text. Off means the text is only cleaned up by rule and inserted straight away.",
   "normalize.timeout_ms":
-    "Wie lange auf das Sprachmodell gewartet wird. Läuft die Zeit ab, wird der reine Erkennungstext eingefügt — verloren geht nichts.",
+    "How long to wait for the language model. If the time runs out, the raw recognised text is inserted \u2014 nothing is lost.",
   "normalize.context_size":
-    "Wie viel Text das Sprachmodell auf einmal sieht. Größer kostet Speicher, kleiner schneidet lange Diktate ab.",
-  "normalize.threads": "Rechenkerne für die Nachbearbeitung.",
+    "How much text the language model sees at once. Larger costs memory, smaller truncates long dictations.",
+  "normalize.threads": "CPU cores used for post-processing.",
   "guardrail.min_word_ratio":
-    "Untergrenze für die Wortzahl nach der Nachbearbeitung im Verhältnis zu davor. 0,55 verwirft eine Fassung, die fast die Hälfte weggekürzt hat.",
+    "Lower bound on the word count after post-processing relative to before. 0.55 rejects a version that has cut away nearly half.",
   "guardrail.max_word_ratio":
-    "Obergrenze im selben Verhältnis. Fängt ein Modell ab, das anfängt zu dichten statt zu glätten.",
+    "Upper bound on the same ratio. Catches a model that has started inventing rather than tidying.",
   "guardrail.min_overlap_english":
-    "Anteil der ursprünglichen Wörter, die in der überarbeiteten Fassung wieder vorkommen müssen. Für Englisch niedriger, weil die Nachbearbeitung dort mehr umformt.",
+    "The share of the original words that must reappear in the reworked version. Lower for English, because post-processing rephrases more there.",
   "guardrail.min_overlap_other":
-    "Dieselbe Schwelle für alle anderen Sprachen, Deutsch eingeschlossen.",
+    "The same threshold for every other language.",
   "guardrail.short_input_words":
-    "Bis zu dieser Länge gilt eine Eingabe als kurz und die Verhältnisprüfungen greifen nicht — bei drei Wörtern sagen sie nichts aus.",
-  "guardrail.ngram_size": "Länge der Wortfolge, auf die die Schleifenerkennung achtet.",
+    "Up to this length an input counts as short and the ratio checks are skipped \u2014 at three words they say nothing.",
+  "guardrail.ngram_size": "Length of the word sequence the loop detection watches for.",
   "guardrail.ngram_max_repeats":
-    "Wie oft dieselbe Wortfolge vorkommen darf, bevor die Fassung als Schleife verworfen wird.",
+    "How often the same word sequence may occur before the version is rejected as a loop.",
   "inject.backend":
-    "wtype tippt den Text Zeichen für Zeichen ins Fenster und braucht keine Einrichtung — unter GNOME (Mutter) bewirkt es allerdings nichts. ydotool legt den Text in die Zwischenablage und drückt einmal Strg+V (in Terminals Strg+Umschalt+V); das funktioniert auch dort, wo wtype nichts ausrichtet, setzt aber einen laufenden ydotoold mit Schreibrecht auf /dev/uinput voraus. libei drückt dieselbe Tastenkombination, aber über das Desktop-Portal statt über einen eigenen Dienst: kein ydotoold, kein /dev/uinput, dafür einmalig ein Berechtigungsdialog, den du bestätigen musst. script übergibt den fertigen Text als erstes Argument an ein eigenes Programm, das dann selbst entscheidet, wie es ihn einfügt. clipboard legt ihn nur in die Zwischenablage, einfügen musst du selbst.",
+    "wtype types the text into the window character by character and needs no setup \u2014 but it does nothing under GNOME (Mutter). ydotool puts the text on the clipboard and presses Ctrl+V once (Ctrl+Shift+V in terminals); that works where wtype cannot, but it requires a running ydotoold with write access to /dev/uinput. libei presses the same chord, but through the desktop portal rather than a service of its own: no ydotoold, no /dev/uinput, at the price of one permission dialog you have to approve. script hands the finished text to a program of your own as its first argument, which then decides for itself how to insert it. clipboard only puts it on the clipboard; pasting is up to you.",
   "inject.script":
-    "Pfad zu dem Programm, das das script-Verfahren aufruft. Es bekommt den fertigen Text als erstes und einziges Argument ($1) und ist danach für alles zuständig: Zwischenablage, Tastenkombination, Fenstererkennung. Muss ausführbar sein; ~ wird aufgelöst. Beispiel: ~/bin/paste.sh. Schlägt es fehl oder ist hier nichts eingetragen, landet der Text wie beim clipboard-Verfahren in der Zwischenablage.",
+    "Path to the program the script method runs. It is given the finished text as its first and only argument ($1) and owns everything after that: clipboard, key chord, window detection. Must be executable; ~ is expanded. Example: ~/bin/paste.sh. If it fails, or nothing is set here, the text lands on the clipboard just as with the clipboard method.",
   "inject.paste_chord":
-    "Welche Tastenkombination die Verfahren ydotool und libei drücken. auto entscheidet nach der Fensterklasse: Strg+Umschalt+V für alles, was unten als Terminal eingetragen ist, sonst Strg+V. Kann yappr das fokussierte Fenster nicht benennen, wird daraus Strg+V — was Terminals ignorieren, ohne dass ein Fehler gemeldet wird. Wenn du hauptsächlich in Terminals diktierst und nichts ankommt, stell hier fest auf Strg+Umschalt+V.",
+    "Which key chord the ydotool and libei methods press. auto decides by window class: Ctrl+Shift+V for anything listed as a terminal below, Ctrl+V otherwise. If yappr cannot name the focused window, that becomes a plain Ctrl+V \u2014 which terminals ignore, with no error reported. If you mostly dictate into terminals and nothing arrives, fix this to Ctrl+Shift+V.",
   "inject.terminal_classes":
-    "Fensterklassen, die als Terminal gelten und deshalb unter auto Strg+Umschalt+V bekommen. Groß-/Kleinschreibung ist egal. Die Klasse deines Fensters steht im Debug-Datensatz unter window_class.",
+    "Window classes that count as a terminal and therefore get Ctrl+Shift+V under auto. Case does not matter. Your window's class is in the debug record under window_class.",
   "inject.restore_clipboard":
-    "Die Verfahren ydotool und libei legen den Text zum Einfügen in die Zwischenablage. Mit dieser Einstellung wird danach wiederhergestellt, was vorher darin lag — der alte Eintrag ist also wieder der aktuelle, und das Diktat rutscht in der Zwischenablage-Historie auf Platz zwei. Aus heißt: das Diktat bleibt in der Zwischenablage liegen. Ausschalten, wenn ein Programm den Text zu spät abholt und deshalb den alten Inhalt einfügt.",
+    "The ydotool and libei methods put the text on the clipboard in order to paste it. With this on, whatever was there before is put back afterwards — so your own entry is the current one again and the dictation drops to second place in your clipboard history. Off means the dictation stays on the clipboard. Turn it off if a program picks the text up too late and therefore pastes the old contents.",
   "inject.trailing_space":
-    "Hängt ein Leerzeichen an, damit das nächste Diktat nicht am vorherigen klebt.",
+    "Appends a space, so the next dictation does not run into the previous one.",
   "inject.keystroke_delay_ms":
-    "Pause zwischen zwei simulierten Tastenanschlägen. Höher setzen, wenn ein Fenster Zeichen verschluckt. Nur das wtype-Verfahren tippt Zeichen für Zeichen; die anderen ignorieren das.",
+    "Pause between two simulated keystrokes. Raise it if a window swallows characters. Only the wtype method types character by character; the others ignore this.",
   "vocabulary.enabled":
-    "Korrigiert Fachbegriffe und Namen schon im Erkennungstext, bevor die Nachbearbeitung ihn zu sehen bekommt.",
+    "Corrects technical terms and names in the recognised text, before post-processing ever sees it.",
   "vocabulary.terms":
-    "Diese Begriffe werden auch bei leichter Fehlerkennung getroffen. Kurze Abkürzungen gehören stattdessen in die Ersetzungstabelle.",
+    "These terms are matched even when slightly misrecognised. Short abbreviations belong in the replacement table instead.",
   "vocabulary.replacements":
-    "Wird genau so ersetzt, ohne unscharfen Vergleich — der richtige Ort für kurze Abkürzungen.",
+    "Replaced exactly as written, with no fuzzy comparison \u2014 the right place for short abbreviations.",
   "vocabulary.max_error_ratio":
-    "0,25 erlaubt bei einem Begriff mit acht Zeichen zwei falsche Zeichen. 0 schaltet unscharfe Treffer ab, feste Ersetzungen bleiben.",
+    "0.25 allows two wrong characters in an eight-character term. 0 turns fuzzy matching off; fixed replacements stay.",
   "vocabulary.min_term_chars":
-    "Kürzere Begriffe werden nur exakt getroffen. Das schützt Dreibuchstabenwörter davor, versehentlich ersetzt zu werden.",
-  "style_default.styling": "Wie förmlich das Ergebnis klingen soll.",
-  "style_default.structure": "Fließtext oder Aufzählung.",
+    "Shorter terms are matched exactly only. That keeps three-letter words from being replaced by accident.",
+  "style_default.styling": "How formal the result should sound.",
+  "style_default.structure": "Prose or a list.",
   "style_default.context":
-    "Wofür der Text gedacht ist. „email“ erlaubt Anrede und Grußformel.",
+    "What the text is for. \u201cemail\u201d allows a salutation and a sign-off.",
   "debug.enabled":
-    "Schreibt zu jedem Diktat einen Datensatz mit Erkennungstext, überarbeiteter Fassung und Zeiten.",
-  "debug.dir": "Verzeichnis für diese Datensätze.",
+    "Writes a record for every dictation with the recognised text, the reworked version and timings.",
+  "debug.dir": "Directory for those records.",
   "debug.save_audio":
-    "Legt zusätzlich die aufgenommene Tonspur ab. Braucht deutlich mehr Platz.",
+    "Also stores the recorded audio. Needs considerably more space.",
   "overlay.position":
-    "Wird eingelesen, steuert aber nichts — unter Wayland kann ein Fenster seine eigene Position nicht setzen.",
+    "Read, but controls nothing \u2014 under Wayland a window cannot set its own position.",
   "ui.theme":
-    "Gilt für beide Fenster, auch für das Diktat-Overlay. \u201eSystem\u201c folgt der Hell-/Dunkel-Einstellung des Schreibtischs; jedes andere Schema legt eine Variante fest und bleibt auch dann, wenn der Schreibtisch wechselt. Wirkt sofort, kein Neustart nötig.",
-  "overlay.width": "Wird eingelesen, steuert aber nichts.",
-  "overlay.height": "Wird eingelesen, steuert aber nichts.",
+    "Applies to both windows, including the dictation overlay. \u201cSystem\u201d follows the desktop's light/dark setting; any other scheme pins a variant and stays there even when the desktop switches. Takes effect immediately, no restart needed.",
+  "overlay.width": "Read, but controls nothing.",
+  "overlay.height": "Read, but controls nothing.",
   "realtime.enabled":
-    "Öffnet einen Zugang, über den andere Programme auf diesem Rechner Ton an yappr schicken und laufend Text zurückbekommen — so benutzt OpenClaw yappr zum Diktieren. Aus heißt: der Zugang ist zu, und nur das Diktat über den Kurzbefehl funktioniert.",
+    "Opens a way in for other programs on this machine to send audio to yappr and get text back as it goes — this is how OpenClaw uses yappr for dictation. Off means the way in is shut, and only dictation by shortcut works.",
   "realtime.port":
-    "Nummer, unter der der Zugang zu erreichen ist. Ist sie schon belegt, kommt er nicht hoch; dann hier eine andere eintragen. Wer den Zugang benutzt, muss dieselbe Nummer kennen — OpenClaw bekommt sie bei der Einrichtung mitgeteilt.",
+    "The number the endpoint answers on. If it is already taken the endpoint does not come up; enter a different one here. Whoever uses it has to know the same number — OpenClaw is told it during setup.",
   "realtime.token":
-    "Gemeinsames Kennwort, freiwillig. Leer heißt: jedes Programm auf diesem Rechner darf mitdiktieren. Ist hier etwas eingetragen, wird nur angenommen, wer dasselbe mitschickt. „Einrichten“ trägt den Schlüssel auch bei OpenClaw ein — änderst du ihn später, richte OpenClaw noch einmal ein, sonst kommt es nicht mehr durch.",
+    "A shared password, optional. Empty means every program on this machine may dictate. With something entered here, only a caller that sends the same value is accepted. \u201cSet up\u201d also enters the key in OpenClaw — if you change it later, run the setup again or OpenClaw will no longer get through.",
   "realtime.silence_ms":
-    "So lange Stille beendet einen Abschnitt; der Text geht dann raus. Kürzer antwortet schneller, zerschneidet aber Sätze an Denkpausen. Länger hält den Satz zusammen und lässt länger auf ihn warten.",
+    "This much silence ends an utterance, and the text goes out. Shorter answers sooner but cuts sentences apart at pauses for thought. Longer holds the sentence together and keeps you waiting for it.",
   "realtime.max_utterance_seconds":
-    "Wer ohne Pause weiterspricht, wird spätestens hier geschnitten. Das Aufgenommene wird trotzdem erkannt — verloren geht nichts, der Text kommt nur in zwei Teilen.",
+    "Anyone who keeps talking without a pause is cut off here at the latest. What was recorded is still recognised — nothing is lost, the text just arrives in two parts.",
   "realtime.normalize":
-    "Schickt auch diese Abschnitte durch Sprachmodell und Prüfung — also genau der Text, den yappr sonst tippen würde. Aus heißt: reiner Erkennungstext, nur mit Groß- und Kleinschreibung und Satzzeichen. Das ist schneller und braucht weniger Speicher, klingt aber nach Diktat statt nach geschriebenem Text. Ist die Nachbearbeitung unter „Erweitert“ ganz abgeschaltet, bleibt sie auch hier aus.",
+    "Sends these utterances through the language model and the guardrail as well — that is, exactly the text yappr would otherwise type. Off means plain recognised text, with capitalisation and punctuation only. That is faster and needs less memory, but it reads like dictation rather than like written text. If post-processing is switched off entirely under \u201cAdvanced\u201d, it stays off here too.",
   "autostart.enabled":
-    "Legt ~/.config/autostart/yappr.desktop an; systemd startet yappr davon bei der nächsten Anmeldung automatisch. Aus heißt: die Datei existiert nicht, und nichts startet von selbst.",
+    "Creates ~/.config/autostart/yappr.desktop; systemd starts yappr from it automatically at your next login. Off means the file does not exist, and nothing starts by itself.",
 };
+
 
 export const ENUMS: Record<string, string[]> = {
   // Mirrors `Theme::ALL` in `crates/yappr-core/src/config.rs`, in the same
@@ -303,18 +304,18 @@ export const ENUMS: Record<string, string[]> = {
 /// labelling them -- `search()` still matches the raw key and value.
 export const ENUM_LABELS: Record<string, Record<string, string>> = {
   "ui.theme": {
-    system: "System (hell/dunkel folgen)",
-    "yappr-light": "yappr Hell",
-    "yappr-dark": "yappr Dunkel",
+    system: "System (follow light/dark)",
+    "yappr-light": "yappr Light",
+    "yappr-dark": "yappr Dark",
     "catppuccin-latte": "Catppuccin Latte",
     "catppuccin-mocha": "Catppuccin Mocha",
     "tokyo-night-day": "Tokyo Night Day",
     "tokyo-night-night": "Tokyo Night Night",
   },
   "inject.paste_chord": {
-    auto: "Automatisch (nach Fensterklasse)",
-    ctrl_v: "Immer Strg+V",
-    ctrl_shift_v: "Immer Strg+Umschalt+V",
+    auto: "Automatic (by window class)",
+    ctrl_v: "Always Ctrl+V",
+    ctrl_shift_v: "Always Ctrl+Shift+V",
   },
 };
 
@@ -327,12 +328,12 @@ export const TABLE_COLUMNS: Record<string, string[]> = {
 };
 
 export const COLUMN_LABELS: Record<string, string> = {
-  from: "Erkannt als",
-  to: "Ersetzen durch",
-  match_class: "Fensterklasse",
-  styling: "Tonfall",
-  structure: "Struktur",
-  context: "Kontext",
+  from: "Heard as",
+  to: "Replace with",
+  match_class: "Window class",
+  styling: "Tone",
+  structure: "Structure",
+  context: "Context",
 };
 
 /// Row order within a section.
@@ -340,7 +341,7 @@ export const COLUMN_LABELS: Record<string, string> = {
 /// Needed because the config arrives as a `serde_json::Value`, whose object is
 /// a `BTreeMap` -- keys reach this window sorted by their *Rust* name, not in
 /// the order the struct declares them. Alphabetical-by-Rust-name is close to
-/// arbitrary once the labels are German: it puts `max_word_ratio` above
+/// arbitrary once the labels are prose: it puts `max_word_ratio` above
 /// `min_word_ratio` with two unrelated overlap thresholds in between, and
 /// sinks a section's master `enabled` switch to third place behind
 /// `context_size`. A section reads top to bottom as "what is this, then how
@@ -513,9 +514,10 @@ export function jsonEqual(a: Json | undefined, b: Json | undefined): boolean {
 }
 
 /// Folds a string down to what a search should compare on: case, diacritics
-/// and `ß` all removed. Typing "grosse" has to find "Größe" and typing
-/// "vokabular" has to find "Vokabular" — a settings search that only matches
-/// what you can already spell exactly is a search nobody uses twice.
+/// and `ß` all removed. The labels are English, but the *values* are not
+/// necessarily — a device name, a vocabulary term or a window class can carry
+/// anything — so typing "grosse" still has to find "Größe". A search that only
+/// matches what you can already spell exactly is a search nobody uses twice.
 export function fold(s: string): string {
   return s
     .toLowerCase()
@@ -524,14 +526,14 @@ export function fold(s: string): string {
     .replace(/\p{Diacritic}/gu, "");
 }
 
-/// Everything one row can be found by: its German label, its raw config key
-/// (so `min_overlap_english` finds it even though the window never shows that
+/// Everything one row can be found by: its label, its raw config key (so
+/// `min_overlap_english` finds it even though the window never shows that
 /// string), its section's title and raw name, its unit, and its help text.
 ///
 /// The raw key is in there deliberately. Nobody is invited to *edit*
 /// `config.toml` any more, but people still read it — in a bug report, or in a
 /// daemon error naming a key — and someone arriving from either is searching
-/// for the name Rust uses, not the one German uses.
+/// for the name Rust uses, not the one this window prints.
 function rowHaystack(section: string, key: string): string {
   const path = `${section}.${key}`;
   return fold(

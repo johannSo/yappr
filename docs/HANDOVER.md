@@ -78,7 +78,7 @@ re-touch it.
    - `bindings.lua`: delete the three `o.bind` lines calling `owf-ctl ptt-start` /
      `ptt-stop` / `cancel`. Add the two lines `yappr --print-shortcuts` prints.
    - `autostart.lua`: delete both `o.launch_on_start` lines. There is no replacement line —
-     autostart is now the Settings window's "Beim Anmelden starten" toggle (step 5).
+     autostart is now the Settings window's "Start at login" toggle (step 5).
    - `windows.lua`: delete the `o.window("openwhisprflow", {...})` block. On Hyprland you
      do not need to paste a replacement — the overlay now positions and unfocuses itself
      via `wlr-layer-shell`. (If you'd rather have the belt-and-braces fallback rule too,
@@ -99,7 +99,7 @@ re-touch it.
    Setup pane should not appear; if it does, something about the on-disk models changed and
    it will say what.
 
-6. **Turn on "Beim Anmelden starten"** in Settings if you want the old autostart behaviour
+6. **Turn on "Start at login"** in Settings if you want the old autostart behaviour
    back — it now writes `~/.config/autostart/yappr.desktop` instead of a Hyprland
    line.
 
@@ -114,7 +114,7 @@ re-touch it.
 |---|---|
 | **Process topology** | Three processes (daemon, overlay, settings) become one binary, `yappr`, hosting the pipeline, socket, tray, overlay, and settings window in a single process. `crates/owf-cli` and `settings-tauri` are deleted. |
 | **Dictation gesture** | Hold-to-talk (`ptt-start`/`ptt-stop` on press/release) becomes press-to-start/press-to-stop (`--toggle`, resolved against the server's current state). `--cancel` is unchanged as a separate shortcut. |
-| **The tray** | New. A native StatusNotifierItem (`ksni`, not Tauri's own tray feature — appindicator-only hosts don't send click events). Left-click opens Settings; right-click gives Status / Einstellungen / Diktat pausieren / Beenden. |
+| **The tray** | New. A native StatusNotifierItem (`ksni`, not Tauri's own tray feature — appindicator-only hosts don't send click events). Left-click opens Settings; right-click gives Status / Settings / Setup / Pause dictation / Quit. |
 | **Pausing** | New. `PAUSED` is a real state; `--toggle` is refused and no microphone opens while paused. Never interrupts an utterance already in flight. |
 | **First run** | `owf-ctl setup` is gone. A Setup pane in the Settings window now provisions models and checks prerequisites (same checks, driven from the GUI). |
 | **Autostart** | An XDG `.desktop` entry written by a Settings toggle, not a Hyprland `exec-once` line. No systemd unit is authored by this project. |
@@ -151,7 +151,7 @@ re-touch it.
   this rewrite, and I did not open a microphone to test it — forbidden by this project's
   standing rule, independent of this task.
 - **Whether left-click on the tray actually sends `Activate` on this machine's tray host.**
-  The code handles both answers (if it doesn't, Einstellungen is the context menu's first,
+  The code handles both answers (if it doesn't, Settings is the context menu's first,
   actionable item), but nobody has clicked the tray icon of the *new*, one-process build —
   doing that myself would mean starting a second instance while the old one still owns the
   socket and tray slot, which is exactly what this task's constraints forbid.
@@ -180,7 +180,7 @@ re-touch it.
 ## Added after this letter: `ydotool` as a third injector
 
 `[inject] backend` now accepts `"ydotool"` alongside `"wtype"` and `"clipboard"`, selectable
-from Settings → Allgemein → Texteingabe → Verfahren. Spec 10.3 planned this and deferred it;
+from Settings → General → Text entry → Method. Spec 10.3 planned this and deferred it;
 it is no longer deferred. `wtype` is still the default — it needs no setup, and `ydotool`
 needs a running `ydotoold` plus write access to `/dev/uinput`, which README's "Typing with
 `ydotool`" section documents rather than automates.
@@ -329,7 +329,7 @@ Invariant 12 in CLAUDE.md is the part to read before editing `server.rs`.
     `load_models` — which on every cold press means the ~3.5 s window
     between `llama-server`'s cold start (~750 ms in) and the ASR model
     finishing — is not reached at all before the process is gone. Press
-    SUPER+D, cancel with SUPER+ALT+D, then tray → Beenden, during that
+    SUPER+D, cancel with SUPER+ALT+D, then tray → Quit, during that
     window, and a ~955 MB `llama-server` is left running; the next start is
     unaffected (`pick_port` just walks past it), so the only symptom is the
     memory this feature exists to reclaim never coming back. Not fixed
@@ -349,7 +349,7 @@ Invariant 12 in CLAUDE.md is the part to read before editing `server.rs`.
 ## Selectable ASR models (2026-09-08)
 
 `[asr] model` chooses between three speech-recognition models; the dropdown is
-in the settings window's Sprache pane and in the wizard's Modelle step. Design:
+in the settings window's Language pane and in the wizard's models step. Design:
 `docs/superpowers/specs/2026-09-08-asr-model-selection-design.md`. Plan:
 `docs/superpowers/plans/2026-09-08-asr-model-selection.md`.
 
@@ -381,7 +381,7 @@ Not verified — still open:
 - **No end-to-end dictation with a non-default model.** The `--ignored` tests
   drive `asr::build` against a fixture; nobody has yet pressed SUPER+D with
   `nemotron-3.5` selected and watched text land in a window.
-- **The wizard and Sprache-pane dropdowns are built, not clicked.**
+- **The wizard and Language-pane dropdowns are built, not clicked.**
   `bun run build` passes for both entry points; the UI has not been exercised
   against a running daemon.
 - ~~primeline-parakeet is not shipped.~~ **Shipped and verified end to end on
@@ -412,7 +412,7 @@ again by hand. `Request::Restart` is `Request::Quit`'s arm plus one call:
 `EventSink::relaunch`, between `shutdown` and `std::process::exit(0)`.
 `TauriSink::relaunch` spawns the binary `pick_successor_binary` chose, with no
 arguments. The settings window latches the requirement, shows a dialog once the
-save settles, and keeps an actionable amber bar if the user picks **Später**.
+save settles, and keeps an actionable amber bar if the user picks **Later**.
 
 Verified on this machine:
 
@@ -788,7 +788,7 @@ another program receives is the text yappr would have typed. `tungstenite 0.30`
 is the one new dependency (sync, `handshake` only, no TLS flavour, no runtime).
 
 **A button that installs an OpenClaw plugin** (`openclaw-plugin/`,
-`src-tauri/src/openclaw.rs`, the new **KI** pane): OpenClaw's dictation is a
+`src-tauri/src/openclaw.rs`, the new **AI** pane): OpenClaw's dictation is a
 pluggable *realtime transcription provider*, so the plugin is one, and the
 button materialises it from `include_str!` data into
 `~/.local/share/yappr/openclaw-plugin/`, links it with `openclaw plugins install

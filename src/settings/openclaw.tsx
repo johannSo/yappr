@@ -1,4 +1,4 @@
-/// The OpenClaw card in the KI pane.
+/// The OpenClaw card in the AI pane.
 ///
 /// Like `Settings.tsx`'s `AutostartCard`, and for the same reason: what this
 /// card reports is not a `config.toml` section. It is the state of *another
@@ -69,17 +69,17 @@ function isComplete(s: OpenClawStatus): boolean {
 /// actually missing rather than by the extreme it is nearest to.
 function headline(s: OpenClawStatus): { tone: "ok" | "todo" | "warn"; text: string } {
   if (!s.cli.found) {
-    return { tone: "warn", text: "OpenClaw wurde auf diesem Rechner nicht gefunden." };
+    return { tone: "warn", text: "OpenClaw was not found on this machine." };
   }
   if (!s.plugin.installed) {
-    return { tone: "todo", text: "Das yappr-Plugin ist in OpenClaw noch nicht eingerichtet." };
+    return { tone: "todo", text: "The yappr plugin is not set up in OpenClaw yet." };
   }
   if (!s.provider.selected) {
     return {
       tone: "todo",
       text: s.provider.configured
-        ? "Das Plugin ist installiert und yappr ist in OpenClaws Konfiguration eingetragen, aber dort nicht als Diktat-Anbieter ausgewählt."
-        : "Das Plugin ist installiert, aber yappr ist in OpenClaw nicht als Diktat-Anbieter eingetragen.",
+        ? "The plugin is installed and yappr is in OpenClaw's config, but it is not selected there as the dictation provider."
+        : "The plugin is installed, but yappr is not registered in OpenClaw as a dictation provider.",
     };
   }
   if (s.provider.stale) {
@@ -90,13 +90,13 @@ function headline(s: OpenClawStatus): { tone: "ok" | "todo" | "warn"; text: stri
     // not.
     return {
       tone: "warn",
-      text: `OpenClaw ist noch auf die früheren Zugangsdaten eingetragen (Port oder Zugangsschlüssel wurden hier geändert). „Erneut einrichten“ schreibt sie neu.`,
+      text: `OpenClaw still holds the earlier connection details (the port or the access key was changed here). “Set up again” rewrites them.`,
     };
   }
   if (!s.realtime.enabled) {
     return {
       tone: "todo",
-      text: "OpenClaw ist auf yappr eingestellt, der lokale Zugang unten ist aber ausgeschaltet — es kommt nichts an.",
+      text: "OpenClaw is pointed at yappr, but the local endpoint below is switched off — nothing arrives.",
     };
   }
   if (!s.realtime.running) {
@@ -106,13 +106,13 @@ function headline(s: OpenClawStatus): { tone: "ok" | "todo" | "warn"; text: stri
     return {
       tone: "warn",
       text: s.realtime.error
-        ? `Der Zugang ist eingeschaltet, lauscht aber nicht: ${s.realtime.error}. Unter „${titleFor("realtime")}“ lässt sich eine andere Portnummer eintragen.`
-        : `Der Zugang ist eingeschaltet, lauscht aber nicht auf Port ${s.realtime.port}. Unter „${titleFor("realtime")}“ lässt sich eine andere Nummer eintragen.`,
+        ? `The endpoint is switched on but is not listening: ${s.realtime.error}. A different port number can be entered under “${titleFor("realtime")}”.`
+        : `The endpoint is switched on but is not listening on port ${s.realtime.port}. A different number can be entered under “${titleFor("realtime")}”.`,
     };
   }
   return {
     tone: "ok",
-    text: `Eingerichtet: OpenClaw diktiert über yappr, der Zugang lauscht auf Port ${s.realtime.port}.`,
+    text: `Set up: OpenClaw dictates through yappr, and the endpoint is listening on port ${s.realtime.port}.`,
   };
 }
 
@@ -168,7 +168,7 @@ export function OpenClawCard({
 }) {
   // `null` is "not asked yet", deliberately distinct from every real answer:
   // this card's whole job is making claims about another program, and the
-  // worst of them ("OpenClaw wurde nicht gefunden") is also the one a
+  // worst of them ("OpenClaw was not found") is also the one a
   // zero-value default would flash on every mount.
   const [status, setStatus] = useState<OpenClawStatus | null>(null);
   const [steps, setSteps] = useState<RunStep[] | null>(null);
@@ -209,7 +209,7 @@ export function OpenClawCard({
         setSteps(res.steps);
         setStatus(res.status);
       } catch (e) {
-        // The German string the command rejected with, shown as it arrived.
+        // The string the command rejected with, shown as it arrived.
         // The status is re-read afterwards either way: a hard failure can
         // still have got halfway, and the rows below have to say where it
         // stopped rather than what they showed before the press.
@@ -236,9 +236,9 @@ export function OpenClawCard({
         <h2>OpenClaw</h2>
       </div>
       <p className="note">
-        OpenClaw ist ein eigenes, lokal installiertes Programm. Ist das Plugin
-        eingerichtet, diktierst du dort über yappr — dieselbe Spracherkennung und
-        dieselbe Nachbearbeitung wie hier, ohne Cloud.
+        OpenClaw is a separate, locally installed program. Once the plugin is set
+        up, you dictate there through yappr — the same speech recognition and the
+        same post-processing as here, with no cloud.
       </p>
 
       <div className="card">
@@ -247,54 +247,54 @@ export function OpenClawCard({
             missing for as long as the check takes, on every machine. */}
         {!status ? (
           <div className="setup-row">
-            <span>Wird geprüft…</span>
+            <span>Checking…</span>
           </div>
         ) : !status.cli.found ? (
-          <Fact ok={false} label="OpenClaw" status="nicht gefunden" detail={status.cli.error} />
+          <Fact ok={false} label="OpenClaw" status="not found" detail={status.cli.error} />
         ) : (
           <>
             <Fact
               ok
               label="OpenClaw"
-              status={status.cli.version ?? "gefunden"}
+              status={status.cli.version ?? "found"}
               detail={status.cli.path}
               mono
             />
             <Fact
               ok={status.plugin.installed}
-              label="yappr-Plugin"
+              label="yappr plugin"
               status={
                 status.plugin.installed
                   ? status.plugin.linked
-                    ? "eingerichtet"
-                    : "vorhanden, nicht verknüpft"
-                  : "nicht eingerichtet"
+                    ? "set up"
+                    : "on disk, not linked"
+                  : "not set up"
               }
               detail={status.plugin.installed ? status.plugin.dir : null}
               mono
             />
             <Fact
               ok={status.provider.selected && !status.provider.stale}
-              label="Diktat-Anbieter in OpenClaw"
+              label="Dictation provider in OpenClaw"
               status={
                 status.provider.selected
                   ? status.provider.stale
-                    ? "yappr, aber veraltete Zugangsdaten"
+                    ? "yappr, but stale connection details"
                     : "yappr"
                   : status.provider.configured
-                    ? "eingetragen, nicht ausgewählt"
-                    : "nicht eingetragen"
+                    ? "registered, not selected"
+                    : "not registered"
               }
             />
             <Fact
               ok={status.realtime.enabled && status.realtime.running}
-              label="Lokaler Zugang"
+              label="Local endpoint"
               status={
                 !status.realtime.enabled
-                  ? "aus"
+                  ? "off"
                   : status.realtime.running
-                    ? `lauscht auf Port ${status.realtime.port}`
-                    : `an, aber nicht erreichbar (Port ${status.realtime.port})`
+                    ? `listening on port ${status.realtime.port}`
+                    : `on, but unreachable (port ${status.realtime.port})`
               }
               detail={status.realtime.enabled ? status.realtime.error : null}
             />
@@ -319,38 +319,38 @@ export function OpenClawCard({
 
       {status && !status.cli.found && (
         <p className="setup-command">
-          OpenClaw wird getrennt von yappr installiert, zum Beispiel mit{" "}
-          <code>npm i -g openclaw</code>. Danach hier erneut prüfen.
+          OpenClaw is installed separately from yappr, for example with{" "}
+          <code>npm i -g openclaw</code>. Then check again here.
         </p>
       )}
 
       {status && status.cli.found && !complete && (
         <p className="setup-command">
-          „Einrichten“ legt das yappr-Plugin an, verknüpft es mit OpenClaw, trägt
-          yappr dort als Diktat-Anbieter ein und schaltet den lokalen Zugang unten
-          ein. Dabei wird die Konfigurationsdatei von OpenClaw geschrieben.
+          “Set up” creates the yappr plugin, links it into OpenClaw, registers
+          yappr there as the dictation provider and switches on the local endpoint
+          below. OpenClaw’s config file is written in the process.
         </p>
       )}
 
       {busy !== null && (
         <p className="setup-command">
-          Das dauert ein paar Sekunden — OpenClaw wird dabei mehrfach aufgerufen.
+          This takes a few seconds — OpenClaw is called several times along the way.
         </p>
       )}
 
       {/* The only place a partial run is visible. Kept whole, failed steps
-          included: "installiert, aber die Konfiguration wurde abgelehnt" is
+          included: "installed, but the config write was refused" is
           exactly the outcome a collapsed success message would hide. */}
       {steps && (
         <>
-        <p className="note">Letzter Durchlauf</p>
+        <p className="note">Last run</p>
         <div className="card">
           {steps.map((s, i) => (
             <Fact
               key={`${i}-${s.label}`}
               ok={s.ok}
               label={s.label}
-              status={s.ok ? "erledigt" : "nicht erledigt"}
+              status={s.ok ? "done" : "not done"}
               detail={s.detail || null}
             />
           ))}
@@ -363,7 +363,7 @@ export function OpenClawCard({
           <Icon name="warn" className="icon-sm" />
           <span>{error}</span>
           <button type="button" className="ghost" onClick={() => void refresh()}>
-            Erneut prüfen
+            Check again
           </button>
         </div>
       )}
@@ -380,7 +380,7 @@ export function OpenClawCard({
             disabled={busy !== null}
             onClick={() => void run("remove")}
           >
-            {busy === "remove" ? "Entfernt…" : "Entfernen"}
+            {busy === "remove" ? "Removing…" : "Remove"}
           </button>
         )}
         <button
@@ -392,13 +392,13 @@ export function OpenClawCard({
           {/* Keyed on the plugin being there, not on everything being in
               place: a re-run is exactly what a half-finished install and a
               stale provider entry both need, and a button that still said
-              "Einrichten" would read as "start over" rather than "fix
+              "Set up" would read as "start over" rather than "fix
               this". The headline above names it by this label. */}
           {busy === "install"
-            ? "Richtet ein…"
+            ? "Setting up…"
             : status?.plugin.installed
-              ? "Erneut einrichten"
-              : "Einrichten"}
+              ? "Set up again"
+              : "Set up"}
         </button>
       </div>
     </section>

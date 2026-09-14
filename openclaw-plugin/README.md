@@ -15,7 +15,7 @@ Verified against openclaw **2026.9.4**. All plugin APIs are experimental; re-tes
 
 ## Install
 
-yappr's settings window does this for you: open the **KI** pane and use the OpenClaw
+yappr's settings window does this for you: open the **AI** pane and use the OpenClaw
 button. It writes these files to `~/.local/share/yappr/openclaw-plugin/` and runs the link
 install below. (yappr's own UI is German; everything this plugin puts in front of OpenClaw
 is English, because OpenClaw is an English product.)
@@ -210,7 +210,7 @@ hint as to why. Use the environment variable.
 ### Two places, one record
 
 This provider's config arrives from **two** paths, and both are written — with identical
-values, in one run — by yappr's "Einrichten" button:
+values, in one run — by yappr's "Set up" button:
 
 | Path | Who reads it | What it is |
 | --- | --- | --- |

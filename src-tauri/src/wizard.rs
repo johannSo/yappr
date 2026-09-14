@@ -28,7 +28,7 @@ use yappr_core::desktop::{self, Desktop};
 ///   it is a nag.
 /// - **It could not explain itself.** The wizard's models step reports the
 ///   model list, so a `ready: false` caused by anything else reads as "Alle
-///   Modelle sind vorhanden" *and* "Einrichtung unvollständig" at the same
+///   models are present" *and* "setup incomplete" at the same
 ///   time -- the exact contradiction that prompted this change.
 ///
 /// The warning did not go away, it moved: `build_wizard_state` sends the
@@ -69,7 +69,7 @@ pub(crate) fn write_marker(path: &Path) -> std::io::Result<()> {
 /// It exists as a named function because the bug it fixes was that only
 /// *one* route out of the wizard wrote it: the last step's Fertig button. A
 /// user who loaded the models, copied the shortcut, and then left by any
-/// other door -- "Einstellungen öffnen" on the last step, "Einstellungen" on
+/// other door -- "Open settings" on the last step, "Settings" on
 /// the models step, or simply closing the window, which is what a finished
 /// window invites -- got the whole wizard again at the next start, forever,
 /// with nothing on screen explaining why. Reported exactly that way on
@@ -82,7 +82,7 @@ pub(crate) fn write_marker(path: &Path) -> std::io::Result<()> {
 /// - [`wizard_finish`] -- Fertig, and it writes this **before** the backend
 ///   patch it also does, so a `set_config` that fails cannot take the marker
 ///   down with it (it used to `?` out one line above the write).
-/// - [`wizard_dismiss`] -- the two "Einstellungen" buttons, via
+/// - [`wizard_dismiss`] -- the two settings buttons, via
 ///   `Settings.tsx`'s `onOpenSettings`.
 /// - `lib.rs`'s close-request hook on the settings window -- the door with
 ///   no button, and the one a user who considers themselves done reaches for.
@@ -94,14 +94,14 @@ pub(crate) fn remember_setup_seen() -> Result<(), String> {
     let path = yappr_core::paths::wizard_marker();
     write_marker(&path).map_err(|e| {
         let msg =
-            format!("Einrichtungsstatus konnte nicht gespeichert werden ({}): {e}", path.display());
+            format!("the setup status could not be saved ({}): {e}", path.display());
         eprintln!("wizard: {msg}");
         msg
     })
 }
 
-/// Leaving the wizard without finishing it: the "Einstellungen" button on
-/// the models step and "Einstellungen öffnen" on the last one. Both are the
+/// Leaving the wizard without finishing it: the "Settings" button on
+/// the models step and "Open settings" on the last one. Both are the
 /// user saying they are done with this window's wizard mode, which is
 /// exactly what the marker records -- see [`remember_setup_seen`].
 #[tauri::command]
@@ -127,7 +127,7 @@ pub fn wizard_dismiss() -> Result<(), String> {
 /// at. Recommending it would hand a new GNOME user a backend that fails
 /// silently into the clipboard fallback anyway, which is what `clipboard`
 /// does honestly. Both it and `[inject] script` are a paragraph in the
-/// wizard, pointing at the Verfahren dropdown, which is where a choice the
+/// wizard, pointing at the Method dropdown, which is where a choice the
 /// user makes for themselves belongs.
 pub(crate) fn recommended_backend(d: &Desktop) -> &'static str {
     match d {
@@ -213,7 +213,7 @@ pub async fn wizard_state() -> Result<serde_json::Value, String> {
         build_wizard_state(marker_present, setup, &d, current)
     })
     .await
-    .map_err(|e| format!("interner Fehler: {e}"))
+    .map_err(|e| format!("internal error: {e}"))
 }
 
 /// The `SetConfig` payload that sets the injection backend and nothing else.
@@ -320,7 +320,7 @@ mod tests {
 
     /// **The bug this whole module was reopened for, on 2026-09-10.** The
     /// marker was written by exactly one thing -- the last step's Fertig
-    /// button -- and the wizard has three other exits: two "Einstellungen"
+    /// button -- and the wizard has three other exits: two settings
     /// buttons and the window's own close control. Take any of them and the
     /// marker stays unwritten, so `should_open` keeps answering `true` and
     /// the wizard takes over the settings window on every launch, forever,
@@ -344,14 +344,14 @@ mod tests {
         // The wizard's own two exits, and the handlers they are wired to.
         let wizard_tsx = source("src/settings/wizard.tsx");
         assert_eq!(
-            // The models step's "Einstellungen" and the last step's
-            // "Einstellungen öffnen". A third button added without this
+            // The models step's "Settings" and the last step's
+            // "Open settings". A third button added without this
             // handler is a fourth unmarked exit.
             wizard_tsx.matches("onClick={onOpenSettings}").count(),
             2,
-            "both 'Einstellungen' buttons must still go through onOpenSettings",
+            "both settings buttons must still go through onOpenSettings",
         );
-        assert!(wizard_tsx.contains("onFinish(firstRun"), "Fertig must still call onFinish");
+        assert!(wizard_tsx.contains("onFinish(firstRun"), "Done must still call onFinish");
 
         // The door with no button. `hide_instead_of_close`'s callback cannot
         // be invoked from a test, so this asserts the wiring is present.
@@ -394,7 +394,7 @@ mod tests {
     /// current health reopens it. `provision`'s `ready` used to be a second,
     /// sufficient reason, and it is a fact the wizard cannot always explain
     /// -- a missing prerequisite binary or a hash mismatch reads as "setup
-    /// incomplete" while the models step says "Alle Modelle sind vorhanden".
+    /// incomplete" while the models step says "All models are present".
     #[test]
     fn a_finished_setup_never_opens_the_wizard_by_itself_again() {
         let dir = scratch_dir("finished");

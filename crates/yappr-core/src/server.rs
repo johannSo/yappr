@@ -261,7 +261,7 @@ pub struct Daemon {
     /// daemon that has been asked to quit never un-quits -- a *restarting*
     /// one does come back, but as a new process with a fresh `Daemon`).
     /// Without this, a
-    /// `PttStart`/`Toggle` landing on the very next `accept()` after Beenden
+    /// `PttStart`/`Toggle` landing on the very next `accept()` after Quit
     /// -- the accept loop is single-threaded, so "next" can be milliseconds
     /// away -- would be accepted normally and could reach `TRANSCRIBING`
     /// inside the short window while `shutdown` is stopping housekeeping and
@@ -352,7 +352,7 @@ pub struct Daemon {
     /// moment it happened -- can still learn *why* the daemon is stuck in
     /// `FAILED` (Task 3, Work Item 3). `None` for the entire run otherwise.
     fatal_error: Mutex<Option<String>>,
-    /// The German sentence startup leaves behind when the config on disk was
+    /// The sentence startup leaves behind when the config on disk was
     /// not usable (spec §3.1) -- either it was quarantined, or a legacy config
     /// in `~/.config` could not be migrated. Reported by `Status` and
     /// `GetConfig` so the settings window can say what happened and name the
@@ -665,7 +665,7 @@ fn open_debug_log_file(debug: &DebugConfig) -> std::io::Result<std::fs::File> {
 /// subscribers -- see [`EventSink`]. The standalone daemon (`run`, below)
 /// passes a sink that discards every event, since it has no in-process
 /// consumer of its own.
-/// Builds the one German sentence that describes whatever went wrong with the
+/// Builds the one sentence that describes whatever went wrong with the
 /// config at startup (spec §3.1), from the two ways it can go wrong.
 ///
 /// Only the parser's **first line** reaches the banner. A `toml` diagnostic is
@@ -686,9 +686,9 @@ fn startup_config_notice(
 
     if let config::Migration::LegacyUnreadable { left_at, error } = migration {
         return Some(format!(
-            "Die bisherige Konfiguration unter {} konnte nicht gelesen werden und wurde \
-             nicht übernommen. Sie liegt unverändert dort; yappr läuft mit \
-             Standardwerten. Grund: {}",
+            "The previous configuration at {} could not be read and was not \
+             carried over. It is still there, untouched; yappr is running with \
+             default settings. Reason: {}",
             left_at.display(),
             first_line(error),
         ));
@@ -697,8 +697,8 @@ fn startup_config_notice(
     let q = quarantine?;
     Some(match &q.moved_to {
         Some(p) => format!(
-            "Die Konfigurationsdatei konnte nicht gelesen werden und wurde nach {} \
-             verschoben. yappr läuft mit Standardwerten. Grund: {}",
+            "The configuration file could not be read and was moved to {}. \
+             yappr is running with default settings. Reason: {}",
             p.display(),
             first_line(&q.error),
         ),
@@ -706,8 +706,8 @@ fn startup_config_notice(
         // saying it "was moved to" its own path would send the user looking
         // for something that is not there.
         None => format!(
-            "Die Konfigurationsdatei konnte nicht gelesen werden und liegt unverändert an \
-             ihrem Platz. yappr läuft mit Standardwerten. Grund: {}",
+            "The configuration file could not be read and is still in place, \
+             untouched. yappr is running with default settings. Reason: {}",
             first_line(&q.error),
         ),
     })
@@ -1219,7 +1219,7 @@ fn ensure_models_loaded_with(
             // This used to carry a much longer argument about an orphaned
             // `llama-server`. A load spawned the child several seconds
             // before it returned, `shutdown` deliberately does not take
-            // `load_lock` (that would hang Beenden behind an in-flight
+            // `load_lock` (that would hang Quit behind an in-flight
             // load), and `std::process::exit(0)` follows `shutdown` within
             // milliseconds -- so a load still inside `load_models` never
             // reached this re-check at all, and the ~955 MB child it had
@@ -1459,7 +1459,7 @@ static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 
 /// Explicit, deterministic teardown, run on `SIGTERM`/`SIGINT`/`SIGHUP`
 /// (`start`'s signal-handling thread), on `Request::Quit`
-/// (`wait_for_busy_to_clear_then_shutdown`, below -- spec §8's Beenden/`--quit`), and,
+/// (`wait_for_busy_to_clear_then_shutdown`, below -- spec §8's Quit/`--quit`), and,
 /// from the Tauri app, on `RunEvent::Exit` (`src-tauri/src/lib.rs`) so a
 /// compositor-issued window close that lets Tauri's own event loop exit
 /// still tears this down rather than orphaning `llama-server`.
@@ -1543,14 +1543,14 @@ fn remove_runtime_files(socket: &Path, lock: &Path) {
 
 // -- Request::Quit (Task 10 / spec §8) --------------------------------------
 
-/// Spec §8 step 1: Beenden/`--quit` must not tear down while an utterance is
+/// Spec §8 step 1: Quit/`--quit` must not tear down while an utterance is
 /// in flight (`is_busy`) -- invariant 1 says a transcribed utterance is never
 /// lost, and `shutdown` stops housekeeping and kills `llama-server`, either
 /// of which could pull the rug out from under a `Normalizing`/`Injecting`
 /// stage that hasn't finished yet. This bounds how long `wait_for_busy_to_
 /// clear` will wait for that stage to finish on its own, so a wedged
 /// pipeline (a `llama-server` or `wtype` call that never returns despite
-/// invariant 6's per-subprocess timeouts) cannot make Beenden unresponsive
+/// invariant 6's per-subprocess timeouts) cannot make Quit unresponsive
 /// forever -- past this bound it shuts down anyway.
 const QUIT_BUSY_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often `wait_for_busy_to_clear` re-checks the state while waiting.
@@ -1587,13 +1587,13 @@ fn wait_for_busy_to_clear(state: &AtomicU8, timeout: Duration, poll: Duration) {
 /// protects text ASR has already *produced*; nothing has been transcribed
 /// yet while merely `RECORDING`, so tearing down and discarding that audio
 /// is not the loss invariant 1 forbids. It is also the behaviour a user
-/// clicking Beenden mid-recording is actually asking for -- stop now, not
+/// clicking Quit mid-recording is actually asking for -- stop now, not
 /// "finish transcribing what I've said so far first". `Daemon::quitting`
 /// (set by the `Request::Quit` arm before this runs) independently closes
 /// the *other* half of this: no *new* recording can start once quitting is
 /// set, so this never has to choose between waiting on `RECORDING` and
 /// racing a fresh one. Do not "fix" this into waiting on `RECORDING` too --
-/// that would make Beenden hang for however long the user has been
+/// that would make Quit hang for however long the user has been
 /// recording, entirely defeating the point of a responsive quit.
 fn wait_for_busy_to_clear_then_shutdown(daemon: &Daemon) {
     wait_for_busy_to_clear_then_shutdown_with(daemon, QUIT_BUSY_WAIT_TIMEOUT, QUIT_BUSY_POLL_INTERVAL);
@@ -2145,14 +2145,14 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
             r
         }
         Request::PttStart => {
-            // Spec §8 step 1: stop accepting new utterances once Beenden has
+            // Spec §8 step 1: stop accepting new utterances once Quit has
             // been requested. See `Daemon::quitting`'s doc comment.
             if daemon.quitting.load(Ordering::SeqCst) {
                 return Response::err("shutting down");
             }
             match current {
                 WARMING => Response::err("warming"),
-                // Task 13: the tray's "Diktat pausieren" is checked. The
+                // Task 13: the tray's "Pause dictation" is checked. The
                 // shortcut stays bound (this refusal is reachable at all
                 // only because it is), it just opens no microphone until
                 // `Request::SetPaused { paused: false }` returns to `IDLE`.
@@ -2223,7 +2223,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
                 s => Response::ok(state_of(s)), // already idle, or still warming
             }
         }
-        // Task 13: the tray's "Diktat pausieren". A compare-and-exchange,
+        // Task 13: the tray's "Pause dictation". A compare-and-exchange,
         // never an unconditional store: a `SetPaused` arriving mid-utterance
         // -- RECORDING included, not just the TRANSCRIBING/NORMALIZING/
         // INJECTING sub-states `is_busy` names -- must defer to it rather
@@ -2233,7 +2233,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
         // and no queue: a pause requested mid-utterance simply does not take,
         // and the tray's checkbox -- driven by this broadcast, never an
         // optimistic guess -- correctly never shows checked for it. The user
-        // presses "Diktat pausieren" again once the daemon is back to `IDLE`.
+        // presses "Pause dictation" again once the daemon is back to `IDLE`.
         //
         // Broadcast only on an actual transition (mirroring `Cancel` above),
         // not on a failed or no-op CAS: `TauriSink::emit` -> `refresh_tray_icon`
@@ -2381,7 +2381,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
             // mid-utterance -- it is reached only by a CAS from `IDLE`, so
             // there is no in-flight recorder or pipeline state here to
             // protect. Without this, pausing dictation from the tray (one
-            // menu row above Einstellungen) silently broke every settings
+            // menu row above Settings) silently broke every settings
             // autosave until the user unpaused again.
             if current != IDLE && current != PAUSED {
                 return Response::err("changing settings requires idle or paused");
@@ -2488,7 +2488,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
             //
             // No terminal `OverlayEvent::Idle` is broadcast here: every
             // other teardown path (a terminating signal, a future tray
-            // Beenden) goes straight from `shutdown` to `exit` with no
+            // Quit) goes straight from `shutdown` to `exit` with no
             // final event either, and a frontend that is about to lose its
             // process has nothing to do with one more state it'll never
             // render.
@@ -4822,7 +4822,7 @@ mod tests {
         f();
     }
 
-    /// Spec §8: Beenden must leave nothing behind. The llama-server child is
+    /// Spec §8: Quit must leave nothing behind. The llama-server child is
     /// the one that leaks today when the process is killed rather than
     /// dropped. Exercises the real `shutdown` (not just `kill_llama`
     /// directly, which `kill_llama_terminates_a_stub_child_and_is_idempotent`
@@ -5036,7 +5036,7 @@ mod tests {
     }
 
     /// The other half of the same fix: the wait is bounded (spec §8's "must
-    /// not make Beenden unresponsive forever"), so a pipeline wedged forever
+    /// not make Quit unresponsive forever"), so a pipeline wedged forever
     /// in a busy state does not hang `Request::Quit`'s shutdown thread
     /// forever either. Uses a tiny timeout/poll pair so the test itself
     /// stays fast; `QUIT_BUSY_WAIT_TIMEOUT` is the real ~10 s bound used in
@@ -5062,7 +5062,7 @@ mod tests {
     /// ("stop accepting new utterances") was never implemented -- only its
     /// second half ("let one already in flight finish") was. Without
     /// `Daemon::quitting`, a `PttStart`/`Toggle` landing on the accept loop's
-    /// very next connection after Beenden would be accepted normally and
+    /// very next connection after Quit would be accepted normally and
     /// could reach `TRANSCRIBING` inside the window while the spawned
     /// shutdown thread is stopping housekeeping and reaping `llama-server`.
     /// Drives `dispatch` directly (not through `Request::Quit`, which this
@@ -5141,7 +5141,7 @@ mod tests {
     static NOT_SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 
     /// Final-review fix 2. `shutdown` takes no `load_lock` -- it must not,
-    /// because that would hang Beenden for up to `STARTUP_HEALTH_TIMEOUT`
+    /// because that would hang Quit for up to `STARTUP_HEALTH_TIMEOUT`
     /// behind an in-flight load -- so a load still running when teardown
     /// begins used to install its `llama-server` into `daemon.llama` *after*
     /// `shutdown`'s `kill_llama` had already looked there and found `None`.
@@ -5149,7 +5149,7 @@ mod tests {
     /// resident, silently: nothing errors, the next start's `pick_port`
     /// simply walks past it, and the user loses precisely the memory this
     /// feature exists to reclaim. Reachable in three keystrokes -- SUPER+D,
-    /// SUPER+ALT+D, Beenden -- because cancelling leaves the state `IDLE`,
+    /// SUPER+ALT+D, Quit -- because cancelling leaves the state `IDLE`,
     /// which `wait_for_busy_to_clear` does not wait on, while the loader
     /// thread `start_recording` spawned is still going. `SIGTERM` at logout
     /// is the same shape.
@@ -5173,7 +5173,7 @@ mod tests {
         let daemon = fake_daemon(IDLE);
         let shutting_down = AtomicBool::new(false);
         let mut load = || {
-            // Beenden lands here: `shutdown` runs to completion on its own
+            // Quit lands here: `shutdown` runs to completion on its own
             // thread while this load is still in flight.
             shutting_down.store(true, Ordering::SeqCst);
             Ok((stub_pipeline(), true))
@@ -5396,7 +5396,7 @@ mod tests {
         .expect("an unreadable legacy config must be reported");
 
         assert!(notice.contains("/home/u/.config/yappr/config.toml"), "{notice}");
-        assert!(notice.contains("nicht übernommen"), "{notice}");
+        assert!(notice.contains("was not carried over"), "{notice}");
         assert!(notice.contains("nope"), "{notice}");
     }
 
@@ -5431,8 +5431,8 @@ mod tests {
         )
         .unwrap();
 
-        assert!(notice.contains("liegt unverändert"), "{notice}");
-        assert!(!notice.contains("verschoben"), "{notice}");
+        assert!(notice.contains("still in place"), "{notice}");
+        assert!(!notice.contains("moved to"), "{notice}");
     }
 
     /// The healthy path stays silent -- a banner on every launch would train
