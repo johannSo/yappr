@@ -78,6 +78,15 @@ ashpd = { version = "0.13", default-features = false, features = [
 # nothing in `futures-lite` can express a deadline. Already in `Cargo.lock`
 # under zbus's `async-io` feature, so this adds no node to the graph.
 async-io = "2"
+# The realtime transcription endpoint's WebSocket framing (`realtime.rs`).
+# Synchronous and stream-based, which is the whole reason for this one over
+# every async alternative: `server.rs` and this crate stay off a runtime, and
+# a session here is a plain thread pair on a `TcpStream`. Default features
+# are `handshake` only -- no TLS flavour of any kind is enabled, and none is
+# wanted: the listener is bound to 127.0.0.1 and a certificate for loopback
+# would be theatre. Deps it brings: `http`, `httparse`, `sha1`, `rand`,
+# `data-encoding` -- no runtime, no OpenSSL.
+tungstenite = "0.30"
 
 [dev-dependencies]
 hound = "3.5"

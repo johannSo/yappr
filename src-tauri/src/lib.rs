@@ -14,6 +14,7 @@ pub mod cli;
 pub mod client;
 mod client_stream;
 mod layer;
+mod openclaw;
 mod provision;
 mod replay;
 mod settings_cmds;
@@ -411,7 +412,10 @@ pub fn run() {
             provision::run_setup,
             wizard::wizard_state,
             wizard::wizard_finish,
-            wizard::wizard_dismiss
+            wizard::wizard_dismiss,
+            openclaw::openclaw_status,
+            openclaw::openclaw_install,
+            openclaw::openclaw_remove
         ])
         .setup(move |app| {
             let window = app

@@ -59,6 +59,17 @@ distinction when editing either — a blanket rename through them makes them fal
 `owf-ctl`, `owf-cli` and `owf-daemon` in comments are the same case: deleted crates
 that genuinely had those names, not stale spellings.
 
+Since 2026-09-14 there is a second way text comes out of this app and it does
+not involve the keyboard at all: `[realtime]` opens a loopback WebSocket
+(`crates/yappr-core/src/realtime.rs`) that another program streams PCM into and
+gets finished utterances back from. It exists for exactly one consumer --
+**OpenClaw**, a separately installed local AI agent, whose dictation is a
+pluggable *realtime transcription provider*. `openclaw-plugin/` is that
+provider, plain ESM with no build step and no imports; `src-tauri/src/openclaw.rs`
+is the settings window's KI pane installing it (materialize, `openclaw plugins
+install --link`, `openclaw config set`). Off by default; the button is what turns
+it on. See invariant 16.
+
 `README.md` is the user-facing setup guide. `docs/HANDOVER.md` is the current state-of-play,
 including what has and has not been verified on real hardware.
 
@@ -85,13 +96,21 @@ bun run tauri dev                         # dev: Vite on :1420 + the Tauri windo
 bun run build                             # frontend only (tsc && vite build -> dist/)
 #   ^ builds BOTH pages: index.html (overlay) and settings.html (settings window).
 
-# Tests (507 passed, 0 failed, 12 #[ignore]d: 11 need downloaded models, one needs a
+# Tests (551 passed, 0 failed, 14 #[ignore]d: 13 need downloaded models, one needs a
 # session bus and a desktop portal -- `libei::tests::the_portal_on_this_desktop_hands_out_keyboards`)
 cargo test --workspace
 # NOT optional. These are the only tests that catch a C++ ABI mismatch between
 # sherpa-onnx and llama.cpp -- see the gotcha at the bottom of this file. A wrong
 # `CXXFLAGS` aborts the process inside the VAD, and the default run notices nothing.
 cargo test --workspace -- --ignored --test-threads=1   # needs models on disk (Settings' Setup pane, or --update-lock)
+#   ^ these load whatever `[asr] model` *defaults* to, not what you have
+#     selected -- provisioning only downloads the selected model, so on a
+#     machine that picked a different one the ASR-backed tests fail on a
+#     missing directory rather than on anything being wrong. That includes
+#     `realtime::tests::a_wav_file_streamed_through_the_socket_comes_back_as_text`,
+#     the one test where socket bytes reach a real model (verified against
+#     `parakeet-primeline-de` on 2026-09-14 by pointing its config at the
+#     model that machine had).
 #   ^ `--test-threads=1` is not optional in practice. Run in parallel, several of
 #     these load S1-mini (~480 MB) and an ASR model at once and
 #     `llama::engine_tests::the_normalizer_trait_cleans_up_a_transcript_end_to_end`
@@ -121,6 +140,12 @@ cargo run -p yappr-core --example libei_probe -- "hallo welt"   # the portal cho
 #     replaces the clipboard, same warning as above.
 cargo run --release -p yappr -- --bench   # ASR latency table
 
+# The realtime endpoint, without OpenClaw and without a microphone. There is no
+# probe example for it: the protocol is a WebSocket, so any client does, and the
+# session test in `realtime.rs` is the executable specification.
+cargo test -p yappr-core --lib realtime::   # 16 tests, no models, no daemon
+node --check openclaw-plugin/*.js           # the plugin ships as source; this is its compiler
+
 # Runtime inspection / control (against a running instance)
 yappr --status | --debug | --subscribe | --reload
 yappr --settings | --wizard | --toggle | --cancel | --quit
@@ -139,6 +164,7 @@ Two Cargo members, one process:
 
 - **`crates/yappr-core`** — the library. Every pipeline stage plus config, paths, wire
   format, model provisioning, debug capture — and, since the one-process rewrite,
+  `realtime.rs` (the loopback transcription endpoint) and
   `server.rs`: the socket server and the `AtomicU8` state machine, moved here unchanged
   (with its tests) from the now-deleted `crates/owf-cli`. Two modules here are async and
   the rest of the crate is not — `gnome.rs` (the accessibility bus) and `libei.rs` (the
@@ -180,7 +206,10 @@ Two Cargo members, one process:
   `setup_status`/`run_setup` calls that pane used to make),
   `schema.ts` (which pane a section lives in, what a field is called in German, which
   fields get an editor better than a text box), `controls.tsx` (the setting-row
-  primitive and its toggle/select/number/list/table editors), `icons.tsx` (inline SVG,
+  primitive and its toggle/select/number/list/table editors),
+  `openclaw.tsx` (the KI pane's OpenClaw card -- the state of *another program*,
+  asked for directly and never mirrored into config, the same argument
+  `AutostartCard` makes about a file's existence), `icons.tsx` (inline SVG,
   so the window needs no icon dependency). No pipeline logic in TS, and no copy of the
   config schema: `schema.ts` only decides how a key that already exists is *shown*, so
   a key added in Rust and named nowhere here still renders, by its JSON type, in its
@@ -616,6 +645,63 @@ the whole lock file stops parsing. See
     was checked against `git HEAD`, and it is the property that makes this a safe
     upgrade for someone who never asked for a theme.
 
+16. **The realtime endpoint is a second caller of the pipeline, not a second
+    pipeline — and it is loopback-only by construction.** `[realtime]`
+    (`realtime.rs`, default off) is the WebSocket OpenClaw's dictation
+    streams audio into. Five things about it are load-bearing:
+    - **`Pipeline::dictate_text` is `process_with_capture` minus the
+      injector**, and both go through `refine`, which is the extracted
+      vocabulary → language → S1-mini → guardrail → `finish` sequence. That
+      shared function is the only reason the plugin's claim ("the text yappr
+      would have typed") is true, and the only reason invariants 1 and 8
+      hold on both paths. A second copy of those stages would be silent
+      when it drifted: both versions still produce text.
+    - **`start` binds `Ipv4Addr::LOCALHOST` and no config key changes
+      that.** `[realtime] token` is the answer for a shared machine. An
+      endpoint that hands out transcripts of whatever is sent to it is not
+      the microphone -- nothing here opens a capture device -- but it is
+      still an unattended ear on the models, and a `bind` key is one typo
+      away from a LAN.
+    - **A session is two threads and only the reader writes to the socket.**
+      `tungstenite::WebSocket` owns its stream and cannot be split, and a
+      mutex around it would be held for the whole of a blocking `read()` --
+      i.e. exactly when the transcription thread needs to answer. The
+      worker posts frames to an outbox the reader drains, which is why
+      `READ_TIMEOUT` (50 ms) is both the stop-flag latency and the
+      worst-case delay on delivering a finished transcript -- the latter
+      being the one that matters, since a transcript is finished exactly
+      when no audio is arriving to wake the loop early.
+    - **`finalized` comes last, or it means nothing.** It is queued as an
+      empty job *behind* the jobs the `finalize` flush produced, so a client
+      that waits for it has been given every transcript. This is what makes
+      the user's last sentence survive releasing the microphone, and it is
+      the same rule invariant 1 states one stage later.
+    - **The models are re-checked per utterance, not just at connect.**
+      `[models] idle_unload_seconds` measures from the last dictation, and a
+      quiet session would otherwise find the models gone mid-sentence. Every
+      utterance calls `ensure_ready` and `touch`.
+
+    Two consequences worth knowing. A realtime utterance and a push-to-talk
+    one **serialise** against each other -- `transcribe` takes the same
+    `pipeline` mutex `process_utterance` holds, for the same sherpa-onnx FFI
+    reason -- so dictating in two places at once makes the second wait
+    rather than corrupting either. And the endpoint emits **no stage
+    events**: the overlay is yappr's own HUD, and lighting it up for a
+    dictation happening in another program would be confusing on a good
+    compositor and invariant 2's problem on Mutter, where the mitigation
+    hides a focused overlay by blocking the pipeline thread.
+
+    **`[realtime]` changes apply live.** `sync_realtime` runs from `start`,
+    from `SetConfig` and from `Reload`, stopping and re-binding as needed --
+    which is not a nicety: the OpenClaw card's install button flips
+    `realtime.enabled` as one of its steps, and an endpoint that only came
+    up on the next launch would make the button's success message a lie.
+    A failed bind is kept as `Daemon::realtime_error` rather than failing
+    the save, because "enabled but not listening" is a real state (the port
+    is taken) that the settings window has to be able to report -- and
+    refusing the save would leave the user unable to change the port that
+    caused it.
+
 ## Conventions
 
 - Code comments cite **`spec N`** / **`spec §N`**, meaning section numbers in one of two
@@ -643,6 +729,36 @@ the whole lock file stops parsing. See
   with no child process left there is nothing to stub, so it was deleted rather than
   left declared and unused. The tests that relied on it now observe `shutdown` through
   the runtime files it removes.
+- **`openclaw-plugin/` is the only copy of the plugin, and `include_str!` is
+  what keeps it that way.** `src-tauri/src/openclaw.rs` embeds all seven files
+  and writes them to `paths::openclaw_plugin_dir()` when the KI pane's button
+  is pressed; there is no build step, no `npm install`, and no second source to
+  forget. Two rules follow and both are pinned by tests in that module. The
+  plugin's **manifest `configSchema` declares one row per canonical key, and
+  only keys that change behaviour**: the Control UI renders one form row per
+  declared property and humanises the key, so declaring the aliases too --
+  which the first version did, because `config.js` accepts them -- produced
+  "Asr model" above "Asr Model" for every alias pair, reported 2026-09-14 as
+  "almost every option is here twice". Advisory keys (`model`) and
+  accepted-and-ignored ones (`language`) are out for the same reason: a form
+  row that changes nothing is worse than no row. That form is only *real*
+  because `config.js`'s `readOwnEntryConfig` merges
+  `plugins.entries.yappr.config` over the `rawConfig` the host resolves -- the
+  host builds a transcription provider's config from
+  `plugins.entries.voice-call.config.streaming.providers.<id>` and nowhere
+  else. `openclaw.rs` writes both copies from one `provider_entry`, and
+  `every_written_setting_is_one_the_plugin_manifest_declares` pins the
+  requirement that follows from `additionalProperties: false`: a key written
+  and not declared fails validation and takes the whole entry with it. The
+  plugin **imports nothing**: it is loaded from a directory with no
+  `node_modules` above it, so a bare specifier -- `openclaw/plugin-sdk/*`
+  included, which is private-local anyway -- cannot resolve, and
+  `definePluginEntry` is written out by hand instead (it is near-identity; diff
+  against the host's `dist/plugin-entry-*.mjs` if a host upgrade changes the
+  entry shape). And a file renamed there must be renamed in `PLUGIN_FILES`
+  too, or the build fails -- which is the point, because the alternative is a
+  directory OpenClaw refuses at install time with a message nobody sees until
+  they click the button.
 - All filesystem locations come from `yappr-core/src/paths.rs` (XDG): config
   `~/.local/state/yappr/config.toml` (moved out of `~/.config` on 2026-09-02, with a
   one-time `config::migrate_from_legacy`; `paths::legacy_config_file()` is the old
@@ -986,6 +1102,49 @@ the whole lock file stops parsing. See
   that one event held a session open for the life of the process and put the permanent
   indicator straight back -- the guard reinstating the bug it was guarding. A silent
   re-open clears the count, so the strikes have to be consecutive.
+- **OpenClaw's transcription relay sends 8 kHz G.711 mu-law and nothing else,
+  and it checks.** `RELAY_INPUT_ENCODING = "g711_ulaw"` /
+  `RELAY_INPUT_SAMPLE_RATE_HZ = 8e3` in the host's `talk-*.mjs`, enforced by
+  `assertRelayInputAudioConfig` before a session starts: a provider config
+  declaring anything else is refused with `Gateway transcription relay requires
+  g711_ulaw/8000 audio`. This holds for the *browser dictation mic*, not just
+  for Twilio -- which is the whole reason bundled Deepgram defaults to what
+  looks like a telephony shape. `openclaw.rs`'s `provider_entry` writes
+  `mulaw`/`8000` for that reason and `the_written_audio_format_is_the_one_the_relay_emits`
+  pins it, because 16 kHz `linear16` is the obvious "fix" and it is the one
+  that makes every dictation fail. Reported 2026-09-14, after shipping exactly
+  that mistake.
+
+  What the narrowband costs was measured, not assumed:
+  `fixtures/hallo_german.wav` through the real socket with real models returned
+  the identical transcript in both formats ("Alles hat ein Ende, nur die Wurst
+  hat zwei."). Both are `#[ignore]`d tests in `realtime.rs`; the mu-law one is
+  the path production actually takes, so a broken companding or resampler
+  fails there while the 16 kHz test still passes.
+- **Everything yappr knows about OpenClaw comes from the `openclaw` CLI, and
+  three of its habits are load-bearing.** (1) **Never parse
+  `~/.openclaw/openclaw.json`.** It is allowed to be JSON5, `$OPENCLAW_CONFIG_PATH`
+  may move it, and `OPENCLAW_CONFIG_READONLY=1` means the user manages it
+  externally -- `openclaw config get/set` handles all three and validates
+  against the live schema. Writing that file directly would be a second
+  implementation of all of it, with a destroyed config as the failure mode.
+  (2) **`--json` output is read with `first_json`, not `serde_json::from_str`**:
+  the CLI prints warnings around its JSON (`plugins.allow is empty; ...` is the
+  common one), and strict parsing reports a healthy install as missing. Its
+  failure envelope for `--json` goes to **stdout**, which is the third time this
+  file has had to say that about a subprocess -- see `hyprctl` and the paste
+  script's `ydotool` -- so `run_cli` keeps both streams and `CliRun::diagnostic`
+  joins them, stderr first, exactly as `inject::diagnostic` does.
+  (3) **A newly linked plugin does not load until OpenClaw's gateway restarts.**
+  `openclaw gateway restart` is the command, and yappr deliberately does not run
+  it: that process is serving live agent sessions. The install reports it as a
+  note instead.
+
+  One more, learned from the docs rather than from a failure: `$PATH` is not
+  enough to find the CLI. yappr starts from a tray icon or a `.desktop` entry
+  and inherits no login shell, so `find_cli` also looks in `~/.npm-global/bin`
+  and the other global-prefix locations -- the same asymmetry that makes
+  `ydotoold`'s socket path a trap two gotchas above.
 - **Do not trust `cpal`'s advertised sample-rate range.** It advertised 16 kHz on hardware
   that rejected the stream build; `capture.rs` now probes by building a throwaway stream and
   falls back to 48 kHz plus `rubato` resampling.

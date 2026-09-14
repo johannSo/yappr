@@ -26,6 +26,18 @@ const PATHS: Record<string, ReactNode> = {
       <path d="M14.5 6.5l3 3" />
     </>
   ),
+  /// The "KI" pane: two four-point sparks, the shape that has come to mean
+  /// "a machine did this". Stroked and hollow like everything else in the
+  /// rail -- the filled version reads as a star, and a star in a sidebar
+  /// reads as "favourites". Each point is a quadratic whose control point is
+  /// the spark's own centre, which is what gives the concave waist; borrowing
+  /// no product's mark was the other constraint.
+  spark: (
+    <>
+      <path d="M10 4Q10 10.5 16.5 10.5Q10 10.5 10 17Q10 10.5 3.5 10.5Q10 10.5 10 4Z" />
+      <path d="M18 15Q18 18 21 18Q18 18 18 21Q18 18 15 18Q18 18 18 15Z" />
+    </>
+  ),
   /// A toothed ring, not a circle with rays: the eight-spoke version read as a
   /// sun at 18px, which is a poor label for the "Erweitert" pane.
   gear: (

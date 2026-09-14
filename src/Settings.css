@@ -1328,6 +1328,20 @@ button:disabled {
   border-top: 1px solid var(--hairline);
 }
 
+/* The OpenClaw card's actions, at the foot of a *section* rather than inside
+   a row list. `.setup-actions` is the near-miss: its top rule closes a card,
+   and this row sits below explanatory text that the card has already been
+   closed under, so it would draw a second line across nothing. The gap is
+   the other difference -- this is the only place in this window outside a
+   dialog with two buttons side by side. */
+.card-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  padding-top: 0.25rem;
+}
+
 .setup-command {
   margin: 0.5rem 0.75rem 0.875rem;
   color: var(--muted);

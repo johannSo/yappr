@@ -37,6 +37,12 @@ hound = "3.5"
 # new to the dependency graph -- `tao` (already a transitive dependency of
 # `tauri` on Linux) already resolves `dbus 0.9.12`, exactly what 0.2 needs.
 ksni = "0.2"
+# `openclaw.rs`'s `find_cli`: yappr starts from a tray icon or a `.desktop`
+# entry and inherits no login shell, so `$PATH` alone does not find an
+# `openclaw` installed under an npm global prefix in `$HOME`. Already in
+# `Cargo.lock` -- `yappr-core`'s `paths.rs` resolves every XDG location with
+# it -- so this adds no node to the graph.
+dirs.workspace = true
 
 # Linux-only, and only for one call: WebKitGTK's WebView widget enforces an
 # internal minimum natural size (~200 logical px tall) that GTK's box

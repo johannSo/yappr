@@ -22,14 +22,19 @@ export type Category = {
   sections: string[];
 };
 
-/// The five panes of the sidebar. Sections are grouped by what a user is
+/// The panes of the sidebar. Sections are grouped by what a user is
 /// trying to change, not by which Rust struct they live in — `audio` and
 /// `inject` are both "the mechanics of one dictation", however far apart they
 /// sit in the pipeline.
+///
+/// `ki` sits between `stil` and `erweitert` on purpose: it is a feature a
+/// user goes looking for ("kann OpenClaw das hier benutzen?"), not a knob
+/// they tune once a year, and `erweitert` is where the tuning lives.
 export const CATEGORIES: Category[] = [
   { id: "allgemein", title: "Allgemein", icon: "sliders", sections: ["audio", "inject"] },
   { id: "sprache", title: "Sprache", icon: "waveform", sections: ["asr", "vocabulary"] },
   { id: "stil", title: "Stil", icon: "pen", sections: ["style_default", "style_rules"] },
+  { id: "ki", title: "KI", icon: "spark", sections: ["realtime"] },
   { id: "erweitert", title: "Erweitert", icon: "gear", sections: ["models", "normalize", "guardrail"] },
   { id: "darstellung", title: "Darstellung", icon: "palette", sections: ["ui"] },
   { id: "diagnose", title: "Diagnose", icon: "pulse", sections: ["debug", "overlay"] },
@@ -59,6 +64,7 @@ export const SECTION_TITLES: Record<string, string> = {
   debug: "Diagnose",
   overlay: "Overlay",
   ui: "Farben & Thema",
+  realtime: "Lokale Transkription für andere Programme",
 };
 
 /**
@@ -77,6 +83,12 @@ export const SECTION_NOTES: Record<string, string> = {
     "Die Fensterklasse ist ein regulärer Ausdruck; die erste passende Regel gewinnt. Nicht gesetzte Achsen erben aus dem Stil darüber.",
   overlay:
     "Wird eingelesen, steuert aber noch nichts: unter Wayland kann ein Fenster seine eigene Position nicht setzen, die kommt aus einer Compositor-Regel.",
+  // No "Neustart möglich" tag and no entry in `RESTART_SECTIONS`: the daemon
+  // stops and restarts the listener on save, so every key here is applied
+  // live. Saying so in the note is the point — a port field that looked like
+  // it needed a restart would get one asked for that nothing owes.
+  realtime:
+    "Nimmt Ton von anderen Programmen auf diesem Rechner entgegen und liefert laufend Text zurück — erreichbar nur von diesem Rechner aus. Änderungen greifen sofort, ohne Neustart.",
 };
 
 export const LABELS: Record<string, string> = {
@@ -121,6 +133,12 @@ export const LABELS: Record<string, string> = {
   "overlay.position": "Position",
   "overlay.width": "Breite",
   "overlay.height": "Höhe",
+  "realtime.enabled": "Endpunkt aktiv",
+  "realtime.port": "Port",
+  "realtime.token": "Zugangsschlüssel",
+  "realtime.silence_ms": "Pause bis zum Abschnittsende",
+  "realtime.max_utterance_seconds": "Maximale Abschnittslänge",
+  "realtime.normalize": "Nachbearbeitung anwenden",
   // Not a `config.toml` key — see `Settings.tsx`'s `AutostartCard` and
   // `settings_cmds.rs`'s module doc for why this is filesystem state
   // (`~/.config/autostart/yappr.desktop` existing or not) rather
@@ -143,6 +161,8 @@ export const UNITS: Record<string, string> = {
   "vocabulary.min_term_chars": "Zeichen",
   "overlay.width": "px",
   "overlay.height": "px",
+  "realtime.silence_ms": "ms",
+  "realtime.max_utterance_seconds": "s",
 };
 
 /// One or two sentences behind each row's ⓘ. Deliberately near-complete: the
@@ -225,6 +245,18 @@ export const HELP: Record<string, string> = {
     "Gilt für beide Fenster, auch für das Diktat-Overlay. \u201eSystem\u201c folgt der Hell-/Dunkel-Einstellung des Schreibtischs; jedes andere Schema legt eine Variante fest und bleibt auch dann, wenn der Schreibtisch wechselt. Wirkt sofort, kein Neustart nötig.",
   "overlay.width": "Wird eingelesen, steuert aber nichts.",
   "overlay.height": "Wird eingelesen, steuert aber nichts.",
+  "realtime.enabled":
+    "Öffnet einen Zugang, über den andere Programme auf diesem Rechner Ton an yappr schicken und laufend Text zurückbekommen — so benutzt OpenClaw yappr zum Diktieren. Aus heißt: der Zugang ist zu, und nur das Diktat über den Kurzbefehl funktioniert.",
+  "realtime.port":
+    "Nummer, unter der der Zugang zu erreichen ist. Ist sie schon belegt, kommt er nicht hoch; dann hier eine andere eintragen. Wer den Zugang benutzt, muss dieselbe Nummer kennen — OpenClaw bekommt sie bei der Einrichtung mitgeteilt.",
+  "realtime.token":
+    "Gemeinsames Kennwort, freiwillig. Leer heißt: jedes Programm auf diesem Rechner darf mitdiktieren. Ist hier etwas eingetragen, wird nur angenommen, wer dasselbe mitschickt. „Einrichten“ trägt den Schlüssel auch bei OpenClaw ein — änderst du ihn später, richte OpenClaw noch einmal ein, sonst kommt es nicht mehr durch.",
+  "realtime.silence_ms":
+    "So lange Stille beendet einen Abschnitt; der Text geht dann raus. Kürzer antwortet schneller, zerschneidet aber Sätze an Denkpausen. Länger hält den Satz zusammen und lässt länger auf ihn warten.",
+  "realtime.max_utterance_seconds":
+    "Wer ohne Pause weiterspricht, wird spätestens hier geschnitten. Das Aufgenommene wird trotzdem erkannt — verloren geht nichts, der Text kommt nur in zwei Teilen.",
+  "realtime.normalize":
+    "Schickt auch diese Abschnitte durch Sprachmodell und Prüfung — also genau der Text, den yappr sonst tippen würde. Aus heißt: reiner Erkennungstext, nur mit Groß- und Kleinschreibung und Satzzeichen. Das ist schneller und braucht weniger Speicher, klingt aber nach Diktat statt nach geschriebenem Text. Ist die Nachbearbeitung unter „Erweitert“ ganz abgeschaltet, bleibt sie auch hier aus.",
   "autostart.enabled":
     "Legt ~/.config/autostart/yappr.desktop an; systemd startet yappr davon bei der nächsten Anmeldung automatisch. Aus heißt: die Datei existiert nicht, und nichts startet von selbst.",
 };
@@ -412,6 +444,14 @@ export const FIELD_ORDER: Record<string, string[]> = {
   style_default: ["styling", "structure", "context"],
   debug: ["enabled", "dir", "save_audio"],
   overlay: ["position", "width", "height"],
+  realtime: [
+    "enabled",
+    "port",
+    "token",
+    "silence_ms",
+    "max_utterance_seconds",
+    "normalize",
+  ],
   ui: ["theme"],
 };
 

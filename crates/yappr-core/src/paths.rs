@@ -33,6 +33,19 @@ pub fn models_dir() -> PathBuf {
     dirs::data_local_dir().expect("no data dir").join(APP).join("models")
 }
 
+/// Where the OpenClaw plugin is materialized before it is linked into
+/// OpenClaw (`src-tauri/src/openclaw.rs`).
+///
+/// Next to the models rather than in the state dir, because it is the same
+/// kind of thing: data this app installs, owns and overwrites, which the
+/// user neither edits nor loses settings by deleting. It has to be a real
+/// directory on disk that outlives the click -- `openclaw plugins install
+/// --link` records this path and loads the plugin from it on every OpenClaw
+/// start, so a temporary directory would work exactly once.
+pub fn openclaw_plugin_dir() -> PathBuf {
+    dirs::data_local_dir().expect("no data dir").join(APP).join("openclaw-plugin")
+}
+
 pub fn state_dir() -> PathBuf {
     dirs::state_dir()
         .unwrap_or_else(|| dirs::data_local_dir().expect("no data dir").join("state"))
