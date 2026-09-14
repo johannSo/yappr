@@ -536,14 +536,16 @@ export function Wizard({
                 <div className="card">
                   <p className="setup-command">
                     Automatisch einfügen geht trotzdem, über Allgemein → Texteingabe →
-                    Verfahren. <code>ydotool</code> drückt das Einfügen selbst; dafür
-                    müssen das Paket <code>ydotool</code> installiert und{" "}
-                    <code>ydotoold</code> gestartet sein, mit Schreibrecht auf{" "}
-                    <code>/dev/uinput</code>. <code>script</code> übergibt den fertigen
-                    Text stattdessen an ein eigenes Programm (Pfad bei{" "}
-                    <em>Einfüge-Skript</em>), als erstes Argument (<code>$1</code>); alles
-                    Weitere — Zwischenablage, Tastenkombination, Fenstererkennung — macht
-                    das Skript dann selbst.
+                    Verfahren. <code>libei</code> drückt das Einfügen über das
+                    Desktop-Portal: nichts zu installieren, nichts zu starten — beim
+                    ersten Mal fragt der Schreibtisch einmal um Erlaubnis, danach nie
+                    wieder. <code>ydotool</code> drückt es selbst; dafür müssen das Paket{" "}
+                    <code>ydotool</code> installiert und <code>ydotoold</code> gestartet
+                    sein, mit Schreibrecht auf <code>/dev/uinput</code>.{" "}
+                    <code>script</code> übergibt den fertigen Text stattdessen an ein
+                    eigenes Programm (Pfad bei <em>Einfüge-Skript</em>), als erstes
+                    Argument (<code>$1</code>); alles Weitere — Zwischenablage,
+                    Tastenkombination, Fenstererkennung — macht das Skript dann selbst.
                   </p>
                 </div>
               )}

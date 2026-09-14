@@ -53,6 +53,31 @@ signal-hook = "0.3"
 # atspi's copy is what keeps that from becoming a second zbus version.
 atspi = { version = "0.30", features = ["zbus"] }
 futures-lite = "2"
+# The XDG Desktop Portal's RemoteDesktop interface, which is how the `libei`
+# injection backend presses its paste chord (`libei.rs`). Pure Rust over the
+# same zbus `atspi` already pulls -- `cargo tree -d -p yappr-core | grep zbus`
+# must keep reporting exactly one copy -- so nothing new is linked, no
+# `libei.so` is needed at runtime, and the `ubuntu:22.04` distrobox AppImage
+# build is unaffected. Three features, all deliberate:
+#   - `async-io`, never `tokio`: this crate is synchronous and `server.rs` must
+#     stay that way, so the async lives behind a `block_on` on one thread
+#     exactly as `gnome.rs`'s does. ashpd's *default* feature is `tokio`, which
+#     is why default features are off.
+#   - `remote_desktop`, the interface itself.
+#   - `screencast`, which ashpd 0.13.13's `remote_desktop` needs and does not
+#     declare: `remote_desktop.rs` imports `screencast::Stream` unconditionally
+#     and the crate does not compile without it. Not a source we use -- yappr
+#     asks for a keyboard and nothing else.
+ashpd = { version = "0.13", default-features = false, features = [
+    "async-io",
+    "remote_desktop",
+    "screencast",
+] }
+# Timeouts for the portal round trips. `procutil::run_with_timeout` does not
+# apply -- there is no subprocess here -- but invariant 6's rule does, and
+# nothing in `futures-lite` can express a deadline. Already in `Cargo.lock`
+# under zbus's `async-io` feature, so this adds no node to the graph.
+async-io = "2"
 
 [dev-dependencies]
 hound = "3.5"

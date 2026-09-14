@@ -78,6 +78,25 @@ const SELF_APP: &str = "yappr";
 /// states nobody dictates into, which would otherwise evict a real answer.
 const SHELL_APP: &str = "gnome-shell";
 
+/// Nor is a desktop portal. Every `xdg-desktop-portal-*` implementation puts
+/// its dialogs -- the RemoteDesktop approval the `libei` backend needs, file
+/// choosers, screenshot pickers -- on the accessibility bus under its own
+/// name, and those dialogs take focus at exactly the moment this module is
+/// trying to name the window a dictation is *for*.
+///
+/// Measured on 2026-09-12, and the reason this exists: two dictations in a
+/// row recorded `window_class: "xdg-desktop-portal-gnome"`, twenty and
+/// thirty seconds *after* the approval dialog had been dismissed -- its
+/// accessible window kept reporting `Active`, and [`active_app`] returns the
+/// first one it finds. `wants_shift` then read "not a terminal", so a
+/// terminal got the plain Ctrl+V it ignores: a dictation that produced no
+/// text and no error, which is the exact failure this whole area keeps
+/// paying for. Worse, yappr had raised that dialog itself.
+///
+/// Matched by prefix so `-gnome`, `-gtk`, `-kde` and the bare service are
+/// all covered; nobody dictates into any of them.
+const PORTAL_APP_PREFIX: &str = "xdg-desktop-portal";
+
 /// GTK's placeholder for an application that never called
 /// `g_set_application_name`, and so the one name that identifies nothing.
 /// ghostty is such an application: every one of its windows arrives on the
@@ -121,12 +140,20 @@ fn names_an_application(name: &str) -> bool {
     !name.is_empty() && name != PLACEHOLDER_APP
 }
 
-fn is_ours_or_the_shell(name: &str) -> bool {
-    name == SELF_APP || name == SHELL_APP
+/// Whether `name` is a window nobody dictates into, and so must never
+/// become the recorded class: our own windows (the overlay holds focus at
+/// the exact moment the answer matters), the shell (the overview, the app
+/// grid, the lock screen, every focus hand-off between them), and a desktop
+/// portal's dialogs (see [`PORTAL_APP_PREFIX`]).
+///
+/// All three share one shape: they are focused *because* of something yappr
+/// or the desktop is doing, never because the user chose them to type into.
+fn is_never_a_dictation_target(name: &str) -> bool {
+    name == SELF_APP || name == SHELL_APP || name.starts_with(PORTAL_APP_PREFIX)
 }
 
 fn record(name: &str) {
-    if !names_an_application(name) || is_ours_or_the_shell(name) {
+    if !names_an_application(name) || is_never_a_dictation_target(name) {
         return;
     }
     let mut slot = slot().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -234,7 +261,7 @@ async fn active_app(conn: &AccessibilityConnection) -> Result<Option<String>, at
         let Ok(name) = app.name().await else {
             continue;
         };
-        if is_ours_or_the_shell(&name) {
+        if is_never_a_dictation_target(&name) {
             continue;
         }
         let Ok(windows) = app.get_children().await else {
@@ -256,7 +283,7 @@ async fn active_app(conn: &AccessibilityConnection) -> Result<Option<String>, at
                 // the windows that can be focused at this moment.
                 return Ok(peer_process_name(conn, &app_ref)
                     .await
-                    .filter(|n| !is_ours_or_the_shell(n)));
+                    .filter(|n| !is_never_a_dictation_target(n)));
             }
         }
     }
@@ -322,6 +349,39 @@ mod tests {
         record("gnome-text-editor");
         record(SHELL_APP);
         assert_eq!(window_class().as_deref(), Some("gnome-text-editor"));
+    }
+
+    #[test]
+    fn a_portal_dialog_is_never_recorded() {
+        // The `libei` backend raises the RemoteDesktop approval dialog
+        // itself, and on 2026-09-12 that dialog became the recorded window
+        // class for two dictations in a row -- long after it was dismissed,
+        // because its accessible window kept reporting `Active`. The chord
+        // that follows a wrong class is a plain Ctrl+V into a terminal:
+        // no text, no error.
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset();
+        record("ghostty");
+        record("xdg-desktop-portal-gnome");
+        assert_eq!(window_class().as_deref(), Some("ghostty"));
+    }
+
+    #[test]
+    fn every_portal_flavour_is_filtered_not_just_the_gnome_one() {
+        // Matched by prefix on purpose: the GTK and KDE implementations put
+        // their dialogs on the bus under their own names, and a user running
+        // yappr there would hit the identical bug.
+        for portal in [
+            "xdg-desktop-portal",
+            "xdg-desktop-portal-gnome",
+            "xdg-desktop-portal-gtk",
+            "xdg-desktop-portal-kde",
+        ] {
+            assert!(is_never_a_dictation_target(portal), "{portal} must be filtered");
+        }
+        // And nothing that merely looks like one.
+        assert!(!is_never_a_dictation_target("ghostty"));
+        assert!(!is_never_a_dictation_target("gnome-text-editor"));
     }
 
     #[test]
