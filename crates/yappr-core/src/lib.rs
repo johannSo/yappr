@@ -10,6 +10,7 @@ pub mod guardrail;
 pub mod hypr;
 pub mod inject;
 pub mod lang;
+pub mod libei;
 pub mod llama;
 pub mod models;
 pub mod normalize;

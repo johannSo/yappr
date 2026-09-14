@@ -536,14 +536,16 @@ export function Wizard({
                 <div className="card">
                   <p className="setup-command">
                     Pasting automatically is still possible, under General → Text entry
-                    → Method. <code>ydotool</code> presses the paste itself; that needs
-                    the <code>ydotool</code> package installed and{" "}
-                    <code>ydotoold</code> running, with write access to{" "}
-                    <code>/dev/uinput</code>. <code>script</code> hands the finished
-                    text to a program of your own instead (path under{" "}
-                    <em>Paste script</em>), as its first argument (<code>$1</code>);
-                    everything after that — clipboard, key chord, window detection — is
-                    then up to the script.
+                    → Method. <code>libei</code> presses the paste through the desktop
+                    portal: nothing to install, nothing to start — the first time, the
+                    desktop asks for permission once, and never again afterwards.{" "}
+                    <code>ydotool</code> presses it itself; that needs the{" "}
+                    <code>ydotool</code> package installed and <code>ydotoold</code>{" "}
+                    running, with write access to <code>/dev/uinput</code>.{" "}
+                    <code>script</code> hands the finished text to a program of your own
+                    instead (path under <em>Paste script</em>), as its first argument
+                    (<code>$1</code>); everything after that — clipboard, key chord,
+                    window detection — is then up to the script.
                   </p>
                 </div>
               )}

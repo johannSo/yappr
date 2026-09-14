@@ -10,8 +10,10 @@ press `SUPER+D` again; the audio is captured, VAD-trimmed, transcribed (one of s
 rewritten by S1-mini (llama.cpp, in-process), checked by a guardrail, and
 typed into the focused window with `wtype` — or, if `[inject] backend` selects it,
 pasted by `ydotool` (`wl-copy` plus one Ctrl+V, Ctrl+Shift+V for a window class in
-`[inject] terminal_classes`, overridable with `[inject] paste_chord`), or handed to a
-*user-supplied script* (yappr runs `[inject] script` with the finished transcript as
+`[inject] terminal_classes`, overridable with `[inject] paste_chord`), pasted by
+**`libei`**, which presses that same chord through the XDG Desktop Portal's
+`RemoteDesktop` interface instead of a daemon (added 2026-09-12; `libei.rs`), or handed
+to a *user-supplied script* (yappr runs `[inject] script` with the finished transcript as
 `$1` and passes nothing else, so the script owns the clipboard, the chord and any
 window detection). A failure of any kind falls back to the clipboard, per invariant 1.
 Fully local at dictation time. `SUPER+ALT+D`
@@ -53,6 +55,14 @@ that genuinely had those names, not stale spellings.
 `README.md` is the user-facing setup guide. `docs/HANDOVER.md` is the current state-of-play,
 including what has and has not been verified on real hardware.
 
+## Answering
+
+- Short bullet points, not essays. State the result, then anything that changes
+  what the reader does next.
+- One line per fact. Cut restated context, rationale the reader already has, and
+  alternatives not taken.
+- Prose only where a caveat needs a sentence to be true.
+
 ## Commands
 
 ```bash
@@ -68,7 +78,8 @@ bun run tauri dev                         # dev: Vite on :1420 + the Tauri windo
 bun run build                             # frontend only (tsc && vite build -> dist/)
 #   ^ builds BOTH pages: index.html (overlay) and settings.html (settings window).
 
-# Tests (480 passed, 0 failed, 11 #[ignore]d because they need downloaded models)
+# Tests (507 passed, 0 failed, 12 #[ignore]d: 11 need downloaded models, one needs a
+# session bus and a desktop portal -- `libei::tests::the_portal_on_this_desktop_hands_out_keyboards`)
 cargo test --workspace
 # NOT optional. These are the only tests that catch a C++ ABI mismatch between
 # sherpa-onnx and llama.cpp -- see the gotcha at the bottom of this file. A wrong
@@ -93,8 +104,14 @@ cargo run -p yappr-core --example script_probe -- "hi" ~/bin/paste.sh    # overr
 #   ^ runs your real paste script, which presses real keys into the focused window and
 #     will replace your clipboard; prints the program, its argv[1] and what it exited
 #     with. Replaced `paste_probe` on 2026-09-09; the ydotool backend came back on
-#     2026-09-11 but the probe did not, so there is no no-mic exercise for the chord --
-#     `--replay` and the `inject.rs` chord tests are what there is.
+#     2026-09-11 but the probe did not, so there is still no no-mic exercise for
+#     *ydotool's* chord -- `--replay` and the `inject.rs` chord tests are what there is.
+cargo run -p yappr-core --example libei_probe -- "hallo welt"   # the portal chord, no mic
+#   ^ the equivalent for the `libei` backend, and the only thing that answers its two
+#     invisible questions: did the portal session come up (it prints the portal's own
+#     refusal, `Session creation inhibited` included), and was the stored restore token
+#     honoured or did a dialog appear. Presses real keys into the focused window and
+#     replaces the clipboard, same warning as above.
 cargo run --release -p yappr -- --bench   # ASR latency table
 
 # Runtime inspection / control (against a running instance)
@@ -116,7 +133,12 @@ Two Cargo members, one process:
 - **`crates/yappr-core`** — the library. Every pipeline stage plus config, paths, wire
   format, model provisioning, debug capture — and, since the one-process rewrite,
   `server.rs`: the socket server and the `AtomicU8` state machine, moved here unchanged
-  (with its tests) from the now-deleted `crates/owf-cli`. Links `sherpa-onnx`, `cpal`,
+  (with its tests) from the now-deleted `crates/owf-cli`. Two modules here are async and
+  the rest of the crate is not — `gnome.rs` (the accessibility bus) and `libei.rs` (the
+  RemoteDesktop portal) — and both confine it the same way: one thread of their own, a
+  `futures_lite::future::block_on`, and zbus's async-io flavour, deliberately never
+  tokio. `server.rs` stays synchronous, and `cargo tree -d -p yappr-core | grep zbus`
+  must keep reporting exactly one zbus. Links `sherpa-onnx`, `cpal`,
   `rubato`, so anything that depends on it inherits a heavy build — which now includes
   the GUI itself, deliberately (see "Why not keep the daemon separate" in the design doc).
 - **`src-tauri`** (package `yappr`, binary `yappr`) — the whole app:
@@ -679,6 +701,16 @@ the whole lock file stops parsing. See
   Only `cargo test --workspace -- --ignored` catches a regression here. Two cheaper
   guards were tried and both are useless — read the note at the top of `vad.rs`'s test
   module before writing a third.
+- **`ashpd`'s `remote_desktop` feature does not compile on its own — it needs
+  `screencast` too.** `remote_desktop.rs` imports `screencast::Stream` unconditionally
+  while the module is gated behind a feature `remote_desktop` does not imply, so
+  `features = ["remote_desktop"]` alone fails with `unresolved import
+  super::screencast`. Verified against ashpd 0.13.13. `screencast = []` pulls in no
+  dependency, so the workaround costs nothing but has to stay: dropping it from
+  `yappr-core/Cargo.toml` breaks the build outright. Its sibling trap is that ashpd's
+  *default* feature is `tokio`; `default-features = false` plus an explicit `async-io`
+  is what keeps this crate on the same runtime flavour `atspi` already chose.
+
 - **`gtk-layer-shell` is a build-time link dependency, not a runtime check.** `src-tauri`'s
   `Cargo.toml` pulls in `gtk-layer-shell = { version = "0.8", features = ["v0_6"] }` for
   `layer.rs`. Without the system library, `cargo build` (or `cargo test`/`cargo clippy` —
@@ -761,8 +793,8 @@ the whole lock file stops parsing. See
   `winclass::active_window_class()` is the *only* source of the target window's class,
   and it has two consumers: `style::resolve`, where a `None` means no `[[style_rules]]`
   entry matches and S1-mini is prompted with `[style_default]` (a quiet wrong-tone, not
-  a lost dictation), and `inject::wants_shift` under the `ydotool` backend, where it is
-  much worse.
+  a lost dictation), and `inject::wants_shift` under the `ydotool` **and `libei`**
+  backends, where it is much worse.
 
   **That second one is the measurement the table below records, and it is why the
   ydotool backend was retired on 2026-09-09.** `wants_shift` reads `None` as "not a
@@ -775,6 +807,14 @@ the whole lock file stops parsing. See
   `None` + `Auto` combination (the only signal there is), and `gnome.rs` closed the
   desktop where `None` used to be unconditional. Do not make `Auto` "smarter" by
   guessing — an unknown class is unknown; the answer is the forced arm.
+
+  **`libei` (2026-09-12) inherits every word of that**, and it is worth saying plainly
+  because the backend is otherwise the safer one: the portal *delivers* whatever chord
+  it is handed and reports success, exactly as `ydotool` exits 0, so an unknown class
+  under `Auto` is the same silent no-text paste. `LibeiInjector::inject` carries the
+  same warning, verbatim, for the same reason. What `libei` does fix is a different
+  thing entirely — it presses a *keysym*, so the compositor resolves `v` in the user's
+  own keymap rather than trusting a key position — and that is orthogonal to the class.
   Measured against Hyprland 0.56.2 on 2026-09-07, the three ways to get that `None` are
   **not** interchangeable and only one of them is a clean exit:
 
@@ -833,7 +873,8 @@ the whole lock file stops parsing. See
   so "unknown" is distinguishable from "old record"), which is how you tell a style
   rule that did not fire from one that fired wrong. An Electron or Qt app that
   registers with no accessibility bus is the setup that still answers `None` on GNOME —
-  and under `ydotool` + `auto` that is a silent no-text paste, not a wrong tone.
+  and under `ydotool` + `auto`, or `libei` + `auto`, that is a silent no-text paste,
+  not a wrong tone.
   The chord measurements this note used to end on — `/dev/input/event*` reads of the
   `ydotoold virtual device`, verified end to end in kitty, ghostty and foot — are in
   git history between 2026-09-07 and the 2026-09-09 retirement, and describe the
@@ -854,6 +895,90 @@ the whole lock file stops parsing. See
   example) breaks every paste. Nothing in the app can fix that from its side: yappr
   starts from the tray or a `.desktop` entry and inherits no shell export, so the
   daemon has to listen where the client looks. Measured on Fedora 44, 2026-09-10.
+- **The RemoteDesktop portal refuses to create a session while the screen is locked,
+  and that is the `libei` backend's most likely-looking "bug".** `CreateSession` comes
+  back `GDBus.Error:org.freedesktop.DBus.Error.Failed: Session creation inhibited`
+  (xdg-desktop-portal-gnome logs it; mutter is what inhibits), with nothing in the
+  message naming the lock screen. Measured 2026-09-12 on Fedora 44 / GNOME Shell 50 /
+  mutter 50.0 / xdg-desktop-portal 1.21.1, against `loginctl` `LockedHint=yes` and
+  `org.gnome.ScreenSaver.GetActive` → `true`; unlocking is the whole fix. Nothing in
+  `libei.rs` treats it as an error to repair: the establishment is never latched, the
+  next press retries after `RETRY_AFTER_FAILURE`, and a dictation that lands in the gap
+  takes the clipboard fallback (invariant 1). It does mean **an automated end-to-end
+  test of this backend cannot run on a locked session**, which is exactly why the
+  backend shipped compiled-and-unit-tested rather than verified — see `docs/HANDOVER.md`.
+
+  What *is* measured on that same machine: `busctl --user introspect
+  org.freedesktop.portal.Desktop /org/freedesktop/portal/desktop
+  org.freedesktop.portal.RemoteDesktop` lists both `.NotifyKeyboardKeysym` and
+  `.ConnectToEIS` at `version 2` with `AvailableDeviceTypes 7`.
+
+- **The screen-sharing indicator cannot be shortened below five seconds, or hidden at
+  all.** gnome-shell's `js/ui/status/remoteAccess.js` holds
+  `MIN_SHARED_INDICATOR_VISIBLE_TIME_US = 5 * GLib.TIME_SPAN_SECOND` and schedules the
+  hide against that floor, so a RemoteDesktop session that lives 250 ms and one that
+  lives four seconds look the same from the top bar. The floor is the point: an
+  indicator an application could flash for 50 ms would not be one. There is no opt-out
+  -- every non-recording `MetaRemoteAccessHandle` reaches this applet, and `ConnectToEIS`
+  is the same session, so phase 2 would not change it either. **The only
+  indicator-free way to paste on GNOME is the `ydotool` backend**, which is uinput and
+  touches no portal. Read `SESSION_LINGER`'s doc before tuning it again: shortening it
+  buys a smaller live grant, never a shorter pill.
+
+- **Mutter 50 does act on `NotifyKeyboardKeysym`, and a held session is a permanent
+  screen-sharing indicator.** Both learned from real use on 2026-09-12, which is when
+  this backend first pasted anything. A plain Ctrl+V arrives and pastes; that settles
+  the question phase 1 was chosen on. What came with it was a complaint nothing in the
+  design had anticipated: GNOME shows its orange screen-sharing pill for the whole life
+  of a RemoteDesktop session, so holding one open for the process meant the top bar
+  claimed yappr was sharing the screen, permanently, for a backend that presses one
+  chord a few times an hour. `libei.rs` now closes the session `SESSION_LINGER` after
+  the last paste and re-opens it for the next -- which is only safe because a restore
+  token makes `Start` silent, and `KEEP_OPEN` is what catches the desktop where it is
+  not. Do not "simplify" that flag away: without it, a desktop whose stored permission
+  does not reopen silently gets a focus-stealing approval dialog **per dictation**,
+  which is invariant 2's problem and far worse than the indicator ever was.
+
+- **The portal's own approval dialog poisons the window class, and that is what "the
+  paste does nothing in a terminal" turned out to be.** Reported on 2026-09-12 as
+  Ctrl+Shift+V not working under `libei`; the chord was never the problem. Two
+  dictations in a row recorded `window_class: "xdg-desktop-portal-gnome"` -- twenty and
+  thirty seconds *after* the RemoteDesktop approval dialog had been dismissed, because
+  its accessible window keeps reporting `Active` and `gnome::active_app` returns the
+  first such window it walks onto. A portal name is not in `terminal_classes`, so
+  `wants_shift` said "not a terminal" and a terminal got the plain Ctrl+V it ignores:
+  no text, no error, the same hole this file already describes twice -- except that
+  here yappr raised the offending dialog itself. `gnome.rs`'s
+  `is_never_a_dictation_target` now filters `xdg-desktop-portal*` by prefix alongside
+  `yappr` and `gnome-shell`, all three being windows focused *because of* something
+  yappr or the desktop is doing.
+
+  Everything that was suspected first was measured and cleared, which is worth
+  recording so nobody re-suspects it: an explicit `XK_Shift_L` **is** honoured by mutter
+  50 (all three shift encodings typed a capital `A`), Ctrl+Shift+V with keysym `v`
+  **does** paste into ghostty through the portal, and the whole real path --
+  `libei_probe` with `ClipboardInjector`, `PASTE_SETTLE` and `winclass` -- pastes into a
+  throwaway ghostty on the first try. The harness that established all of that was
+  `examples/zz_keysym_scratch.rs`, deleted once it had answered; it is in commit
+  `e0c6f5d` if a recurrence ever needs it back. It spawned a throwaway ghostty, typed
+  one character per candidate encoding into it and printed which survived, and it needs
+  an **unlocked** screen, per the gotcha above.
+
+- **A restore token opens a session silently, and a healthy restore returns the *same*
+  token.** Measured 2026-09-12 across four close/re-open cycles 5 s, 45 s and 90 s
+  apart: ~5,5 ms each, `same_token=true` every time, against 4,0 s for a first
+  dialog-bearing `Start` and 21,2 s for one against a stale token. Closing costs ~1-9 ms.
+  That is the measurement the open-per-paste session lifetime rests on
+  (`SESSION_LINGER`), and the identical-token part is why `SessionReport::token_reused`
+  is recorded rather than inferred from timing.
+
+  **One re-open in real use raised a dialog anyway** (3,4 s, 42 s after a silent 12 ms
+  one, confirmed against xdg-desktop-portal-gnome's journal) and has never reproduced.
+  The cause is not understood. `DIALOG_STRIKES_BEFORE_HOLDING` is the response, and its
+  value being **2** is the whole point: the first version latched on a single dialog, so
+  that one event held a session open for the life of the process and put the permanent
+  indicator straight back -- the guard reinstating the bug it was guarding. A silent
+  re-open clears the count, so the strikes have to be consecutive.
 - **Do not trust `cpal`'s advertised sample-rate range.** It advertised 16 kHz on hardware
   that rejected the stream build; `capture.rs` now probes by building a throwaway stream and
   falls back to 48 kHz plus `rubato` resampling.

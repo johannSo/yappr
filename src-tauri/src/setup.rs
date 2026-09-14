@@ -245,6 +245,19 @@ struct Prerequisite {
 /// `inject::diagnostic`), and the clipboard fallback carries the transcript
 /// meanwhile.
 ///
+/// The `libei` backend gets **no entry at all**, and the absence is the
+/// point: there is no binary to look for. Its prerequisite is that the
+/// desktop's portal implements `org.freedesktop.portal.RemoteDesktop`, which
+/// is a D-Bus question this list cannot ask -- every entry here is a `$PATH`
+/// lookup. Asking it would also have to be optional for exactly the reason
+/// `ydotool`'s entry is, so the most it could ever buy is one more
+/// `status_line`; `LibeiInjector` reports a portal that will not answer when
+/// it is actually asked to paste (`crate::libei` records the portal's own
+/// words, `Session creation inhibited` included), the clipboard fallback
+/// carries the transcript meanwhile, and
+/// `cargo run -p yappr-core --example libei_probe` answers the question
+/// properly for anyone who wants it answered.
+///
 /// There is deliberately no check for the script backend's program:
 /// `[inject] script` names a file the user writes themselves, and reporting
 /// its absence as a missing prerequisite would put a permanent gap on every

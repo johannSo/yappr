@@ -85,6 +85,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "ashpd"
+version = "0.13.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb8421aaa9644a5faf26735f258b669b15f063313ef8f8e2bdb28912a1a6f111"
+dependencies = [
+ "enumflags2",
+ "futures-util",
+ "getrandom 0.4.3",
+ "serde",
+ "serde_repr",
+ "zbus",
+]
+
+[[package]]
 name = "async-broadcast"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6026,7 +6040,7 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
 name = "yappr"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "anyhow",
  "gtk",
@@ -6044,9 +6058,11 @@ dependencies = [
 
 [[package]]
 name = "yappr-core"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "anyhow",
+ "ashpd",
+ "async-io",
  "atspi",
  "bzip2 0.5.2",
  "cpal",

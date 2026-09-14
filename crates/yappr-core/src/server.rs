@@ -750,6 +750,14 @@ pub fn start(sink: Arc<dyn EventSink>) -> Result<(Arc<Daemon>, UnixListener)> {
     // `tracing`, so nothing is lost by the reordering.
     init_tracing(&cfg.debug);
 
+    // Before the first `ptt-start`, for the same reason `winclass` is: the
+    // `libei` backend's portal session is what raises an approval dialog,
+    // and that dialog takes keyboard focus. Raising it at INJECTING, with
+    // the overlay up, is invariant 2 head-on. Does nothing unless this is
+    // the selected backend, and never fails outwardly -- see
+    // `libei::prewarm_if_selected`.
+    crate::libei::prewarm_if_selected(&cfg.inject);
+
     match &migration {
         config::Migration::NotNeeded => {}
         config::Migration::Moved(renamed) => {
@@ -2077,6 +2085,10 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
                     // lock nesting of any kind (invariant 12).
                     *lock_ignoring_poison(&daemon.models_cfg) = new_cfg.models.clone();
 
+                    // The other moment a user picks this backend, and the
+                    // other moment there is someone at the keyboard to
+                    // answer the portal's dialog. Idempotent and cheap.
+                    crate::libei::prewarm_if_selected(&new_cfg.inject);
                     let injector = inject::build(&new_cfg.inject);
                     let mut guard = lock_ignoring_poison(&daemon.pipeline);
                     match guard.as_mut() {
@@ -2165,6 +2177,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request) -> Response {
             // `restart_reason` already reports, so its error is not an error
             // here -- the file is written either way, and the response tells
             // the truth about what took effect.
+            crate::libei::prewarm_if_selected(&new_cfg.inject);
             let injector = inject::build(&new_cfg.inject);
             {
                 let mut guard = lock_ignoring_poison(&daemon.pipeline);

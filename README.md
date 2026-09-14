@@ -180,8 +180,9 @@ Two differences:
 - **`wtype` does nothing here.** Mutter doesn't implement the virtual-keyboard protocol
   `wtype` types through. The wizard detects GNOME and sets `[inject] backend =
   "clipboard"` for you on a first run: the transcript lands in the clipboard and you
-  press Ctrl+V. To have it inserted for you, switch *Method* to `ydotool` (which
-  needs a running `ydotoold`) or to `script` with a paste script of your own — see
+  press Ctrl+V. To have it inserted for you, switch *Method* to `libei` (nothing to
+  install; approve one dialog), to `ydotool` (which needs a running `ydotoold`), or to
+  `script` with a paste script of your own — see
   [Pasting where `wtype` can't type](#pasting-where-wtype-cant-type).
 - **Add the shortcuts in Settings → Keyboard → Custom Shortcuts**, running
   `yappr --toggle` and `yappr --cancel`. The wizard also offers a `gsettings` script
@@ -271,7 +272,7 @@ first start, and the old `~/.config/yappr/config.toml` is left behind as
 | `[asr]` | `num_threads` for Parakeet |
 | `[normalize]` | `enabled` (`false` skips S1-mini and types rule-cleaned raw text), plus `timeout_ms`, `context_size`, `threads` |
 | `[guardrail]` | `min_word_ratio`/`max_word_ratio`, `min_overlap_english`/`min_overlap_other`, `short_input_words`, `ngram_size`/`ngram_max_repeats` |
-| `[inject]` | `backend` (`wtype`, `ydotool`, `script`, `clipboard`), `script` (the program the `script` backend runs), `paste_chord`/`terminal_classes` (ydotool only) — see [Pasting where `wtype` can't type](#pasting-where-wtype-cant-type) — plus `trailing_space`, `keystroke_delay_ms` (wtype only) |
+| `[inject]` | `backend` (`wtype`, `libei`, `ydotool`, `script`, `clipboard`), `script` (the program the `script` backend runs), `paste_chord`/`terminal_classes` (`ydotool` and `libei` only) — see [Pasting where `wtype` can't type](#pasting-where-wtype-cant-type) — plus `trailing_space`, `keystroke_delay_ms` (wtype only) |
 | `[vocabulary]` | terms and replacements applied to the raw transcript before clean-up — put short acronyms in `replacements`, not `terms` |
 | `[style_default]`, `[[style_rules]]` | the `styling`/`structure`/`context` axes S1-mini is prompted with, and per-application overrides matched on window class (regex) |
 | `[debug]` | `enabled` (off), `dir` (default `~/yappr`), `save_audio` — see [Troubleshooting](#troubleshooting) |
@@ -297,15 +298,58 @@ changed some other way, such as one restored from a backup.
 
 `wtype` is the default and needs no setup: it types through the compositor's own
 virtual-keyboard protocol. But it does nothing on GNOME, and it's known to drop
-keystrokes in some XWayland and Electron windows. Two backends cover those, under
+keystrokes in some XWayland and Electron windows. Three backends cover those, under
 Settings → General → Text entry → *Method*:
 
 | `[inject] backend` | What it does | What it needs |
 |---|---|---|
 | `wtype` | Types the text into the focused window. | Nothing. Does nothing on GNOME. |
+| `libei` | Copies the text and presses the paste chord through the desktop portal. | Nothing to install. One approval dialog, once. Needs a portal that implements `RemoteDesktop` (GNOME, KDE; not `xdg-desktop-portal-wlr`). |
 | `ydotool` | Copies the text and presses the paste chord for you. | `ydotool`, plus a running `ydotoold` with write access to `/dev/uinput`. |
 | `script` | Hands the text to a program of yours, which does the inserting. | A script you write. |
 | `clipboard` | Copies the text; you paste it. | Nothing. |
+
+`libei` and `ydotool` do the same thing by different routes and share the same two
+settings, `paste_chord` and `terminal_classes`. `ydotool` is the one verified end to end
+on real hardware, which is the only reason it is listed first in this section; `libei`
+is the one that asks nothing of you beyond a click.
+
+#### `libei`
+
+```toml
+[inject]
+backend = "libei"
+paste_chord = "auto"          # or "ctrl_v" / "ctrl_shift_v"
+```
+
+Same paste as `ydotool` — `wl-copy`, then one Ctrl+V (Ctrl+Shift+V for a terminal) —
+sent through `org.freedesktop.portal.RemoteDesktop` instead of a daemon of your own.
+Nothing to install: the portal is already running, there is no `/dev/uinput`, no group
+to join and no socket path to get wrong. The first time yappr asks, your desktop shows
+an approval dialog; say yes and the permission is stored as a portal *restore token*
+under `~/.local/state/yappr/libei-restore-token`, and you are never asked again. Delete
+that file to be asked afresh; revoke it in your desktop's privacy settings to take the
+permission away.
+
+Two things worth knowing. It presses a **keysym**, not a key position, so the
+compositor resolves `v` against the keymap you actually have — the one respect in which
+it is better than `ydotool` rather than merely cheaper. And **the portal refuses to
+start a session while the screen is locked** (`Session creation inhibited`), which is
+harmless: yappr retries, and a dictation that lands in that window falls back to the
+clipboard with a notification.
+
+`xdg-desktop-portal-wlr` — sway, river, Wayfire — implements no `RemoteDesktop` at all,
+so this backend does nothing there. Those are wlroots compositors, where `wtype` works
+natively and is already the default.
+
+```bash
+cargo run -p yappr-core --example libei_probe -- "hallo welt"
+```
+
+runs exactly what a dictation runs, without a microphone: it prints whether the session
+came up, whether the stored token was honoured or a dialog appeared, the window class,
+the chord it chose, and what the paste returned. It presses real keys into the focused
+window and replaces your clipboard, so focus a scratch window first.
 
 #### `ydotool`
 
@@ -428,10 +472,11 @@ needed — `preload_at_startup` alone still unloads after the idle timeout.
 | Symptom | Likely cause |
 |---|---|
 | **Nothing happens when I press `SUPER+D`** | The app isn't running (check for the tray icon), or the shortcut isn't bound. Run `yappr --toggle` in a terminal: with no app running it exits non-zero and raises a notification. |
-| **Nothing gets typed, but the overlay says it worked** | `wtype` can't reach that window — you're on GNOME, or it's an XWayland/Electron window. Check the clipboard: the text is probably there. Fix it with the [`ydotool` or `script` backend](#pasting-where-wtype-cant-type). |
+| **Nothing gets typed, but the overlay says it worked** | `wtype` can't reach that window — you're on GNOME, or it's an XWayland/Electron window. Check the clipboard: the text is probably there. Fix it with the [`libei`, `ydotool` or `script` backend](#pasting-where-wtype-cant-type). |
+| **The `libei` backend pastes nothing** | Run `cargo run -p yappr-core --example libei_probe -- "hallo"`, which prints why. `Session creation inhibited` means the screen was locked when yappr asked — unlock and it retries. A portal that answers nothing at all means your desktop has no `RemoteDesktop` implementation (`xdg-desktop-portal-wlr`); use `wtype` or `script` there. If it pastes everywhere *except* terminals, it's the chord, not the portal: set `paste_chord = "ctrl_shift_v"`. |
 | **The `ydotool` backend pastes nothing** | Usually `ydotoold`: not running, or listening on a socket the client doesn't look at (see above). yappr logs what `ydotool` said on *both* streams — it reports this one on stdout — and falls back to the clipboard with a notification. If it pastes everywhere *except* terminals, it's the chord, not the daemon: set `paste_chord = "ctrl_shift_v"`. |
 | **The `script` backend produced nothing and a notification says it fell back to the clipboard** | Your script failed. Run it by hand — `~/bin/paste.sh "hallo"` — and watch what it says; yappr logs its stdout and stderr either way. The usual causes are a path that isn't executable (`chmod +x`), a wrong `[inject] script` path, and a helper it calls (`ydotoold`, `wl-copy`) not being up. `cargo run -p yappr-core --example script_probe -- "hallo"` runs it exactly the way yappr does. |
-| **Nothing is pasted *into a terminal*** | Plain Ctrl+V was sent, which terminals ignore. Under `ydotool`: set `paste_chord = "ctrl_shift_v"`, or add the window class `yappr --debug` reports to `terminal_classes`. Under `script`: that choice is your script's — have it check the focused window's class, or send Ctrl+Shift+V unconditionally, which browsers and Electron read as "paste as plain text" anyway. |
+| **Nothing is pasted *into a terminal*** | Plain Ctrl+V was sent, which terminals ignore. Under `ydotool` or `libei`: set `paste_chord = "ctrl_shift_v"`, or add the window class `yappr --debug` reports to `terminal_classes`. Under `script`: that choice is your script's — have it check the focused window's class, or send Ctrl+Shift+V unconditionally, which browsers and Electron read as "paste as plain text" anyway. |
 | **`cargo build` fails in `gtk-layer-shell-sys`** | `sudo pacman -S gtk-layer-shell`. |
 | **Blank windows after building** | Built without `--features custom-protocol`, or without `bun run build` first. |
 | **The first dictation of the day is slow** | Expected — the models load lazily. See [Memory use](#memory-use). |

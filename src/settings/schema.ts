@@ -186,11 +186,11 @@ export const HELP: Record<string, string> = {
   "guardrail.ngram_max_repeats":
     "How often the same word sequence may occur before the version is rejected as a loop.",
   "inject.backend":
-    "wtype types the text into the window character by character and needs no setup \u2014 but it does nothing under GNOME (Mutter). ydotool puts the text on the clipboard and presses Ctrl+V once (Ctrl+Shift+V in terminals); that works where wtype cannot, but it requires a running ydotoold with write access to /dev/uinput. script hands the finished text to a program of your own as its first argument, which then decides for itself how to insert it. clipboard only puts it on the clipboard; pasting is up to you.",
+    "wtype types the text into the window character by character and needs no setup \u2014 but it does nothing under GNOME (Mutter). ydotool puts the text on the clipboard and presses Ctrl+V once (Ctrl+Shift+V in terminals); that works where wtype cannot, but it requires a running ydotoold with write access to /dev/uinput. libei presses the same chord, but through the desktop portal rather than a service of its own: no ydotoold, no /dev/uinput, at the price of one permission dialog you have to approve. script hands the finished text to a program of your own as its first argument, which then decides for itself how to insert it. clipboard only puts it on the clipboard; pasting is up to you.",
   "inject.script":
     "Path to the program the script method runs. It is given the finished text as its first and only argument ($1) and owns everything after that: clipboard, key chord, window detection. Must be executable; ~ is expanded. Example: ~/bin/paste.sh. If it fails, or nothing is set here, the text lands on the clipboard just as with the clipboard method.",
   "inject.paste_chord":
-    "Which key chord the ydotool method presses. auto decides by window class: Ctrl+Shift+V for anything listed as a terminal below, Ctrl+V otherwise. If yappr cannot name the focused window, that becomes a plain Ctrl+V \u2014 which terminals ignore, with no error reported. If you mostly dictate into terminals and nothing arrives, fix this to Ctrl+Shift+V.",
+    "Which key chord the ydotool and libei methods press. auto decides by window class: Ctrl+Shift+V for anything listed as a terminal below, Ctrl+V otherwise. If yappr cannot name the focused window, that becomes a plain Ctrl+V \u2014 which terminals ignore, with no error reported. If you mostly dictate into terminals and nothing arrives, fix this to Ctrl+Shift+V.",
   "inject.terminal_classes":
     "Window classes that count as a terminal and therefore get Ctrl+Shift+V under auto. Case does not matter. Your window's class is in the debug record under window_class.",
   "inject.trailing_space":
@@ -247,7 +247,7 @@ export const ENUMS: Record<string, string[]> = {
     "parakeet-unified-en",
     "nemotron-3.5",
   ],
-  "inject.backend": ["wtype", "ydotool", "script", "clipboard"],
+  "inject.backend": ["wtype", "ydotool", "libei", "script", "clipboard"],
   "inject.paste_chord": ["auto", "ctrl_v", "ctrl_shift_v"],
   "style_default.styling": ["casual", "semi-casual", "semi-formal", "formal"],
   "style_default.structure": ["prose", "lists"],
@@ -346,19 +346,23 @@ export const OBSOLETE_FIELDS = new Set([
 /// is the case that forced it: `inject::build` reads it only for
 /// `InjectBackend::Script`, so under `wtype` it is a path field that changes
 /// nothing, sitting directly under the dropdown that would make it matter.
-/// `paste_chord` and `terminal_classes` are the same shape -- only
-/// `YdotoolInjector` reads them -- and they are the reason the bar is worth
+/// `paste_chord` and `terminal_classes` are the same shape -- only the two
+/// backends that press a chord themselves, `YdotoolInjector` and
+/// `LibeiInjector`, read them -- and they are the reason the bar is worth
 /// restating: they spent two days in `OBSOLETE_FIELDS` instead, which is
-/// where a setting goes to be forgotten rather than merely hidden.
+/// where a setting goes to be forgotten rather than merely hidden. Note the
+/// shape a second reader gives this table: `is` is a *list*, so adding a
+/// backend that reads a row means adding it here too. Forget it and the new
+/// backend's two settings are invisible under the backend that needs them.
 ///
 /// This does not make a setting unreachable, in either of the two ways that
 /// would matter. Choosing the backend brings its rows back; and a search for
 /// "script" or "chord" still lands on `inject.backend`, whose help text names
-/// all four backends, which is the row you have to change anyway.
+/// every backend, which is the row you have to change anyway.
 export const DEPENDENT_FIELDS: Record<string, { on: string; is: Json[] }> = {
   "inject.script": { on: "backend", is: ["script"] },
-  "inject.paste_chord": { on: "backend", is: ["ydotool"] },
-  "inject.terminal_classes": { on: "backend", is: ["ydotool"] },
+  "inject.paste_chord": { on: "backend", is: ["ydotool", "libei"] },
+  "inject.terminal_classes": { on: "backend", is: ["ydotool", "libei"] },
 };
 
 /// Whether a row's dependency (if it has one) is currently satisfied.

@@ -25,6 +25,15 @@ on:
   push:
     tags:
       - "v*"
+  # A tag push is a one-shot event: it cannot be replayed without deleting and
+  # re-pushing the tag, which is a poor way to retry a 20-minute build. This is
+  # the retry, and it takes the tag as an input rather than reading the ref, so
+  # it can be started from `main` and still attach to an existing release.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and attach the AppImage to"
+        required: true
 
 # The one permission the asset upload needs. Everything else stays read-only.
 permissions:
@@ -39,6 +48,13 @@ jobs:
     # webkit2gtk-4.1 (Tauri's own recommendation) or the bundle runs on
     # rolling-release hosts only. See CLAUDE.md's portability note.
     container: ubuntu:22.04
+    defaults:
+      run:
+        # Not optional, and the failure is late and confusing: inside a
+        # container the runner picks `sh -e {0}`, so `set -o pipefail` and
+        # the bash array in the upload step below die with "Illegal option"
+        # after the 8-minute build has already succeeded.
+        shell: bash
     # The workspace compiles llama.cpp from source and links sherpa-onnx; a
     # cold build is comfortably over the 6 h default only in theory, but the
     # explicit cap keeps a wedged job from burning a day.
@@ -82,7 +98,10 @@ jobs:
             librsvg2-dev libssl-dev libxdo-dev libayatana-appindicator3-dev \
             libasound2-dev
 
+      # On a dispatch this is the tag input; on a tag push it is the tag itself.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -140,7 +159,7 @@ jobs:
       - name: Attach the AppImage to the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ inputs.tag || github.ref_name }}
           API: https://api.github.com/repos/${{ github.repository }}
           UPLOADS: https://uploads.github.com/repos/${{ github.repository }}
         run: |

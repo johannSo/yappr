@@ -78,7 +78,7 @@ re-touch it.
    - `bindings.lua`: delete the three `o.bind` lines calling `owf-ctl ptt-start` /
      `ptt-stop` / `cancel`. Add the two lines `yappr --print-shortcuts` prints.
    - `autostart.lua`: delete both `o.launch_on_start` lines. There is no replacement line —
-     autostart is now the Settings window's "Beim Anmelden starten" toggle (step 5).
+     autostart is now the Settings window's "Start at login" toggle (step 5).
    - `windows.lua`: delete the `o.window("openwhisprflow", {...})` block. On Hyprland you
      do not need to paste a replacement — the overlay now positions and unfocuses itself
      via `wlr-layer-shell`. (If you'd rather have the belt-and-braces fallback rule too,
@@ -99,7 +99,7 @@ re-touch it.
    Setup pane should not appear; if it does, something about the on-disk models changed and
    it will say what.
 
-6. **Turn on "Beim Anmelden starten"** in Settings if you want the old autostart behaviour
+6. **Turn on "Start at login"** in Settings if you want the old autostart behaviour
    back — it now writes `~/.config/autostart/yappr.desktop` instead of a Hyprland
    line.
 
@@ -539,3 +539,196 @@ on the `[normalize] port` precedent: `#[serde(skip_serializing)]` and hidden by
   script the design was built against is the user's `handy-paste.sh`, which needs GNOME's
   "Window Calls Extended" extension and a running `ydotoold`; neither is present on this
   Arch/Hyprland machine.
+
+---
+
+## Added after this letter: the `libei` injection backend (2026-09-12)
+
+A fifth `[inject] backend`, `"libei"`, alongside `wtype` / `ydotool` / `script` /
+`clipboard`. **Nothing above is retired or changed by it.** `wtype` is still the
+default; `ydotool` is still the only backend proven end to end on real hardware
+(2026-09-07, Fedora 44/GNOME 50, into Ptyxis and GNOME Text Editor), and this one does
+not inherit that standing by being newer.
+
+What it is: the same paste `ydotool` performs — `wl-copy`, settle, one Ctrl+V
+(Ctrl+Shift+V for a terminal, by the same `inject::wants_shift`) — pressed through
+`org.freedesktop.portal.RemoteDesktop.NotifyKeyboardKeysym` instead of a `ydotoold` the
+user has to run. It costs one approval dialog, once, and then nothing: the portal's
+restore token is stored `0600` at `~/.local/state/yappr/libei-restore-token` with
+`PersistMode::ExplicitlyRevoked`. `crates/yappr-core/src/libei.rs` owns the session —
+module-level rather than on the injector, because `SetConfig` rebuilds the injector on
+every settings autosave and a session re-approving itself per keystroke would be worse
+than none.
+
+Phase 1 (`NotifyKeyboardKeysym`), not phase 2 (`ConnectToEIS`). The task prompt framed
+these as fallback and future; the reach argument runs the other way. `NotifyKeyboardKeysym`
+is long-standing on GNOME and Plasma 5.27+, `ConnectToEIS` needs GNOME 45+/Plasma 6+/
+xdg-desktop-portal 1.18+, and the Notify path is ~100 lines against a protocol
+implementation. It is also layout-independent in a way `ydotool key` is not: a keysym is
+resolved by the compositor against the user's own keymap, where a raw evdev keycode
+trusts a key position. `reis` is not a dependency and no EIS code was written.
+
+Dependencies: `ashpd 0.13` (`default-features = false`, `async-io`, `remote_desktop`,
+`screencast`) and `async-io 2`. Pure Rust, nothing linked, no `libei.so` at runtime, no
+new system package in README's install lists, and the `ubuntu:22.04` distrobox AppImage
+build is unaffected. `cargo tree -p yappr-core` reports exactly one `zbus` (5.19.0),
+shared with `atspi` — checked, and worth re-checking on any ashpd bump. Two ashpd traps
+are recorded in `CLAUDE.md`'s gotchas: its default feature is `tokio`, and its
+`remote_desktop` feature does not compile without `screencast`.
+
+### What is verified, and what is not
+
+- `cargo test --workspace`: **507 passed, 0 failed, 12 ignored.** `cargo clippy
+  --workspace --all-targets`: clean. `bun run build`: clean.
+- `cargo test --workspace -- --ignored --test-threads=1`: **8 passed, 4 failed.** The
+  four are `asr_fixture`'s, and they fail for want of downloaded models on this machine
+  (`tokens.txt does not exist` for `parakeet-tdt-0.6b-v3-int8` and
+  `nemotron-3.5-asr-streaming-0.6b-560ms-int8`; only `parakeet-primeline-de-int8` is on
+  disk), not for anything this change touched. The half of that run the gate actually
+  exists for did pass: `vad::tests::*` builds a `SileroTrimmer` and the four
+  `llama::engine_tests` load S1-mini, both in one process, with no
+  `free(): invalid pointer` — so adding ashpd did not disturb the `_GLIBCXX_USE_CXX11_ABI=0`
+  arrangement `.cargo/config.toml` enforces. The twelfth ignored test is new and is the
+  one live check this backend can have without a dialog:
+  `libei::tests::the_portal_on_this_desktop_hands_out_keyboards` asks the real portal
+  for its version and device types and stops short of `CreateSession`. It passes here
+  (version 2, `Keyboard | Pointer | Touchscreen`), which is what proves the ashpd
+  wiring actually talks to this desktop rather than merely compiling.
+- **Not verified on hardware. Nothing has been pasted through this backend.** The
+  reason is specific and worth knowing rather than apologising for: **the RemoteDesktop
+  portal refuses to create a session while the screen is locked**, answering
+  `Session creation inhibited`, and this machine's session was locked
+  (`LockedHint=yes`, `org.gnome.ScreenSaver.GetActive` → `true`) for the whole of the
+  work. `CreateSession` was reached, with a throwaway ashpd binary, and got exactly
+  that refusal; `Start`, the approval dialog, the restore-token round trip and the chord
+  itself were never exercised.
+- So the open question is the one the prompt asked to settle first, and it is still
+  open: **whether Mutter 50 acts on `NotifyKeyboardKeysym` for a keyboard-only session
+  with no linked ScreenCast.** What is measured is that the method exists —
+  `busctl --user introspect org.freedesktop.portal.Desktop /org/freedesktop/portal/desktop
+  org.freedesktop.portal.RemoteDesktop` lists `.NotifyKeyboardKeysym` and `.ConnectToEIS`
+  at `version 2`, `AvailableDeviceTypes 7`. If it turns out to be inert, phase 2 is the
+  answer and `libei.rs`'s `Portal::press` is the only thing that has to change:
+  `SessionReport::path` exists so the probe reports which way in was used rather than
+  asserting one.
+- **To verify it, on an unlocked session:** focus a scratch window and run
+  `cargo run -p yappr-core --example libei_probe -- "hallo welt"`. It presses real keys
+  and replaces the clipboard. It prints whether the session came up (with the portal's
+  own words if not), whether the stored token was honoured or a dialog appeared — the
+  dialog is inferred from how long `Start` took, and the probe says so — the window
+  class, the chord chosen, and the injection result. Running it twice is the restore-token
+  test: the second run should print `restore token sent = true` and a `Start` in
+  milliseconds.
+
+### Everything that changed
+
+`config.rs` (the variant, the two doc comments that said "only the ydotool backend reads
+this"), `inject.rs` (`LibeiInjector`, the `build()` arm, a new `InjectError::Portal` for
+a backend with no exit status to report), `libei.rs` (new), `server.rs` (prewarm at
+start and on `SetConfig`/`Reload` — never in `LibeiInjector::new`, which `cargo test`
+reaches), `wizard.rs`'s backend match, `setup.rs`'s prerequisite doc (no check added:
+there is no binary, and the portal is not a `$PATH` question), `schema.ts`
+(`ENUMS`, the help text, and **`DEPENDENT_FIELDS`**, where `paste_chord` and
+`terminal_classes` had to become `["ydotool", "libei"]` or the new backend's two settings
+would be invisible under it), `wizard.tsx`'s GNOME copy, `README.md`, `CLAUDE.md`.
+
+### First real use, same day (2026-09-12)
+
+The section above says nothing had ever been pasted through this backend. That is no
+longer true, and three things came out of the first session on hardware
+(Fedora 44 / GNOME Shell 50 / mutter 50.0, an AppImage built from this branch).
+
+- **Phase 1 works.** A plain Ctrl+V delivered through
+  `RemoteDesktop.NotifyKeyboardKeysym` pastes. Mutter 50 acts on the method, which was
+  the one open question the whole backend was gambling on, and it settles the choice of
+  phase 1 over `ConnectToEIS`. The first `Start` took 4,0 s (the approval dialog), issued
+  a restore token, and stored it.
+- **A held session is a permanent screen-sharing indicator, and that is not acceptable.**
+  Reported immediately: GNOME's orange pill sat in the top bar for as long as yappr ran.
+  Nothing in the design had considered it -- decision 4 ("the session is created once and
+  reused") optimised entirely for not raising a dialog mid-dictation and never asked what
+  an open session *looks like*. Fixed by closing the session `SESSION_LINGER` (2 s) after
+  the last paste and re-opening it for the next, which the restore token makes silent.
+  `KEEP_OPEN` is the guard on that assumption: the first time a `Start` that offered a
+  token still takes long enough to have shown a dialog, the session stops being closed
+  for the rest of the process and the log says why. One surprise dialog at worst, ever,
+  and never one per dictation.
+- **Resolved the same evening, and it was not the chord: the portal's own approval
+  dialog poisons the window class.** Reported as Ctrl+Shift+V not working in a terminal.
+  Three measurements cleared the chord, in order: an explicit `XK_Shift_L` *is* honoured
+  by mutter 50 (all three shift encodings typed a capital `A`); Ctrl+Shift+V with keysym
+  `v` *does* paste into ghostty through the portal; and the whole real path --
+  `libei_probe`, so `ClipboardInjector` + `PASTE_SETTLE` + `winclass` + `press_chord` --
+  pasted into a throwaway ghostty first try, with `active_window_class() =
+  Some("ghostty")` and the chord resolved to Ctrl+Shift+V.
+
+  The debug records named the real cause. The two dictations before the reported one
+  read `window_class: "xdg-desktop-portal-gnome"` -- the RemoteDesktop approval dialog,
+  still reporting its accessible window as `Active` twenty and thirty seconds after it
+  was dismissed, and `gnome::active_app` returns the first `Active` window it walks
+  onto. A portal is not in `terminal_classes`, so `wants_shift` chose plain Ctrl+V and
+  the terminal ignored it. `gnome.rs` now filters `xdg-desktop-portal*` by prefix in
+  `is_never_a_dictation_target`, beside `yappr` and `gnome-shell`.
+
+  Two things worth keeping from this. The bug was *caused* by the feature that hit it --
+  the dialog is one yappr raised -- and it landed on the one code path this repo has
+  already been burned by twice. And it was found from the debug records, not from
+  reading the code: three rounds of reasoning about mutter's
+  `apply_level_modifiers_in_impl` produced nothing, and one `ls -t ~/yappr/logs` produced
+  the answer.
+
+- **Also measured: the restore token opens a session silently.** `Start` took 6,2 ms with
+  a stored token against 4,0 s for the first, dialog-bearing one. That is the number the
+  open-per-paste session lifetime depends on.
+
+- **Superseded: Ctrl+Shift+V does not paste into a terminal.** Plain Ctrl+V works; the terminal
+  chord does not, in ghostty, where the `ydotool` backend's identical chord did work on
+  2026-09-07. This is not the unknown-window-class hole -- the debug record reads
+  `window_class: "ghostty"`, so `wants_shift` returned true and the shifted chord is what
+  was sent, and `inject` reported success with no fallback. Nor does mutter's source
+  explain it: `apply_level_modifiers_in_impl` returns early for level 0, so an explicit
+  `XK_Shift_L` is not dropped on the way to a level-0 `v`.
+
+  `crates/yappr-core/examples/zz_keysym_scratch.rs` was a **temporary** diagnostic for
+  exactly this, deleted once it had answered -- it lives in commit `e0c6f5d` if a
+  recurrence ever needs it back. It spawned a throwaway ghostty, typed one character per
+  candidate encoding into it, and printed which survived: explicit `Shift_L` + `a`, the
+  shifted keysym `A` alone (mutter presses shift itself for the level), and both
+  together. It needs an unlocked screen -- the portal refuses `CreateSession`
+  otherwise -- which is why the question was still open at the time of writing.
+
+  Do not guess a fix from the two plausible encodings. The one that is *not* verified
+  will be wrong on some other desktop's portal, and a silently wrong chord is the exact
+  failure mode this backend inherited from `ydotool` and which `CLAUDE.md` says twice not
+  to paper over.
+
+### The indicator, round two (2026-09-12, same evening)
+
+Closing the session after each paste shipped, and the indicator stayed up anyway. The
+log said exactly why:
+
+```
+12:58:07 session established token_offered=true token_issued=true start_ms=12
+12:58:49 session established token_offered=true token_issued=true start_ms=3391
+12:58:49 WARN the stored portal permission did not open a session silently ...
+```
+
+The prewarm was silent (12 ms) and closed. The first paste re-opened 42 s later and took
+3,4 s -- a real dialog, confirmed by `Failed to associate portal window with parent
+window` in xdg-desktop-portal-gnome's journal at 14:58:45 local. `KEEP_OPEN` then did
+what it was written to do and stopped closing the session, for the life of the process.
+
+**The guard was the bug.** Latching on a single dialog meant one unexplained event
+reinstated the permanent indicator that the whole change existed to remove. It is a
+count now (`DIALOG_STRIKES_BEFORE_HOLDING = 2`, cleared by any silent re-open), which
+bounds the damage at two dialogs ever while still protecting a desktop whose permission
+genuinely does not restore.
+
+What the dialog itself was is **still unknown, and worth saying plainly rather than
+dressing up**. Four deliberate close/re-open cycles at 5 s, 45 s and 90 s gaps were all
+silent, ~5,5 ms, and returned the identical token; a stale token, by contrast, produces a
+21,2 s dialog and a *different* token. So the token in the file had gone stale between
+12:58:07 and 12:58:49 for a reason nothing reproduces -- most likely churn from the
+several probe processes that share that one file, each rotating it. `SessionReport` now
+carries `token_reused` and the establishment log line prints it, so the next occurrence
+is one line of diagnosis instead of an afternoon of it.
