@@ -689,12 +689,13 @@ longer true, and three things came out of the first session on hardware
   explain it: `apply_level_modifiers_in_impl` returns early for level 0, so an explicit
   `XK_Shift_L` is not dropped on the way to a level-0 `v`.
 
-  `crates/yappr-core/examples/zz_keysym_scratch.rs` is a **temporary** diagnostic for
-  exactly this, and should be deleted once it has been run. It spawns a throwaway
-  ghostty, types one character per candidate encoding into it, and prints which survived:
-  explicit `Shift_L` + `a`, the shifted keysym `A` alone (mutter presses shift itself for
-  the level), and both together. It needs an unlocked screen -- the portal refuses
-  `CreateSession` otherwise -- which is why the question is still open here.
+  `crates/yappr-core/examples/zz_keysym_scratch.rs` was a **temporary** diagnostic for
+  exactly this, deleted once it had answered -- it lives in commit `e0c6f5d` if a
+  recurrence ever needs it back. It spawned a throwaway ghostty, typed one character per
+  candidate encoding into it, and printed which survived: explicit `Shift_L` + `a`, the
+  shifted keysym `A` alone (mutter presses shift itself for the level), and both
+  together. It needs an unlocked screen -- the portal refuses `CreateSession`
+  otherwise -- which is why the question was still open at the time of writing.
 
   Do not guess a fix from the two plausible encodings. The one that is *not* verified
   will be wrong on some other desktop's portal, and a silently wrong chord is the exact

@@ -958,9 +958,11 @@ the whole lock file stops parsing. See
   50 (all three shift encodings typed a capital `A`), Ctrl+Shift+V with keysym `v`
   **does** paste into ghostty through the portal, and the whole real path --
   `libei_probe` with `ClipboardInjector`, `PASTE_SETTLE` and `winclass` -- pastes into a
-  throwaway ghostty on the first try. `examples/zz_keysym_scratch.rs` is the
-  **temporary** harness that established all of that and should be deleted; it needs an
-  **unlocked** screen, per the gotcha above.
+  throwaway ghostty on the first try. The harness that established all of that was
+  `examples/zz_keysym_scratch.rs`, deleted once it had answered; it is in commit
+  `e0c6f5d` if a recurrence ever needs it back. It spawned a throwaway ghostty, typed
+  one character per candidate encoding into it and printed which survived, and it needs
+  an **unlocked** screen, per the gotcha above.
 
 - **A restore token opens a session silently, and a healthy restore returns the *same*
   token.** Measured 2026-09-12 across four close/re-open cycles 5 s, 45 s and 90 s
