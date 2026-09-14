@@ -481,6 +481,58 @@ mod tests {
         }
     }
 
+    /// Every injection backend Rust accepts must be in the dropdown, and
+    /// the dropdown must offer nothing Rust would reject.
+    ///
+    /// `ENUMS["inject.backend"]` is a hand-written second copy of
+    /// `InjectBackend::ALL`, and both ways it can drift are silent.
+    /// `schema.ts`'s standing guarantee is that a key added in Rust becomes
+    /// *unlabelled*, never unreachable -- but that covers keys, not enum
+    /// *values*: a backend missing from this list has no row in the dropdown
+    /// to select, so the only way to choose it is to hand-edit the one file
+    /// the app has stopped inviting anyone to edit (invariant 9). A value
+    /// here that Rust does not accept goes the other way: it selects, the
+    /// autosave is rejected, and the user is told their own choice is
+    /// invalid. Same reasoning as `themes_are_declared_everywhere_they_have_to_be`.
+    #[test]
+    fn every_injection_backend_is_offered_by_the_settings_dropdown() {
+        use yappr_core::config::InjectBackend;
+
+        let schema = frontend("src/settings/schema.ts");
+        let listed: Vec<String> = schema
+            .split_once(r#""inject.backend": ["#)
+            .expect("schema.ts should declare ENUMS[\"inject.backend\"]")
+            .1
+            .split_once(']')
+            .expect("the backend list should be closed")
+            .0
+            .split(',')
+            .map(|v| v.trim().trim_matches('"').to_string())
+            .filter(|v| !v.is_empty())
+            .collect();
+        assert!(!listed.is_empty(), "the scan found nothing, so it stopped working");
+
+        let known: HashSet<String> = InjectBackend::ALL
+            .iter()
+            .map(|b| {
+                serde_json::to_value(b).unwrap().as_str().expect("a string").to_string()
+            })
+            .collect();
+
+        for backend in &known {
+            assert!(
+                listed.contains(backend),
+                "schema.ts's dropdown omits `{backend}`, so nobody can select it"
+            );
+        }
+        for backend in &listed {
+            assert!(
+                known.contains(backend),
+                "schema.ts offers `{backend}`, which Rust would reject on save"
+            );
+        }
+    }
+
     /// `schema.ts`'s `DEPENDENT_FIELDS`, as
     /// `(section, key, dependency key, trigger values)`.
     fn dependent_fields(ts: &str) -> Vec<(String, String, String, Vec<String>)> {

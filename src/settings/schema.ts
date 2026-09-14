@@ -186,11 +186,11 @@ export const HELP: Record<string, string> = {
   "guardrail.ngram_max_repeats":
     "Wie oft dieselbe Wortfolge vorkommen darf, bevor die Fassung als Schleife verworfen wird.",
   "inject.backend":
-    "wtype tippt den Text Zeichen für Zeichen ins Fenster und braucht keine Einrichtung — unter GNOME (Mutter) bewirkt es allerdings nichts. ydotool legt den Text in die Zwischenablage und drückt einmal Strg+V (in Terminals Strg+Umschalt+V); das funktioniert auch dort, wo wtype nichts ausrichtet, setzt aber einen laufenden ydotoold mit Schreibrecht auf /dev/uinput voraus. script übergibt den fertigen Text als erstes Argument an ein eigenes Programm, das dann selbst entscheidet, wie es ihn einfügt. clipboard legt ihn nur in die Zwischenablage, einfügen musst du selbst.",
+    "wtype tippt den Text Zeichen für Zeichen ins Fenster und braucht keine Einrichtung — unter GNOME (Mutter) bewirkt es allerdings nichts. ydotool legt den Text in die Zwischenablage und drückt einmal Strg+V (in Terminals Strg+Umschalt+V); das funktioniert auch dort, wo wtype nichts ausrichtet, setzt aber einen laufenden ydotoold mit Schreibrecht auf /dev/uinput voraus. libei drückt dieselbe Tastenkombination, aber über das Desktop-Portal statt über einen eigenen Dienst: kein ydotoold, kein /dev/uinput, dafür einmalig ein Berechtigungsdialog, den du bestätigen musst. script übergibt den fertigen Text als erstes Argument an ein eigenes Programm, das dann selbst entscheidet, wie es ihn einfügt. clipboard legt ihn nur in die Zwischenablage, einfügen musst du selbst.",
   "inject.script":
     "Pfad zu dem Programm, das das script-Verfahren aufruft. Es bekommt den fertigen Text als erstes und einziges Argument ($1) und ist danach für alles zuständig: Zwischenablage, Tastenkombination, Fenstererkennung. Muss ausführbar sein; ~ wird aufgelöst. Beispiel: ~/bin/paste.sh. Schlägt es fehl oder ist hier nichts eingetragen, landet der Text wie beim clipboard-Verfahren in der Zwischenablage.",
   "inject.paste_chord":
-    "Welche Tastenkombination das ydotool-Verfahren drückt. auto entscheidet nach der Fensterklasse: Strg+Umschalt+V für alles, was unten als Terminal eingetragen ist, sonst Strg+V. Kann yappr das fokussierte Fenster nicht benennen, wird daraus Strg+V — was Terminals ignorieren, ohne dass ein Fehler gemeldet wird. Wenn du hauptsächlich in Terminals diktierst und nichts ankommt, stell hier fest auf Strg+Umschalt+V.",
+    "Welche Tastenkombination die Verfahren ydotool und libei drücken. auto entscheidet nach der Fensterklasse: Strg+Umschalt+V für alles, was unten als Terminal eingetragen ist, sonst Strg+V. Kann yappr das fokussierte Fenster nicht benennen, wird daraus Strg+V — was Terminals ignorieren, ohne dass ein Fehler gemeldet wird. Wenn du hauptsächlich in Terminals diktierst und nichts ankommt, stell hier fest auf Strg+Umschalt+V.",
   "inject.terminal_classes":
     "Fensterklassen, die als Terminal gelten und deshalb unter auto Strg+Umschalt+V bekommen. Groß-/Kleinschreibung ist egal. Die Klasse deines Fensters steht im Debug-Datensatz unter window_class.",
   "inject.trailing_space":
@@ -246,7 +246,7 @@ export const ENUMS: Record<string, string[]> = {
     "parakeet-unified-en",
     "nemotron-3.5",
   ],
-  "inject.backend": ["wtype", "ydotool", "script", "clipboard"],
+  "inject.backend": ["wtype", "ydotool", "libei", "script", "clipboard"],
   "inject.paste_chord": ["auto", "ctrl_v", "ctrl_shift_v"],
   "style_default.styling": ["casual", "semi-casual", "semi-formal", "formal"],
   "style_default.structure": ["prose", "lists"],
@@ -345,19 +345,23 @@ export const OBSOLETE_FIELDS = new Set([
 /// is the case that forced it: `inject::build` reads it only for
 /// `InjectBackend::Script`, so under `wtype` it is a path field that changes
 /// nothing, sitting directly under the dropdown that would make it matter.
-/// `paste_chord` and `terminal_classes` are the same shape -- only
-/// `YdotoolInjector` reads them -- and they are the reason the bar is worth
+/// `paste_chord` and `terminal_classes` are the same shape -- only the two
+/// backends that press a chord themselves, `YdotoolInjector` and
+/// `LibeiInjector`, read them -- and they are the reason the bar is worth
 /// restating: they spent two days in `OBSOLETE_FIELDS` instead, which is
-/// where a setting goes to be forgotten rather than merely hidden.
+/// where a setting goes to be forgotten rather than merely hidden. Note the
+/// shape a second reader gives this table: `is` is a *list*, so adding a
+/// backend that reads a row means adding it here too. Forget it and the new
+/// backend's two settings are invisible under the backend that needs them.
 ///
 /// This does not make a setting unreachable, in either of the two ways that
 /// would matter. Choosing the backend brings its rows back; and a search for
 /// "script" or "chord" still lands on `inject.backend`, whose help text names
-/// all four backends, which is the row you have to change anyway.
+/// every backend, which is the row you have to change anyway.
 export const DEPENDENT_FIELDS: Record<string, { on: string; is: Json[] }> = {
   "inject.script": { on: "backend", is: ["script"] },
-  "inject.paste_chord": { on: "backend", is: ["ydotool"] },
-  "inject.terminal_classes": { on: "backend", is: ["ydotool"] },
+  "inject.paste_chord": { on: "backend", is: ["ydotool", "libei"] },
+  "inject.terminal_classes": { on: "backend", is: ["ydotool", "libei"] },
 };
 
 /// Whether a row's dependency (if it has one) is currently satisfied.

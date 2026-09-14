@@ -205,6 +205,7 @@ pub async fn wizard_state() -> Result<serde_json::Value, String> {
             .map(|c| match c.inject.backend {
                 yappr_core::config::InjectBackend::Ydotool => "ydotool",
                 yappr_core::config::InjectBackend::Script => "script",
+                yappr_core::config::InjectBackend::Libei => "libei",
                 yappr_core::config::InjectBackend::Clipboard => "clipboard",
                 yappr_core::config::InjectBackend::Wtype => "wtype",
             })

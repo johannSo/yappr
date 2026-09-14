@@ -403,10 +403,60 @@ pub enum InjectBackend {
     ///
     /// [`Ydotool`]: InjectBackend::Ydotool
     Script,
+    /// The same paste as [`Ydotool`] -- `wl-copy`, then one Ctrl+V
+    /// (Ctrl+Shift+V for a terminal) -- pressed through the **XDG Desktop
+    /// Portal's RemoteDesktop interface** instead of a `ydotool` daemon. See
+    /// [`crate::libei`] for the transport and [`crate::inject::LibeiInjector`]
+    /// for the injector.
+    ///
+    /// What it costs: one approval dialog, the first time yappr asks. What it
+    /// buys: everything `ydotool` asks for and this does not -- no `ydotoold`,
+    /// no write access to `/dev/uinput`, no group membership, and no socket
+    /// path the client has to guess. It also presses a *keysym* rather than a
+    /// raw evdev keycode, so the compositor resolves `v` against the keymap
+    /// the user actually has.
+    ///
+    /// When to choose it: on GNOME/Mutter, where `wtype` types nothing at all,
+    /// if you would rather approve a dialog once than run a daemon. Choose
+    /// [`Ydotool`] instead if you already have `ydotoold` working -- it is the
+    /// configuration verified end to end on real hardware, and this one is
+    /// newer. Choose [`Script`] if your desktop's portal has no RemoteDesktop
+    /// implementation at all (xdg-desktop-portal-wlr -- sway, river, Wayfire
+    /// -- has none, though `wtype` works natively there and is the default for
+    /// that reason).
+    ///
+    /// It reads `paste_chord` and `terminal_classes` exactly as [`Ydotool`]
+    /// does, and it inherits that backend's one real hole with them: an
+    /// unknown window class under `PasteChord::Auto` means a plain Ctrl+V that
+    /// terminals ignore. `LibeiInjector` warns on that combination for the
+    /// same reason `YdotoolInjector` does.
+    ///
+    /// [`Script`]: InjectBackend::Script
+    /// [`Ydotool`]: InjectBackend::Ydotool
+    Libei,
     Clipboard,
 }
 
-/// Which chord the `ydotool` backend presses to paste (spec 10.3).
+impl InjectBackend {
+    /// Every variant, in the order the settings dropdown offers them:
+    /// `wtype` first because it is the default and needs nothing, then the
+    /// two that press a chord, then the escape hatches. Exists for the same
+    /// reason [`Theme::ALL`] does -- a drift test has to be able to
+    /// enumerate without a macro crate, and `ENUMS["inject.backend"]` in
+    /// `src/settings/schema.ts` is a hand-written second copy of this list
+    /// which `tsc` cannot check. A backend missing from that copy is one no
+    /// user can select.
+    pub const ALL: [InjectBackend; 5] = [
+        InjectBackend::Wtype,
+        InjectBackend::Libei,
+        InjectBackend::Ydotool,
+        InjectBackend::Script,
+        InjectBackend::Clipboard,
+    ];
+}
+
+/// Which chord the `ydotool` and `libei` backends press to paste
+/// (spec 10.3).
 ///
 /// `Auto` is the historical behaviour and still the default: Ctrl+Shift+V
 /// when the focused window's class is in `terminal_classes`, plain Ctrl+V
@@ -417,11 +467,13 @@ pub enum InjectBackend {
 /// focused at all, or an Electron/Qt app on no accessibility bus.
 ///
 /// An unknown class means `Auto` sends plain Ctrl+V, which every terminal
-/// ignores -- and `ydotool` exits 0, so nothing fails, no clipboard-fallback
-/// notification fires and nothing is logged as an error. The user sees a
-/// dictation that simply produced no text; `inject::YdotoolInjector` warns
-/// on exactly that combination, because the warning is the only signal
-/// there is. `CtrlShiftV` is the answer for "my compositor cannot tell
+/// ignores -- and `ydotool` exits 0 (the portal likewise reports a chord it
+/// delivered, whatever the chord was), so nothing fails, no
+/// clipboard-fallback notification fires and nothing is logged as an error.
+/// The user sees a dictation that simply produced no text;
+/// `inject::YdotoolInjector` and `inject::LibeiInjector` both warn on
+/// exactly that combination, because the warning is the only signal there
+/// is. `CtrlShiftV` is the answer for "my compositor cannot tell
 /// yappr what is focused, and I dictate into a terminal".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -455,11 +507,13 @@ pub struct InjectConfig {
     /// Window classes (matched case-insensitively against the class captured
     /// at recording start) whose paste chord is Ctrl+Shift+V rather than
     /// Ctrl+V -- terminals reserve plain Ctrl+V for the applications running
-    /// inside them. Only the `ydotool` backend reads this.
+    /// inside them. Read by the two backends that press a chord themselves,
+    /// `ydotool` and `libei`, and by nothing else.
     #[serde(default = "d_terminal_classes")]
     pub terminal_classes: Vec<String>,
-    /// Which paste chord the `ydotool` backend presses. Only that backend
-    /// reads this. See [`PasteChord`] for why an override is needed at all.
+    /// Which paste chord the `ydotool` and `libei` backends press. Only
+    /// those two read this. See [`PasteChord`] for why an override is needed
+    /// at all.
     #[serde(default = "d_paste_chord")]
     pub paste_chord: PasteChord,
 }
@@ -1605,10 +1659,28 @@ to = "KDD"
             ("wtype", InjectBackend::Wtype),
             ("ydotool", InjectBackend::Ydotool),
             ("script", InjectBackend::Script),
+            ("libei", InjectBackend::Libei),
             ("clipboard", InjectBackend::Clipboard),
         ] {
             let c = Config::from_str(&format!("[inject]\nbackend = \"{spelling}\"\n")).unwrap();
             assert_eq!(c.inject.backend, expected, "for {spelling}");
+        }
+        // And the table above is the whole enum, so a variant added without
+        // a spelling here (and therefore without one in `schema.ts`) fails
+        // rather than passing quietly.
+        assert_eq!(InjectBackend::ALL.len(), 5);
+    }
+
+    #[test]
+    fn every_inject_backend_in_all_round_trips_through_config_toml() {
+        // `InjectBackend::ALL` is what the settings-dropdown drift test
+        // enumerates, so a variant listed there that `config.toml` cannot
+        // actually name would put an unselectable entry in the GUI.
+        for backend in InjectBackend::ALL {
+            let spelling = serde_json::to_value(backend).unwrap();
+            let spelling = spelling.as_str().expect("a backend serialises as a string");
+            let c = Config::from_str(&format!("[inject]\nbackend = \"{spelling}\"\n")).unwrap();
+            assert_eq!(c.inject.backend, backend, "for {spelling}");
         }
     }
 
