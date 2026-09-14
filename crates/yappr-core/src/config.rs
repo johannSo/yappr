@@ -974,7 +974,7 @@ pub fn load_or_quarantine(path: &Path) -> (Config, Option<Quarantine>) {
                     Some(Quarantine {
                         moved_to: None,
                         error: format!(
-                            "{error} (konnte auch nicht beiseitegelegt werden: {rename_err})"
+                            "{error} (and it could not be moved aside either: {rename_err})"
                         ),
                     }),
                 ),
@@ -1078,8 +1078,8 @@ pub fn migrate_from_legacy(legacy: &Path, current: &Path) -> Result<Migration> {
 /// the app's now (spec §1), and the one thing a human who opens it needs to
 /// know is that editing it is pointless.
 const HEADER: &str = "\
-# Automatisch erzeugt von yappr. Änderungen über die Einstellungen
-# (Tray-Symbol anklicken oder `yappr --settings`) -- Handedits gehen verloren.
+# Generated automatically by yappr. Change settings in the app
+# (click the tray icon, or `yappr --settings`) -- hand edits are lost.
 ";
 
 /// The config as it is written to disk: a pure function of [`Config`], which is

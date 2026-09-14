@@ -34,7 +34,7 @@ nothing un-canonicalises. See the window-class gotcha at the bottom of this file
 yappr is one binary, `yappr`, and one process. Running it with no
 arguments starts everything: a tray icon (no window), the Unix socket, the models, and
 the pipeline. Left-clicking the tray (or `yappr --settings`) opens the settings
-window; right-clicking gives Status / Einstellungen / Diktat pausieren / Beenden. There is
+window; right-clicking gives Status / Settings / Setup / Pause dictation / Quit. There is
 no `owf-ctl`, no separate daemon binary, and no systemd unit.
 
 The app was called **OpenWhisprFlow** until 2026-08-29, and the rename reached the
@@ -149,20 +149,20 @@ Two Cargo members, one process:
   `wizard.tsx` (the four-step first-run wizard, which takes over the whole
   window while it is active and replaced the old Setup pane; it owns the
   `setup_status`/`run_setup` calls that pane used to make),
-  `schema.ts` (which pane a section lives in, what a field is called in German, which
+  `schema.ts` (which pane a section lives in, what a field is called, which
   fields get an editor better than a text box), `controls.tsx` (the setting-row
   primitive and its toggle/select/number/list/table editors), `icons.tsx` (inline SVG,
   so the window needs no icon dependency). No pipeline logic in TS, and no copy of the
   config schema: `schema.ts` only decides how a key that already exists is *shown*, so
   a key added in Rust and named nowhere here still renders, by its JSON type, in its
-  section's pane — or in the `Weitere` pane if no category claims its section. A new
+  section's pane — or in the `Other` pane if no category claims its section. A new
   setting can become unlabelled; it cannot become unreachable. The two tables that
   *do* hide a row are `OBSOLETE_FIELDS` (keys Rust accepts and ignores, so not
   settings at all) and `DEPENDENT_FIELDS` (a row inert for every value of another
   row — `inject.script` under a backend that is not `script`, `inject.paste_chord`
   and `inject.terminal_classes` under one that is not `ydotool`; the dropdown that
   brings them back sits right above them). `schema.ts` also
-  owns `search()`, which matches a query against a row's German label, its help
+  owns `search()`, which matches a query against a row's label, its help
   text, *and* its raw `config.toml` key — a key added in Rust and named nowhere
   here is still findable by the name Rust gives it.
   Colour lives in two files of its own. `palettes.css` holds every theme as a set
@@ -403,7 +403,7 @@ the whole lock file stops parsing. See
     failure path, and it must stay that way. Because a missed second press now leaves the
     microphone open until this fires, its default is a number the user should choose
     deliberately rather than inherit silently; `config_write.rs`'s annotated fixture and
-    the Settings GUI describe it as ending "a forgotten recording" (Sicherheitsnetz), not
+    the Settings GUI describe it as ending "a forgotten recording" (a safety net), not
     a stuck key, for the same reason.
 12. **The models are not resident by default, and `load_lock` is always taken
     before `pipeline`.** `[models] preload_at_startup` defaults to `false`, so
@@ -480,15 +480,15 @@ the whole lock file stops parsing. See
     - **2026-09-09, first pass:** the two questions were split, because one
       unready model had the wizard *replace* the settings window on every
       launch, with the only way out three clicks away at the last step's
-      "Einstellungen öffnen" -- the settings window became unreachable over
+      "Open settings" -- the settings window became unreachable over
       an errand that takes one click. (That is also why the models step
-      carries an "Einstellungen" button when the marker exists.)
+      carries a "Settings" button when the marker exists.)
     - **Same day, second pass:** `!ready` stopped opening the window at all.
       It is false for a missing prerequisite *binary* and for a hash
       mismatch too -- neither of which the wizard has a button for, and
       `ydotoold` not *running* is not even checkable -- so it reopened
       forever over gaps it could not close, while its models step said
-      "Alle Modelle sind vorhanden". Reported as exactly that
+      "All models are present". Reported as exactly that
       contradiction.
     The warning moved rather than went away: `build_wizard_state` passes
     `provision::setup_status`'s whole answer through as `setup`, and
@@ -504,8 +504,8 @@ the whole lock file stops parsing. See
     - **2026-09-10, third pass — the other side of the same coin.** Making
       the marker the *only* input is worth nothing unless every way out of
       the wizard writes it, and until this date exactly one did: the last
-      step's **Fertig** button. The wizard has three other exits — the
-      models step's "Einstellungen", the last step's "Einstellungen öffnen",
+      step's **Done** button. The wizard has three other exits — the
+      models step's "Settings", the last step's "Open settings",
       and the window's own close control, which is what a user who
       considers themselves finished reaches for — and all three left
       `wizard-done` unwritten, so a machine with every model downloaded,
@@ -513,8 +513,8 @@ the whole lock file stops parsing. See
       again on every launch, with nothing on screen saying why. Reported
       exactly that way, against a `~/.local/state/yappr/` holding a
       `config.toml` and no marker. Every exit funnels through
-      `wizard::remember_setup_seen` now: `wizard_finish` (Fertig),
-      `wizard_dismiss` (both "Einstellungen" buttons, via `Settings.tsx`'s
+      `wizard::remember_setup_seen` now: `wizard_finish` (Done),
+      `wizard_dismiss` (both settings buttons, via `Settings.tsx`'s
       `onOpenSettings`), and `lib.rs`'s close-request hook on the settings
       window — deliberately unconditional there, since that hook cannot see
       whether the webview is in wizard mode and does not need to: a

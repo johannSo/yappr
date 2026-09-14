@@ -17,7 +17,7 @@
 //! spec §12 listed to verify by probe before implementing, and it turned
 //! out not to need answering first: the two possible answers don't need
 //! different code, only different first contacts. [`OwfTray::activate`]
-//! opens Settings for a host that sends `Activate`; **Einstellungen is the
+//! opens Settings for a host that sends `Activate`; **Settings is the
 //! first actionable item** of the context menu for a host that doesn't
 //! (the status line above it is disabled, so it is not actionable). One
 //! implementation, correct either way, and correct on a machine that
@@ -35,7 +35,7 @@
 //! it would now freeze the tray too). `Tray::activate` and every menu
 //! item's `activate` below run on `ksni`'s own thread, never Tauri's.
 //!
-//! ## Left click and Einstellungen do not dispatch `Request::ShowSettings`
+//! ## Left click and Settings do not dispatch `Request::ShowSettings`
 //!
 //! A deliberate deviation from this task's own brief sketch, which routes
 //! `activate` through `Request::ShowSettings`. That request's only handler
@@ -44,7 +44,7 @@
 //! window -- so routing through it would be a round trip through a
 //! `Daemon` for an action that never touches daemon state, and `--replay`
 //! manages no `Daemon` at all, so that round trip has nowhere to go there.
-//! Left click and Einstellungen call [`crate::show_settings_window`]
+//! Left click and Settings call [`crate::show_settings_window`]
 //! directly instead -- the same function `TauriSink::show_settings` calls,
 //! so there is one definition of "show Settings", not two -- which keeps
 //! both tray actions working identically under `--replay`, the one way
@@ -110,20 +110,20 @@
 //! `Daemon::broadcast` (-> `TauriSink::emit` -> `refresh_tray_icon` ->
 //! `Handle::set_state`) on `ksni`'s own thread would try to lock a `Mutex`
 //! it is already holding, on the same thread -- a guaranteed, permanent
-//! self-deadlock: frozen icon, dead menu, dead Beenden, recoverable only by
+//! self-deadlock: frozen icon, dead menu, dead Quit, recoverable only by
 //! killing the process from outside.
 //!
 //! Not reachable via `Request::Quit` or `show_settings_window`: `Quit`
 //! spawns its wait-then-shutdown work on a fresh thread and broadcasts
 //! nothing on the calling one, and `show_settings_window` broadcasts
-//! nothing at all. `Request::SetPaused` ("Diktat pausieren", Task 13) is the
+//! nothing at all. `Request::SetPaused` ("Pause dictation", Task 13) is the
 //! trap made real: its handler (`server.rs`) really does call
 //! `daemon.broadcast` synchronously on whatever thread calls `dispatch`. So
 //! every `dispatch` call reachable from a tray callback runs on its own
 //! freshly spawned thread ([`OwfTray::quit`] and [`OwfTray::toggle_paused`]
 //! are the two examples), never inline in the callback -- for `toggle_paused`
-//! this is not just defensive: without the thread hop, checking "Diktat
-//! pausieren" would deadlock the ksni thread on the very first click.
+//! this is not just defensive: without the thread hop, checking "Pause
+//! dictation" would deadlock the ksni thread on the very first click.
 
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -150,19 +150,18 @@ pub fn icon_name(state: State) -> &'static str {
     }
 }
 
-/// The context menu's non-interactive first row, in German to match the
-/// rest of the settings GUI.
+/// The context menu's non-interactive first row.
 fn status_label(state: State) -> &'static str {
     use State::*;
     match state {
-        Warming => "Wird vorbereitet …",
-        Idle => "Bereit",
-        Recording => "Nimmt auf …",
-        Transcribing => "Transkribiert …",
-        Normalizing => "Verbessert Text …",
-        Injecting => "Fügt Text ein …",
-        Paused => "Pausiert",
-        Error => "Fehler",
+        Warming => "Starting up …",
+        Idle => "Ready",
+        Recording => "Recording …",
+        Transcribing => "Transcribing …",
+        Normalizing => "Improving text …",
+        Injecting => "Inserting text …",
+        Paused => "Paused",
+        Error => "Error",
     }
 }
 
@@ -254,14 +253,14 @@ struct OwfTray {
 }
 
 impl OwfTray {
-    /// Beenden: routes through `Request::Quit`, exactly what `--quit` and
+    /// Quit: routes through `Request::Quit`, exactly what `--quit` and
     /// the tray must both use -- never `shutdown`/`exit` directly, which
     /// would skip spec §8 step 1 (waiting out an in-flight utterance) and
     /// reintroduce the transcript-loss bug a previous task fixed. `None`
     /// under `--replay` (`settings_cmds::Server(None)`, managed in both
     /// branches of `lib.rs`'s `setup()`): there is no daemon to ask, and
     /// with no pipeline ever running there, there is nothing invariant 1
-    /// protects either -- so Beenden does nothing rather than reaching for
+    /// protects either -- so Quit does nothing rather than reaching for
     /// `exit` on its own, which would just be a second, divergent teardown
     /// path to maintain.
     ///
@@ -281,7 +280,7 @@ impl OwfTray {
         }
     }
 
-    /// "Diktat pausieren": a click always means "flip whatever this
+    /// "Pause dictation": a click always means "flip whatever this
     /// checkbox currently shows", so it dispatches `Request::SetPaused` with
     /// the opposite of `self.state == State::Paused` -- never a fixed
     /// `true`/`false`. `None` under `--replay`, the same reasoning as
@@ -336,17 +335,17 @@ impl ksni::Tray for OwfTray {
             StandardItem { label: status_label(self.state).into(), enabled: false, ..Default::default() }
                 .into(),
             StandardItem {
-                label: "Einstellungen".into(),
+                label: "Settings".into(),
                 activate: Box::new(|this: &mut Self| crate::show_settings_window(&this.app)),
                 ..Default::default()
             }
             .into(),
             // Calls the helper directly rather than dispatching
-            // `Request::ShowWizard`, exactly as Einstellungen above does and
+            // `Request::ShowWizard`, exactly as Settings above does and
             // for the reason this module's doc comment gives: a menu
             // activation must never block on the accept loop.
             StandardItem {
-                label: "Einrichtung…".into(),
+                label: "Setup…".into(),
                 activate: Box::new(|this: &mut Self| crate::show_wizard_window(&this.app)),
                 ..Default::default()
             }
@@ -357,14 +356,14 @@ impl ksni::Tray for OwfTray {
             // visibly a click that did nothing, not a checkbox lying about
             // what the shortcut will do next.
             CheckmarkItem {
-                label: "Diktat pausieren".into(),
+                label: "Pause dictation".into(),
                 checked: matches!(self.state, State::Paused),
                 activate: Box::new(|this: &mut Self| this.toggle_paused()),
                 ..Default::default()
             }
             .into(),
             StandardItem {
-                label: "Beenden".into(),
+                label: "Quit".into(),
                 activate: Box::new(|this: &mut Self| this.quit()),
                 ..Default::default()
             }
@@ -426,10 +425,10 @@ impl Handle {
 /// bus and serves it on `ksni`'s own OS thread (`TrayService::spawn` --
 /// never Tauri's event loop; see this module's doc comment). Called once
 /// from `lib.rs`'s `setup()`, unconditionally in both the normal and
-/// `--replay` branches: Beenden must exist as a menu item under `--replay`
+/// `--replay` branches: Quit must exist as a menu item under `--replay`
 /// too ([`OwfTray::quit`]'s doc comment covers what it does there), and a
 /// tray that only sometimes exists would be a worse surprise than one
-/// whose Beenden is sometimes inert.
+/// whose Quit is sometimes inert.
 pub fn spawn(app: AppHandle) -> Handle {
     let service = ksni::TrayService::new(OwfTray { app, state: State::Warming });
     let inner = service.handle();

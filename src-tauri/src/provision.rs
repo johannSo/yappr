@@ -141,7 +141,7 @@ fn compute_missing_models(model: AsrModel) -> Result<Vec<String>, String> {
         return Ok(Vec::new());
     }
     let lock = LockFile::load().map_err(|e| format!("models.lock.toml: {e:#}"))?;
-    models::verify(&lock, &required).map_err(|e| format!("Modelle prüfen: {e:#}"))
+    models::verify(&lock, &required).map_err(|e| format!("checking models: {e:#}"))
 }
 
 /// Which models are missing, computed at most once per process and shared
@@ -199,7 +199,7 @@ fn check_missing() -> Result<(Vec<&'static str>, Vec<String>), String> {
 /// fast re-render race -- this is the guard that actually matters.
 static INSTALL_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
-const ALREADY_INSTALLING: &str = "Installation läuft bereits.";
+const ALREADY_INSTALLING: &str = "An installation is already running.";
 
 /// Claims the single install slot, or refuses with [`ALREADY_INSTALLING`] if
 /// it's already held. Pure enough to test directly (no disk, no network) --
@@ -266,7 +266,7 @@ pub async fn setup_status() -> Result<serde_json::Value, String> {
         Ok(build_status(missing_prerequisites, missing_model_names))
     })
     .await
-    .map_err(|e| format!("interner Fehler: {e}"))?;
+    .map_err(|e| format!("internal error: {e}"))?;
     result
 }
 
@@ -339,7 +339,7 @@ pub async fn run_setup(app: tauri::AppHandle) -> Result<serde_json::Value, Strin
         })
     })
     .await
-    .map_err(|e| format!("interner Fehler: {e}"))?;
+    .map_err(|e| format!("internal error: {e}"))?;
 
     // Whatever happened, `download_all` may have changed what's on disk --
     // an artifact failing partway through does not roll back the ones

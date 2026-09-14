@@ -1,7 +1,7 @@
 /// The download affordance for a model chosen in Settings rather than in the
 /// wizard.
 ///
-/// A dropdown autosaves the moment it changes (invariant 9), so the Sprache
+/// A dropdown autosaves the moment it changes (invariant 9), so the Language
 /// pane can be left naming a model that is not on disk. Only the *selected*
 /// model is ever downloaded (spec asr-model §4), which makes that an ordinary
 /// state rather than a broken install -- but the user has to be told here,
@@ -38,7 +38,7 @@ export function AsrModelDownload({ model, revision }: { model: string; revision:
     <div className="banner notice">
       <Icon name="warn" className="icon-sm" />
       <div className="setup-row__body">
-        <span>{missing.map((m) => m.display).join(", ")} — noch nicht heruntergeladen.</span>
+        <span>{missing.map((m) => m.display).join(", ")} — not downloaded yet.</span>
         {missing.map((m) => {
           const progress = setup.downloads[m.name];
           if (!progress) return null;
@@ -46,7 +46,7 @@ export function AsrModelDownload({ model, revision }: { model: string; revision:
             progress.total === null ? null : Math.round((progress.done / progress.total) * 100);
           return (
             <span key={m.name} className="setup-row__head">
-              {m.display}: {pct === null ? "lädt…" : `${pct} %`}
+              {m.display}: {pct === null ? "downloading…" : `${pct} %`}
             </span>
           );
         })}
@@ -58,7 +58,7 @@ export function AsrModelDownload({ model, revision }: { model: string; revision:
         disabled={setup.installing}
         onClick={() => setup.install()}
       >
-        {setup.installing ? "Lädt…" : "Jetzt laden"}
+        {setup.installing ? "Downloading…" : "Download now"}
       </button>
     </div>
   );

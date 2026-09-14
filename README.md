@@ -81,7 +81,7 @@ cat > ~/.local/share/applications/yappr.desktop <<'EOF'
 [Desktop Entry]
 Type=Application
 Name=yappr
-Comment=Startet das Diktat-Overlay im Hintergrund
+Comment=Starts the dictation overlay in the background
 Exec=yappr
 Terminal=false
 Categories=Utility;AudioVideo;
@@ -100,7 +100,7 @@ appears in the focused window a moment later. `SUPER+ALT+D` throws the recording
 
 There is **no key to release**: a recording keeps going until you press again. If you
 forget, a watchdog ends it after `audio.max_seconds` (120 s by default) and *transcribes what it captured* rather than discarding it. If 120 seconds of open microphone isn't a
-trade you want, lower it in Settings → Allgemein → Mikrofon & Aufnahme.
+trade you want, lower it in Settings → General → Microphone & recording.
 
 ### What the overlay shows
 
@@ -122,11 +122,11 @@ into the overlay instead of your editor.
 Left-click opens Settings. Right-click gives you:
 
 - **Status** — what the app is doing right now
-- **Einstellungen** — the settings window
-- **Einrichtung…** — reopen the setup wizard
-- **Diktat pausieren** — refuse `SUPER+D` entirely until you un-pause (never interrupts
+- **Settings** — the settings window
+- **Setup…** — reopen the setup wizard
+- **Pause dictation** — refuse `SUPER+D` entirely until you un-pause (never interrupts
   a dictation already in flight)
-- **Beenden** — quit
+- **Quit** — quit
 
 ### If typing fails
 
@@ -137,7 +137,7 @@ if the clean-up model is down, times out, or produces something the guardrail re
 
 ### Start it at login
 
-Settings → Allgemein → **"Beim Anmelden starten"**. It writes
+Settings → General → **"Start at login"**. It writes
 `~/.config/autostart/yappr.desktop`.
 Off by default.
 
@@ -180,7 +180,7 @@ Two differences:
 - **`wtype` does nothing here.** Mutter doesn't implement the virtual-keyboard protocol
   `wtype` types through. The wizard detects GNOME and sets `[inject] backend =
   "clipboard"` for you on a first run: the transcript lands in the clipboard and you
-  press Ctrl+V. To have it inserted for you, switch *Verfahren* to `ydotool` (which
+  press Ctrl+V. To have it inserted for you, switch *Method* to `ydotool` (which
   needs a running `ydotoold`) or to `script` with a paste script of your own — see
   [Pasting where `wtype` can't type](#pasting-where-wtype-cant-type).
 - **Add the shortcuts in Settings → Keyboard → Custom Shortcuts**, running
@@ -204,8 +204,8 @@ Nothing is desktop-specific except shortcut registration. Bind `yappr --toggle` 
 
 Left-click the tray icon, or `yappr --settings`. Everything in `config.toml` is
 editable there — microphone, dictation vocabulary, styles, thresholds, colours — across
-six panes: **Allgemein**, **Sprache**, **Stil**, **Darstellung**, **Erweitert**,
-**Diagnose**. There's a search box; it matches German labels, help text, *and* the raw
+six panes: **General**, **Language**, **Style**, **Appearance**, **Advanced**,
+**Diagnostics**. There's a search box; it matches labels, help text, *and* the raw
 `config.toml` key names.
 
 There is no Save button. Toggles and dropdowns save immediately, text and number fields
@@ -216,14 +216,14 @@ the value isn't the default.
 
 ### Themes
 
-**Darstellung → Farbschema** picks the palette, and it applies to both windows —
+**Appearance → Colour scheme** picks the palette, and it applies to both windows —
 the settings window *and* the dictation overlay. It takes effect the moment you
 choose it; nothing to restart.
 
 | | |
 |---|---|
 | **System** | The palette yappr ships with, following your desktop's light/dark preference. The default. |
-| **yappr Hell**, **yappr Dunkel** | The same two palettes, pinned, so they stay put when your desktop switches. |
+| **yappr Light**, **yappr Dark** | The same two palettes, pinned, so they stay put when your desktop switches. |
 | **Catppuccin Latte**, **Catppuccin Mocha** | [Catppuccin](https://catppuccin.com), light and dark. |
 | **Tokyo Night Day**, **Tokyo Night Night** | [Tokyo Night](https://github.com/folke/tokyonight.nvim), light and dark. |
 
@@ -241,8 +241,8 @@ untouched. If you'd rather have the exact upstream colours than readable ones,
 that's a knob yappr doesn't have.
 
 **`[asr]` and `[normalize]` changes can need a restart**, and the window asks you when
-they do: a prompt with a **Jetzt neu starten** button that shuts yappr down and brings it
-straight back. Pick **Später** and the offer stays as a bar at the top of the pane until
+they do: a prompt with a **Restart now** button that shuts yappr down and brings it
+straight back. Pick **Later** and the offer stays as a bar at the top of the pane until
 you take it. You never have to restart it by hand.
 
 They only need one if the models are actually loaded at that moment. With the default
@@ -298,7 +298,7 @@ changed some other way, such as one restored from a backup.
 `wtype` is the default and needs no setup: it types through the compositor's own
 virtual-keyboard protocol. But it does nothing on GNOME, and it's known to drop
 keystrokes in some XWayland and Electron windows. Two backends cover those, under
-Settings → Allgemein → Texteingabe → *Verfahren*:
+Settings → General → Text entry → *Method*:
 
 | `[inject] backend` | What it does | What it needs |
 |---|---|---|
@@ -359,7 +359,7 @@ it, which is also why a script written for another dictation tool usually works
 unchanged.
 
 The path is tilde-expanded (`~/bin/paste.sh` works) and the file must be executable
-(`chmod +x`). Set it in Settings → Allgemein → Texteingabe → *Einfüge-Skript*, or in
+(`chmod +x`). Set it in Settings → General → Text entry → *Paste script*, or in
 `config.toml` as above.
 
 The smallest useful script:
@@ -396,7 +396,7 @@ notification instead of being pasted. 0.2.7 restores it as a real backend, and
 
 If your config still says `ydotool`, it now means `ydotool` again and there is nothing
 to do. If anything saved your config while you were on 0.2.5 or 0.2.6, the word was
-rewritten to `script` — set *Verfahren* back to `ydotool` in Settings, or edit the file:
+rewritten to `script` — set *Method* back to `ydotool` in Settings, or edit the file:
 yappr will not guess which of the two you meant. Your `paste_chord` and
 `terminal_classes` were dropped from the file by that same save; they fall back to their
 defaults (`auto`, and the shipped terminal list), so re-enter them only if you had
@@ -413,12 +413,12 @@ The price: the first dictation after a pause waits once for the models to load.
 Recording starts instantly and loading happens while you speak, so you only notice it on
 a very short dictation, where the text may arrive a couple of seconds late.
 
-Two settings under **Erweitert → Modelle & Speicher**:
+Two settings under **Advanced → Models & memory**:
 
 | Setting | Default | Meaning |
 |---|---|---|
-| Modelle beim Start laden (`preload_at_startup`) | off | Load everything at app start. No wait on the first dictation, but the memory is held from launch. |
-| Modelle entladen nach (`idle_unload_seconds`) | 60 s | Idle time after which the models are released. `0` means never. |
+| Load models at startup (`preload_at_startup`) | off | Load everything at app start. No wait on the first dictation, but the memory is held from launch. |
+| Unload models after (`idle_unload_seconds`) | 60 s | Idle time after which the models are released. `0` means never. |
 
 Want them always warm? Turn the first **on** *and* set the second to `0`. Both are
 needed — `preload_at_startup` alone still unloads after the idle timeout.

@@ -22,7 +22,7 @@ const HYPRCTL_TIMEOUT: Duration = Duration::from_secs(3);
 /// This has now broken twice, and the emitted text has to carry both
 /// breaks, because a user's Hyprland config may be stale by either
 /// generation. First, `owf-ctl` stopped existing: autostart became the
-/// Settings window's "Beim Anmelden starten" toggle (spec §9) rather than a
+/// Settings window's "Start at login" toggle (spec §9) rather than a
 /// Hyprland line, and hold-to-talk's release-edge binding (the paired
 /// `{ release = true }` `o.bind` call; `bindr` in the classic format) lost
 /// its replacement under press/press toggle (spec §3) -- there is nothing
@@ -62,7 +62,7 @@ const HYPRCTL_TIMEOUT: Duration = Duration::from_secs(3);
 /// bug the previous two-app split existed to avoid (spec §12 item 2). The
 /// overlay's title, `"yappr overlay"`, comes from its window
 /// declaration in `src-tauri/tauri.conf.json`; the settings window's title
-/// there, `"yappr – Einstellungen"`, does not match the regex below,
+/// there, `"yappr – Settings"`, does not match the regex below,
 /// so the rule reaches only the overlay.
 ///
 /// Every rule *effect* below is the exact Lua spelling registered by the
@@ -113,7 +113,7 @@ pub const SHORTCUT_CONFIG_LUA: &str = r#"-- yappr dictation shortcuts and window
 -- "openwhisprflow"), the o.window("openwhisprflow", { ... }) rule keyed on
 -- the app's class, and its title-keyed successor
 -- o.window({ title = "^openwhisprflow overlay$" }, { ... }).
--- Autostart is now the Settings window's "Beim Anmelden starten" toggle,
+-- Autostart is now the Settings window's "Start at login" toggle,
 -- not a Hyprland line; and the class-matched rule also reaches the settings
 -- window, which then cannot take a keystroke.
 --
@@ -189,7 +189,7 @@ pub const SHORTCUT_CONFIG_CONF: &str = r#"# yappr dictation shortcuts and window
 # `exec, openwhisprflow --toggle` / `--cancel` binds, and every
 # windowrulev2 line matched on class:^(openwhisprflow)$ or on
 # title:^(openwhisprflow overlay)$. Autostart is now the Settings window's
-# "Beim Anmelden starten" toggle, not a Hyprland line; and the
+# "Start at login" toggle, not a Hyprland line; and the
 # class-matched rule also reaches the settings window, which then cannot
 # take a keystroke.
 #

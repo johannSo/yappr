@@ -23,13 +23,13 @@ pub enum Desktop {
 }
 
 impl Desktop {
-    /// The name a human reads, in the wizard's German UI.
+    /// The name a human reads, in the wizard's UI.
     pub fn display(&self) -> &str {
         match self {
             Desktop::Hyprland => "Hyprland",
             Desktop::Gnome => "GNOME",
             Desktop::Other(name) => name,
-            Desktop::Unknown => "unbekannt",
+            Desktop::Unknown => "unknown",
         }
     }
 
@@ -132,12 +132,12 @@ pub struct ShortcutInstructions {
 fn bindings() -> Vec<ShortcutBinding> {
     vec![
         ShortcutBinding {
-            name: "yappr: Diktat starten/stoppen".into(),
+            name: "yappr: start/stop dictation".into(),
             command: "yappr --toggle".into(),
             keys: "Super+D".into(),
         },
         ShortcutBinding {
-            name: "yappr: Diktat abbrechen".into(),
+            name: "yappr: cancel dictation".into(),
             command: "yappr --cancel".into(),
             keys: "Super+Alt+D".into(),
         },
@@ -156,11 +156,11 @@ fn bindings() -> Vec<ShortcutBinding> {
 const GNOME_GSETTINGS_SNIPPET: &str = r#"BASE=/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings
 SCHEMA=org.gnome.settings-daemon.plugins.media-keys.custom-keybinding
 
-gsettings set $SCHEMA:$BASE/yappr-toggle/ name    'yappr: Diktat starten/stoppen'
+gsettings set $SCHEMA:$BASE/yappr-toggle/ name    'yappr: start/stop dictation'
 gsettings set $SCHEMA:$BASE/yappr-toggle/ command 'yappr --toggle'
 gsettings set $SCHEMA:$BASE/yappr-toggle/ binding '<Super>d'
 
-gsettings set $SCHEMA:$BASE/yappr-cancel/ name    'yappr: Diktat abbrechen'
+gsettings set $SCHEMA:$BASE/yappr-cancel/ name    'yappr: cancel dictation'
 gsettings set $SCHEMA:$BASE/yappr-cancel/ command 'yappr --cancel'
 gsettings set $SCHEMA:$BASE/yappr-cancel/ binding '<Super><Alt>d'
 
@@ -174,8 +174,8 @@ gsettings set org.gnome.settings-daemon.plugins.media-keys custom-keybindings "$
 "#;
 
 const GENERIC_SNIPPET: &str = "\
-yappr --toggle    # Diktat starten/stoppen
-yappr --cancel    # Diktat abbrechen
+yappr --toggle    # start/stop dictation
+yappr --cancel    # cancel dictation
 ";
 
 /// What the wizard's shortcut step shows for `d`.
@@ -201,7 +201,7 @@ pub fn shortcut_instructions(d: &Desktop) -> ShortcutInstructions {
         Desktop::Gnome => ShortcutInstructions {
             kind: ShortcutKind::Gnome,
             target: Some(
-                "Einstellungen → Tastatur → Tastenkürzel anpassen → Eigene Tastenkürzel".into(),
+                "Settings → Keyboard → View and Customize Shortcuts → Custom Shortcuts".into(),
             ),
             snippet: GNOME_GSETTINGS_SNIPPET.to_string(),
             bindings: bindings(),

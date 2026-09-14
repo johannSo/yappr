@@ -227,7 +227,7 @@ struct Prerequisite {
 /// anyway cost a GNOME user a `sudo pacman -S wtype` that would still type
 /// nothing, and -- because a *fatal* gap makes `setup_status` report the
 /// whole install as not ready -- a wizard that reopened on every launch,
-/// forever. That gap is a standing "Einrichtung unvollständig" banner rather
+/// forever. That gap is a standing "setup incomplete" banner rather
 /// than a reopening wizard since 2026-09-09 (invariant 14); a permanent
 /// banner nobody can act on is no better.
 ///
@@ -490,7 +490,7 @@ mod tests {
     /// Optional is the load-bearing half. A fatal gap makes `setup_status`
     /// report the whole install as not ready, and `ydotoold` also has to be
     /// *running*, which no package check can see -- so a fatal entry would
-    /// have meant "Einrichtung unvollständig" forever on every machine that
+    /// have meant "setup incomplete" forever on every machine that
     /// never chose this backend. Optional, it is one line in the startup
     /// report and nothing else, which is what a backend the user opts into
     /// is worth.

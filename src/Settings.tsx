@@ -33,7 +33,7 @@ import {
 /// short enough that letting go of the keyboard feels like it committed.
 const DEBOUNCE_MS = 700;
 
-/// How long the "Gespeichert" capsule stays up before it leaves.
+/// How long the "Saved" capsule stays up before it leaves.
 const SAVED_MS = 1800;
 
 /// The house spring, in the two shapes this window uses. Apple's damping
@@ -83,7 +83,7 @@ export default function Settings() {
   // owed it stays owed until the process actually restarts, which is the only
   // thing that can pay it off — hence no setter that clears this.
   const [restartPending, setRestartPending] = useState(false);
-  // "Später": the dialog has been answered once, so it stops re-opening and
+  // "Later": the dialog has been answered once, so it stops re-opening and
   // the amber banner carries the offer from then on. Not a dismissal of the
   // requirement itself — see `restartPending`.
   const [restartDeferred, setRestartDeferred] = useState(false);
@@ -106,7 +106,7 @@ export default function Settings() {
   // matter — the split is now also a difference in kind, since the restart
   // side is a latched boolean and this one is the daemon's own text.
   const [configNotice, setConfigNotice] = useState<string | null>(null);
-  // "Verstanden" has to stick. The daemon reports the same notice on every
+  // "Got it" has to stick. The daemon reports the same notice on every
   // `get_config`, and this window re-reads on every reveal, so without this the
   // banner would come back each time the window is reopened.
   const dismissedNoticeRef = useRef<string | null>(null);
@@ -140,7 +140,7 @@ export default function Settings() {
   const paneRef = useRef<HTMLDivElement | null>(null);
 
   // `quiet` is the reveal path (see the `show-settings` listener below): the
-  // same read, without the full-window "Lade…" state. A window that blanked
+  // same read, without the full-window "Loading…" state. A window that blanked
   // itself every time it was reopened would be a worse thing to look at than
   // a stale value, which rather defeats the point.
   const load = useCallback(async (quiet = false) => {
@@ -266,7 +266,7 @@ export default function Settings() {
   // Re-reads the facts *without* the activate branch. Called on the way out
   // of the wizard: the banner below has to disappear once the model is there,
   // and `loadWizardState` cannot be used for that -- on a first run the
-  // marker is not written until "Fertig", so it would put the user straight
+  // marker is not written until "Done", so it would put the user straight
   // back into the wizard they just left.
   const refreshWizardState = useCallback(async () => {
     try {
@@ -276,7 +276,7 @@ export default function Settings() {
     }
   }, []);
 
-  // `yappr --wizard` and the tray's Einrichtung item. The state is re-read
+  // `yappr --wizard` and the tray's Setup item. The state is re-read
   // rather than reused: the desktop or the backend may have changed since
   // this window mounted.
   useEffect(() => {
@@ -414,8 +414,8 @@ export default function Settings() {
   /// scheduled off the success path for that reason.
   ///
   /// The `catch` is not dead code even so: in `--replay` mode there is no
-  /// daemon to restart and `restart_app` answers with a stated German error
-  /// rather than exiting anything.
+  /// daemon to restart and `restart_app` answers with a stated error rather
+  /// than exiting anything.
   const restartNow = useCallback(async () => {
     setRestarting(true);
     setRestartError(null);
@@ -445,7 +445,7 @@ export default function Settings() {
   if (loading) {
     return (
       <main className="shell shell--bare">
-        <p className="status">Lade…</p>
+        <p className="status">Loading…</p>
       </main>
     );
   }
@@ -456,10 +456,10 @@ export default function Settings() {
         <div className="pane">
           <div className="banner error">
             <Icon name="warn" className="icon-sm" />
-            <span>{loadError ?? "Keine Konfiguration geladen."}</span>
+            <span>{loadError ?? "No configuration loaded."}</span>
           </div>
           <button type="button" className="add" onClick={() => void load()}>
-            Erneut versuchen
+            Try again
           </button>
         </div>
       </main>
@@ -521,9 +521,9 @@ export default function Settings() {
             // every exit has to persist the marker — that is invariant 14's
             // "finished once, never again by itself". This one wrote nothing
             // until 2026-09-10, so a user who took the models step's
-            // "Einstellungen" button, or the last step's "Einstellungen
-            // öffnen", got the whole wizard back on every launch of a
-            // perfectly set-up install.
+            // "Settings" button, or the last step's "Open settings", got the
+            // whole wizard back on every launch of a perfectly set-up
+            // install.
             onOpenSettings={() => {
               invoke("wizard_dismiss")
                 .then(() => setWizardError(null))
@@ -559,8 +559,8 @@ export default function Settings() {
               ref={searchRef}
               type="search"
               className="searchbox__input"
-              placeholder="Suchen"
-              aria-label="Einstellungen durchsuchen"
+              placeholder="Search"
+              aria-label="Search settings"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
             />
@@ -569,7 +569,7 @@ export default function Settings() {
                 <motion.button
                   type="button"
                   className="searchbox__clear"
-                  aria-label="Suche leeren"
+                  aria-label="Clear search"
                   onClick={() => {
                     setQuery("");
                     searchRef.current?.focus();
@@ -644,10 +644,10 @@ export default function Settings() {
                 has scrolled -- a rule would sit there just as hard when there
                 is nothing underneath it. */}
             <header className={`topbar${scrolled ? " is-scrolled" : ""}`}>
-              <h1>{searching ? "Suchergebnisse" : current.title}</h1>
+              <h1>{searching ? "Search results" : current.title}</h1>
               {searching && (
                 <span className="topbar__count">
-                  {hitCount === 1 ? "1 Einstellung" : `${hitCount} Einstellungen`}
+                  {hitCount === 1 ? "1 setting" : `${hitCount} settings`}
                 </span>
               )}
             </header>
@@ -667,7 +667,7 @@ export default function Settings() {
                     <Icon name="warn" className="icon-sm" />
                     <span>{saveError}</span>
                     <button type="button" className="ghost" onClick={() => void flush()}>
-                      Erneut speichern
+                      Save again
                     </button>
                   </motion.div>
                 )}
@@ -691,7 +691,7 @@ export default function Settings() {
                         setConfigNotice(null);
                       }}
                     >
-                      Verstanden
+                      Got it
                     </button>
                   </motion.div>
                 )}
@@ -716,7 +716,7 @@ export default function Settings() {
                           .catch((e) => setWizardError(String(e)));
                       }}
                     >
-                      Erneut versuchen
+                      Try again
                     </button>
                   </motion.div>
                 )}
@@ -739,7 +739,7 @@ export default function Settings() {
                     <Icon name="warn" className="icon-sm" />
                     <span>{setupGapSummary(wizardState.setup)}</span>
                     <button type="button" className="add" onClick={() => setWizardActive(true)}>
-                      Einrichtung öffnen
+                      Open setup
                     </button>
                   </motion.div>
                 )}
@@ -754,20 +754,20 @@ export default function Settings() {
                     transition={SETTLE}
                   >
                     <Icon name="warn" className="icon-sm" />
-                    {/* No "Verstanden" here any more. Acknowledging used to
+                    {/* No "Got it" here any more. Acknowledging used to
                         be the only thing this banner could offer, because
                         nothing in the app could restart it; now that the
                         button next to it works, a dismissal would only hide
                         a requirement that is still owed and leave no way
                         back to it. The restart is the acknowledgement. */}
-                    <span>Damit die Änderung greift, muss yappr neu starten.</span>
+                    <span>yappr has to restart for the change to take effect.</span>
                     <button
                       type="button"
                       className="add"
                       disabled={!saveSettled || restarting}
                       onClick={() => void restartNow()}
                     >
-                      {restarting ? "Startet neu…" : "Jetzt neu starten"}
+                      {restarting ? "Restarting…" : "Restart now"}
                     </button>
                   </motion.div>
                 )}
@@ -776,13 +776,13 @@ export default function Settings() {
               {searching && hitCount === 0 ? (
                 <div className="nothing">
                   <Icon name="search" className="nothing__glyph" />
-                  <p className="nothing__title">Nichts gefunden</p>
+                  <p className="nothing__title">Nothing found</p>
                   <p className="nothing__body">
-                    Keine Einstellung passt zu „{query.trim()}“. Gesucht wird in Namen,
-                    Erklärungen und den Schlüsseln aus <code>config.toml</code>.
+                    No setting matches “{query.trim()}”. The search covers names,
+                    explanations and the keys from <code>config.toml</code>.
                   </p>
                   <button type="button" className="add" onClick={() => setQuery("")}>
-                    Suche leeren
+                    Clear search
                   </button>
                 </div>
               ) : (
@@ -824,10 +824,10 @@ export default function Settings() {
                       `AutostartCard`'s own doc comment), so it renders
                       alongside `shown.map` rather than through it. Appended
                       after the config-backed sections rather than before —
-                      Allgemein's other rows (Mikrofon, Texteingabe) are
-                      about how one dictation behaves, this is about the app
+                      General's other rows (Microphone, Text entry) are about
+                      how one dictation behaves, this is about the app
                       itself. */}
-                  {!searching && current.id === "allgemein" && <AutostartCard />}
+                  {!searching && current.id === "general" && <AutostartCard />}
                 </motion.div>
               )}
             </div>
@@ -855,7 +855,7 @@ export default function Settings() {
 /// `yappr --quit` and start it again by hand. Something the app can do for
 /// you is worth interrupting for; something it cannot is not. The banner
 /// remains as the standing reminder once this has been answered with
-/// "Später", which is why deferring here does not clear the requirement.
+/// "Later", which is why deferring here does not clear the requirement.
 ///
 /// The scrim is the only element in this window that covers the pane, and it
 /// is not a blur: this window's own CSS header states that elevation is
@@ -944,12 +944,12 @@ function RestartDialog({
             transition={SETTLE}
           >
             <h2 className="dialog__title" id="restart-title">
-              Neustart nötig
+              Restart required
             </h2>
             <p className="dialog__body">
-              Die Änderung ist gespeichert, greift aber erst, wenn yappr neu
-              startet. Das dauert einen Moment; dein Kurzbefehl und deine
-              Einstellungen bleiben dabei erhalten.
+              The change is saved, but it only takes effect once yappr
+              restarts. That takes a moment; your shortcut and your settings
+              are kept.
             </p>
             {error && (
               <p className="dialog__error">
@@ -959,7 +959,7 @@ function RestartDialog({
             )}
             <div className="dialog__actions">
               <button type="button" className="ghost" onClick={onDefer} disabled={restarting}>
-                Später
+                Later
               </button>
               {/* Focused on open: this is the action the dialog exists to
                   offer, and it also puts the keyboard inside the dialog so
@@ -971,7 +971,7 @@ function RestartDialog({
                 onClick={onRestart}
                 disabled={restarting}
               >
-                {restarting ? "Startet neu…" : "Jetzt neu starten"}
+                {restarting ? "Restarting…" : "Restart now"}
               </button>
             </div>
           </motion.div>
@@ -984,7 +984,7 @@ function RestartDialog({
 /// The autosave's only permanent voice.
 ///
 /// It says nothing at rest, which is the point: a window with no Save button
-/// has nothing to confirm most of the time, and a badge reading "Gesichert"
+/// has nothing to confirm most of the time, and a badge reading "Saved"
 /// forever is a light that is always on. Failure is deliberately *not* here —
 /// it stays as the banner at the top of the pane, because a failure needs to
 /// persist and to carry a retry, and a capsule that fades out after two
@@ -1020,7 +1020,7 @@ function SaveCapsule({ state }: { state: SaveState }) {
             ) : (
               <span className="save-capsule__spin" aria-hidden="true" />
             )}
-            <span>{state === "saved" ? "Gespeichert" : "Speichert…"}</span>
+            <span>{state === "saved" ? "Saved" : "Saving…"}</span>
           </motion.div>
         )}
       </AnimatePresence>
@@ -1028,7 +1028,7 @@ function SaveCapsule({ state }: { state: SaveState }) {
   );
 }
 
-/// "Beim Anmelden starten" (spec §9, task 16). Deliberately **not** rendered
+/// "Start at login" (spec §9, task 16). Deliberately **not** rendered
 /// through `SectionCard`/`config[section]` the way every other row in this
 /// window is: the thing being toggled is whether
 /// `~/.config/autostart/yappr.desktop` exists, which is filesystem
@@ -1145,9 +1145,9 @@ function SectionCard({
         {RESTART_SECTIONS.has(name) && (
           <span
             className="tag"
-            title="Diese Einstellungen werden gelesen, wenn die Modelle geladen werden. Sind sie gerade im Speicher, fragt yappr nach dem Speichern nach einem Neustart — sonst greift die Änderung beim nächsten Diktat."
+            title="These settings are read when the models are loaded. If they are in memory right now, yappr asks for a restart after saving — otherwise the change takes effect on the next dictation."
           >
-            Neustart möglich
+            May need a restart
           </span>
         )}
         {sectionReset && <ResetButton onClick={() => onSection(defaults as Json, "now")} />}
@@ -1180,7 +1180,7 @@ function SectionCard({
               );
             })
         ) : (
-          <p className="empty">Unerwarteter Abschnitt.</p>
+          <p className="empty">Unexpected section.</p>
         )}
       </div>
       {extra}

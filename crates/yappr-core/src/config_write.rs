@@ -268,8 +268,8 @@ mod tests {
         save_config(&path, &json!({"audio": {"max_seconds": 90}})).unwrap();
 
         let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(raw.starts_with("# Automatisch erzeugt von yappr"), "raw:\n{raw}");
-        assert!(raw.contains("Handedits gehen verloren"), "raw:\n{raw}");
+        assert!(raw.starts_with("# Generated automatically by yappr"), "raw:\n{raw}");
+        assert!(raw.contains("hand edits are lost"), "raw:\n{raw}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
