@@ -950,3 +950,141 @@ fn a_reload_applies_a_new_vocabulary_without_restarting_the_daemon() {
     assert!(after.text.contains("Hyprland"), "reload did not apply: {:?}", after.text);
 }
 
+
+// ---------------------------------------------------------------------------
+// `dictate_text`: the realtime endpoint's half of the pipeline (invariant 16).
+//
+// The point of every test here is that the *text* is the same text -- the
+// OpenClaw plugin's whole claim is "what yappr would have typed", and the
+// only thing making it true is that both paths go through `refine`.
+// ---------------------------------------------------------------------------
+
+/// The same utterance down both paths produces the same string, and only one
+/// of them injects it.
+///
+/// If `dictate_text` ever grows its own copy of the vocabulary/normalize/
+/// guardrail/`finish` sequence, this is what notices -- a drift there is
+/// otherwise silent, because the wrong version still produces perfectly
+/// plausible text.
+#[test]
+fn a_realtime_utterance_produces_the_text_dictation_would_have_typed() {
+    let spy = std::sync::Arc::new(MockInjector::default());
+    let p = Pipeline::new(
+        Config::from_str("").unwrap(),
+        Box::new(FixedAsr("das treffen ist um vier".into())),
+        Box::new(WholeBuffer),
+        Box::new(AlwaysEnglish),
+        Box::new(FixedNormalizer("das Treffen ist um vier".into())),
+        Box::new(FwdInjector(std::sync::Arc::clone(&spy))),
+    )
+    .with_rejections_path(scratch_rejections_path("realtime-parity"));
+
+    let typed = p.process(&samples(), None).unwrap().expect("an outcome");
+    let streamed = p.dictate_text(&samples(), true).unwrap().expect("a transcript");
+
+    assert_eq!(
+        streamed,
+        typed.text.trim_end(),
+        "both paths run `refine`; the only difference may be `[inject] trailing_space`"
+    );
+    // `finish` ran on the streamed copy too: capitalised, with a full stop.
+    assert!(streamed.starts_with("Das "), "{streamed}");
+    assert!(streamed.ends_with('.'), "{streamed}");
+    assert_eq!(
+        spy.injected().len(),
+        1,
+        "only `process` injects -- a realtime utterance must never reach the keyboard"
+    );
+}
+
+/// Invariant 1, on the realtime path: a normalizer that fails costs the
+/// clean-up, never the transcript.
+#[test]
+fn a_realtime_utterance_survives_a_dead_normalizer() {
+    let p = Pipeline::new(
+        Config::from_str("").unwrap(),
+        Box::new(FixedAsr("send the invoice on friday".into())),
+        Box::new(WholeBuffer),
+        Box::new(AlwaysEnglish),
+        Box::new(BrokenNormalizer),
+        Box::new(MockInjector::default()),
+    );
+
+    let text = p.dictate_text(&samples(), true).unwrap().expect("a transcript");
+    assert_eq!(text, "Send the invoice on friday.");
+}
+
+/// `[realtime] normalize = false` is the caller's own switch, and it must
+/// reach the normalizer as a *skip*, not as a call whose result is discarded
+/// -- the model is the expensive part.
+#[test]
+fn a_realtime_utterance_can_skip_the_rewrite_without_skipping_finish() {
+    let p = Pipeline::new(
+        Config::from_str("").unwrap(),
+        Box::new(FixedAsr("das treffen ist um vier".into())),
+        Box::new(WholeBuffer),
+        Box::new(AlwaysEnglish),
+        Box::new(PanickingNormalizer),
+        Box::new(MockInjector::default()),
+    );
+
+    let text = p.dictate_text(&samples(), false).unwrap().expect("a transcript");
+    assert_eq!(text, "Das treffen ist um vier.");
+}
+
+/// And it cannot switch the rewrite back *on*: `[normalize] enabled = false`
+/// is the global answer, and a second switch that overrode it would be a
+/// setting that lies.
+#[test]
+fn the_realtime_switch_cannot_re_enable_a_globally_disabled_rewrite() {
+    let p = Pipeline::new(
+        Config::from_str("[normalize]\nenabled = false\n").unwrap(),
+        Box::new(FixedAsr("das treffen ist um vier".into())),
+        Box::new(WholeBuffer),
+        Box::new(AlwaysEnglish),
+        Box::new(PanickingNormalizer),
+        Box::new(MockInjector::default()),
+    );
+
+    let text = p.dictate_text(&samples(), true).unwrap().expect("a transcript");
+    assert_eq!(text, "Das treffen ist um vier.");
+}
+
+/// A segment of breath is ordinary, not an error: the streaming VAD errs
+/// towards cutting. `None` is what keeps the plugin from posting an empty
+/// message into the user's session.
+#[test]
+fn a_realtime_segment_with_no_words_produces_nothing_at_all() {
+    let p = Pipeline::new(
+        Config::from_str("").unwrap(),
+        Box::new(FixedAsr("   ".into())),
+        Box::new(WholeBuffer),
+        Box::new(AlwaysEnglish),
+        Box::new(PanickingNormalizer),
+        Box::new(MockInjector::default()),
+    );
+
+    assert!(p.dictate_text(&samples(), true).unwrap().is_none());
+    assert!(p.dictate_text(&[], true).unwrap().is_none());
+}
+
+/// The vocabulary runs here too (invariant 10) -- and before the rewrite, so
+/// a corrected term is what S1-mini and the guardrail both see.
+#[test]
+fn the_dictation_vocabulary_applies_to_realtime_utterances() {
+    let cfg = Config::from_str(
+        "[vocabulary]\nenabled = true\nterms = [\"Kubernetes\"]\n\n[normalize]\nenabled = false\n",
+    )
+    .unwrap();
+    let p = Pipeline::new(
+        cfg,
+        Box::new(FixedAsr("wir deployen auf kubernetis".into())),
+        Box::new(WholeBuffer),
+        Box::new(AlwaysEnglish),
+        Box::new(PanickingNormalizer),
+        Box::new(MockInjector::default()),
+    );
+
+    let text = p.dictate_text(&samples(), true).unwrap().expect("a transcript");
+    assert!(text.contains("Kubernetes"), "{text}");
+}

@@ -97,6 +97,117 @@ impl Trimmer for SileroTrimmer {
     }
 }
 
+/// Cuts a *live* stream into utterances, where [`Trimmer`] finds the speech
+/// in a buffer that is already complete.
+///
+/// The distinction is the whole reason this exists next to `SileroTrimmer`
+/// rather than inside it. Press-to-stop dictation knows when the utterance
+/// ended -- the user said so -- and asks the VAD only where inside the
+/// recording the speech was. A realtime session (`realtime.rs`) has nobody
+/// to ask: the audio arrives chunk by chunk and *something* has to decide
+/// that a pause was the end of a sentence. Silero already makes exactly that
+/// judgement, so this streams audio into the same model and takes its
+/// finished segments off the queue instead of re-scanning a growing buffer.
+///
+/// A `#[cfg(test)]` implementation of [`Segmenter`] is what lets the whole
+/// WebSocket server be tested with no model on disk; this implementation is
+/// covered by the `--ignored` tests at the bottom of this file, for the ABI
+/// reason this module's test header describes.
+pub trait Segmenter: Send {
+    /// Feeds 16 kHz mono samples in. Never blocks on a decision.
+    fn accept(&mut self, samples: &[f32]);
+    /// Takes the next finished utterance, if the pause after one has
+    /// already been observed. Call until it answers `None`.
+    fn take_segment(&mut self) -> Option<Vec<f32>>;
+    /// Whether speech is being heard *right now* -- the first evidence a
+    /// turn has started, which is all `onSpeechStart` needs.
+    fn speaking(&self) -> bool;
+    /// Ends the stream: whatever is still open becomes a segment rather
+    /// than being dropped. Invariant 1's rule applied one layer earlier --
+    /// audio that has been spoken into the socket must not disappear
+    /// because the socket closed before the speaker paused.
+    fn flush(&mut self);
+}
+
+/// [`Segmenter`] over the same Silero model `SileroTrimmer` uses, with the
+/// two durations that decide segmentation taken from `[realtime]` instead of
+/// being fixed.
+pub struct SileroSegmenter {
+    vad: VoiceActivityDetector,
+    /// Odd samples left over from the last `accept`, because the model wants
+    /// whole [`VAD_WINDOW`]s and a WebSocket frame is whatever size the
+    /// sender felt like. Dropping the remainder instead would delete up to
+    /// 31 ms of audio per frame, all of it at frame boundaries -- i.e.
+    /// spread evenly through every utterance.
+    pending: Vec<f32>,
+}
+
+impl SileroSegmenter {
+    /// `silence_ms` is how long a pause has to be to end an utterance;
+    /// `max_utterance_seconds` is where an unbroken stretch of speech is cut
+    /// anyway.
+    pub fn new(models_dir: &Path, silence_ms: u32, max_utterance_seconds: u32) -> Result<Self> {
+        let model = models_dir.join("silero_vad.onnx");
+        anyhow::ensure!(model.exists(), "missing {}", model.display());
+
+        let mut config = VadModelConfig::default();
+        config.silero_vad.model = Some(model.to_string_lossy().into_owned());
+        config.silero_vad.threshold = 0.5;
+        config.silero_vad.min_silence_duration = silence_ms as f32 / 1000.0;
+        config.silero_vad.min_speech_duration = 0.25;
+        config.silero_vad.max_speech_duration = max_utterance_seconds as f32;
+        config.sample_rate = SAMPLE_RATE;
+        config.num_threads = 1;
+        config.debug = false;
+
+        // The ring buffer sherpa keeps segments in. One `max_speech_duration`
+        // would be exactly enough only if the consumer never fell behind;
+        // transcription happens between `accept` calls, so size it for a few
+        // utterances' worth and let the floor cover a very short cap.
+        let capacity = (max_utterance_seconds as f32 * 3.0).max(30.0);
+        let vad = VoiceActivityDetector::create(&config, capacity)
+            .context("VoiceActivityDetector::create returned None")?;
+
+        Ok(Self { vad, pending: Vec::new() })
+    }
+}
+
+impl Segmenter for SileroSegmenter {
+    fn accept(&mut self, samples: &[f32]) {
+        self.pending.extend_from_slice(samples);
+        let whole = self.pending.len() - self.pending.len() % VAD_WINDOW;
+        for chunk in self.pending[..whole].chunks(VAD_WINDOW) {
+            self.vad.accept_waveform(chunk);
+        }
+        self.pending.drain(..whole);
+    }
+
+    fn take_segment(&mut self) -> Option<Vec<f32>> {
+        if self.vad.is_empty() {
+            return None;
+        }
+        let seg = self.vad.front()?;
+        let samples = seg.samples().to_vec();
+        self.vad.pop();
+        Some(samples)
+    }
+
+    fn speaking(&self) -> bool {
+        self.vad.detected()
+    }
+
+    fn flush(&mut self) {
+        // The remainder first: it is the most recent audio there is, and
+        // flushing without it would cut the last word of the last sentence
+        // -- the one case a user notices immediately.
+        if !self.pending.is_empty() {
+            let tail = std::mem::take(&mut self.pending);
+            self.vad.accept_waveform(&tail);
+        }
+        self.vad.flush();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! The `#[ignore]`d tests below are the only thing that catches a

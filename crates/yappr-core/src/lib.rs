@@ -18,6 +18,7 @@ pub mod paths;
 pub mod pipeline;
 pub mod procutil;
 pub mod proto;
+pub mod realtime;
 pub mod server;
 pub mod style;
 pub mod vad;

@@ -18,7 +18,7 @@ No cloud, no account, no network calls while you dictate.
 | **Everything else** | right-click the tray icon |
 
 **Jump to:** [Install](#install) · [First run](#first-run) · [Using it](#using-it) ·
-[Settings](#settings) · [Troubleshooting](#troubleshooting) ·
+[Settings](#settings) · [OpenClaw](#dictating-in-openclaw) · [Troubleshooting](#troubleshooting) ·
 [How it works](#how-it-works) · [Limitations](#known-limitations)
 
 ## Install
@@ -205,8 +205,8 @@ Nothing is desktop-specific except shortcut registration. Bind `yappr --toggle` 
 
 Left-click the tray icon, or `yappr --settings`. Everything in `config.toml` is
 editable there — microphone, dictation vocabulary, styles, thresholds, colours — across
-six panes: **Allgemein**, **Sprache**, **Stil**, **Darstellung**, **Erweitert**,
-**Diagnose**. There's a search box; it matches German labels, help text, *and* the raw
+seven panes: **Allgemein**, **Sprache**, **Stil**, **KI**, **Erweitert**,
+**Darstellung**, **Diagnose**. There's a search box; it matches German labels, help text, *and* the raw
 `config.toml` key names.
 
 There is no Save button. Toggles and dropdowns save immediately, text and number fields
@@ -252,6 +252,70 @@ the new model or normalizer on your next dictation, so nothing is asked. Everyth
 — the microphone included — applies at your next dictation, or immediately with
 `yappr --reload`.
 
+### Dictating in OpenClaw
+
+[OpenClaw](https://openclaw.ai) is a separate, locally installed AI agent. Its
+dictation normally goes to a cloud speech service. The **KI** pane turns that
+around: one button installs a yappr plugin into OpenClaw and points its dictation
+at this machine's models instead — same Parakeet, same S1-mini clean-up, same
+vocabulary and style rules as the text yappr types into your editor, and nothing
+leaves the machine.
+
+**Einrichten** does five things, and reports each one separately:
+
+1. writes the plugin to `~/.local/share/yappr/openclaw-plugin/`
+2. switches on yappr's local endpoint (`[realtime] enabled = true`)
+3. runs `openclaw plugins install --link` against that directory
+4. runs `openclaw plugins enable yappr`
+5. writes yappr into OpenClaw's own config as its streaming transcription provider
+
+Steps 3–5 call the `openclaw` CLI, which is what writes OpenClaw's config file —
+yappr never edits it directly. If OpenClaw isn't installed, the button says so and
+does nothing; install it separately (`npm i -g openclaw`) and press **Erneut
+prüfen**.
+
+**One manual step is left, deliberately:** OpenClaw only loads a newly linked
+plugin when its gateway restarts (`openclaw gateway restart`). yappr doesn't do
+that for you — that process is serving live agent sessions, and ending them is not
+a side effect a dictation app's settings window should have.
+
+**Entfernen** undoes the OpenClaw side (unselects the provider, removes its entry,
+disables and unlinks the plugin) and deliberately leaves `[realtime]` alone: that
+is yappr's own setting, and you may have switched the endpoint on for something
+else.
+
+#### What the endpoint is
+
+`[realtime]` opens a WebSocket on **127.0.0.1 only** — there is no setting that
+puts it on a network interface. A program connects, streams microphone audio, and
+gets finished sentences back:
+
+| | |
+|---|---|
+| **Address** | `ws://127.0.0.1:17869/v1/transcribe` (`[realtime] port`) |
+| **Audio in** | PCM s16le or G.711 µ-law, mono, any sample rate from 8 kHz up — declared as `?sample_rate=&encoding=`. OpenClaw always sends µ-law at 8 kHz; that is its relay's fixed contract, not a setting |
+| **Text out** | one JSON `{"type":"final","text":…}` per utterance, cut by the same Silero VAD yappr uses on its own recordings |
+| **Interim results** | none. yappr transcribes whole utterances; there is nothing to show mid-sentence |
+| **Access** | any local program, unless you set `[realtime] token` — then `Authorization: Bearer <token>` or `?token=` is required |
+
+`silence_ms` (700 ms) is how long a pause ends a sentence, and
+`max_utterance_seconds` (20 s) is where a stretch of unbroken speech gets cut
+anyway — what gets cut is still transcribed, never dropped. `normalize` decides
+whether those transcripts get the S1-mini rewrite or stop at the raw ASR plus
+capitalisation and punctuation; it can only turn clean-up *off*, never on when
+`[normalize] enabled = false`.
+
+The endpoint costs nothing while nothing is connected, and it opens no microphone
+of its own — the audio comes from whatever connected to it. Changes to `[realtime]`
+take effect immediately; there is no restart to do.
+
+If you change the port or the token *after* installing, OpenClaw is left pointing at
+the old ones and the card says so (“veraltete Zugangsdaten”) — press **Erneut
+einrichten** to write them across.
+
+The plugin's own source, protocol notes and manual install instructions are in
+[`openclaw-plugin/README.md`](openclaw-plugin/README.md).
+
 ## config.toml
 
 Lives at `~/.local/state/yappr/config.toml`, written on first run.
@@ -278,6 +342,7 @@ first start, and the old `~/.config/yappr/config.toml` is left behind as
 | `[debug]` | `enabled` (off), `dir` (default `~/yappr`), `save_audio` — see [Troubleshooting](#troubleshooting) |
 | `[overlay]` | `position`, `width`, `height` — read, but inert: under Wayland a window can't place itself, so this changes nothing today |
 | `[ui]` | `theme` — see [Themes](#themes) |
+| `[realtime]` | `enabled` (off), `port`, `token`, `silence_ms`, `max_utterance_seconds`, `normalize` — the local endpoint other programs dictate through; see [Dictating in OpenClaw](#dictating-in-openclaw) |
 
 > **A config that won't load is moved aside, not ignored.** Every section is
 > `deny_unknown_fields`, so an unrecognised key is still caught rather than silently
