@@ -11,8 +11,10 @@
 //! appeared anyway, the window class the chord was chosen from, and which
 //! chord that turned out to be.
 //!
-//! **It presses real keys into whatever window is focused, and it replaces
-//! your clipboard.** Focus a scratch window first. The very first run also
+//! **It presses real keys into whatever window is focused, and it puts the
+//! transcript on your clipboard.** Focus a scratch window first. Whatever
+//! you had copied is handed back afterwards, exactly as a dictation does it,
+//! unless you have `[inject] restore_clipboard = false`. The very first run also
 //! raises the portal's approval dialog, which takes focus itself -- answer
 //! it, then focus the scratch window again before the chord goes out.
 //!
@@ -108,6 +110,15 @@ fn main() {
         );
     }
     println!("text                  = {text:?}");
+    println!(
+        "restore_clipboard     = {}  ({})",
+        cfg.inject.restore_clipboard,
+        if cfg.inject.restore_clipboard {
+            "what you had copied is put back after the paste"
+        } else {
+            "the transcript stays in the clipboard"
+        }
+    );
 
     match inject::build(&cfg.inject).inject(&text, class.as_deref()) {
         Ok(()) => println!("inject()              = Ok"),

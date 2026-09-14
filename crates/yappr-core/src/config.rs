@@ -516,6 +516,31 @@ pub struct InjectConfig {
     /// at all.
     #[serde(default = "d_paste_chord")]
     pub paste_chord: PasteChord,
+    /// Whether the `ydotool` and `libei` backends hand the clipboard back
+    /// the way they found it once the paste has landed. Only those two read
+    /// it -- they are the only backends that stage the transcript on the
+    /// clipboard themselves. On by default.
+    ///
+    /// Both pastes work by `wl-copy`ing the transcript and pressing one
+    /// chord, which leaves the transcript sitting in the clipboard
+    /// afterwards: whatever the user had copied before dictating is gone,
+    /// and the next Ctrl+V they press by hand repeats the dictation. With
+    /// this on, the previous contents are read first and written back
+    /// `inject::CLIPBOARD_RESTORE_SETTLE` after the chord -- so the *old*
+    /// entry is current again and the transcript is one step down in
+    /// whatever clipboard history the user runs (cliphist, clipman, Klipper).
+    ///
+    /// Off is for the desktop where that settle is not enough: an
+    /// application that reads the selection lazily, after the restore has
+    /// already happened, pastes the old text instead of the dictation.
+    /// Nothing in yappr can observe that, which is why the escape hatch is a
+    /// setting rather than a heuristic. Two cases restore nothing at all and
+    /// leave the transcript in place, deliberately: a clipboard that was
+    /// empty before the dictation (clearing it would put the transcript
+    /// beyond reach of a user with no history manager), and a paste that
+    /// failed (the transcript is the clipboard fallback, invariant 1).
+    #[serde(default = "d_true")]
+    pub restore_clipboard: bool,
 }
 
 fn d_backend() -> InjectBackend {
@@ -577,6 +602,7 @@ impl Default for InjectConfig {
             script: d_script(),
             terminal_classes: d_terminal_classes(),
             paste_chord: d_paste_chord(),
+            restore_clipboard: true,
         }
     }
 }

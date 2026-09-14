@@ -16,6 +16,13 @@ pasted by `ydotool` (`wl-copy` plus one Ctrl+V, Ctrl+Shift+V for a window class 
 to a *user-supplied script* (yappr runs `[inject] script` with the finished transcript as
 `$1` and passes nothing else, so the script owns the clipboard, the chord and any
 window detection). A failure of any kind falls back to the clipboard, per invariant 1.
+Both chord-pressing backends put the clipboard back the way they found it once the paste
+has landed (`[inject] restore_clipboard`, default on, added 2026-09-14): the snapshot is
+taken before the transcript is staged and written back `CLIPBOARD_RESTORE_SETTLE` after
+the chord, so the user's own entry is current again and the dictation is the second
+entry in their clipboard history. `paste_through_clipboard` in `inject.rs` is the shared
+body of both backends, and the ordering *is* the feature — see its doc for the three
+cases that deliberately restore nothing (setting off, empty clipboard, failed paste).
 Fully local at dictation time. `SUPER+ALT+D`
 cancels a recording in progress; nothing else can end one deliberately — see invariant 11.
 
