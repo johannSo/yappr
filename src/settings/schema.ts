@@ -104,6 +104,7 @@ export const LABELS: Record<string, string> = {
   "inject.script": "Einfüge-Skript",
   "inject.paste_chord": "Einfüge-Tastenkombination",
   "inject.terminal_classes": "Terminal-Fensterklassen",
+  "inject.restore_clipboard": "Zwischenablage wiederherstellen",
   "inject.trailing_space": "Leerzeichen anhängen",
   "inject.keystroke_delay_ms": "Tastenverzögerung",
   "vocabulary.enabled": "Vokabular aktiv",
@@ -193,6 +194,8 @@ export const HELP: Record<string, string> = {
     "Welche Tastenkombination die Verfahren ydotool und libei drücken. auto entscheidet nach der Fensterklasse: Strg+Umschalt+V für alles, was unten als Terminal eingetragen ist, sonst Strg+V. Kann yappr das fokussierte Fenster nicht benennen, wird daraus Strg+V — was Terminals ignorieren, ohne dass ein Fehler gemeldet wird. Wenn du hauptsächlich in Terminals diktierst und nichts ankommt, stell hier fest auf Strg+Umschalt+V.",
   "inject.terminal_classes":
     "Fensterklassen, die als Terminal gelten und deshalb unter auto Strg+Umschalt+V bekommen. Groß-/Kleinschreibung ist egal. Die Klasse deines Fensters steht im Debug-Datensatz unter window_class.",
+  "inject.restore_clipboard":
+    "Die Verfahren ydotool und libei legen den Text zum Einfügen in die Zwischenablage. Mit dieser Einstellung wird danach wiederhergestellt, was vorher darin lag — der alte Eintrag ist also wieder der aktuelle, und das Diktat rutscht in der Zwischenablage-Historie auf Platz zwei. Aus heißt: das Diktat bleibt in der Zwischenablage liegen. Ausschalten, wenn ein Programm den Text zu spät abholt und deshalb den alten Inhalt einfügt.",
   "inject.trailing_space":
     "Hängt ein Leerzeichen an, damit das nächste Diktat nicht am vorherigen klebt.",
   "inject.keystroke_delay_ms":
@@ -362,6 +365,7 @@ export const DEPENDENT_FIELDS: Record<string, { on: string; is: Json[] }> = {
   "inject.script": { on: "backend", is: ["script"] },
   "inject.paste_chord": { on: "backend", is: ["ydotool", "libei"] },
   "inject.terminal_classes": { on: "backend", is: ["ydotool", "libei"] },
+  "inject.restore_clipboard": { on: "backend", is: ["ydotool", "libei"] },
 };
 
 /// Whether a row's dependency (if it has one) is currently satisfied.
@@ -390,6 +394,7 @@ export const FIELD_ORDER: Record<string, string[]> = {
     "script",
     "paste_chord",
     "terminal_classes",
+    "restore_clipboard",
     "trailing_space",
     "keystroke_delay_ms",
   ],

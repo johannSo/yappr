@@ -732,3 +732,42 @@ silent, ~5,5 ms, and returned the identical token; a stale token, by contrast, p
 several probe processes that share that one file, each rotating it. `SessionReport` now
 carries `token_reused` and the establishment log line prints it, so the next occurrence
 is one line of diagnosis instead of an afternoon of it.
+
+## The clipboard is handed back after a paste (2026-09-14)
+
+Both backends that paste rather than type -- `ydotool` and `libei` -- work by `wl-copy`ing
+the transcript and pressing one chord, which left the transcript sitting in the clipboard
+afterwards: whatever the user had copied before dictating was gone, and the next Ctrl+V
+they pressed by hand repeated the dictation. They now read the clipboard first and write
+it back once the paste has landed (`[inject] restore_clipboard`, default on), so the
+user's own entry is current again and the dictation is the *second* entry in whatever
+clipboard history they run.
+
+`inject::paste_through_clipboard` is the shared body of both backends, and the ordering is
+the whole feature: snapshot before staging (staging is what destroys it), restore after the
+chord plus `CLIPBOARD_RESTORE_SETTLE` (300 ms -- the target still has to ask for the
+selection and read it). Three cases restore nothing, all deliberately: the setting off, an
+empty clipboard (`wl-copy --clear` would leave a user without a history manager nothing to
+paste), and a failed press -- there the transcript staying put *is* the clipboard fallback
+the user is about to be notified about, invariant 1.
+
+### What is verified, and what is not
+
+Verified: the ordering, the three skip cases and the type selection, by unit test
+(`inject.rs`, through a `Clipboard` trait so `cargo test` never touches the developer's own
+clipboard). `cargo test --workspace` and `cargo clippy --workspace --all-targets` are clean;
+the `--ignored` half passes except the four ASR fixtures whose models are not downloaded on
+this machine.
+
+**Not verified: a real paste on real hardware.** Nobody has dictated through this yet. The
+one way it can go wrong is invisible from inside yappr -- an application that asks for the
+selection *after* the restore has happened pastes the old clipboard instead of the
+dictation, and nothing reports which bytes a client read. 300 ms is `handy-paste.sh`'s
+number and it has been good enough for that script's users; `restore_clipboard = false` is
+the escape hatch, and it is why the behaviour is a setting rather than a heuristic.
+`cargo run -p yappr-core --example libei_probe -- "hallo welt"` exercises the whole path
+without a microphone and now prints the setting's value.
+
+Also unverified: the non-text path. A copied image is snapshotted under its own MIME type
+and handed back with `wl-copy --type`, which is the right shape, but only text has actually
+been through it.

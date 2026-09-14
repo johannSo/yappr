@@ -272,7 +272,7 @@ first start, and the old `~/.config/yappr/config.toml` is left behind as
 | `[asr]` | `num_threads` for Parakeet |
 | `[normalize]` | `enabled` (`false` skips S1-mini and types rule-cleaned raw text), plus `timeout_ms`, `context_size`, `threads` |
 | `[guardrail]` | `min_word_ratio`/`max_word_ratio`, `min_overlap_english`/`min_overlap_other`, `short_input_words`, `ngram_size`/`ngram_max_repeats` |
-| `[inject]` | `backend` (`wtype`, `libei`, `ydotool`, `script`, `clipboard`), `script` (the program the `script` backend runs), `paste_chord`/`terminal_classes` (`ydotool` and `libei` only) — see [Pasting where `wtype` can't type](#pasting-where-wtype-cant-type) — plus `trailing_space`, `keystroke_delay_ms` (wtype only) |
+| `[inject]` | `backend` (`wtype`, `libei`, `ydotool`, `script`, `clipboard`), `script` (the program the `script` backend runs), `paste_chord`/`terminal_classes`/`restore_clipboard` (`ydotool` and `libei` only) — see [Pasting where `wtype` can't type](#pasting-where-wtype-cant-type) — plus `trailing_space`, `keystroke_delay_ms` (wtype only) |
 | `[vocabulary]` | terms and replacements applied to the raw transcript before clean-up — put short acronyms in `replacements`, not `terms` |
 | `[style_default]`, `[[style_rules]]` | the `styling`/`structure`/`context` axes S1-mini is prompted with, and per-application overrides matched on window class (regex) |
 | `[debug]` | `enabled` (off), `dir` (default `~/yappr`), `save_audio` — see [Troubleshooting](#troubleshooting) |
@@ -309,10 +309,20 @@ Settings → Allgemein → Texteingabe → *Verfahren*:
 | `script` | Hands the text to a program of yours, which does the inserting. | A script you write. |
 | `clipboard` | Copies the text; you paste it. | Nothing. |
 
-`libei` and `ydotool` do the same thing by different routes and share the same two
-settings, `paste_chord` and `terminal_classes`. `ydotool` is the one verified end to end
-on real hardware, which is the only reason it is listed first in this section; `libei`
-is the one that asks nothing of you beyond a click.
+`libei` and `ydotool` do the same thing by different routes and share the same three
+settings, `paste_chord`, `terminal_classes` and `restore_clipboard`. `ydotool` is the
+one verified end to end on real hardware, which is the only reason it is listed first in
+this section; `libei` is the one that asks nothing of you beyond a click.
+
+Both paste by putting the transcript on the clipboard, so both **put back what was in
+the clipboard before** once the paste has landed (`[inject] restore_clipboard`, on by
+default). What you had copied is the current clipboard entry again, and the dictation
+sits one place below it in whatever clipboard history you run — so the next Ctrl+V you
+press by hand is still *your* text, not the last thing you dictated. Turn it off if a
+program reads the clipboard so late that it ends up pasting the old contents instead of
+the dictation; nothing can detect that from yappr's side. An empty clipboard and a
+failed paste both restore nothing on purpose — in the second case the transcript is the
+clipboard fallback you are being notified about.
 
 #### `libei`
 
@@ -320,6 +330,7 @@ is the one that asks nothing of you beyond a click.
 [inject]
 backend = "libei"
 paste_chord = "auto"          # or "ctrl_v" / "ctrl_shift_v"
+restore_clipboard = true      # put back what you had copied, after pasting
 ```
 
 Same paste as `ydotool` — `wl-copy`, then one Ctrl+V (Ctrl+Shift+V for a terminal) —
@@ -357,6 +368,7 @@ window and replaces your clipboard, so focus a scratch window first.
 [inject]
 backend = "ydotool"
 paste_chord = "auto"          # or "ctrl_v" / "ctrl_shift_v"
+restore_clipboard = true      # put back what you had copied, after pasting
 ```
 
 It copies the transcript with `wl-copy` and then presses **one Ctrl+V** by raw keycode
