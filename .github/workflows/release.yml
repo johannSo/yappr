@@ -9,6 +9,11 @@
 #
 # That creates the tag and the release; the tag workflow below builds the
 # AppImage and attaches it to that release. Watch it with `gh run watch`.
+# The tag is also the version: the build stamps it into Cargo.toml,
+# src-tauri/Cargo.toml, package.json and tauri.conf.json before compiling, so
+# the AppImage's filename and the number the settings window reports both come
+# from the tag and there is nothing to bump by hand. The checked-in version
+# numbers only ever describe a local build.
 # (A bare `git push --tags` also works — the job then creates the release
 # itself instead of uploading into an existing one.)
 #
@@ -41,7 +46,7 @@ permissions:
 
 jobs:
   build-appimage:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2204
     # The image, not the runner label, is what pins glibc: an AppImage links
     # against whatever built it and glibc is backwards- but never forwards-
     # compatible, so this has to be the oldest base that still ships
@@ -103,6 +108,57 @@ jobs:
         with:
           ref: ${{ inputs.tag || github.ref_name }}
 
+      # --- version -----------------------------------------------------------
+      # The tag is the version of record. Everything else is downstream of it:
+      # `tauri.conf.json` names the AppImage file and the `.desktop` entry, and
+      # `src-tauri/Cargo.toml` is what `CARGO_PKG_VERSION` — the number the
+      # settings window's sidebar foot shows — is baked from. Before this step
+      # existed, cutting a tag without hand-editing all four files shipped
+      # `yappr_0.2.8_amd64.AppImage` for a v0.3 release, reporting 0.2.8 inside
+      # the app too. `the_binary_and_the_bundle_agree_on_the_version_number`
+      # (settings_cmds.rs) pins that those two must not diverge; this keeps them
+      # from diverging *from the release*, which no test can see.
+      #
+      # It stamps the tag rather than the release title on purpose: a bare tag
+      # push has no release yet (the upload step below creates it), so the title
+      # does not exist at build time on that path — and `gh release create` names
+      # a release after its tag anyway, so for a title left at its default the
+      # two are the same string.
+      - name: Stamp the release version into the build
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          # `v0.3` is a perfectly ordinary tag and not a version cargo or tauri
+          # will accept, so fill the missing patch component in rather than
+          # failing on it. Anything that is still not semver after that is a
+          # typo worth stopping for — a bad version reaches the user as a
+          # filename.
+          case "$version" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            [0-9]*.[0-9]*) version="$version.0" ;;
+          esac
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "tag '$TAG' does not name a version (want vX.Y or vX.Y.Z[-pre])" >&2
+            exit 1
+          fi
+
+          sed -i 's/^version = ".*"/version = "'"$version"'"/' Cargo.toml src-tauri/Cargo.toml
+          for json in package.json src-tauri/tauri.conf.json; do
+            jq --arg v "$version" '.version = $v' "$json" > "$json.tmp"
+            mv "$json.tmp" "$json"
+          done
+
+          # Read back rather than trusting the writes: a sed that matched
+          # nothing exits 0, and the result of that is a silently mislabelled
+          # bundle — the exact failure this step exists to end.
+          for f in Cargo.toml src-tauri/Cargo.toml package.json src-tauri/tauri.conf.json; do
+            grep -q "\"$version\"" "$f" || { echo "failed to stamp $f" >&2; exit 1; }
+            echo "$f -> $version"
+          done
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -125,8 +181,17 @@ jobs:
       # window) and runs `bun run build` as beforeBuildCommand.
       - name: Build the AppImage
         run: |
+          set -euo pipefail
           bun install --frozen-lockfile
           bun run tauri build --bundles appimage
+          # The stamp step is only worth anything if it reached the bundle, and
+          # the bundle's name is the one place that is observable before a user
+          # downloads it.
+          built=$(basename target/release/bundle/appimage/*.AppImage)
+          case "$built" in
+            *"$VERSION"*) echo "built $built" ;;
+            *) echo "$built does not carry the release version $VERSION" >&2; exit 1 ;;
+          esac
 
       # The linuxdeploy build Tauri pins (1-alpha) symlinks the AppDir root icon
       # to whichever hicolor size it happens to list first — 32x32 in practice —
